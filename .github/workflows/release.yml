@@ -1,0 +1,39 @@
+# .github/workflows/release.yml
+name: Build Tauri App (Cross-platform)
+
+on:
+  push:
+    tags:
+      - 'v*'  # 只有 push 标签以 v 开头时才会触发，比如 v1.0.0
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build with tauri
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'v${{ github.ref_name }}'
+
