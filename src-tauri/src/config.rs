@@ -2,6 +2,8 @@ use config::{Config, ConfigError, File};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Command;
+use std::env;
+use std::path::{Path,PathBuf};
 
 
 #[derive(Debug, Deserialize)]
@@ -38,10 +40,57 @@ pub struct AppConfig {
     pub mongodb: MongoConfig,
 }
 
-pub fn load_config() -> Result<AppConfig, ConfigError> {
-    let builder = Config::builder().add_source(File::with_name("config"));
+
+pub fn load_config(path: &Path) -> Result<AppConfig, ConfigError> {
+    let builder = Config::builder().add_source(File::from(path));
     let cfg = builder.build()?;
     cfg.try_deserialize()
+}
+
+pub fn default_config_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        // 开发模式下直接用 src-tauri 目录的配置
+        return PathBuf::from("config.toml");
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        // 获取当前可执行文件路径
+        if let Ok(exe_path) = env::current_exe() {
+            #[cfg(target_os = "macos")]
+            {
+                // macOS: app bundle 中：.app/Contents/MacOS/<binary>
+                if let Some(resources_dir) = exe_path
+                    .parent() // MacOS
+                    .and_then(|p| p.parent()) // Contents
+                    .map(|p| p.join("Resources"))
+                {
+                    return resources_dir.join("config.toml");
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: 和 .exe 放在同一目录（或 resource 子目录）
+                return exe_path
+                    .parent()
+                    .map(|p| p.join("config.toml"))
+                    .unwrap_or_else(|| PathBuf::from("config.toml"));
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Linux: 通常放在 /usr/share/<app>/config.toml 或可执行文件旁边
+                return exe_path
+                    .parent()
+                    .map(|p| p.join("config.toml"))
+                    .unwrap_or_else(|| PathBuf::from("config.toml"));
+            }
+        }
+
+        // fallback
+        PathBuf::from("config.toml")
+    }
 }
 
 

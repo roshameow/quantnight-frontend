@@ -6,21 +6,30 @@ mod watcher;
 mod datas;
 mod mongo_manager;
 
+use std::env;
+use std::path::PathBuf;
+
 use tauri::{Manager};
 use tauri::async_runtime;
 use mongo_manager::MongoClients;
 use crate::config::load_config;
+use crate::config::default_config_path;
 
 
 fn main() {
-    let config = load_config().expect("配置加载失败");
+    let config_path = env::args().nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_path);
+    println!("加载配置路径: {:?}", config_path);
+    let config = load_config(&config_path).expect("配置加载失败");
+    
     let mongo_clients = async_runtime::block_on(async {
         MongoClients::new(&config).await.expect("MongoDB 初始化失败")
     });
 
     tauri::Builder::default()
         .manage(mongo_clients) // ✅ 注册给 Tauri 的 State 系统
-        .manage(load_config().expect("配置加载失败"))
+        .manage(config)
         .invoke_handler(tauri::generate_handler![
             commands::create_task,
             commands::generate_list,

@@ -60,6 +60,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppConfig } from "@/config";
 
 
+
 // props
 const props = defineProps({ show: Boolean });
 // emit
@@ -100,7 +101,7 @@ const defaultJson = {
 const form = ref({
   taskName: "",
   configText: JSON.stringify(defaultJson, null, 2), // 预填入 JSON 字符串
-  templatePath: AppConfig.superTemplatePath,
+  templatePath: AppConfig.superTemplatePath || '',
   templateFilename: "",
   templateCode: "",
   isRemote: false, // ✅ 本地（false）/远程（true）标记

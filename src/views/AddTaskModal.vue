@@ -59,22 +59,6 @@ import { useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { AppConfig } from "@/config";
 
-// props
-const props = defineProps({ show: Boolean });
-// emit
-const emit = defineEmits(["update:show", "add-task"]);
-// 局部状态绑定
-const showModal = ref(props.show);
-
-// watch 同步 props => state
-watch(
-  () => props.show,
-  (v) => (showModal.value = v)
-);
-// watch 同步 state => emit 更新父组件
-watch(showModal, (v) => emit("update:show", v));
-
-const message = useMessage();
 
 // ✅ 默认 JSON 示例
 const defaultJson = {
@@ -104,6 +88,25 @@ const form = ref({
   isRemote: false, // ✅ 本地（false）/远程（true）标记
 });
 
+// props
+const props = defineProps({ show: Boolean });
+// emit
+const emit = defineEmits(["update:show", "add-task"]);
+// 局部状态绑定
+const showModal = ref(props.show);
+
+// watch 同步 props => state
+watch(
+  () => props.show,
+  (v) => (showModal.value = v)
+);
+// watch 同步 state => emit 更新父组件
+watch(showModal, (v) => emit("update:show", v));
+
+const message = useMessage();
+
+
+
 watch(
   () => props.show,
   async (v) => {
@@ -123,17 +126,6 @@ watch(
   }
 );
 
-const activeTab = ref("paste"); // 控制配置 Tab
-const templateTab = ref("paste"); // 控制模板 Tab（避免冲突）
-
-const handleConfigUpload = ({ file }) => {
-  const reader = new FileReader();
-  reader.onload = () => {
-    form.value.configText = reader.result;
-    activeTab.value = "paste";
-  };
-  reader.readAsText(file.file);
-};
 
 const handleTemplateUpload = ({ file }) => {
   const reader = new FileReader();
@@ -157,7 +149,7 @@ const handleSubmit = () => {
       name: form.value.taskName,
       config: JSON.parse(form.value.configText), // 修复 JSON 字符串错误解析
       template: form.value.templateCode,
-      templatefile: form.value.templateFilename,
+      templatefile: form.value.templateFilename || '',
       status: "pending",
       createdAt: new Date(),
     };
