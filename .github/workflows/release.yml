@@ -9,33 +9,12 @@ jobs:
   build:
     strategy:
       matrix:
-        platform: [ubuntu-22.04, windows-latest, macos-latest]
+        platform: [macos-latest, windows-latest]  # 去掉 ubuntu-latest
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v4
-
-      # ✅ 仅在 Linux 打印系统信息
-      - name: Print OS info (Linux only)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          uname -a
-          lsb_release -a || cat /etc/os-release
-
-      # ✅ 安装 Linux 构建依赖
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            pkg-config \
-            build-essential \
-            libssl-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
 
       - name: Setup Node
         uses: actions/setup-node@v4
