@@ -34,10 +34,13 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Debug GITHUB_TOKEN
+        run: echo "GITHUB_TOKEN is ${{ secrets.DEPLOY_TOKEN }}"
+
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'v${{ github.ref_name }}'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.DEPLOY_TOKEN }}
 
