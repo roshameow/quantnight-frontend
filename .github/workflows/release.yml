@@ -3,7 +3,7 @@ name: Build Tauri App (Cross-platform)
 on:
   push:
     tags:
-      - 'v*'  # 只有 push 标签以 v 开头时才会触发，比如 v1.0.0
+      - 'v*'
 
 jobs:
   build:
@@ -16,11 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Print OS info
+      # ✅ 仅在 Linux 打印系统信息
+      - name: Print OS info (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           uname -a
           lsb_release -a || cat /etc/os-release
 
+      # ✅ 安装 Linux 构建依赖
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -52,4 +55,3 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'v${{ github.ref_name }}'
           githubToken: ${{ secrets.GITHUB_TOKEN }}
-
