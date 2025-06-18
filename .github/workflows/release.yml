@@ -31,8 +31,8 @@ jobs:
 
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'v${{ github.ref_name }}'
+          github_token: ${{ secrets.DEPLOY_TOKEN }}
+
