@@ -34,4 +34,4 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'v${{ github.ref_name }}'
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
