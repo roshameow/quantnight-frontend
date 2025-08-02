@@ -35,6 +35,14 @@
             spellcheck="false"
           />
           <n-input
+            v-model:value="delayFilter"
+            placeholder="Delay"
+            clearable
+            @update:value="fetchData"
+            style="width: 100px"
+            spellcheck="false"
+          />
+          <n-input
             v-model:value="daysFilter"
             placeholder="Days Before"
             type="number"
@@ -64,6 +72,15 @@
           <n-input
             v-model:value="minMarginFilter"
             placeholder="Min Margin (‱)"
+            type="number"
+            clearable
+            @update:value="fetchData"
+            style="width: 130px"
+            spellcheck="false"
+          />
+          <n-input
+            v-model:value="minReturnFilter"
+            placeholder="Min Return (‱)"
             type="number"
             clearable
             @update:value="fetchData"
@@ -118,10 +135,12 @@ const data = ref([]);
 const searchQuery = ref("");
 const statusFilter = ref("");
 const regionFilter = ref("");
+const delayFilter = ref(null);
 const daysFilter = ref(null);
 const minTurnoverFilter = ref(null);
 const maxTurnoverFilter = ref(null);
 const minMarginFilter = ref(null);
+const minReturnFilter = ref(null);
 
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set()); // 用于记录正在加载的 ID
@@ -297,6 +316,7 @@ async function fetchData() {
     query: searchQuery.value.trim() || null,
     status: statusFilter.value || null,
     region: regionFilter.value || null,
+    delay: delayFilter.value ? parseInt(delayFilter.value) : null,
     days_within: daysFilter.value ? parseInt(daysFilter.value) : null,
     min_turnover:
       minTurnoverFilter.value != null ? parseFloat(minTurnoverFilter.value) / 100 : null,
@@ -304,6 +324,8 @@ async function fetchData() {
       maxTurnoverFilter.value != null ? parseFloat(maxTurnoverFilter.value) / 100 : null,
     min_margin:
       minMarginFilter.value != null ? parseFloat(minMarginFilter.value) / 10000 : null,
+    min_returns:
+      minReturnFilter.value != null ? parseFloat(minReturnFilter.value) / 100 : null,
   };
 
   try {
@@ -350,6 +372,7 @@ const columns = [
   },
   { title: "ID", key: "id" },
   { title: "Region", key: "region" },
+  { title: "Score", key: "pnl_score", sorter: "default" },
   { title: "Sharpe", key: "sharpe", sorter: "default" },
   { title: "Fitness", key: "fitness", sorter: "default" },
   {
@@ -544,7 +567,6 @@ const columns = [
   word-break: break-word;
   overflow: visible;
 }
-
 
 /* 确保展开后的内容能够正常显示 */
 .custom-table .n-data-table-wrapper .n-data-table-table .n-data-table-td {

@@ -30,6 +30,8 @@ pub struct AlphaResult {
     pub status: String,
     pub message: Option<String>,
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
+    pub pnl_score: Option<f64>,   // ✅ 新增
+
 }
 
 #[derive(Deserialize)]
@@ -41,6 +43,8 @@ pub struct AlphaQuery {
     pub min_turnover: Option<f64>,
     pub max_turnover: Option<f64>,
     pub min_margin: Option<f64>, // ✅ 新增字段
+    pub delay: Option<u32>,      // ✅ 新增：delay 筛选
+    pub min_returns: Option<f64>,    // ✅ 新增：returns 筛选
 }
 
 #[command]
@@ -68,6 +72,10 @@ pub async fn get_alpha_results(params: AlphaQuery,clients: State<'_, MongoClient
         filters.push(doc! { "settings.region": region });
     }
 
+    if let Some(delay) = params.delay {
+        filters.push(doc! { "settings.delay": delay as i32 });
+    }
+
     if let Some(days) = params.days_within {
         let since = Utc::now() - Duration::days(days as i64);
         println!("Filtering by date >= {}", since.to_rfc3339());
@@ -81,8 +89,27 @@ pub async fn get_alpha_results(params: AlphaQuery,clients: State<'_, MongoClient
         filters.push(doc! { "is.turnover": { "$lte": max } });
     }
 
-    if let Some(min) = params.min_margin {
-        filters.push(doc! { "is.margin": { "$gte": min } });
+
+    if let Some(min_margin) = params.min_margin {
+        filters.push(doc! {
+            "$expr": {
+                "$gte": [
+                    { "$abs": "$is.margin" },
+                    min_margin
+                ]
+            }
+        });
+    }
+
+    if let Some(min_returns) = params.min_returns {
+        filters.push(doc! {
+            "$expr": {
+                "$gte": [
+                    { "$abs": "$is.returns" },
+                    min_returns
+                ]
+            }
+        });
     }
 
     let filter = if filters.is_empty() {
@@ -166,6 +193,8 @@ pub async fn get_alpha_results(params: AlphaQuery,clients: State<'_, MongoClient
         let long_count = is.and_then(|d| d.get_i32("longCount").ok());
         let short_count = is.and_then(|d| d.get_i32("shortCount").ok());
         let returns = is.and_then(|d| d.get_f64("returns").ok());
+        let pnl_score = doc.get_f64("pnl_score").ok();
+
 
         let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
         if date_created.is_none() {
@@ -223,6 +252,7 @@ pub async fn get_alpha_results(params: AlphaQuery,clients: State<'_, MongoClient
             status,
             message,
             date_created,
+            pnl_score,
         });
     }
 
