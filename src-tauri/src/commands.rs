@@ -13,14 +13,8 @@ use tauri::{command, State};
 use crate::config::{run_bash_script, run_python_module, AppConfig};
 use crate::mongo_manager::MongoClients;
 
-
-use serde_json::Value;
 use serde_json::from_str;
 use serde_json::Value as JsonValue;
-
-
-use bson::Bson;
-use chrono::Utc;
 
 #[derive(Debug, Deserialize)]
 pub struct NewTask {
@@ -56,7 +50,7 @@ pub async fn create_task(
     let is_remote = new_task.is_remote.unwrap_or(false);
     let task_type = new_task.task_type.clone().unwrap_or_else(|| "regular".to_string());
 
-    let mut task_doc = doc! {
+    let task_doc = doc! {
         "name": &new_task.name,
         "template": &new_task.template,
         "templatefile": &new_task.templatefile,
@@ -87,8 +81,6 @@ pub async fn create_task(
 }
 
 
-
-
 #[command]
 pub async fn generate_list(id: String,clients: State<'_, MongoClients>,
     config: State<'_, AppConfig>,) -> Result<(), String> {
@@ -115,7 +107,7 @@ pub async fn generate_list(id: String,clients: State<'_, MongoClients>,
     replacements.insert("{name}", name);
     replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
 
-    run_python_module(&config, "generate_list", &replacements)?;
+    run_python_module(&config, "generate_list", &replacements).await?;
     // 可选：更新状态
     tasks
         .update_one(

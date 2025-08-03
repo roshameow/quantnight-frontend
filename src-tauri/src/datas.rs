@@ -366,12 +366,14 @@ pub struct CorrResult {
 }
 
 #[command]
-pub fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppConfig>) -> Result<HashMap<String, CorrResult>, String> {
+pub async fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppConfig>) -> Result<HashMap<String, CorrResult>, String> {
     let alpha_str = alpha_ids.join(",");
     let mut replacements = HashMap::new();
     replacements.insert("{alpha_ids}", alpha_str.as_str());
 
-    let stdout = run_python_module(&config, "alpha_correlation", &replacements)?;
+    // let stdout = run_python_module(&config, "alpha_correlation", &replacements)?;
+    let stdout = run_python_module(&config, "alpha_correlation", &replacements).await?; // 注意 .await?
+
 
     serde_json::from_str(&stdout).map_err(|e| format!("解析 JSON 失败: {}", e))
 }
