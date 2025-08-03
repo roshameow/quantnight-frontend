@@ -14,15 +14,22 @@ use crate::config::{run_bash_script, run_python_module, AppConfig};
 use crate::mongo_manager::MongoClients;
 
 
+use serde_json::Value;
+use serde_json::from_str;
+use serde_json::Value as JsonValue;
+
+
+use bson::Bson;
+use chrono::Utc;
+
 #[derive(Debug, Deserialize)]
 pub struct NewTask {
     pub name: String,
     pub template: String,
     pub templatefile: String,
     pub status: Option<String>,
-    pub is_remote: Option<bool>, // 👈 新增字段，默认为 false
-    pub task_type: Option<String>, // 👈 新增字段
-
+    pub is_remote: Option<bool>,
+    pub task_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,16 +39,16 @@ pub struct CreatedTask {
     pub template: String,
     pub templatefile: String,
     pub status: String,
-    pub is_remote: Option<bool>, // 👈 新增字段，默认为 false
-    pub task_type: Option<String>, // 👈 新增字段
+    pub is_remote: Option<bool>,
+    pub task_type: Option<String>,
 }
 
-
 #[command]
-pub async fn create_task(new_task: NewTask,clients: State<'_, MongoClients>) -> Result<CreatedTask, String> {
-
+pub async fn create_task(
+    new_task: NewTask,
+    clients: State<'_, MongoClients>,
+) -> Result<CreatedTask, String> {
     let client = &clients.local;
-
     let db = client.database("simulation_mission");
     let coll = db.collection::<Document>("tasks");
 
@@ -49,18 +56,19 @@ pub async fn create_task(new_task: NewTask,clients: State<'_, MongoClients>) -> 
     let is_remote = new_task.is_remote.unwrap_or(false);
     let task_type = new_task.task_type.clone().unwrap_or_else(|| "regular".to_string());
 
-    let task_doc = doc! {
+    let mut task_doc = doc! {
         "name": &new_task.name,
         "template": &new_task.template,
         "templatefile": &new_task.templatefile,
         "status": &status,
-        "isRemote": Some(is_remote),
+        "isRemote": is_remote,
         "taskType": &task_type,
     };
 
-    let result = coll.insert_one(task_doc, None)
+    let result = coll
+        .insert_one(task_doc, None)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("插入失败: {}", e))?;
 
     let inserted_id = result
         .inserted_id
@@ -75,9 +83,10 @@ pub async fn create_task(new_task: NewTask,clients: State<'_, MongoClients>) -> 
         status,
         is_remote: Some(is_remote),
         task_type: Some(task_type),
-        
     })
 }
+
+
 
 
 #[command]
@@ -208,6 +217,8 @@ pub struct Task {
     pub is_remote: Option<bool>, // 可选字段
     #[serde(rename = "taskType")] // 👈 加上这个
     pub task_type: Option<String>, // 或者 task_type: Option<String>
+    #[serde(rename = "mission_config")]
+    pub mission_config: Option<JsonValue>, // 加上这一行，接收嵌套的 config
 
 }
 
@@ -305,9 +316,15 @@ pub async fn delete_task(id: String, clients: State<'_, MongoClients>) -> Result
     Ok(())
 }
 
-#[command]
-pub async fn start_task(task_name: String, config: String, is_remote: bool, clients: State<'_, MongoClients>, app_config: State<'_, AppConfig>) -> Result<(), String> {
 
+#[command]
+pub async fn start_task(
+    task_name: String,
+    config: String,
+    is_remote: bool,
+    clients: State<'_, MongoClients>,
+    app_config: State<'_, AppConfig>,
+) -> Result<(), String> {
     let (stdout, _) = run_bash_script(
         "start_task",
         &[("task_name", &task_name), ("config", &config)],
@@ -319,14 +336,31 @@ pub async fn start_task(task_name: String, config: String, is_remote: bool, clie
     println!("start_task 脚本输出:\n{}", stdout);
 
     let client = &clients.local;
-
     let db = client.database("simulation_mission");
     let tasks = db.collection::<Document>("tasks");
 
+    // 解析 config 并准备写入 mission_config
+    let mut set_doc = doc! { "status": "running" };
+
+    if let Ok(json_val) = from_str::<serde_json::Value>(&config) {
+        if let Ok(bson_val) = bson::to_bson(&json_val) {
+            if let bson::Bson::Document(doc_inner) = bson_val {
+                set_doc.insert("mission_config", doc_inner);
+            }
+        } else {
+            eprintln!("config 转 BSON 失败");
+        }
+    } else {
+        eprintln!("config 解析成 JSON 失败");
+    }
+
+    // 组合更新
+    let update = doc! { "$set": set_doc };
+
     tasks
         .update_one(
-            doc! { "name": &task_name , "status": { "$ne": "deactive" }},
-            doc! { "$set": { "status": "running" } },
+            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
+            update,
             None,
         )
         .await
@@ -334,6 +368,7 @@ pub async fn start_task(task_name: String, config: String, is_remote: bool, clie
 
     Ok(())
 }
+
 
 #[command]
 pub async fn start_super_task(task_name: String, config: String, is_remote: bool, clients: State<'_, MongoClients>,app_config: State<'_, AppConfig>) -> Result<(), String> {

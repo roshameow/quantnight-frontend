@@ -42,18 +42,34 @@ pub struct AlphaQuery {
     pub days_within: Option<u32>,
     pub min_turnover: Option<f64>,
     pub max_turnover: Option<f64>,
-    pub min_margin: Option<f64>, // ✅ 新增字段
-    pub delay: Option<u32>,      // ✅ 新增：delay 筛选
-    pub min_returns: Option<f64>,    // ✅ 新增：returns 筛选
+    pub min_margin: Option<f64>,
+    pub delay: Option<u32>,
+    pub min_returns: Option<f64>,
+    pub collection: Option<String>, // 新增：可选的 collection 名称
+}
+
+fn sanitize_collection_name(name: &str) -> Option<String> {
+    // 只允许字母数字和下划线，防止注入奇怪字符
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(name.to_string())
+    } else {
+        None
+    }
 }
 
 #[command]
-pub async fn get_alpha_results(params: AlphaQuery,clients: State<'_, MongoClients>) -> Result<Vec<AlphaResult>, String> {
+pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClients>) -> Result<Vec<AlphaResult>, String> {
 
     let client = &clients.local;
-
     let db = client.database("alpha_db");
-    let collection = db.collection::<mongodb::bson::Document>("alpha_results");
+
+    // 选择 collection：优先用前端传的，fallback 到默认
+    let coll_name = params
+        .collection
+        .as_deref()
+        .and_then(|s| sanitize_collection_name(s))
+        .unwrap_or_else(|| "alpha_results".to_string());
+    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
 
     let mut filters = vec![];
 
@@ -273,21 +289,30 @@ pub struct PnlResponse {
     pnl_series: Vec<PnlPoint>,
 }
 
+#[derive(Deserialize)]
+pub struct PnlQuery {
+    pub id: String,
+    pub collection: Option<String>,
+}
+
 #[command]
 pub async fn get_pnl_by_id(
-    id: String,
-    state: State<'_, MongoClients>, // ✅ 正确引入 State
+    query: PnlQuery,
+    state: State<'_, MongoClients>,
 ) -> Result<PnlResponse, String> {
-    use mongodb::bson::{doc, Document};
-    let client = &state.local; // 使用本地 Mongo
+    use mongodb::bson::doc;
 
-
-    // 获取数据库和集合
+    let client = &state.local;
     let db = client.database("alpha_db");
-    let collection = db.collection::<Document>("alpha_results");
 
-    // 查询条件，匹配指定的 id
-    let filter = doc! { "id": &id };
+    let coll_name = query
+        .collection
+        .as_deref()
+        .and_then(|s| sanitize_collection_name(s))
+        .unwrap_or_else(|| "alpha_results".to_string());
+
+    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
+    let filter = doc! { "id": &query.id };
     // println!("🔎 Querying PnL for id = {}", id);
 
     // 查询并返回文档

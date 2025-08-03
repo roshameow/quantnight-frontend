@@ -37,6 +37,8 @@ struct TaskProgress {
     collection: String,
     success: usize,
     total: usize,
+    priority_success: Option<usize>,
+    priority_total: Option<usize>,
     is_remote: bool, // 额外加个字段，用于前端查看是否用的是 remote
 }
 
@@ -144,11 +146,36 @@ async fn emit_task_progress(
         .await
         .unwrap_or(0) as usize;
 
+    let priority_filter = doc! {
+        "priority": {
+            "$exists": true,
+            "$ne": 0
+        }
+    };
+
+    let priority_total = collection
+        .count_documents(priority_filter.clone(), None)
+        .await
+        .unwrap_or(0) as usize;
+
+    let priority_success = collection
+        .count_documents(doc! { 
+            "status": "success",
+            "priority": {
+                "$exists": true,
+                "$ne": 0
+            }
+        }, None)
+        .await
+        .unwrap_or(0) as usize;
+
     let payload = TaskProgress {
         collection: collection_name.to_string(),
         success,
         total,
         is_remote,
+        priority_success: Some(priority_success),
+        priority_total: Some(priority_total),
     };
     let result = app_handle.emit("task-progress-update", payload.clone());
     // println!(

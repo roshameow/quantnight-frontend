@@ -74,9 +74,25 @@
           </template>
           <div>
             任务进度：
-            {{ taskProgressMap[task.name]?.success ?? 0 }}
+            {{
+              (taskProgressMap[task.name]?.success ?? 0) -
+              (taskProgressMap[task.name]?.priority_success ?? 0)
+            }}+
+            {{ taskProgressMap[task.name]?.priority_success ?? 0 }}
             /
-            {{ taskProgressMap[task.name]?.total ?? 0 }}
+            {{
+              (taskProgressMap[task.name]?.total ?? 0) -
+              (taskProgressMap[task.name]?.priority_total ?? 0)
+            }}+
+            {{ taskProgressMap[task.name]?.priority_total ?? 0 }}
+          </div>
+          <div v-if="task.status === 'running'">
+            <template v-if="hasConcurrencyConfig(task)">
+              <div style="margin-top: 4px; font-size: 12px; color: #555">
+                最大并发: {{ getMaxConcurrent(task) }} &nbsp;|&nbsp; 子任务上限:
+                {{ getMaxMultiSimulationChildren(task) }}
+              </div>
+            </template>
           </div>
           <n-space style="margin-top: 2px">
             <n-switch
@@ -365,6 +381,7 @@ onMounted(async () => {
   console.log("组件已挂载");
   const dispose = await listen("task-progress-update", async (event) => {
     const payload = event?.payload;
+    // console.log("收到任务进度更新:", payload);
 
     if (
       payload &&
@@ -374,7 +391,25 @@ onMounted(async () => {
       "total" in payload
     ) {
       const { collection, success, total } = payload;
-      taskProgressMap.value[collection] = { success, total };
+      // taskProgressMap.value[collection] = { success, total };
+      const priority_success =
+        payload && typeof payload.priority_success === "number"
+          ? payload.priority_success
+          : 0;
+      const priority_total =
+        payload && typeof payload.priority_total === "number"
+          ? payload.priority_total
+          : 0;
+      const is_remote =
+        payload && typeof payload.is_remote === "boolean" ? payload.is_remote : false;
+
+      taskProgressMap.value[collection] = {
+        success,
+        total,
+        priority_success,
+        priority_total,
+        is_remote,
+      };
 
       // ✅ 检查任务是否完成
       if (success >= total && total > 0) {
@@ -426,26 +461,90 @@ const getStatusType = (status) =>
   status === "done" ? "success" : status === "running" ? "warning" : "default";
 
 const getProgressBarStyle = (task) => {
-  const progress = taskProgressMap.value[task.name];
-  const percent =
-    progress && progress.total > 0
-      ? Math.min((progress.success / progress.total) * 100, 100)
-      : 0;
+  const progress = taskProgressMap.value[task.name] || {};
+  const success = typeof progress.success === "number" ? progress.success : 0;
+  const total =
+    typeof progress.total === "number" && progress.total > 0 ? progress.total : 1;
+  const priority_success =
+    typeof progress.priority_success === "number" ? progress.priority_success : 0;
+
+  const nonPrioritySuccess = Math.max(success - priority_success, 0);
+
+  const greenPercent = (nonPrioritySuccess / total) * 100;
+  const redPercent = (priority_success / total) * 100;
 
   const isSuper = task.taskType === "super";
+  const mainColor = isSuper ? "#64b5f6" : "#a1e3a1";
+  const priorityColor = "#caa969";
+  const bgColor = "#f0f0f0";
+
+  const layers = [];
+  const sizes = [];
+  const positions = [];
+
+  if (greenPercent > 0) {
+    layers.push(`linear-gradient(to right, ${mainColor}, ${mainColor})`);
+    sizes.push(`${greenPercent}% 100%`);
+    positions.push(`left top`);
+  }
+
+  if (redPercent > 0) {
+    layers.push(`linear-gradient(to right, ${priorityColor}, ${priorityColor})`);
+    sizes.push(`${redPercent}% 100%`);
+    positions.push(`${greenPercent}% 0`);
+  }
 
   return {
-    width: "100%",
-    height: "100%",
     position: "absolute",
-    top: 0,
-    left: 0,
+    top: "0",
+    left: "0",
+    height: "100%",
+    width: "100%",
     zIndex: 0,
     borderRadius: "10px 10px 0 0",
-    background: isSuper
-      ? `linear-gradient(to right, #64b5f6 ${percent}%, #f0f0f0 ${percent}%)`
-      : `linear-gradient(to right, #a1e3a1 ${percent}%, #f0f0f0 ${percent}%)`,
+    overflow: "hidden",
+    pointerEvents: "none",
+    backgroundColor: bgColor,
+    backgroundImage: layers.join(", "),
+    backgroundSize: sizes.join(", "),
+    backgroundPosition: positions.join(", "),
+    backgroundRepeat: "no-repeat",
   };
+};
+
+// 安全地取嵌套字段
+function getNested(obj, pathArray) {
+  return pathArray.reduce(
+    (acc, key) => (acc && acc[key] != null ? acc[key] : undefined),
+    obj
+  );
+}
+
+const getMaxConcurrent = (task) => {
+  // 假定配置在 task.mission_config 或 task.config，根据你实际结构调整
+  return (
+    getNested(task, ["mission_config", "max_concurrent"]) ??
+    getNested(task, ["config", "max_concurrent"]) ??
+    "-"
+  );
+};
+
+const getMaxMultiSimulationChildren = (task) => {
+  return (
+    getNested(task, ["mission_config", "max_multi_simulation_children"]) ??
+    getNested(task, ["config", "max_multi_simulation_children"]) ??
+    "-"
+  );
+};
+
+const hasConcurrencyConfig = (task) => {
+  const mc =
+    getNested(task, ["mission_config", "max_concurrent"]) ??
+    getNested(task, ["config", "max_concurrent"]);
+  const mm =
+    getNested(task, ["mission_config", "max_multi_simulation_children"]) ??
+    getNested(task, ["config", "max_multi_simulation_children"]);
+  return task.status === "running" && (mc != null || mm != null);
 };
 </script>
 

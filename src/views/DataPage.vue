@@ -5,6 +5,17 @@
     <n-grid :cols="24" :x-gap="12" :y-gap="8" item-responsive responsive="screen">
       <!-- 左侧：输入项 -->
       <n-grid-item span="22 m:20 l:21">
+        <n-select
+          v-model:value="collectionFilter"
+          :options="[
+            { label: 'alpha_results', value: 'alpha_results' },
+            { label: 'alpha_submitted', value: 'alpha_submitted' },
+          ]"
+          placeholder="Collection"
+          style="width: 160px"
+          @update:value="fetchData"
+        />
+
         <n-space align="center" wrap :size="[12, 12]">
           <n-input
             v-model:value="searchQuery"
@@ -141,6 +152,7 @@ const minTurnoverFilter = ref(null);
 const maxTurnoverFilter = ref(null);
 const minMarginFilter = ref(null);
 const minReturnFilter = ref(null);
+const collectionFilter = ref("alpha_results"); // 默认
 
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set()); // 用于记录正在加载的 ID
@@ -217,7 +229,14 @@ const loadPNL = async (id) => {
 
   loadingSet.value.add(id);
   try {
-    const result = await invoke("get_pnl_by_id", { id });
+    // const result = await invoke("get_pnl_by_id", { id });
+    const result = await invoke("get_pnl_by_id", {
+      query: {
+        id,
+        collection: collectionFilter.value, // 如果你也传 collection
+      },
+    });
+
     pnlDataMap.value[id] = result.pnl_series;
   } catch (e) {
     console.error("Error loading PnL:", e);
@@ -326,6 +345,7 @@ async function fetchData() {
       minMarginFilter.value != null ? parseFloat(minMarginFilter.value) / 10000 : null,
     min_returns:
       minReturnFilter.value != null ? parseFloat(minReturnFilter.value) / 100 : null,
+    collection: collectionFilter.value || "alpha_results", // 新增这一行
   };
 
   try {
@@ -372,7 +392,15 @@ const columns = [
   },
   { title: "ID", key: "id" },
   { title: "Region", key: "region" },
-  { title: "Score", key: "pnl_score", sorter: "default" },
+  {
+    title: "Score",
+    key: "pnl_score",
+    sorter: "default",
+    render(row) {
+      const v = row.pnl_score;
+      return v != null ? Math.round(v).toLocaleString() : "--";
+    },
+  },
   { title: "Sharpe", key: "sharpe", sorter: "default" },
   { title: "Fitness", key: "fitness", sorter: "default" },
   {
