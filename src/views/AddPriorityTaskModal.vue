@@ -2,7 +2,7 @@
   <n-modal
     v-model:show="showModal"
     preset="dialog"
-    title="添加回测任务"
+    title="添加插队任务"
     :style="{ width: '700px' }"
   >
     <n-form label-placement="top">
@@ -15,7 +15,7 @@
       </n-form-item>
 
       <n-form-item label="添加模板路径（可选）">
-        <n-input v-model:value="form.templatePath" placeholder="模版路径" />
+        <n-input v-model:value="form.priorityTemplatePath" placeholder="模版路径" />
       </n-form-item>
 
       <n-form-item>
@@ -60,29 +60,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppConfig } from "@/config";
 
 
-// ✅ 默认 JSON 示例
-const defaultJson = {
-  max_concurrent: 9,
-  max_multi_simulation_children: 10,
-  template: "second_round",
-  breakpoint: false,
-  append_alphas: false,
-  mission_tag: "anl11_2_2tic",
-  tag: {
-    name: "anl11_2_2tic",
-    tags: ["anl11_2_2tic"],
-    regular: {
-      description:
-        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
-    },
-  },
-};
 
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
-  configText: JSON.stringify(defaultJson, null, 2), // 预填入 JSON 字符串
-  templatePath: AppConfig.templatePath,
+  configText: "", // 预填入 JSON 字符串
+  priorityTemplatePath: AppConfig.priorityTemplatePath,
   templateFilename: "",
   templateCode: "",
   isRemote: false, // ✅ 本地（false）/远程（true）标记
@@ -114,9 +97,10 @@ watch(
     if (v) {
       try {
         const latestTemplate = await invoke("read_latest_py_file", {
-          folderPath: form.value.templatePath,
+          folderPath: form.value.priorityTemplatePath,
         });
         form.value.templateFilename = latestTemplate.replace(/\.py$/i, "");
+        form.value.taskName = form.value.templateFilename + "__priority";
         console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
       } catch (err) {
         console.error("读取模板失败:", err);
@@ -144,24 +128,29 @@ const handleSubmit = () => {
   }
 
   try {
+    let parsedConfig = {};
+    if (form.value.configText && form.value.configText.trim() !== "") {
+      parsedConfig = JSON.parse(form.value.configText);
+    }
+
     const newTask = {
-      // id: Date.now().toString(),
       name: form.value.taskName,
-      config: JSON.parse(form.value.configText), // 修复 JSON 字符串错误解析
-      template: form.value.templateCode,
-      templatefile: form.value.templateFilename || '',
+      config: parsedConfig,
+      template: form.value.templateCode || "",
+      templatefile: form.value.templateFilename || "",
       status: "pending",
       createdAt: new Date(),
     };
 
-    emit("add-task", newTask);
-    // message.success("任务创建成功");
+    emit("add-priority-task", newTask);
+    message.success("任务创建成功");
     showModal.value = false;
   } catch (e) {
     console.error(e);
     message.error("配置 JSON 格式错误！");
   }
 };
+
 
 const handleCancel = () => {
   showModal.value = false;

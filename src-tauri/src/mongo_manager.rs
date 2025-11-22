@@ -12,6 +12,8 @@ pub struct MongoClients {
 
 impl MongoClients {
     pub async fn new(config: &AppConfig) -> Result<Self> {
+        println!("⚠️ MongoClients::new() called");
+
         let local_uri = &config.mongodb.local_uri;
         let remote_uri = &config.mongodb.remote_uri;
 

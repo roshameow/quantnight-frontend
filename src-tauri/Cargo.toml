@@ -25,6 +25,7 @@ serde_json = "1"
 mongodb = { version = "2.8", features = ["tokio-runtime"] }
 bson = "2"
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"       # ✅ 用于 join! 并发
 futures-util = "0.3"  #提供mongodb的异步流迭代方法
 anyhow = "1.0"
 chrono = { version = "0.4.41", features = ["serde"] }   #提供后端日期, 时间计算

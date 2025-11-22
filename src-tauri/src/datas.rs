@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use futures_util::stream::TryStreamExt;
+use futures::join;
+
 use mongodb::{
     bson::doc,
     options::FindOptions,
@@ -35,8 +38,21 @@ pub struct AlphaResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]  // 前端传字符串时自动匹配
+pub enum SortField {
+    DateCreated,
+    Sharpe,
+    Returns,
+    Turnover,
+    Fitness,
+    Margin,
+    PnlScore,
+}
+
+#[derive(Deserialize)]
 pub struct AlphaQuery {
     pub query: Option<String>,
+    pub id: Option<String>,
     pub status: Option<String>,
     pub region: Option<String>,
     pub days_within: Option<u32>,
@@ -46,6 +62,11 @@ pub struct AlphaQuery {
     pub delay: Option<u32>,
     pub min_returns: Option<f64>,
     pub collection: Option<String>, // 新增：可选的 collection 名称
+    pub page: Option<u32>,       // ✅ 新增
+    pub page_size: Option<u32>,  // ✅ 新增
+
+    pub sort_field: Option<SortField>, // ✅ 使用枚举
+    pub sort_order: Option<i32>,       // 1 = 升序, -1 = 降序
 }
 
 fn sanitize_collection_name(name: &str) -> Option<String> {
@@ -57,13 +78,31 @@ fn sanitize_collection_name(name: &str) -> Option<String> {
     }
 }
 
+#[derive(Serialize)]
+pub struct PagedResult<T> {
+    pub data: Vec<T>,   // 当前页数据
+    pub total: u64,     // 总条数
+    pub page: u32,      // 当前页
+    pub page_size: u32, // 每页大小
+}
+
+
 #[command]
-pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClients>) -> Result<Vec<AlphaResult>, String> {
+pub async fn get_alpha_results(
+    params: AlphaQuery,
+    clients: State<'_, Arc<MongoClients>>,
+) -> Result<PagedResult<AlphaResult>, String> {
+
+    let t0 = std::time::Instant::now();
 
     let client = &clients.local;
     let db = client.database("alpha_db");
 
-    // 选择 collection：优先用前端传的，fallback 到默认
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(50);
+    let skip = ((page - 1) * page_size) as u64;
+
+    // --- STEP 1: 获取 collection ---
     let coll_name = params
         .collection
         .as_deref()
@@ -71,6 +110,8 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
         .unwrap_or_else(|| "alpha_results".to_string());
     let collection = db.collection::<mongodb::bson::Document>(&coll_name);
 
+    // --- STEP 2: 构建过滤条件 ---
+    let t_filter = std::time::Instant::now();
     let mut filters = vec![];
 
     if let Some(q) = &params.query {
@@ -84,47 +125,33 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
         });
     }
 
+    if let Some(id) = &params.id {
+        filters.push(doc! { "id": id });
+    }
     if let Some(region) = &params.region {
         filters.push(doc! { "settings.region": region });
     }
-
     if let Some(delay) = params.delay {
         filters.push(doc! { "settings.delay": delay as i32 });
     }
-
     if let Some(days) = params.days_within {
         let since = Utc::now() - Duration::days(days as i64);
-        println!("Filtering by date >= {}", since.to_rfc3339());
         filters.push(doc! { "dateCreated": { "$gte": since.to_rfc3339() } });
     }
-
     if let Some(min) = params.min_turnover {
         filters.push(doc! { "is.turnover": { "$gte": min } });
     }
     if let Some(max) = params.max_turnover {
         filters.push(doc! { "is.turnover": { "$lte": max } });
     }
-
-
     if let Some(min_margin) = params.min_margin {
         filters.push(doc! {
-            "$expr": {
-                "$gte": [
-                    { "$abs": "$is.margin" },
-                    min_margin
-                ]
-            }
+            "$expr": { "$gte": [ { "$abs": "$is.margin" }, min_margin ] }
         });
     }
-
     if let Some(min_returns) = params.min_returns {
         filters.push(doc! {
-            "$expr": {
-                "$gte": [
-                    { "$abs": "$is.returns" },
-                    min_returns
-                ]
-            }
+            "$expr": { "$gte": [ { "$abs": "$is.returns" }, min_returns ] }
         });
     }
 
@@ -133,46 +160,79 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
     } else {
         doc! { "$and": filters }
     };
-
+    println!("⏱ filter build took {:?}", t_filter.elapsed());
     println!("Mongo filter: {:?}", filter);
 
+    // --- STEP 3: 并发执行 count + find ---
+    let t_count = std::time::Instant::now();
+    let t_find = std::time::Instant::now();
+
+    let sort_doc = if let Some(field) = &params.sort_field {
+        let order = params.sort_order.unwrap_or(-1);
+        let mongo_field = match field {
+            SortField::DateCreated => "dateCreated",
+            SortField::Sharpe => "is.sharpe",
+            SortField::Returns => "is.returns",
+            SortField::Turnover => "is.turnover",
+            SortField::Fitness => "is.fitness",
+            SortField::Margin => "is.margin",
+            SortField::PnlScore => "pnl_score",
+        };
+        doc! { mongo_field: order }
+    } else {
+        doc! { "dateCreated": -1 }
+    };
+
     let find_options = FindOptions::builder()
-        .projection(doc! { "pnl": 0 })  // 排除 pnl 字段
-        .sort(doc! { "dateCreated": -1 }) // 按照日期倒序排序
+        .projection(doc! { "pnl": 0 })
+        .sort(sort_doc)
+        .skip(skip)
+        .limit(page_size as i64)
         .build();
 
-    let mut cursor = match collection.find(filter, find_options).await {
+    // 并发执行 count_documents 和 find
+    let (count_res, cursor_res) = join!(
+        collection.count_documents(filter.clone(), None),
+        collection.find(filter.clone(), find_options)
+    );
+
+    let total = match count_res {
+        Ok(count) => count,
+        Err(e) => {
+            println!("⚠️ count_documents error: {}", e);
+            0
+        }
+    };
+    println!("⏱ count_documents took {:?}", t_count.elapsed());
+
+    let mut cursor = match cursor_res {
         Ok(cursor) => cursor,
         Err(e) => {
-            println!("DB query error: {}", e);
+            println!("❌ collection.find() error: {}", e);
             return Err(format!("DB query error: {}", e));
         }
     };
+    println!("⏱ collection.find() took {:?}", t_find.elapsed());
 
+    // --- STEP 4: 遍历 cursor 并解析结果 ---
+    let t_fetch = std::time::Instant::now();
     let mut results = Vec::new();
+    let mut doc_count = 0;
+
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        doc_count += 1;
+
         let id = match doc.get_str("id") {
             Ok(s) => s.to_string(),
-            Err(_) => {
-                println!("❗ Document missing 'id': {:?}", doc);
-                continue;
-            }
+            Err(_) => continue,
         };
-        
+
         let region = match doc.get_document("settings").and_then(|d| d.get_str("region")) {
             Ok(s) => s.to_string(),
-            Err(_) => {
-                println!("❗ Document missing 'settings.region': {:?}", doc);
-                continue;
-            }
+            Err(_) => continue,
         };
 
-
         let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
-        if alpha_type == "UNKNOWN" {
-            println!("⚠️ Unknown alpha type in doc {}: {:?}", id, doc.get("type"));
-        }
-
         let code = match alpha_type {
             "REGULAR" => doc.get_document("regular").ok()
                 .and_then(|d| d.get_str("code").ok())
@@ -188,20 +248,10 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
                     .to_string();
                 Some(format!("{}\n{}", selection_code, combo_code))
             }
-            _ => {
-                println!("❓ Unrecognized alpha_type '{}', no code extracted", alpha_type);
-                None
-            }
+            _ => None,
         };
 
-        let is = match doc.get_document("is") {
-            Ok(doc) => Some(doc),
-            Err(_) => {
-                println!("⚠️ Missing or invalid 'is' in doc {}: {:?}", id, doc.get("is"));
-                None
-            }
-        };
-
+        let is = doc.get_document("is").ok();
         let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
         let fitness = is.and_then(|d| d.get_f64("fitness").ok());
         let turnover = is.and_then(|d| d.get_f64("turnover").ok());
@@ -211,12 +261,9 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
         let returns = is.and_then(|d| d.get_f64("returns").ok());
         let pnl_score = doc.get_f64("pnl_score").ok();
 
-
         let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
-        if date_created.is_none() {
-            println!("📅 Missing dateCreated in doc {}", id);
-        }
 
+        // 检查 status
         let mut sub_universe_sharpe = None;
         let mut message = None;
         let mut status = "UNKNOWN".to_string();
@@ -226,7 +273,7 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
                 if let Some(check_doc) = item.as_document() {
                     if let Ok(result) = check_doc.get_str("result") {
                         if result == "FAIL" || result == "WARNING" {
-                            status = "FAIL".to_string();  // 将状态设置为 "FAIL"
+                            status = "FAIL".to_string();
                             if let Ok(name) = check_doc.get_str("name") {
                                 message = Some(match message {
                                     Some(m) => format!("{},{}", m, name),
@@ -243,15 +290,11 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
             }
         }
 
-
-
-        // 根据计算结果筛选status
         if let Some(status_filter) = &params.status {
             if status != *status_filter {
-                continue;  // 如果状态不匹配，则跳过
+                continue;
             }
         }
-        // println!("✅ Parsed result for {}: code = {:?}", id, code);
 
         results.push(AlphaResult {
             id,
@@ -270,11 +313,31 @@ pub async fn get_alpha_results(params: AlphaQuery, clients: State<'_, MongoClien
             date_created,
             pnl_score,
         });
+
+        if doc_count % 50 == 0 {
+            println!(
+                "⏱ parsed {} docs, elapsed {:?}",
+                doc_count,
+                t_fetch.elapsed()
+            );
+        }
     }
 
+    drop(cursor);
+
+
+    println!("⏱ cursor iteration & parse took {:?}", t_fetch.elapsed());
     println!("Total results returned: {}", results.len());
-    Ok(results)
+    println!("✅ Total get_alpha_results() took {:?}", t0.elapsed());
+
+    Ok(PagedResult {
+        data: results,
+        total,
+        page,
+        page_size,
+    })
 }
+
 
 
 #[derive(Debug, Serialize)]
@@ -298,11 +361,11 @@ pub struct PnlQuery {
 #[command]
 pub async fn get_pnl_by_id(
     query: PnlQuery,
-    state: State<'_, MongoClients>,
+    clients: State<'_, Arc<MongoClients>>,
 ) -> Result<PnlResponse, String> {
     use mongodb::bson::doc;
 
-    let client = &state.local;
+    let client = &clients.local;
     let db = client.database("alpha_db");
 
     let coll_name = query
@@ -313,7 +376,6 @@ pub async fn get_pnl_by_id(
 
     let collection = db.collection::<mongodb::bson::Document>(&coll_name);
     let filter = doc! { "id": &query.id };
-    // println!("🔎 Querying PnL for id = {}", id);
 
     // 查询并返回文档
     let doc = collection
@@ -321,6 +383,8 @@ pub async fn get_pnl_by_id(
         .await
         .map_err(|e| format!("DB error: {}", e))?
         .ok_or_else(|| "Document not found".to_string())?;
+
+    // println!("📦 Document keys: {:?}", doc.keys().collect::<Vec<_>>());
 
     // 提取 pnl 字段中的 records 数组
     let pnl_obj = doc.get_document("pnl").map_err(|_| "No pnl field")?;

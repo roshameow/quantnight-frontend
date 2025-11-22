@@ -78,29 +78,12 @@ watch(showModal, (v) => emit("update:show", v));
 
 const message = useMessage();
 
-// ✅ 默认 JSON 示例
-const defaultJson = {
-  max_concurrent: 3,
-  max_multi_simulation_children: 1,
-  template: "second_round",
-  breakpoint: false,
-  append_alphas: false,
-  mission_tag: "anl11_2_2tic",
-  tag: {
-    name: "anl11_2_2tic",
-    tags: ["anl11_2_2tic"],
-    regular: {
-      description:
-        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
-    },
-  },
-};
 
 
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
-  configText: JSON.stringify(defaultJson, null, 2), // 预填入 JSON 字符串
+  configText: "", // 预填入 JSON 字符串
   templatePath: AppConfig.superTemplatePath || '',
   templateFilename: "",
   templateCode: "",
@@ -127,8 +110,6 @@ watch(
   }
 );
 
-const activeTab = ref("paste"); // 控制配置 Tab
-const templateTab = ref("paste"); // 控制模板 Tab（避免冲突）
 
 
 const handleTemplateUpload = ({ file }) => {

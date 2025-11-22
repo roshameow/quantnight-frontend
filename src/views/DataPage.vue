@@ -10,6 +10,7 @@
           :options="[
             { label: 'alpha_results', value: 'alpha_results' },
             { label: 'alpha_submitted', value: 'alpha_submitted' },
+            { label: 'alpha_submitted_zzz', value: 'alpha_submitted_zzz' },
           ]"
           placeholder="Collection"
           style="width: 160px"
@@ -25,6 +26,14 @@
             style="width: 280px"
             spellcheck="false"
           />
+          <n-input
+            v-model:value="idFilter"
+            placeholder="ID"
+            @update:value="fetchData"
+            style="width: 80px"
+            spellcheck="false"
+          />
+
           <n-select
             v-model:value="statusFilter"
             :options="[
@@ -33,14 +42,12 @@
               { label: 'FAIL', value: 'FAIL' },
             ]"
             placeholder="Status"
-            clearable
             style="width: 130px"
             @update:value="fetchData"
           />
           <n-input
             v-model:value="regionFilter"
             placeholder="Region"
-            clearable
             @update:value="fetchData"
             style="width: 100px"
             spellcheck="false"
@@ -48,7 +55,6 @@
           <n-input
             v-model:value="delayFilter"
             placeholder="Delay"
-            clearable
             @update:value="fetchData"
             style="width: 100px"
             spellcheck="false"
@@ -57,7 +63,6 @@
             v-model:value="daysFilter"
             placeholder="Days Before"
             type="number"
-            clearable
             @update:value="fetchData"
             style="width: 130px"
             spellcheck="false"
@@ -66,7 +71,6 @@
             v-model:value="minTurnoverFilter"
             placeholder="Min Turnover (%)"
             type="number"
-            clearable
             @update:value="fetchData"
             style="width: 130px"
             spellcheck="false"
@@ -75,7 +79,6 @@
             v-model:value="maxTurnoverFilter"
             placeholder="Max Turnover (%)"
             type="number"
-            clearable
             @update:value="fetchData"
             style="width: 130px"
             spellcheck="false"
@@ -84,7 +87,6 @@
             v-model:value="minMarginFilter"
             placeholder="Min Margin (‱)"
             type="number"
-            clearable
             @update:value="fetchData"
             style="width: 130px"
             spellcheck="false"
@@ -93,7 +95,6 @@
             v-model:value="minReturnFilter"
             placeholder="Min Return (‱)"
             type="number"
-            clearable
             @update:value="fetchData"
             style="width: 130px"
             spellcheck="false"
@@ -110,18 +111,32 @@
     </n-grid>
   </div>
 
-  <n-data-table
-    :columns="columns"
-    :data="data"
-    :pagination="{
-      pageSize: 20,
-      showQuickJumper: true,
-    }"
-    :bordered="false"
-    :scroll-x="1200"
-    class="custom-table"
-    :row-key="(row) => row.id"
-  />
+  <!-- 表格 + 分页容器 -->
+  <div style="display: flex; flex-direction: column">
+    <n-data-table
+      :columns="columns"
+      :data="data"
+      :bordered="false"
+      :scroll-x="1200"
+      class="custom-table"
+      :row-key="(row) => row.id"
+      remote
+      @update:sorter="handleSorterUpdate"
+    />
+
+    <!-- 分页右下角对齐 -->
+    <div style="display: flex; justify-content: flex-end; margin-top: 12px">
+      <n-pagination
+        v-model:page="pagination.page"
+        v-model:page-size="pagination.pageSize"
+        :page-count="Math.ceil(pagination.itemCount / pagination.pageSize)"
+        :show-quick-jumper="true"
+        :show-size-picker="true"
+        @update:page="fetchData"
+        @update:page-size="fetchData"
+      />
+    </div>
+  </div>
 </template>
 
 <script setup>
@@ -144,6 +159,7 @@ use([
 
 const data = ref([]);
 const searchQuery = ref("");
+const idFilter = ref("");
 const statusFilter = ref("");
 const regionFilter = ref("");
 const delayFilter = ref(null);
@@ -160,6 +176,17 @@ const loadingSet = ref(new Set()); // 用于记录正在加载的 ID
 const expandedRowIds = ref(new Set());
 const corrLoading = ref(false);
 
+const pagination = ref({
+  page: 1,
+  pageSize: 20,
+  itemCount: 0, // 👈 必须有，NaiveUI 根据它算总页数
+  showQuickJumper: true,
+  showSizePicker: true, // 建议加，可以切换每页条数
+});
+
+const sortField = ref(null);
+const sortOrder = ref(null);
+
 const getCurrentPageIDsFromDOM = () => {
   const rows = document.querySelectorAll(
     ".n-data-table-base-table-body table.n-data-table-table tbody tr"
@@ -175,6 +202,17 @@ const getCurrentPageIDsFromDOM = () => {
   });
   return ids;
 };
+
+function handleSorterUpdate(sorter) {
+  if (sorter) {
+    sortField.value = sorter.columnKey; // 比如 "sharpe"
+    sortOrder.value = sorter.order === "ascend" ? 1 : -1;
+  } else {
+    sortField.value = null;
+    sortOrder.value = null;
+  }
+  fetchData(); // 触发重新请求
+}
 
 const calculateCorr = async () => {
   await nextTick(); // 等 DOM 渲染完毕
@@ -333,6 +371,7 @@ async function fetchData() {
 
   const params = {
     query: searchQuery.value.trim() || null,
+    id: idFilter.value.trim() || null,
     status: statusFilter.value || null,
     region: regionFilter.value || null,
     delay: delayFilter.value ? parseInt(delayFilter.value) : null,
@@ -346,6 +385,12 @@ async function fetchData() {
     min_returns:
       minReturnFilter.value != null ? parseFloat(minReturnFilter.value) / 100 : null,
     collection: collectionFilter.value || "alpha_results", // 新增这一行
+    page: pagination.value.page, // ✅ 新增
+    page_size: pagination.value.pageSize, // ✅ 新增
+
+    // 👇 新增：排序参数
+    sort_field: sortField.value,
+    sort_order: sortOrder.value,
   };
 
   try {
@@ -353,7 +398,10 @@ async function fetchData() {
 
     // ⚠️ 只更新最新请求的结果
     if (currentRequestId === latestRequestId.value) {
-      data.value = result;
+      data.value = result.data;
+      pagination.value.itemCount = result.total; // 👈 NaiveUI 用这个计算页数
+      pagination.value.page = result.page;
+      pagination.value.pageSize = result.page_size;
     } else {
       console.log("⚠️ Stale response ignored");
     }
@@ -395,18 +443,18 @@ const columns = [
   {
     title: "Score",
     key: "pnl_score",
-    sorter: "default",
+    sorter: "true",
     render(row) {
       const v = row.pnl_score;
       return v != null ? Math.round(v).toLocaleString() : "--";
     },
   },
-  { title: "Sharpe", key: "sharpe", sorter: "default" },
-  { title: "Fitness", key: "fitness", sorter: "default" },
+  { title: "Sharpe", key: "sharpe", sorter: "true" },
+  { title: "Fitness", key: "fitness", sorter: "true" },
   {
     title: "Returns",
     key: "returns",
-    sorter: "default",
+    sorter: "true",
     render(row) {
       const val = row.returns;
       return val != null ? (val * 100).toFixed(2) + "%" : "--";
@@ -415,7 +463,7 @@ const columns = [
   {
     title: "Turnover",
     key: "turnover",
-    sorter: "default",
+    sorter: "true",
     render(row) {
       const val = row.turnover;
       return val != null ? (val * 100).toFixed(2) + "%" : "--";
@@ -424,7 +472,7 @@ const columns = [
   {
     title: "Margin",
     key: "margin",
-    sorter: "default",
+    sorter: "true",
     render(row) {
       const val = row.margin;
       return val != null ? (val * 10000).toFixed(2) + "‱" : "--";
@@ -533,6 +581,14 @@ const columns = [
 </script>
 
 <style>
+.n-input {
+  --n-padding-top: 4px !important;
+  --n-padding-bottom: 4px !important;
+  --n-padding-left: 8px !important;
+  --n-padding-right: 8px !important;
+  --n-font-size: 13px !important;
+}
+
 /* Increase specificity to ensure styles are applied */
 .n-data-table.custom-table {
   --n-font-size: 12px !important; /* Use a more appropriate font size */

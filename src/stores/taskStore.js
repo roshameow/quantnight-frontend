@@ -3,28 +3,47 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
 export const useTaskStore = defineStore('task', () => {
-  // 所有任务列表
   const tasks = ref([])
+  const taskProgressMap = ref({})
 
-  /**
-   * 添加一个新任务（不生成本地 id，保留 Mongo 的 _id）
-   * @param {Object} task - 任务对象
-   */
+  // 添加新任务
   const addTask = (task) => {
-    tasks.value.unshift(task) // 新任务插入顶部
+    tasks.value.push(task)
   }
 
-  /**
-   * 清空任务（可用于调试或重置）
-   */
+  // 清空任务
   const clearTasks = () => {
     tasks.value = []
   }
 
+  // 更新任务的进度
+  const updateProgress = (progress) => {
+    // 保证更新触发响应式
+    taskProgressMap.value[progress.collection] = {
+      success: progress.success,
+      total: progress.total,
+      priority_success: progress.priority_success ?? 0,
+      priority_total: progress.priority_total ?? 0,
+      is_remote: progress.is_remote ?? false,
+    }
+  }
+
+  // 初始化任务的进度
+  const initializeProgressForTasks = (tasksList) => {
+    tasksList.forEach((task) => {
+      if (!taskProgressMap.value[task.name]) {
+        taskProgressMap.value[task.name] = { success: 0, total: 0, priority_success: 0, priority_total: 0, is_remote: false }
+        console.log("Progress initialized for task", task.name)
+      }
+    })
+  }
+
   return {
     tasks,
+    taskProgressMap,
     addTask,
-    clearTasks
+    clearTasks,
+    updateProgress,
+    initializeProgressForTasks,
   }
 })
-

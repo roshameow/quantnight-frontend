@@ -1,36 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
-use std::error::Error;
+use std::sync::Arc;
 
 use bson::{doc, Document};
-use futures_util::{StreamExt, stream::TryStreamExt};
+use futures_util::stream::StreamExt;
 use mongodb::{
-    Client, Collection, Database,
+    Client, Collection,
     options::{ChangeStreamOptions, FullDocumentType},
 };
 use serde::Serialize;
-use tauri::{
-    AppHandle, command, Emitter, Result as TauriResult, State,
-    async_runtime::JoinHandle,
-};
-use tokio::sync::RwLock;
-use tokio::sync::OnceCell;
-
-
+use tauri::{State, Emitter, AppHandle, Result as TauriResult};
 use crate::mongo_manager::MongoClients;
 
-
-
-#[command]
-pub async fn frontend_ready(
-    app: AppHandle,
-    mongo_clients: State<'_, MongoClients>,
-) -> Result<(), String> {
-    let clients = mongo_clients.inner().clone();
-
-    start_all_task_watchers(app, clients)
-        .await
-        .map_err(|e| format!("启动监听失败: {}", e))
-}
 
 #[derive(Debug, Serialize, Clone)]
 struct TaskProgress {
@@ -39,101 +18,188 @@ struct TaskProgress {
     total: usize,
     priority_success: Option<usize>,
     priority_total: Option<usize>,
-    is_remote: bool, // 额外加个字段，用于前端查看是否用的是 remote
+    is_remote: bool,
 }
 
-type TaskMap = Arc<RwLock<HashMap<String, JoinHandle<()>>>>;
+static TASKS_WATCH_STARTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
+/// 前端 ready 时调用，启动 watcher
+#[tauri::command]
+pub async fn frontend_ready(
+    app: AppHandle,
+    mongo_clients: State<'_, Arc<MongoClients>>, // 这里是 State 类型
+) -> Result<(), String> {
+    // 从 State 中获取实际的 Arc<MongoClients> 对象
+    let mongo_clients = mongo_clients.clone();  // 这里提取出 Arc<MongoClients>
+    
+    let local = mongo_clients.local.clone();
+    let remote = mongo_clients.remote.clone();
 
-static TASKS_WATCH_STARTED: OnceCell<()> = OnceCell::const_new();
+    // 传递正确的类型
+    emit_all_collections_once(app.clone(), mongo_clients).await;
 
-pub async fn start_all_task_watchers(app_handle: AppHandle, clients: MongoClients) -> Result<(), Box<dyn Error>> {
-    let client = &clients.local;
-    let client_remote = &clients.remote;
-
-    let task_coll = client.database("simulation_mission").collection::<Document>("tasks");
-
-    let filter = doc! { "status": { "$ne": "deactive" } };
-    let mut cursor = task_coll.find(Some(filter), None).await?;
-    let watchers: TaskMap = Arc::new(RwLock::new(HashMap::new()));
-
-    while let Ok(Some(task)) = cursor.try_next().await {
-        if let Some(name) = task.get_str("name").ok() {
-            let is_remote = task.get_bool("isRemote").unwrap_or(false);
-            start_or_restart_watcher(&app_handle, name.to_string(), is_remote, &client, &client_remote, watchers.clone()).await;
-        }
-    }
-
-    // 监听 tasks 表的变更（是否更新 is_remote）
     if TASKS_WATCH_STARTED.set(()).is_ok() {
-        let watchers_clone = watchers.clone();
-        let app_clone = app_handle.clone();
-        let client_clone = client.clone();
-        let client_remote_clone = client_remote.clone();
-
+        let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
-            watch_tasks_changes(
-                app_clone,
-                client_clone,
-                client_remote_clone,
-                watchers_clone,
-            )
-            .await;
+            watch_simulation_db_changes(app_clone, local, remote).await;
         });
+        println!("🔥 simulation_db 全局 watcher 已启动");
     } else {
-        println!("watch_tasks_changes 已启动，跳过重复启动");
+        println!("全局 watcher 已启动，跳过重复启动");
     }
 
     Ok(())
 }
 
 
-async fn start_single_watcher(app_handle: AppHandle, db: Database, collection_name: String, is_remote: bool) {
-    let collection: Collection<Document> = db.collection(&collection_name);
+/// 根据 collection 名称，从 simulation_mission.tasks 中查询 isRemote
+pub async fn get_is_remote_for_collection(
+    client_mission: Arc<Client>,
+    collection_name: &str,
+) -> bool {
+    let db_mission = client_mission.database("simulation_mission");
+    let tasks_coll = db_mission.collection::<mongodb::bson::Document>("tasks");
 
-    loop {    //自动重启监听逻辑
-        // 初次推送一次状态
-        if let Err(err) = emit_task_progress(&app_handle, &collection, &collection_name, is_remote).await {
-            eprintln!("初始推送失败 [{}]: {}", collection_name, err);
-        } else {
-            println!("初始推送成功 [{}]", collection_name);  // 成功推送日志
+    let filter = doc! {
+        "name": collection_name,
+        "status": { "$ne": "deactive" }
+    };
+
+    match tasks_coll.find_one(filter, None).await {
+        Ok(Some(task_doc)) => {
+            let is_remote = task_doc
+                .get_bool("isRemote")
+                .unwrap_or(false);
+
+            // println!(
+            //     "🔍 get_is_remote_for_collection: [{}] => is_remote={}",
+            //     collection_name, is_remote
+            // );
+            is_remote
         }
-
-        let options = ChangeStreamOptions::default();
-        let mut change_stream = match collection.watch([], options).await {
-            Ok(stream) => {
-                println!("成功开始监听集合 [{}]", collection_name);  // 成功开始监听日志
-                stream
-            },
-            Err(err) => {
-                eprintln!("监听集合 [{}] 失败: {}", collection_name, err);
-                // 等待一段时间后重试
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-
-        while let Some(event) = change_stream.next().await {
-            match event {
-                Ok(_) => {
-                    if let Err(err) = emit_task_progress(&app_handle, &collection, &collection_name,is_remote).await {
-                        eprintln!("推送失败 [{}]: {}", collection_name, err);
-                    }
-                }
-                Err(err) => {
-                    eprintln!("监听失败 [{}]: {}", collection_name, err);
-                    // 中断当前监听，重新启动
-                    break;
-                }
-            }
+        Ok(None) => {
+            println!(
+                "⚠️ 任务 [{}] 未在 tasks 中找到，默认 is_remote=false",
+                collection_name
+            );
+            false
         }
-        // 等待再重新监听，防止频繁死循环
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Err(e) => {
+            eprintln!(
+                "❌ 查询 tasks 失败 [{}]: {}，默认 is_remote=false",
+                collection_name, e
+            );
+            false
+        }
     }
-
 }
 
+
+/// 监听 simulation_db 下所有 collections
+pub async fn watch_simulation_db_changes(
+    app: AppHandle,
+    client_local: Arc<Client>,
+    client_remote: Arc<Client>,
+) {
+    let db_local = client_local.database("simulation_db");
+
+    // 1️⃣ 启动时先 emit 所有现有 collections —— 用同步 await，而不是 spawn
+    if let Ok(collections) = db_local.list_collection_names(None).await {
+        for coll_name in collections {
+            if coll_name.starts_with("system.") { continue; }
+            let is_remote = get_is_remote_for_collection(
+                client_local.clone(),
+                &coll_name
+            ).await;
+
+            // 这里不要 spawn，直接 await
+            if let Err(e) = emit_progress_for_collection(
+                app.clone(),
+                client_local.clone(),
+                client_remote.clone(),
+                coll_name.clone(),
+                is_remote, // 或者根据你的业务判断是否 remote
+            ).await {
+                eprintln!("初始 emit 失败 [{}]: {}", coll_name, e);
+            } else {
+                println!("初始 emit 成功 [{}]", coll_name);
+            }
+        }
+    }
+
+    // 2️⃣ change stream 监听新增/更新
+    let options = ChangeStreamOptions::builder()
+        .full_document(Some(FullDocumentType::UpdateLookup))
+        .build();
+
+    let mut stream = match db_local.watch([], Some(options)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("监听 simulation_db 失败: {}", e);
+            return;
+        }
+    };
+
+    println!("开始监听 simulation_db 下所有集合…");
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(change) => {
+                let ns = match change.ns { Some(ns) => ns, None => continue };
+                let coll_name = match ns.coll { Some(name) => name, None => continue };
+                if coll_name.starts_with("system.") { continue; }
+
+                let doc = match change.full_document { Some(d) => d, None => continue };
+                // println!("🔔 检测到 collection [{}] 有变更，开始 emit 进度…", doc);
+                let is_remote = doc.get_bool("isRemote").unwrap_or(false);
+
+                let app_clone = app.clone();
+                let local = client_local.clone();
+                let remote = client_remote.clone();
+                let coll_name_cloned = coll_name.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = emit_progress_for_collection(
+                        app_clone,
+                        local,
+                        remote,
+                        coll_name_cloned,
+                        is_remote,
+                    ).await {
+                        eprintln!("emit 失败 [{}]: {}", coll_name, e);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("simulation_db watcher 失败: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+/// 对单个 collection emit 任务进度
+pub async fn emit_progress_for_collection(
+    app: AppHandle,
+    client_local: Arc<Client>,
+    client_remote: Arc<Client>,
+    collection_name: String,
+    is_remote: bool,
+) -> TauriResult<()> {
+    // println!("📊 Emitting progress for collection: {}, is_remote: {}", collection_name, is_remote);
+    
+    let db = if is_remote { 
+        client_remote.database("simulation_db") 
+    } else { 
+        client_local.database("simulation_db") 
+    };
+    let collection = db.collection::<Document>(&collection_name);
+
+    emit_task_progress(&app, &collection, &collection_name, is_remote).await
+}
+
+
+/// 计算统计并 emit
 async fn emit_task_progress(
     app_handle: &AppHandle,
     collection: &Collection<Document>,
@@ -141,33 +207,16 @@ async fn emit_task_progress(
     is_remote: bool,
 ) -> TauriResult<()> {
     let total = collection.count_documents(None, None).await.unwrap_or(0) as usize;
-    let success = collection
-        .count_documents(doc! { "status": "success" }, None)
-        .await
-        .unwrap_or(0) as usize;
+    let success = collection.count_documents(doc! { "status": "success" }, None)
+        .await.unwrap_or(0) as usize;
 
-    let priority_filter = doc! {
-        "priority": {
-            "$exists": true,
-            "$ne": 0
-        }
-    };
+    let priority_total = collection.count_documents(doc! { "priority": { "$exists": true, "$ne": 0 } }, None)
+        .await.unwrap_or(0) as usize;
 
-    let priority_total = collection
-        .count_documents(priority_filter.clone(), None)
-        .await
-        .unwrap_or(0) as usize;
-
-    let priority_success = collection
-        .count_documents(doc! { 
-            "status": "success",
-            "priority": {
-                "$exists": true,
-                "$ne": 0
-            }
-        }, None)
-        .await
-        .unwrap_or(0) as usize;
+    let priority_success = collection.count_documents(doc! { 
+        "status": "success",
+        "priority": { "$exists": true, "$ne": 0 }
+    }, None).await.unwrap_or(0) as usize;
 
     let payload = TaskProgress {
         collection: collection_name.to_string(),
@@ -177,96 +226,53 @@ async fn emit_task_progress(
         priority_success: Some(priority_success),
         priority_total: Some(priority_total),
     };
-    let result = app_handle.emit("task-progress-update", payload.clone());
-    // println!(
-    //     "emit [{}] -> success={}, total={} | result = {:?}",
-    //     collection_name, payload.success, payload.total, result
-    // );
-    
-    result?; // 保持函数签名不变
+
+    app_handle.emit("task-progress-update", payload.clone())?;
+    // println!("Emitted progress for [{}]: {:?}", collection_name, payload);
     Ok(())
 }
 
-async fn start_or_restart_watcher(
-    app: &AppHandle,
-    name: String,
-    is_remote: bool,
-    local_client: &Client,
-    remote_client: &Client,
-    task_map: TaskMap,
-) {
-    let db = if is_remote {
-        remote_client.database("simulation_db")
-    } else {
-        local_client.database("simulation_db")
-    };
 
-    let mut map = task_map.write().await;
-    if let Some(handle) = map.remove(&name) {
-        handle.abort(); // 停掉旧的
-    }
-
-    let app_clone = app.clone();
-    let name_clone = name.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        start_single_watcher(app_clone, db, name_clone,is_remote).await;
-    });
-
-    map.insert(name, handle);
-}
-
-
-pub async fn watch_tasks_changes(
+async fn emit_all_collections_once(
     app: AppHandle,
-    client: Arc<Client>,
-    client_remote: Arc<Client>,
-    task_map: TaskMap,
+    mongo_clients: State<'_, Arc<MongoClients>>,
 ) {
-    let task_coll = client.database("simulation_mission").collection::<Document>("tasks");
+    let db_local = mongo_clients.local.database("simulation_mission");
+    let collection = db_local.collection::<Document>("tasks");
 
-    let options = ChangeStreamOptions::builder()
-        .full_document(Some(FullDocumentType::UpdateLookup))
-        .build();
+    println!("🔥 初始 emit 任务进度 for tasks 集合");
 
-    let mut stream = match task_coll.watch([], Some(options)).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("监听 tasks 失败: {}", e);
-            return;
-        }
-    };
+    // 添加查询条件，过滤掉 status 为 "deactive" 的文档
+    let filter = doc! { "status": { "$ne": "deactive" } };
 
-    while let Some(event) = stream.next().await {
-        if let Ok(change) = event {
-            if let Some(doc) = change.full_document {
-                if let Ok(name) = doc.get_str("name") {
-                    // 注意这里字段名和实际保持一致
-                    let is_remote = doc.get_bool("isRemote").unwrap_or(false);
-                    let status = doc.get_str("status").unwrap_or("active");
-                    if status != "deactive" {
-                        println!("任务更新: {} -> is_remote={}", name, is_remote);
-                        start_or_restart_watcher(
-                            &app,
-                            name.to_string(),
-                            is_remote,
-                            &client,
-                            &client_remote,
-                            task_map.clone(),
-                        ).await;
-                    } else {
-                        println!("跳过 deactive 任务: {}", name);
-                    }
-                    if status == "deactive" {
-                        let mut map = task_map.write().await;
-                        if let Some(handle) = map.remove(name) {
-                            println!("停止监听 deactive 任务: {}", name);
-                            handle.abort();
-                        }
-                        continue;
-                    }
+    if let Ok(documents) = collection.find(filter, None).await {
+        let mut cursor = documents;
+        while let Some(doc) = cursor.next().await {
+            match doc {
+                Ok(doc) => {
+                    // 获取文档中的 'isRemote' 和 'name' 字段
+                    let is_remote = doc.get("isRemote").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let name = doc.get_str("name").unwrap_or("未知").to_string();
+                    println!("✅ 已 emit 任务进度 for 任务: {}, is_remote: {}", name, is_remote);
+
+                    // 调用 emit_progress_for_collection 时传递正确的 is_remote
+                    _ = emit_progress_for_collection(
+                        app.clone(),
+                        mongo_clients.local.clone(),
+                        mongo_clients.remote.clone(),
+                        name,
+                        is_remote,
+                    ).await;
+
+                }
+                Err(e) => {
+                    eprintln!("查询任务文档失败: {}", e);
                 }
             }
         }
+    } else {
+        eprintln!("查询 simulation_mission 集合失败");
     }
 }
+
 

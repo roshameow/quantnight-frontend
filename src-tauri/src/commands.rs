@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use std::sync::Arc;
 
 use futures_util::stream::TryStreamExt;
 use mongodb::{
@@ -40,7 +41,7 @@ pub struct CreatedTask {
 #[command]
 pub async fn create_task(
     new_task: NewTask,
-    clients: State<'_, MongoClients>,
+    clients: State<'_, Arc<MongoClients>>
 ) -> Result<CreatedTask, String> {
     let client = &clients.local;
     let db = client.database("simulation_mission");
@@ -82,7 +83,7 @@ pub async fn create_task(
 
 
 #[command]
-pub async fn generate_list(id: String,clients: State<'_, MongoClients>,
+pub async fn generate_list(id: String,clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,) -> Result<(), String> {
 
     let client = &clients.local;
@@ -128,7 +129,7 @@ pub struct Updates {
 }
 
 #[tauri::command]
-pub async fn update_task(id: String, updates: Updates,clients: State<'_, MongoClients>) -> Result<(), String> {
+pub async fn update_remote_status(id: String, updates: Updates,clients: State<'_, Arc<MongoClients>>) -> Result<(), String> {
     let client = &clients.local;
     let db = client.database("simulation_mission");
     let collection = db.collection::<mongodb::bson::Document>("tasks");
@@ -191,8 +192,7 @@ pub fn read_latest_py_file(folder_path: String) -> Result<String, String> {
 #[command]
 pub async fn sync_remote_task(alpha_mission_list: String, config: State<'_, AppConfig>) -> Result<(), String> {
 
-    let (stdout, _) = run_bash_script("sync_remote_task", &[("alpha_mission_list", &alpha_mission_list)], false, &config).await?;
-    println!("sync_remote_task 脚本输出:\n{}", stdout);
+    let (_, _) = run_bash_script("sync_remote_task", &[("alpha_mission_list", &alpha_mission_list)], false, &config).await?;
     Ok(())
 }
 
@@ -215,7 +215,7 @@ pub struct Task {
 }
 
 #[command]
-pub async fn get_all_tasks(clients: State<'_, MongoClients>) -> Result<Vec<Task>, String> {
+pub async fn get_all_tasks(clients: State<'_, Arc<MongoClients>>) -> Result<Vec<Task>, String> {
     let client = &clients.local;
 
     let db = client.database("simulation_mission");
@@ -239,7 +239,7 @@ pub async fn get_all_tasks(clients: State<'_, MongoClients>) -> Result<Vec<Task>
 }
 
 #[command]
-pub async fn delete_task(id: String, clients: State<'_, MongoClients>) -> Result<(), String> {
+pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> Result<(), String> {
     let client = &clients.local;
 
     let db = client.database("simulation_mission");
@@ -314,18 +314,16 @@ pub async fn start_task(
     task_name: String,
     config: String,
     is_remote: bool,
-    clients: State<'_, MongoClients>,
+    clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let (stdout, _) = run_bash_script(
+    let (_, _) = run_bash_script(
         "start_task",
         &[("task_name", &task_name), ("config", &config)],
         is_remote,
         &app_config,
     )
     .await?;
-
-    println!("start_task 脚本输出:\n{}", stdout);
 
     let client = &clients.local;
     let db = client.database("simulation_mission");
@@ -363,16 +361,14 @@ pub async fn start_task(
 
 
 #[command]
-pub async fn start_super_task(task_name: String, config: String, is_remote: bool, clients: State<'_, MongoClients>,app_config: State<'_, AppConfig>) -> Result<(), String> {
-    let (stdout, _) = run_bash_script(
+pub async fn start_super_task(task_name: String, config: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
+    let (_, _) = run_bash_script(
         "start_super_task",
         &[("task_name", &task_name), ("config", &config)],
         is_remote,
         &app_config,
     )
     .await?;
-
-    println!("start_super_task 脚本输出:\n{}", stdout);
 
     let client = &clients.local;
 
@@ -391,10 +387,114 @@ pub async fn start_super_task(task_name: String, config: String, is_remote: bool
     Ok(())
 }
 
+#[command]
+pub async fn start_priority_task(
+    task_name: String,
+    config: String,
+    is_remote: bool,
+    clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    // 调用后端脚本启动任务
+    let (_, _) = run_bash_script(
+        "start_priority_task",
+        &[("task_name", &task_name), ("config", &config)],
+        is_remote,
+        &app_config,
+    )
+    .await?;
+
+    let client = &clients.local;
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    // 解析 config 并准备写入 mission_config
+    let mut set_doc = doc! { "status": "running" };
+
+    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&config) {
+        match bson::to_bson(&json_val) {
+            Ok(bson_val) => {
+                if let bson::Bson::Document(doc_inner) = bson_val {
+                    set_doc.insert("mission_config", doc_inner);
+                }
+            }
+            Err(e) => eprintln!("config 转 BSON 失败: {}", e),
+        }
+    } else {
+        eprintln!("config 解析成 JSON 失败");
+    }
+
+    // 组合更新
+    let update = doc! { "$set": set_doc };
+
+    tasks
+        .update_one(
+            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
+            update,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 
 #[command]
-pub async fn pause_task(task_name: String, is_remote: bool, clients: State<'_, MongoClients>, app_config: State<'_, AppConfig>) -> Result<(), String> {
+pub async fn check_task_status(
+    task_name: String,
+    is_remote: bool,
+    clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>,
+) -> Result<String, String> {
+    // 调用 bash 脚本，传入 task_name 和 is_remote
     let (stdout, _) = run_bash_script(
+        "check_task_status",
+        &[("task_name", &task_name)],
+        is_remote,
+        &app_config,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 返回 stdout 给前端
+    Ok(stdout.trim().to_string())
+}
+
+#[command]
+pub async fn update_priority_task(task_name: String, config: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
+
+
+    println!("Received config: {}", config); // 打印 config 内容
+
+    let (_, _) = run_bash_script(
+        "update_priority_task",
+        &[("task_name", &task_name), ("config", &config)],
+        is_remote,
+        &app_config,
+    )
+    .await?;
+
+    let client = &clients.local;
+
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    tasks
+        .update_one(
+            doc! { "name": &task_name , "status": { "$ne": "deactive" }},
+            doc! { "$set": { "status": "running" } },
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[command]
+pub async fn pause_task(task_name: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
+    let (_, _) = run_bash_script(
         "pause_task",
         &[("task_name", &task_name)],
         is_remote,
@@ -402,7 +502,6 @@ pub async fn pause_task(task_name: String, is_remote: bool, clients: State<'_, M
     )
     .await?;
 
-    println!("pause_task 脚本输出:\n{}", stdout);
     let client = &clients.local;
 
     let db = client.database("simulation_mission");

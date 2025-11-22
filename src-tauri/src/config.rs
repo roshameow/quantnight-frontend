@@ -1,15 +1,18 @@
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
 use config::{Config, ConfigError, File};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::process::Command;
-use std::env;
-use std::path::{Path,PathBuf};
-use tokio::process::Command as TokioCommand;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use futures_util::future::try_join;
-use serde_json::json;
-use std::time::Duration;
-use tokio::time::timeout;
+use serde::Deserialize;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command as TokioCommand,
+    time::timeout,
+};
 
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +133,7 @@ pub async fn run_bash_script(
         .ok_or(format!("{} 缺少 script 字段", script_key))?;
 
     let mut args = vec![script.clone()];
+
     args.extend(replace_args(&script_cfg.args, vars));
     if is_remote {
         args.push("--remote".to_string());
