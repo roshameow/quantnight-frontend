@@ -444,7 +444,6 @@ pub async fn start_priority_task(
 pub async fn check_task_status(
     task_name: String,
     is_remote: bool,
-    clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<String, String> {
     // 调用 bash 脚本，传入 task_name 和 is_remote

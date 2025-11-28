@@ -91,12 +91,13 @@ pub struct PagedResult<T> {
 pub async fn get_alpha_results(
     params: AlphaQuery,
     clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
 ) -> Result<PagedResult<AlphaResult>, String> {
 
     let t0 = std::time::Instant::now();
 
     let client = &clients.local;
-    let db = client.database("alpha_db");
+    let db = client.database(&config.mongodb.databases.alpha);
 
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(50);
@@ -362,11 +363,12 @@ pub struct PnlQuery {
 pub async fn get_pnl_by_id(
     query: PnlQuery,
     clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
 ) -> Result<PnlResponse, String> {
     use mongodb::bson::doc;
 
     let client = &clients.local;
-    let db = client.database("alpha_db");
+    let db = client.database(&config.mongodb.databases.alpha);
 
     let coll_name = query
         .collection
@@ -441,11 +443,3 @@ pub async fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppCo
 
     serde_json::from_str(&stdout).map_err(|e| format!("解析 JSON 失败: {}", e))
 }
-
-
-
-
-
-
-
-

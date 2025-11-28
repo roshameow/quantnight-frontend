@@ -15,7 +15,7 @@ use tokio::{
 };
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ScriptConfig {
     pub module: Option<String>,  // Python 脚本：-m xxx
     pub command: Option<String>, // 如 "bash" 或 "python3"
@@ -23,26 +23,34 @@ pub struct ScriptConfig {
     pub args: Vec<String>,       // 参数模板
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PythonConfig {
     pub interpreter: String,
     pub working_dir: String,
     pub scripts: HashMap<String, ScriptConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BashConfig {
     pub working_dir: String,
     pub scripts: HashMap<String, ScriptConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct DatabaseNames {
+    pub mission: String,
+    pub simulation: String,
+    pub alpha: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct MongoConfig {
     pub local_uri: String,
     pub remote_uri: String,
+    pub databases: DatabaseNames,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub python: PythonConfig,
     pub bash: BashConfig,
