@@ -5,6 +5,7 @@ mod config;
 mod watcher;
 mod datas;
 mod mongo_manager;
+mod frontend_config; // Add the new module
 
 use std::env;
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ fn main() {
             datas::get_alpha_results,
             datas::get_pnl_by_id,
             datas::compute_correlation,
+            frontend_config::get_config_js_content, // Add the new command
+            frontend_config::save_config_js_content, // Add the new command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

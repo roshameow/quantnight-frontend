@@ -87,7 +87,6 @@ const message = useMessage();
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
-  configText: "", // 预填入 JSON 字符串
   templatePath: AppConfig.superTemplatePath || '',
   templateFilename: "",
   templateCode: "",
@@ -136,7 +135,6 @@ const handleSubmit = () => {
     const newTask = {
       // id: Date.now().toString(),
       name: form.value.taskName,
-      config: JSON.parse(form.value.configText), // 修复 JSON 字符串错误解析
       template: form.value.templateCode,
       templatefile: form.value.templateFilename,
       status: "pending",

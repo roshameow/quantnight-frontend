@@ -64,28 +64,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { AppConfig } from "@/config";
 
 
-// ✅ 默认 JSON 示例
-const defaultJson = {
-  max_concurrent: 9,
-  max_multi_simulation_children: 10,
-  template: "second_round",
-  breakpoint: false,
-  append_alphas: false,
-  mission_tag: "anl11_2_2tic",
-  tag: {
-    name: "anl11_2_2tic",
-    tags: ["anl11_2_2tic"],
-    regular: {
-      description:
-        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
-    },
-  },
-};
-
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
-  configText: JSON.stringify(defaultJson, null, 2), // 预填入 JSON 字符串
   templatePath: AppConfig.templatePath,
   templateFilename: "",
   templateCode: "",
@@ -147,25 +128,18 @@ const handleSubmit = () => {
     return;
   }
 
-  try {
-    const newTask = {
-      // id: Date.now().toString(),
-      name: form.value.taskName,
-      config: JSON.parse(form.value.configText), // 修复 JSON 字符串错误解析
-      template: form.value.templateCode,
-      templatefile: form.value.templateFilename || '',
-      status: "pending",
-      createdAt: new Date(),
-    };
+  const newTask = {
+    name: form.value.taskName,
+    template: form.value.templateCode,
+    templatefile: form.value.templateFilename || '',
+    status: "pending",
+    createdAt: new Date(),
+  };
 
-    emit("add-task", newTask);
-    // message.success("任务创建成功");
-    showModal.value = false;
-  } catch (e) {
-    console.error(e);
-    message.error("配置 JSON 格式错误！");
-  }
+  emit("add-task", newTask);
+  showModal.value = false;
 };
+
 
 const handleCancel = () => {
   showModal.value = false;
