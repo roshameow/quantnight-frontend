@@ -104,8 +104,10 @@ async function fetchData() {
     region: filters.region || null,
     delay: filters.delay ? parseInt(filters.delay) : null,
     days_within: filters.days ? parseInt(filters.days) : null,
-    min_turnover: filters.minTurnover != null ? parseFloat(filters.minTurnover) / 100 : null,
-    max_turnover: filters.maxTurnover != null ? parseFloat(filters.maxTurnover) / 100 : null,
+    min_turnover:
+      filters.minTurnover != null ? parseFloat(filters.minTurnover) / 100 : null,
+    max_turnover:
+      filters.maxTurnover != null ? parseFloat(filters.maxTurnover) / 100 : null,
     min_margin: filters.minMargin != null ? parseFloat(filters.minMargin) / 10000 : null,
     min_returns: filters.minReturn != null ? parseFloat(filters.minReturn) / 100 : null,
     page: pagination.value.page,
@@ -147,12 +149,12 @@ async function loadPNL(id) {
 async function calculateCorr() {
   corrLoading.value = true;
   try {
-    const idsOnPage = data.value.map(item => item.id);
+    const idsOnPage = data.value.map((item) => item.id);
     if (idsOnPage.length === 0) return;
 
     const result = await invoke("compute_correlation", { alphaIds: idsOnPage });
-    
-    const updatedData = data.value.map(row => {
+
+    const updatedData = data.value.map((row) => {
       const corr = result[row.id];
       if (corr) {
         return { ...row, corr_ppac: corr.ppac_correlation, corr_os: corr.os_correlation };
@@ -160,7 +162,6 @@ async function calculateCorr() {
       return row;
     });
     data.value = updatedData;
-
   } catch (e) {
     console.error("计算 corr 失败", e);
   } finally {
@@ -324,24 +325,28 @@ onMounted(() => {
   font-size: 12px !important;
 }
 
-.n-base-selection-tag-wrapper .n-tag .n-tag__content{
-  font-size: 6px !important;
-}
-
-/* Reduce line spacing for the smaller font */
-.n-base-select-menu .n-base-select-option {
-  padding-top: 2px !important;
-  padding-bottom: 2px !important;
-  min-height: auto !important; /* Override the default minimum height */
-}
-
 /* Make the selected tags in the filter bar more compact */
 .n-base-selection-tag-wrapper .n-tag {
-  height: 20px !important;
-  padding-left: 6px !important;
-  padding-right: 6px !important;
+  height: 12px !important;
+  padding-left: 4px !important;
+  padding-right: 0px !important;
+  padding-top: 0px;
+  padding-bottom: 0px;
 }
 .n-base-selection-tag-wrapper .n-tag .n-tag__content {
-  font-size: 12px !important;
+  font-size: 8px !important;
+}
+
+/* Remove padding from the virtual list container, discovered via inspection */
+.n-base-select-menu .v-vl-items {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+/* Adjust option height to be compact and consistent for virtual list */
+.n-base-select-menu .n-base-select-option {
+  padding-top: 1px !important;
+  padding-bottom: 1px !important;
+  min-height: 18px !important; /* A specific, small height for the virtual list to calculate */
 }
 </style>

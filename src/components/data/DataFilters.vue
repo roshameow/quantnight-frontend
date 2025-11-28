@@ -91,19 +91,21 @@
             :value="modelValue.messages"
             multiple
             clearable
+            :virtual-scroll="false"
             @update:value="updateFilter('messages', $event)"
             :options="excludeMessageOptions"
             placeholder="Exclude Messages"
-            style="width: 200px"
+            style="width: 400px"
           />
           <n-select
             :value="modelValue.messagesIn"
             multiple
             clearable
+            :virtual-scroll="false"
             @update:value="updateFilter('messagesIn', $event)"
             :options="includeMessageOptions"
             placeholder="Include Messages"
-            style="width: 200px"
+            style="width: 400px"
           />
         </n-space>
       </n-grid-item>

@@ -6,7 +6,7 @@ use futures_util::stream::TryStreamExt;
 use futures::join;
 
 use mongodb::{
-    bson::{doc, Bson},
+    bson::doc,
     options::FindOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -91,8 +91,6 @@ pub async fn get_alpha_results(
     clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,
 ) -> Result<PagedResult<AlphaResult>, String> {
-
-    let t0 = std::time::Instant::now();
 
     let client = &clients.local;
     let db = client.database(&config.mongodb.databases.alpha);
@@ -231,12 +229,9 @@ pub async fn get_alpha_results(
     };
     println!("⏱ collection.find() took {:?}", t_find.elapsed());
 
-    let t_fetch = std::time::Instant::now();
     let mut results = Vec::new();
-    let mut doc_count = 0;
 
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
-        doc_count += 1;
 
         let id = match doc.get_str("id") {
             Ok(s) => s.to_string(),
@@ -331,35 +326,6 @@ pub async fn get_alpha_results(
     })
 }
 
-#[command]
-pub async fn get_unique_messages(
-    collection: Option<String>,
-    clients: State<'_, Arc<MongoClients>>,
-    config: State<'_, AppConfig>,
-) -> Result<Vec<String>, String> {
-    let client = &clients.local;
-    let db = client.database(&config.mongodb.databases.alpha);
-    let coll_name = collection
-        .as_deref()
-        .and_then(sanitize_collection_name)
-        .unwrap_or_else(|| "alpha_results".to_string());
-    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
-
-    let distinct_result = collection
-        .distinct("is.checks.name", None, None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let messages: Vec<String> = distinct_result
-        .into_iter()
-        .filter_map(|bson| match bson {
-            Bson::String(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-
-    Ok(messages)
-}
 
 
 #[derive(Debug, Serialize)]
@@ -386,7 +352,6 @@ pub async fn get_pnl_by_id(
     clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,
 ) -> Result<PnlResponse, String> {
-    use mongodb::bson::doc;
 
     let client = &clients.local;
     let db = client.database(&config.mongodb.databases.alpha);

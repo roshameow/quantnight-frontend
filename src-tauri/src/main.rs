@@ -48,7 +48,6 @@ fn main() {
             watcher::frontend_ready,  // 确保此命令通过前端调用
             datas::get_alpha_results,
             datas::get_pnl_by_id,
-            datas::get_unique_messages,
             datas::compute_correlation,
         ])
         .run(tauri::generate_context!())
