@@ -6,7 +6,7 @@ use futures_util::stream::TryStreamExt;
 use futures::join;
 
 use mongodb::{
-    bson::doc,
+    bson::{doc, Bson},
     options::FindOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,6 @@ pub struct AlphaResult {
     pub long_count: Option<i32>,
     pub short_count: Option<i32>,
     pub sub_universe_sharpe: Option<f64>,
-    pub status: String,
     pub message: Option<String>,
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
     pub pnl_score: Option<f64>,   // ✅ 新增
@@ -53,7 +52,8 @@ pub enum SortField {
 pub struct AlphaQuery {
     pub query: Option<String>,
     pub id: Option<String>,
-    pub status: Option<String>,
+    pub messages_in: Option<Vec<String>>, // Renamed from messages
+    pub messages_nin: Option<Vec<String>>, // Added for exclusion
     pub region: Option<String>,
     pub days_within: Option<u32>,
     pub min_turnover: Option<f64>,
@@ -61,16 +61,14 @@ pub struct AlphaQuery {
     pub min_margin: Option<f64>,
     pub delay: Option<u32>,
     pub min_returns: Option<f64>,
-    pub collection: Option<String>, // 新增：可选的 collection 名称
-    pub page: Option<u32>,       // ✅ 新增
-    pub page_size: Option<u32>,  // ✅ 新增
-
-    pub sort_field: Option<SortField>, // ✅ 使用枚举
-    pub sort_order: Option<i32>,       // 1 = 升序, -1 = 降序
+    pub collection: Option<String>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub sort_field: Option<SortField>,
+    pub sort_order: Option<i32>,
 }
 
 fn sanitize_collection_name(name: &str) -> Option<String> {
-    // 只允许字母数字和下划线，防止注入奇怪字符
     if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Some(name.to_string())
     } else {
@@ -80,10 +78,10 @@ fn sanitize_collection_name(name: &str) -> Option<String> {
 
 #[derive(Serialize)]
 pub struct PagedResult<T> {
-    pub data: Vec<T>,   // 当前页数据
-    pub total: u64,     // 总条数
-    pub page: u32,      // 当前页
-    pub page_size: u32, // 每页大小
+    pub data: Vec<T>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
 }
 
 
@@ -103,7 +101,6 @@ pub async fn get_alpha_results(
     let page_size = params.page_size.unwrap_or(50);
     let skip = ((page - 1) * page_size) as u64;
 
-    // --- STEP 1: 获取 collection ---
     let coll_name = params
         .collection
         .as_deref()
@@ -111,7 +108,6 @@ pub async fn get_alpha_results(
         .unwrap_or_else(|| "alpha_results".to_string());
     let collection = db.collection::<mongodb::bson::Document>(&coll_name);
 
-    // --- STEP 2: 构建过滤条件 ---
     let t_filter = std::time::Instant::now();
     let mut filters = vec![];
 
@@ -124,6 +120,34 @@ pub async fn get_alpha_results(
                 { "combo.code": { "$regex": &escaped, "$options": "i" } }
             ]
         });
+    }
+
+    if let Some(messages) = &params.messages_in {
+        if !messages.is_empty() {
+            filters.push(doc! {
+                "is.checks": {
+                    "$elemMatch": {
+                        "name": { "$in": messages },
+                        "result": { "$in": ["FAIL", "WARNING"] }
+                    }
+                }
+            });
+        }
+    }
+
+    if let Some(messages) = &params.messages_nin {
+        if !messages.is_empty() {
+            filters.push(doc! {
+                "is.checks": {
+                    "$not": {
+                        "$elemMatch": {
+                            "name": { "$in": messages },
+                            "result": { "$in": ["FAIL", "WARNING"] }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     if let Some(id) = &params.id {
@@ -164,7 +188,6 @@ pub async fn get_alpha_results(
     println!("⏱ filter build took {:?}", t_filter.elapsed());
     println!("Mongo filter: {:?}", filter);
 
-    // --- STEP 3: 并发执行 count + find ---
     let t_count = std::time::Instant::now();
     let t_find = std::time::Instant::now();
 
@@ -191,19 +214,12 @@ pub async fn get_alpha_results(
         .limit(page_size as i64)
         .build();
 
-    // 并发执行 count_documents 和 find
     let (count_res, cursor_res) = join!(
         collection.count_documents(filter.clone(), None),
         collection.find(filter.clone(), find_options)
     );
 
-    let total = match count_res {
-        Ok(count) => count,
-        Err(e) => {
-            println!("⚠️ count_documents error: {}", e);
-            0
-        }
-    };
+    let total = count_res.unwrap_or(0);
     println!("⏱ count_documents took {:?}", t_count.elapsed());
 
     let mut cursor = match cursor_res {
@@ -215,7 +231,6 @@ pub async fn get_alpha_results(
     };
     println!("⏱ collection.find() took {:?}", t_find.elapsed());
 
-    // --- STEP 4: 遍历 cursor 并解析结果 ---
     let t_fetch = std::time::Instant::now();
     let mut results = Vec::new();
     let mut doc_count = 0;
@@ -264,17 +279,14 @@ pub async fn get_alpha_results(
 
         let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
 
-        // 检查 status
         let mut sub_universe_sharpe = None;
         let mut message = None;
-        let mut status = "UNKNOWN".to_string();
 
         if let Some(checks) = is.and_then(|d| d.get_array("checks").ok()) {
             for item in checks {
                 if let Some(check_doc) = item.as_document() {
                     if let Ok(result) = check_doc.get_str("result") {
                         if result == "FAIL" || result == "WARNING" {
-                            status = "FAIL".to_string();
                             if let Ok(name) = check_doc.get_str("name") {
                                 message = Some(match message {
                                     Some(m) => format!("{},{}", m, name),
@@ -291,12 +303,6 @@ pub async fn get_alpha_results(
             }
         }
 
-        if let Some(status_filter) = &params.status {
-            if status != *status_filter {
-                continue;
-            }
-        }
-
         results.push(AlphaResult {
             id,
             region,
@@ -309,27 +315,13 @@ pub async fn get_alpha_results(
             long_count,
             short_count,
             sub_universe_sharpe,
-            status,
             message,
             date_created,
             pnl_score,
         });
-
-        if doc_count % 50 == 0 {
-            println!(
-                "⏱ parsed {} docs, elapsed {:?}",
-                doc_count,
-                t_fetch.elapsed()
-            );
-        }
     }
 
     drop(cursor);
-
-
-    println!("⏱ cursor iteration & parse took {:?}", t_fetch.elapsed());
-    println!("Total results returned: {}", results.len());
-    println!("✅ Total get_alpha_results() took {:?}", t0.elapsed());
 
     Ok(PagedResult {
         data: results,
@@ -339,13 +331,42 @@ pub async fn get_alpha_results(
     })
 }
 
+#[command]
+pub async fn get_unique_messages(
+    collection: Option<String>,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<Vec<String>, String> {
+    let client = &clients.local;
+    let db = client.database(&config.mongodb.databases.alpha);
+    let coll_name = collection
+        .as_deref()
+        .and_then(sanitize_collection_name)
+        .unwrap_or_else(|| "alpha_results".to_string());
+    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
+
+    let distinct_result = collection
+        .distinct("is.checks.name", None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let messages: Vec<String> = distinct_result
+        .into_iter()
+        .filter_map(|bson| match bson {
+            Bson::String(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    Ok(messages)
+}
 
 
 #[derive(Debug, Serialize)]
 pub struct PnlPoint {
     date: String,
     pnl: f64,
-    risk_neutralized_pnl: Option<f64>,  // 如果有的话
+    risk_neutralized_pnl: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,39 +400,27 @@ pub async fn get_pnl_by_id(
     let collection = db.collection::<mongodb::bson::Document>(&coll_name);
     let filter = doc! { "id": &query.id };
 
-    // 查询并返回文档
     let doc = collection
         .find_one(filter, None)
         .await
         .map_err(|e| format!("DB error: {}", e))?
         .ok_or_else(|| "Document not found".to_string())?;
 
-    // println!("📦 Document keys: {:?}", doc.keys().collect::<Vec<_>>());
-
-    // 提取 pnl 字段中的 records 数组
     let pnl_obj = doc.get_document("pnl").map_err(|_| "No pnl field")?;
     let records = pnl_obj.get_array("records").map_err(|_| "No records array")?;
 
-    // 将 records 数组转换为 PnlPoint 数组
     let pnl_series: Vec<PnlPoint> = records
         .iter()
         .filter_map(|entry| {
             entry.as_array().and_then(|arr| {
                 if arr.len() >= 2 {
-                    // 提取第一个元素作为日期
                     let date = arr.get(0)?.as_str()?.to_string();
-                    
-                    // 提取第二个元素作为 PnL
                     let pnl = arr.get(1)?.as_f64().or(arr.get(1)?.as_i32().map(|v| v as f64))?;
-                    
-                    // 提取第三个元素作为风险中性PnL（如果存在）
                     let risk_neutralized_pnl = if arr.len() > 2 {
                         arr.get(2)?.as_f64().or(arr.get(2)?.as_i32().map(|v| v as f64))
                     } else {
                         None
                     };
-
-                    // 返回 PnlPoint 实例
                     Some(PnlPoint { date, pnl, risk_neutralized_pnl })
                 } else {
                     None
@@ -420,7 +429,6 @@ pub async fn get_pnl_by_id(
         })
         .collect();
 
-    // 返回结果
     Ok(PnlResponse { pnl_series })
 }
 
@@ -437,9 +445,7 @@ pub async fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppCo
     let mut replacements = HashMap::new();
     replacements.insert("{alpha_ids}", alpha_str.as_str());
 
-    // let stdout = run_python_module(&config, "alpha_correlation", &replacements)?;
-    let stdout = run_python_module(&config, "alpha_correlation", &replacements).await?; // 注意 .await?
-
+    let stdout = run_python_module(&config, "alpha_correlation", &replacements).await?;
 
     serde_json::from_str(&stdout).map_err(|e| format!("解析 JSON 失败: {}", e))
 }

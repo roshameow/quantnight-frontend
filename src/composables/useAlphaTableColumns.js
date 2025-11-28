@@ -105,7 +105,6 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       render: (row) => row.date_created?.split("T")[0] ?? "--",
       sorter: true,
     },
-    { title: "Status", key: "status" },
     {
       title: "Message",
       key: "message",

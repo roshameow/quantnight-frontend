@@ -1,7 +1,8 @@
 <template>
   <div>
     <DataFilters
-      v-model="filters"
+      :model-value="filters"
+      @update:model-value="onFiltersUpdate"
       :corr-loading="corrLoading"
       @calculate-corr="calculateCorr"
     />
@@ -36,7 +37,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, nextTick, reactive } from "vue";
+import { ref, watch, onMounted, reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import DataFilters from "../components/data/DataFilters.vue";
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
@@ -52,7 +53,8 @@ const filters = reactive({
   collection: "alpha_results",
   searchQuery: "",
   id: "",
-  status: "",
+  messages: [], // This is for NIN
+  messagesIn: [], // This is for IN
   region: "",
   delay: null,
   days: null,
@@ -61,6 +63,10 @@ const filters = reactive({
   minMargin: null,
   minReturn: null,
 });
+
+const onFiltersUpdate = (newFilters) => {
+  Object.assign(filters, newFilters);
+};
 
 const pagination = ref({
   page: 1,
@@ -93,7 +99,8 @@ async function fetchData() {
     collection: filters.collection || "alpha_results",
     query: filters.searchQuery.trim() || null,
     id: filters.id.trim() || null,
-    status: filters.status || null,
+    messages_nin: filters.messages.length > 0 ? filters.messages : null,
+    messages_in: filters.messagesIn.length > 0 ? filters.messagesIn : null,
     region: filters.region || null,
     delay: filters.delay ? parseInt(filters.delay) : null,
     days_within: filters.days ? parseInt(filters.days) : null,
@@ -180,9 +187,21 @@ function handlePageSizeChange(pageSize) {
 }
 
 // --- Watchers & Lifecycle ---
-watch(filters, fetchData, { deep: true });
+watch(
+  filters,
+  (newFilters, oldFilters) => {
+    // Check if the collection has changed
+    if (newFilters.collection !== oldFilters.collection) {
+      filters.messages = []; // Reset messages when collection changes
+    }
+    fetchData(); // Fetch data on any filter change
+  },
+  { deep: true }
+);
 
-onMounted(fetchData);
+onMounted(() => {
+  fetchData();
+});
 </script>
 
 <style>
@@ -257,6 +276,10 @@ onMounted(fetchData);
   overflow: visible;
 }
 
+.message-cell {
+  font-size: 12px !important;
+}
+
 /* 确保展开后的内容能够正常显示 */
 .custom-table .n-data-table-wrapper .n-data-table-table .n-data-table-td {
   max-width: 300px !important; /* 控制最大宽度 */
@@ -292,5 +315,33 @@ onMounted(fetchData);
   word-break: break-word;
   background-color: #f5f5f5; /* Optional: highlight on hover */
   z-index: 10;
+}
+
+/* 
+  Correct override for Naive UI's teleported select menu, based on inspection.
+*/
+.n-base-select-menu .n-base-select-option .n-base-select-option__content {
+  font-size: 12px !important;
+}
+
+.n-base-selection-tag-wrapper .n-tag .n-tag__content{
+  font-size: 6px !important;
+}
+
+/* Reduce line spacing for the smaller font */
+.n-base-select-menu .n-base-select-option {
+  padding-top: 2px !important;
+  padding-bottom: 2px !important;
+  min-height: auto !important; /* Override the default minimum height */
+}
+
+/* Make the selected tags in the filter bar more compact */
+.n-base-selection-tag-wrapper .n-tag {
+  height: 20px !important;
+  padding-left: 6px !important;
+  padding-right: 6px !important;
+}
+.n-base-selection-tag-wrapper .n-tag .n-tag__content {
+  font-size: 12px !important;
 }
 </style>

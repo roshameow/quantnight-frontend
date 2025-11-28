@@ -33,17 +33,6 @@
             style="width: 80px"
             spellcheck="false"
           />
-          <n-select
-            :value="modelValue.status"
-            @update:value="updateFilter('status', $event)"
-            :options="[
-              { label: 'All Status', value: '' },
-              { label: 'UNKNOWN', value: 'UNKNOWN' },
-              { label: 'FAIL', value: 'FAIL' },
-            ]"
-            placeholder="Status"
-            style="width: 130px"
-          />
           <n-input
             :value="modelValue.region"
             @update:value="updateFilter('region', $event)"
@@ -98,6 +87,24 @@
             style="width: 130px"
             spellcheck="false"
           />
+          <n-select
+            :value="modelValue.messages"
+            multiple
+            clearable
+            @update:value="updateFilter('messages', $event)"
+            :options="excludeMessageOptions"
+            placeholder="Exclude Messages"
+            style="width: 200px"
+          />
+          <n-select
+            :value="modelValue.messagesIn"
+            multiple
+            clearable
+            @update:value="updateFilter('messagesIn', $event)"
+            :options="includeMessageOptions"
+            placeholder="Include Messages"
+            style="width: 200px"
+          />
         </n-space>
       </n-grid-item>
 
@@ -112,6 +119,8 @@
 </template>
 
 <script setup>
+import messagesData from '../../data/messages.json';
+
 const props = defineProps({
   modelValue: {
     type: Object,
@@ -123,15 +132,19 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['update:modelValue', 'calculateCorr']);
+const excludeMessageOptions = messagesData.exclude.map(msg => ({ label: msg, value: msg }));
+const includeMessageOptions = messagesData.include.map(msg => ({ label: msg, value: msg }));
+
+const emit = defineEmits(["update:modelValue", "calculateCorr"]);
 
 const updateFilter = (key, value) => {
-  emit('update:modelValue', { ...props.modelValue, [key]: value });
+  emit("update:modelValue", { ...props.modelValue, [key]: value });
 };
 </script>
 
 <style scoped>
-.n-input, .n-select {
+.n-input,
+.n-select {
   --n-padding-top: 4px !important;
   --n-padding-bottom: 4px !important;
   --n-padding-left: 8px !important;
