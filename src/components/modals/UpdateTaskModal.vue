@@ -1,13 +1,18 @@
 <template>
-  <n-modal v-model:show="show" title="启动任务配置" preset="dialog">
+  <n-modal v-model:show="show" title="更新任务配置" preset="dialog">
     <n-form :model="form" label-placement="top">
       <n-form-item label="配置 JSON">
-        <n-input type="textarea" v-model:value="form.config" autosize />
+        <n-input
+          type="textarea"
+          v-model:value="form.config"
+          autosize
+          spellcheck="false"
+        />
       </n-form-item>
     </n-form>
     <template #action>
       <n-button @click="onCancel">取消</n-button>
-      <n-button type="primary" @click="onConfirm">启动</n-button>
+      <n-button type="primary" @click="onConfirm">更新</n-button>
     </template>
   </n-modal>
 </template>
@@ -29,13 +34,7 @@ const props = defineProps({
   },
 });
 
-const emits = defineEmits([
-  "update:show",
-  "start-task",
-  "start-super-task",
-  "start-priority-task",
-]);
-
+const emits = defineEmits(["update:show", "update-task", "update-priority-task"]);
 const message = useMessage();
 const show = ref(props.show);
 watch(
@@ -46,7 +45,7 @@ watch(show, (val) => emits("update:show", val));
 
 const form = ref({ config: "" });
 
-// ✅ 普通任务 defaultJson
+// ---------- Default Configs ----------
 const normalDefaultJson = {
   max_concurrent: 8,
   max_multi_simulation_children: 10,
@@ -60,7 +59,6 @@ const normalDefaultJson = {
   },
 };
 
-// ✅ Super 任务 defaultJson
 const superDefaultJson = {
   max_concurrent: 3,
   max_multi_simulation_children: 1,
@@ -78,7 +76,6 @@ const superDefaultJson = {
   },
 };
 
-// ✅ Priority 任务 defaultJson
 const priorityDefaultJson = {
   interval: 600,
   priority: 1,
@@ -89,6 +86,7 @@ const priorityDefaultJson = {
   },
 };
 
+// ---------- 生成默认配置 ----------
 function generateDefaultConfig(task, isSuper, isPriority) {
   const template = isSuper
     ? superDefaultJson
@@ -106,13 +104,11 @@ function generateDefaultConfig(task, isSuper, isPriority) {
   return cloned;
 }
 
+// ---------- 初始化表单 ----------
 watch(
   () => props.show,
   (val) => {
     show.value = val;
-    console.log("watch:：props.isSuper", props.isSuper);
-
-    // ✅ 每次打开弹窗都重新生成 config
     if (val && props.task) {
       const config = generateDefaultConfig(props.task, props.isSuper, props.isPriority);
       form.value.config = JSON.stringify(config, null, 2);
@@ -121,33 +117,26 @@ watch(
   { immediate: true }
 );
 
-const onCancel = () => {
-  show.value = false;
-};
+const onCancel = () => (show.value = false);
 
 const onConfirm = () => {
   try {
     const parsed = JSON.parse(form.value.config);
-
     if (!props.task || !props.task.name) {
-      message.error("任务信息缺失，无法启动");
+      message.error("任务信息缺失，无法更新");
       return;
     }
 
     if (props.isPriority) {
-      emits("start-priority-task", {
-        taskName: props.task.name,
-        config: parsed,
-        isRemote: props.task.isRemote,
-      });
-    } else if (props.isSuper) {
-      emits("start-super-task", {
+      // Priority任务走这个
+      emits("update-priority-task", {
         taskName: props.task.name,
         config: parsed,
         isRemote: props.task.isRemote,
       });
     } else {
-      emits("start-task", {
+      // 普通 / super任务走这个
+      emits("update-task", {
         taskName: props.task.name,
         config: parsed,
         isRemote: props.task.isRemote,
@@ -156,7 +145,7 @@ const onConfirm = () => {
 
     show.value = false;
   } catch (e) {
-    message.error("JSON 格式错误: " + e.message);
+    message.error("JSON 格式错误，请检查输入");
   }
 };
 </script>

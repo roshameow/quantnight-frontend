@@ -1,59 +1,47 @@
-# QuantNight 前端模块
+# 前端架构
 
-本文档简要介绍 Vue.js 前端应用的源代码结构和功能划分。
+本项目前端采用 Vue 3 (Composition API) 构建，并遵循“容器组件”与“展示组件”分离的设计模式，以提高代码的可维护性和复用性。
 
 ## 目录结构
 
-### `main.js`
+-   **`src/main.js`**: 应用入口文件，负责初始化 Vue 应用、路由和 Pinia 状态管理。
+-   **`src/router/index.js`**: 定义应用的页面路由。
+-   **`src/stores/`**: 存放 Pinia store 模块。
+    -   `taskStore.js`: 全局管理任务列表、任务进度等状态，实现跨组件共享。
+-   **`src/views/`**: 存放页面级组件，作为“容器”，负责业务逻辑、数据获取和状态管理。
+    -   `TaskManager.vue`: 任务管理页面的主容器。
+    -   `DataPage.vue`: Alpha 数据分析页面的主容器。
+-   **`src/components/`**: 存放可复用的“展示组件”，它们接收 props 并通过 emits 与父组件通信。
+    -   `modals/`: 存放所有弹窗组件，如 `AddTaskModal`、`StartTaskModal` 等。
+    -   `TaskCards/`: 存放与任务卡片相关的组件，如 `PriorityTaskCard`、`RegularTaskCard`。
+    -   `data/`: 存放与数据展示相关的组件，如 `DataFilters`。
+-   **`src/composables/`**: 存放可复用的 Vue Composition API 函数（“组合式函数”）。
+    -   `useAlphaTableColumns.js`: 抽离了 `DataPage` 中复杂的表格列定义逻辑。
 
-**应用入口文件**
+## 核心页面与组件拆分逻辑
 
-- 负责初始化 Vue 实例。
-- 集成并配置路由（Vue Router）、状态管理（Pinia）等核心插件。
-- 将根组件 `App.vue` 挂载到 `index.html` 的 DOM 节点上。
+### 1. 任务管理 (`TaskManager.vue`)
 
-### `App.vue`
+-   **`TaskManager.vue` (容器)**:
+    -   通过 `invoke` 与 Tauri 后端通信，处理所有任务相关的增删改查操作。
+    -   管理所有任务弹窗的显示/隐藏状态。
+    -   监听子组件（如卡片、工具栏）发出的事件并执行相应逻辑。
+-   **`TaskManagerToolbar.vue` (展示)**:
+    -   显示顶部的“添加任务”按钮组。
+    -   点击时，通过 `emits` 通知父组件打开相应的弹窗。
+-   **`PriorityTaskCard.vue` / `RegularTaskCard.vue` (展示)**:
+    -   接收 `task` 和 `progress` 对象作为 props 来渲染卡片UI。
+    -   卡片上的所有操作按钮（如启动、暂停）都通过 `emits` 将事件和任务信息传递给父容器处理。
 
-**根组件**
+### 2. 数据分析 (`DataPage.vue`)
 
-- 作为整个应用的顶层容器。
-- 通常包含一个 `<router-view>` 标签，用于动态渲染当前路由所对应的页面视图。
-- 可能会包含一些全局性的布局组件，如 `AppLayout.vue`。
-
-### `assets/`
-
-**静态资源目录**
-
-- 存放全局 CSS 样式（如 `main.css`）、图片（SVG、PNG 等）、字体文件以及其他不会被代码直接引用的静态资源。
-
-### `components/`
-
-**可复用组件目录**
-
-- 存放应用中通用的、与具体业务页面解耦的 UI 组件。这些组件可以在多个视图（Views）中被复用。
-- **`AppLayout.vue`**: 定义了应用的主体布局结构，例如侧边栏、顶部导航栏和主内容区域。
-- **`TaskCards/`**: 存放与任务卡片展示相关的各类组件，体现了组件的模块化组织。
-
-### `router/`
-
-**路由管理目录**
-
-- **`index.js`**: 定义应用的页面路由规则。它建立 URL 路径与 `views` 目录下页面组件之间的映射关系，是实现单页面应用（SPA）导航的核心。
-
-### `stores/`
-
-**状态管理目录 (Pinia)**
-
-- 存放 Pinia 的各个状态模块（Store）。
-- **`taskStore.js`**: 专门用于管理任务相关的全局状态，例如任务列表、加载状态、筛选条件等。它负责调用 Tauri 后端命令进行数据交互，并为整个应用提供一个统一、响应式的数据源。
-
-### `views/`
-
-**页面视图目录**
-
-- 存放与路由直接映射的页面级组件，代表了应用的不同功能页面或大型功能区块。
-- **`TaskManager.vue`**: 核心的**任务管理页面**，用于展示、操作和监控所有任务。
-- **`DataPage.vue`**: **数据分析页面**，用于展示 Alpha 结果、PNL 曲线图等从后端获取的数据。
-- **`TestManager.vue`**: 可能用于开发或测试特定功能的页面。
-- **`*Modal.vue`** (如 `AddTaskModal.vue`, `StartTaskModal.vue`): 各种**操作模态框**组件。虽然它们是模态框，但由于其业务逻辑与特定视图紧密相关，因此被组织在这里，用于处理创建、启动、更新任务等具体的用户交互流程。
-- **`TaskFlowCard.vue`**: 用于展示单个任务流程的卡片组件，可能包含较为复杂的业务逻辑。
+-   **`DataPage.vue` (容器)**:
+    -   管理筛选条件、分页和排序的状态。
+    -   调用 Tauri 后端获取 Alpha 数据。
+    -   使用 `useAlphaTableColumns` 组合式函数来获取表格的列定义。
+-   **`DataFilters.vue` (展示)**:
+    -   包含所有的筛选输入框和选择器。
+    -   使用 `v-model` 与父组件的 `filters` 对象双向绑定，实现状态同步。
+-   **`useAlphaTableColumns.js` (逻辑复用)**:
+    -   一个独立的函数，返回一个响应式的 `columns` 数组。
+    -   封装了所有复杂的列渲染逻辑，包括自定义单元格、Popover 弹窗和内嵌的 ECharts PNL 图表，使 `DataPage.vue` 的代码更加简洁。

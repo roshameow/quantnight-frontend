@@ -15,7 +15,11 @@
       </n-form-item>
 
       <n-form-item label="添加模板路径（可选）">
-        <n-input v-model:value="form.templatePath" placeholder="模版路径" />
+        <n-input
+          v-model:value="form.templatePath"
+          placeholder="模版路径"
+          spellcheck="false"
+        />
       </n-form-item>
 
       <n-form-item>

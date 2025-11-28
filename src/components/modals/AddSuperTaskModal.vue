@@ -2,7 +2,7 @@
   <n-modal
     v-model:show="showModal"
     preset="dialog"
-    title="添加插队任务"
+    title="添加Super Alpha回测任务"
     :style="{ width: '700px' }"
   >
     <n-form label-placement="top">
@@ -15,7 +15,11 @@
       </n-form-item>
 
       <n-form-item label="添加模板路径（可选）">
-        <n-input v-model:value="form.priorityTemplatePath" placeholder="模版路径" />
+        <n-input
+          v-model:value="form.templatePath"
+          placeholder="模版路径"
+          spellcheck="false"
+        />
       </n-form-item>
 
       <n-form-item>
@@ -61,16 +65,6 @@ import { AppConfig } from "@/config";
 
 
 
-// ✅ 预填表单数据
-const form = ref({
-  taskName: "",
-  configText: "", // 预填入 JSON 字符串
-  priorityTemplatePath: AppConfig.priorityTemplatePath,
-  templateFilename: "",
-  templateCode: "",
-  isRemote: false, // ✅ 本地（false）/远程（true）标记
-});
-
 // props
 const props = defineProps({ show: Boolean });
 // emit
@@ -90,6 +84,17 @@ const message = useMessage();
 
 
 
+// ✅ 预填表单数据
+const form = ref({
+  taskName: "",
+  configText: "", // 预填入 JSON 字符串
+  templatePath: AppConfig.superTemplatePath || '',
+  templateFilename: "",
+  templateCode: "",
+  isRemote: false, // ✅ 本地（false）/远程（true）标记
+  taskType: "super",
+});
+
 watch(
   () => props.show,
   async (v) => {
@@ -97,10 +102,9 @@ watch(
     if (v) {
       try {
         const latestTemplate = await invoke("read_latest_py_file", {
-          folderPath: form.value.priorityTemplatePath,
+          folderPath: form.value.templatePath,
         });
         form.value.templateFilename = latestTemplate.replace(/\.py$/i, "");
-        form.value.taskName = form.value.templateFilename + "__priority";
         console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
       } catch (err) {
         console.error("读取模板失败:", err);
@@ -109,6 +113,7 @@ watch(
     }
   }
 );
+
 
 
 const handleTemplateUpload = ({ file }) => {
@@ -128,21 +133,18 @@ const handleSubmit = () => {
   }
 
   try {
-    let parsedConfig = {};
-    if (form.value.configText && form.value.configText.trim() !== "") {
-      parsedConfig = JSON.parse(form.value.configText);
-    }
-
     const newTask = {
+      // id: Date.now().toString(),
       name: form.value.taskName,
-      config: parsedConfig,
-      template: form.value.templateCode || "",
-      templatefile: form.value.templateFilename || "",
+      config: JSON.parse(form.value.configText), // 修复 JSON 字符串错误解析
+      template: form.value.templateCode,
+      templatefile: form.value.templateFilename,
       status: "pending",
       createdAt: new Date(),
+      isSuper: true, // ✅ 加上这一行
     };
 
-    emit("add-priority-task", newTask);
+    emit("add-super-task", newTask);
     message.success("任务创建成功");
     showModal.value = false;
   } catch (e) {
@@ -150,7 +152,6 @@ const handleSubmit = () => {
     message.error("配置 JSON 格式错误！");
   }
 };
-
 
 const handleCancel = () => {
   showModal.value = false;
