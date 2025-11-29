@@ -69,7 +69,7 @@ import { AppConfig } from "@/config";
 const form = ref({
   taskName: "",
   configText: "", // 预填入 JSON 字符串
-  priorityTemplatePath: AppConfig.priorityTemplatePath,
+  priorityTemplatePath: AppConfig.paths.priorityTemplatePath,
   templateFilename: "",
   templateCode: "",
   isRemote: false, // ✅ 本地（false）/远程（true）标记

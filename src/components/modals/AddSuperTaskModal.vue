@@ -87,7 +87,7 @@ const message = useMessage();
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
-  templatePath: AppConfig.superTemplatePath || '',
+  templatePath: AppConfig.paths.superTemplatePath || '',
   templateFilename: "",
   templateCode: "",
   isRemote: false, // ✅ 本地（false）/远程（true）标记
