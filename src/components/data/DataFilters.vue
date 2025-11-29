@@ -8,11 +8,7 @@
         <n-select
           :value="modelValue.collection"
           @update:value="updateFilter('collection', $event)"
-          :options="[
-            { label: 'alpha_results', value: 'alpha_results' },
-            { label: 'alpha_submitted', value: 'alpha_submitted' },
-            { label: 'alpha_submitted_zzz', value: 'alpha_submitted_zzz' },
-          ]"
+          :options="configStore.dataFilterOptions"
           placeholder="Collection"
           style="width: 160px"
         />
@@ -122,6 +118,9 @@
 
 <script setup>
 import messagesData from '../../data/messages.json';
+import { useConfigStore } from '../../stores/configStore';
+
+const configStore = useConfigStore();
 
 const props = defineProps({
   modelValue: {

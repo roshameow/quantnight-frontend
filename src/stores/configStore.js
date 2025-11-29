@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import TOML from '@iarna/toml';
 
 export const useConfigStore = defineStore('config', () => {
   // --- State ---
@@ -9,6 +10,8 @@ export const useConfigStore = defineStore('config', () => {
     templatePath: '',
     priorityTemplatePath: '',
   });
+  const dataFilterOptions = ref([]);
+  const backendConfig = ref({}); // Will hold the parsed TOML object
   const isLoading = ref(true);
   const error = ref(null);
 
@@ -30,11 +33,12 @@ export const useConfigStore = defineStore('config', () => {
 
   /**
    * Formats the configuration object back into the string content for config.js.
-   * @param {object} pathsObject The paths configuration object.
+   * @param {object} configObject The configuration object.
    */
-  function _formatContent(pathsObject) {
-    const json_str = JSON.stringify(pathsObject, null, 2); // Pretty print
-    return `export const AppConfig = ${json_str};\n`;
+  function _formatContent(configObject) {
+    const json_str = JSON.stringify(configObject, null, 2); // Pretty print
+    return `export const AppConfig = ${json_str};
+`;
   }
 
   // --- Actions ---
@@ -42,46 +46,74 @@ export const useConfigStore = defineStore('config', () => {
   /**
    * Fetches the config.js content from the Rust backend and parses it.
    */
-  async function fetchConfig() {
+  async function fetchFrontendConfig() {
     isLoading.value = true;
     error.value = null;
     try {
       const content = await invoke('get_config_js_content');
-      paths.value = _parseContent(content);
+      const config = _parseContent(content);
+      paths.value = config.paths || { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
+      dataFilterOptions.value = config.dataFilterOptions || [];
     } catch (e) {
       console.error('Failed to fetch or parse config.js:', e);
-      error.value = 'Failed to load configurations from backend.';
+      error.value = 'Failed to load configurations. Please check src/config.js.';
+      paths.value = { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
+      dataFilterOptions.value = [];
     } finally {
       isLoading.value = false;
     }
   }
 
   /**
-   * Saves the current paths configuration back to the config.js file via the Rust backend.
+   * Saves the provided configuration object to the config.js file via the Rust backend.
+   * @param {object} configToSave The configuration object to save.
    */
-  async function saveConfig() {
-    isLoading.value = true;
-    error.value = null;
+  async function saveFrontendConfig(configToSave) {
     try {
-      const newContent = _formatContent(paths.value);
+      const newContent = _formatContent(configToSave);
       await invoke('save_config_js_content', { content: newContent });
     } catch (e) {
       console.error('Failed to save config.js:', e);
       error.value = 'Failed to save configurations to backend.';
-      throw e; // Re-throw to let the UI component know about the failure
-    } finally {
-      isLoading.value = false;
+      throw e;
+    }
+  }
+
+  async function fetchBackendConfig() {
+    try {
+      const content = await invoke('get_config_toml_content');
+      backendConfig.value = TOML.parse(content);
+    } catch (e) {
+      console.error('Failed to fetch or parse config.toml:', e);
+      error.value = 'Failed to load backend configuration.';
+      backendConfig.value = {};
+    }
+  }
+
+  async function saveBackendConfig(updatedConfigObject) {
+    try {
+      const newTomlContent = TOML.stringify(updatedConfigObject);
+      await invoke('save_config_toml_content', { content: newTomlContent });
+    } catch (e) {
+      console.error('Failed to save config.toml:', e);
+      error.value = 'Failed to save backend configuration.';
+      throw e;
     }
   }
 
   // --- Initial Load ---
-  fetchConfig();
+  fetchFrontendConfig();
+  fetchBackendConfig();
 
   return {
     paths,
+    dataFilterOptions,
+    backendConfig,
     isLoading,
     error,
-    fetchConfig,
-    saveConfig,
+    fetchFrontendConfig,
+    saveFrontendConfig,
+    fetchBackendConfig,
+    saveBackendConfig,
   };
 });

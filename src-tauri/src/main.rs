@@ -52,6 +52,8 @@ fn main() {
             datas::compute_correlation,
             frontend_config::get_config_js_content, // Add the new command
             frontend_config::save_config_js_content, // Add the new command
+            frontend_config::get_config_toml_content,
+            frontend_config::save_config_toml_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
