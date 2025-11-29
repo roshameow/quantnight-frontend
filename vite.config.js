@@ -26,11 +26,16 @@ export default defineConfig(async () => ({
   },
 
   ],
+  define: {
+    // ✅ 修复：为浏览器环境定义 global 变量
+    'global': 'window',
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
     },
   },
+
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
