@@ -11,7 +11,11 @@
             padding: 10px 10px;
             font-size: 14px;
             background-color: #ff9800;
+            box-shadow: 0 2px 4px rgba(255, 152, 0, 0.2);
+            transition: all 0.2s ease;
           "
+          @mouseenter="$event.target.style.transform = 'translateY(-1px)'"
+          @mouseleave="$event.target.style.transform = 'translateY(0)'"
         >
           ➕ 添加Priority任务
         </n-button>
@@ -24,7 +28,11 @@
             padding: 10px 10px;
             font-size: 14px;
             background-color: #4caf50;
+            box-shadow: 0 2px 4px rgba(76, 175, 80, 0.2);
+            transition: all 0.2s ease;
           "
+          @mouseenter="$event.target.style.transform = 'translateY(-1px)'"
+          @mouseleave="$event.target.style.transform = 'translateY(0)'"
         >
           ➕ 添加任务
         </n-button>
@@ -37,7 +45,11 @@
             padding: 10px 10px;
             font-size: 14px;
             background-color: #2196f3;
+            box-shadow: 0 2px 4px rgba(33, 150, 243, 0.2);
+            transition: all 0.2s ease;
           "
+          @mouseenter="$event.target.style.transform = 'translateY(-1px)'"
+          @mouseleave="$event.target.style.transform = 'translateY(0)'"
         >
           ➕ 添加Super任务
         </n-button>

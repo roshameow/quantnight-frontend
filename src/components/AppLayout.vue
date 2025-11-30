@@ -1,13 +1,18 @@
 <template>
   <n-layout>
-    <n-layout-header bordered style="padding: 16px; background: #f5f5f5;">
+    <n-layout-header bordered class="app-header">
       <n-space justify="space-between" align="center">
-        <div class="text-xl font-bold">🧠 QuantNight 回测平台</div>
+        <div class="app-title">
+          <div class="title-text">
+            <span class="brand">QuantNight</span>
+            <span class="subtitle">量化回测平台</span>
+          </div>
+        </div>
         <n-button tertiary @click="showSettingsModal = true">设置</n-button>
       </n-space>
     </n-layout-header>
 
-    <n-layout has-sider style="height: calc(100vh - 64px);">
+    <n-layout has-sider style="height: calc(100vh - 49px);">
       <n-layout-sider bordered width="200">
         <n-menu
           :options="menuOptions"
@@ -59,7 +64,34 @@ function handleMenuClick(key) {
 </script>
 
 <style scoped>
-.text-xl {
+.app-header {
+  padding: 12px 24px;
+  background: #ffffff;
+  border-bottom: 1px solid #e8e8e8;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+}
+
+.app-title {
+  display: flex;
+  align-items: center;
+}
+
+.title-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
   font-size: 20px;
+  font-weight: 600;
+  color: #1a1a1a;
+  letter-spacing: -0.5px;
+}
+
+.subtitle {
+  font-size: 12px;
+  color: #666666;
+  font-weight: 400;
+  margin-top: 1px;
 }
 </style>
