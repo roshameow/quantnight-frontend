@@ -221,6 +221,8 @@ const updateIsRemote = async (id, isRemote) => {
       updates: { is_remote: isRemote },
     });
     message.success(`运行方式已更新为 ${isRemote ? "远程" : "本地"}`);
+    // 重新获取任务数据以更新界面
+    await fetchTasks();
   } catch (err) {
     console.error("更新 isRemote 失败", err);
     message.error("运行方式更新失败");
