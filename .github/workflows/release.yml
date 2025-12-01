@@ -3,7 +3,7 @@ name: Build Tauri App (Cross-platform)
 on:
   push:
     tags:
-      - 'v*'
+      - '*'
 
 permissions:
   contents: write
