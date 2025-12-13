@@ -1,18 +1,24 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "quantnight-frontend",
+  "productName": "QuantNight",
   "version": "0.1.0",
-  "identifier": "wenliu",
+  "identifier": "quantnight",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
+  "bundle": {
+    "resources": [
+      "src-tauri/config.toml",
+      "../src/config.js"
+    ]
+  },
   "app": {
     "windows": [
       {
-        "title": "quantnight-frontend",
+        "title": "QuantNight",
         "width": 800,
         "height": 600,
         "devtools": true
