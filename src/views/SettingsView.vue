@@ -3,6 +3,9 @@
     <n-space vertical size="large">
       <!-- Frontend Configuration (from config.js) -->
       <n-card title="Frontend Configuration (config.js)" size="small">
+        <template #header-extra>
+          <n-tag type="info" size="small">支持热修复</n-tag>
+        </template>
         <n-card title="Template Paths" size="small" style="margin-bottom: 16px;">
           <div style="display: flex; flex-direction: column; gap: 6px;">
             <div style="display: flex; align-items: center; margin-bottom: 6px;">
@@ -36,6 +39,9 @@
 
       <!-- Backend Configuration (from config.toml) -->
       <n-card title="Backend Configuration (config.toml)" size="small">
+        <template #header-extra>
+          <n-tag type="warning" size="small">修改后将重启应用</n-tag>
+        </template>
         <n-card title="MongoDB & Database Settings" size="small" style="margin-bottom: 16px;">
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <n-h4 style="margin-bottom: 8px;">MongoDB Connection</n-h4>
@@ -96,16 +102,16 @@
                 <n-input v-model:value="mapping.button_label" size="tiny" spellcheck="false" />
               </td>
               <td>
-                <n-select v-model:value="mapping.script_type" size="tiny" style="width: 70px;">
-                  <n-option value="python" label="Python" />
-                  <n-option value="bash" label="Bash" />
-                </n-select>
+                <n-select v-model:value="mapping.script_type" size="tiny" style="width: 70px;" :options="[
+                  { value: 'python', label: 'Python' },
+                  { value: 'bash', label: 'Bash' }
+                ]" />
               </td>
               <td>
                 <n-input v-model:value="mapping.script_key" size="tiny" spellcheck="false" />
               </td>
               <td>
-                <n-tooltip trigger="hover" max-width="400">
+                <n-tooltip trigger="hover" :style="{ maxWidth: '400px' }">
                   <template #trigger>
                     <n-input v-model:value="mapping.script_command" size="tiny" spellcheck="false" />
                   </template>
@@ -162,6 +168,7 @@ import {
   NTooltip,
   NSelect,
   NSwitch,
+  NH4,
   useMessage,
 } from 'naive-ui';
 import { useConfigStore } from '../stores/configStore';
@@ -220,6 +227,10 @@ onMounted(async () => {
       working_dir: configStore.backendConfig.python.working_dir || ''
     };
   }
+  
+  // Debug logging for initialization
+  console.log('Initialized localMongoConfig:', localMongoConfig.value);
+  console.log('Initialized localPythonConfig:', localPythonConfig.value);
 });
 
 function addOption() {
@@ -231,31 +242,72 @@ function removeOption(index) {
 }
 
 async function handleSave() {
-  // --- Save Frontend Config ---
+  const savePromises = [];
+  
+  // --- Check if Frontend Config was modified ---
   const frontendConfig = {
     paths: localPaths.value,
     dataFilterOptions: localDataFilterOptions.value,
   };
-  configStore.$patch({
-    paths: frontendConfig.paths,
-    dataFilterOptions: frontendConfig.dataFilterOptions,
-  });
+  
+  const frontendChanged = JSON.stringify(frontendConfig.paths) !== JSON.stringify(configStore.paths || {}) ||
+                          JSON.stringify(frontendConfig.dataFilterOptions) !== JSON.stringify(configStore.dataFilterOptions || []);
+  
+  if (frontendChanged) {
+    configStore.$patch({
+      paths: frontendConfig.paths,
+      dataFilterOptions: frontendConfig.dataFilterOptions,
+    });
+    savePromises.push(configStore.saveFrontendConfig(frontendConfig));
+  }
 
-  // --- Update Backend Config ---
-  const updatedBackendConfig = {
-    mongodb: localMongoConfig.value,
-    python: localPythonConfig.value
-  };
+  // --- Check if Backend Config was modified ---
+  // Only check if any backend fields have non-empty values that differ from defaults
+  const mongoDbChanged = localMongoConfig.value.local_uri !== (configStore.backendConfig.mongodb?.local_uri || '') ||
+                          localMongoConfig.value.remote_uri !== (configStore.backendConfig.mongodb?.remote_uri || '') ||
+                          localMongoConfig.value.databases.mission !== (configStore.backendConfig.mongodb?.databases?.mission || '') ||
+                          localMongoConfig.value.databases.simulation !== (configStore.backendConfig.mongodb?.databases?.simulation || '') ||
+                          localMongoConfig.value.databases.alpha !== (configStore.backendConfig.mongodb?.databases?.alpha || '');
+                          
+  const pythonChanged = localPythonConfig.value.interpreter !== (configStore.backendConfig.python?.interpreter || '') ||
+                        localPythonConfig.value.working_dir !== (configStore.backendConfig.python?.working_dir || '');
+  
+  const backendChanged = mongoDbChanged || pythonChanged;
+  
+  console.log('mongoDbChanged:', mongoDbChanged);
+  console.log('pythonChanged:', pythonChanged);
+  console.log('backendChanged result:', backendChanged);
+  
+  if (backendChanged) {
+    const backendConfig = {
+      mongodb: localMongoConfig.value,
+      python: localPythonConfig.value
+    };
+    savePromises.push(configStore.saveBackendConfig(backendConfig));
+  }
 
   try {
-    // Save both frontend and backend configs
-    await Promise.all([
-      configStore.saveFrontendConfig(frontendConfig),
-      configStore.saveBackendConfig(updatedBackendConfig)
-    ]);
+    if (savePromises.length === 0) {
+      message.info('No changes detected.');
+      return;
+    }
     
-    message.success('Settings saved successfully! Hot reload will apply changes.');
+    // Debug logging
+    console.log('Frontend changed:', frontendChanged);
+    console.log('Backend changed:', backendChanged);
+    console.log('Save promises:', savePromises);
+    
+    // Save only the modified configs
+    await Promise.all(savePromises);
+    
+    // Display appropriate message based on what was actually saved
+    if (backendChanged) {
+      message.warning('Backend configuration saved. The application will now restart to apply changes.');
+    } else if (frontendChanged) {
+      message.success('Frontend settings saved successfully!');
+    }
   } catch (e) {
+    console.error('Error saving settings:', e);
     message.error('Failed to save settings. Check console for details.');
   }
 }

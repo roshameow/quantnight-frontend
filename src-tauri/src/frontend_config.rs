@@ -35,6 +35,16 @@ pub fn get_config_toml_content() -> Result<String, String> {
 
 #[command]
 pub fn save_config_toml_content(content: String) -> Result<(), String> {
-    fs::write(get_config_toml_path(), content)
-        .map_err(|e| format!("Failed to write to config.toml: {}", e))
+    let config_path = get_config_toml_path();
+    println!("Attempting to save config.toml to: {:?}", config_path);
+    println!("Content to save (first 200 chars): {}", &content[..content.len().min(200)]);
+    
+    fs::write(&config_path, content)
+        .map_err(|e| {
+            eprintln!("Failed to write to config.toml at {:?}: {}", config_path, e);
+            format!("Failed to write to config.toml: {}", e)
+        })?;
+    
+    println!("Successfully saved config.toml");
+    Ok(())
 }

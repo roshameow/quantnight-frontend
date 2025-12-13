@@ -110,11 +110,44 @@ export const useConfigStore = defineStore('config', () => {
         completeConfig.bash = backendConfig.value.bash;
       }
       
+      // Ensure python.scripts exists and is an object
+      if (completeConfig.python && !completeConfig.python.scripts) {
+        completeConfig.python.scripts = {};
+      }
+      
+      // Ensure bash.scripts exists and is an object
+      if (completeConfig.bash && !completeConfig.bash.scripts) {
+        completeConfig.bash.scripts = {};
+      }
+      
       console.log('Saving backend config:', completeConfig);
+      
+      // Validate the config before serializing
+      if (!completeConfig.mongodb || !completeConfig.mongodb.databases) {
+        throw new Error('MongoDB configuration or databases section is missing');
+      }
+      
       const newTomlContent = TOML.stringify(completeConfig);
+      console.log('Generated TOML content:', newTomlContent);
+      
+      // Check if there were actual changes before updating the store
+      const hasChanges = JSON.stringify(completeConfig) !== JSON.stringify(backendConfig.value);
+      
+      // Debug logging
+      console.log('saveBackendConfig - hasChanges:', hasChanges);
+      console.log('saveBackendConfig - completeConfig:', completeConfig);
+      console.log('saveBackendConfig - backendConfig.value:', backendConfig.value);
+      
       await invoke('save_config_toml_content', { content: newTomlContent });
+      
       // Update the store with the new config
       backendConfig.value = completeConfig;
+      
+      // Only restart if there were actual changes to backend config
+      if (hasChanges) {
+        // Restart the application to apply backend configuration changes
+        await invoke('restart_app');
+      }
     } catch (e) {
       console.error('Failed to save config.toml:', e);
       error.value = 'Failed to save backend configuration.';
@@ -160,6 +193,7 @@ export const useConfigStore = defineStore('config', () => {
     fetchFrontendConfig,
     saveFrontendConfig,
     fetchBackendConfig,
+    saveBackendConfig,
     fetchButtonMappings,
     saveButtonMappings,
   };

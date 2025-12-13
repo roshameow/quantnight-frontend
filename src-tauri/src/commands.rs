@@ -679,8 +679,13 @@ pub async fn pause_task(task_name: String, is_remote: bool, clients: State<'_, A
         )
         .await
         .map_err(|e| e.to_string())?;
+Ok(())
+}
 
-    Ok(())
+#[command]
+pub fn restart_app() -> Result<(), String> {
+    // Use std::process to restart the application
+    std::process::exit(0); // This will cause the application to exit, and the process manager can restart it
 }
 
 
