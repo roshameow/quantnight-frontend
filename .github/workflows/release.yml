@@ -27,12 +27,9 @@ jobs:
           node-version: 18
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: actions-rs/toolchain@v1
         with:
-          workspaces: src-tauri
+          toolchain: stable
 
       - name: Install frontend deps
         run: npm ci
@@ -49,7 +46,6 @@ jobs:
 
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
-        timeout-minutes: 30
 
         env:
           GITHUB_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
