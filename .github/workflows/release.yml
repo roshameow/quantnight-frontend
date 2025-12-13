@@ -34,16 +34,6 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Setup default configs for release
-        run: |
-          # Copy default config files if they don't exist
-          if [ ! -f src/config.js ]; then
-            cp src/config.default.js src/config.js
-          fi
-          if [ ! -f src-tauri/config.toml ]; then
-            cp src-tauri/config.default.toml src-tauri/config.toml
-          fi
-
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
 
