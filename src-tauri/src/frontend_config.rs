@@ -2,6 +2,44 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::command;
 
+// --- Helper function to get the path to our config file ---
+fn get_config_js_path() -> PathBuf {
+    // Try multiple possible locations for config.js
+    let paths = vec![
+        "../src/config.js",           // Development path
+        "./config.js",                // Production path (bundled resource)
+        "../config.js",               // Alternative production path
+    ];
+    
+    for path in paths {
+        let path_buf = PathBuf::from(path);
+        if path_buf.exists() {
+            return path_buf;
+        }
+    }
+    
+    // Fallback to development path if none exist
+    PathBuf::from("../src/config.js")
+}
+
+fn get_config_toml_path() -> PathBuf {
+    // Try multiple possible locations for config.toml
+    let paths = vec![
+        "./config.toml",              // Development and production path
+        "config.toml",               // Alternative production path
+    ];
+    
+    for path in paths {
+        let path_buf = PathBuf::from(path);
+        if path_buf.exists() {
+            return path_buf;
+        }
+    }
+    
+    // Fallback to default path if none exist
+    PathBuf::from("./config.toml")
+}
+
 // --- Helper function to create default config if it doesn't exist ---
 fn create_default_config_if_missing() {
     let config_js_path = get_config_js_path();
@@ -96,44 +134,6 @@ args = [ "{task_name}" ]"#;
             println!("Created default config.toml at {:?}", config_toml_path);
         }
     }
-}
-
-// --- Helper function to get the path to our config file ---
-fn get_config_js_path() -> PathBuf {
-    // Try multiple possible locations for config.js
-    let paths = vec![
-        "../src/config.js",           // Development path
-        "./config.js",                // Production path (bundled resource)
-        "../config.js",               // Alternative production path
-    ];
-    
-    for path in paths {
-        let path_buf = PathBuf::from(path);
-        if path_buf.exists() {
-            return path_buf;
-        }
-    }
-    
-    // Fallback to development path if none exist
-    PathBuf::from("../src/config.js")
-}
-
-fn get_config_toml_path() -> PathBuf {
-    // Try multiple possible locations for config.toml
-    let paths = vec![
-        "./config.toml",              // Development and production path
-        "config.toml",               // Alternative production path
-    ];
-    
-    for path in paths {
-        let path_buf = PathBuf::from(path);
-        if path_buf.exists() {
-            return path_buf;
-        }
-    }
-    
-    // Fallback to default path if none exist
-    PathBuf::from("./config.toml")
 }
 
 // --- Tauri Commands ---

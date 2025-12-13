@@ -27,9 +27,12 @@ jobs:
           node-version: 18
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
+          workspaces: src-tauri
 
       - name: Install frontend deps
         run: npm ci
@@ -46,10 +49,11 @@ jobs:
 
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
+        timeout-minutes: 30
 
         env:
           GITHUB_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: ${{ github.ref_name }}
+          releaseName: QuantNight ${{ github.ref_name }}
 
