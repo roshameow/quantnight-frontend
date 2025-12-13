@@ -113,11 +113,11 @@ fn get_default_config_path() -> Option<PathBuf> {
         if let Ok(exe_path) = std::env::current_exe() {
             #[cfg(target_os = "macos")]
             {
-                // macOS: app bundle 中：.app/Contents/Resources/config.toml
+                // macOS: app bundle 中：.app/Contents/Resources/resources/config.toml
                 if let Some(resources_dir) = exe_path
                     .parent() // MacOS
                     .and_then(|p| p.parent()) // Contents
-                    .map(|p| p.join("Resources"))
+                    .map(|p| p.join("Resources").join("resources"))
                 {
                     return Some(resources_dir.join("config.toml"));
                 }
@@ -125,18 +125,18 @@ fn get_default_config_path() -> Option<PathBuf> {
 
             #[cfg(target_os = "windows")]
             {
-                // Windows: 和 .exe 放在同一目录
+                // Windows: 和 .exe 放在同一目录的 resources 子目录
                 return exe_path
                     .parent()
-                    .map(|p| p.join("config.toml"));
+                    .and_then(|p| Some(p.join("resources").join("config.toml")));
             }
 
             #[cfg(target_os = "linux")]
             {
-                // Linux: 通常放在 /usr/share/<app>/config.toml 或可执行文件旁边
+                // Linux: 通常放在 /usr/share/<app>/resources/config.toml 或可执行文件旁边的 resources 目录
                 return exe_path
                     .parent()
-                    .map(|p| p.join("config.toml"));
+                    .and_then(|p| Some(p.join("resources").join("config.toml")));
             }
         }
     }
@@ -156,7 +156,7 @@ fn fallback_config_path() -> PathBuf {
                 if let Some(resources_dir) = exe_path
                     .parent() // MacOS
                     .and_then(|p| p.parent()) // Contents
-                    .map(|p| p.join("Resources"))
+                    .map(|p| p.join("Resources").join("resources"))
                 {
                     return resources_dir.join("config.toml");
                 }
@@ -164,19 +164,19 @@ fn fallback_config_path() -> PathBuf {
 
             #[cfg(target_os = "windows")]
             {
-                // Windows: 和 .exe 放在同一目录（或 resource 子目录）
+                // Windows: 和 .exe 放在同一目录的 resources 子目录
                 return exe_path
                     .parent()
-                    .map(|p| p.join("config.toml"))
+                    .and_then(|p| Some(p.join("resources").join("config.toml")))
                     .unwrap_or_else(|| PathBuf::from("config.toml"));
             }
 
             #[cfg(target_os = "linux")]
             {
-                // Linux: 通常放在 /usr/share/<app>/config.toml 或可执行文件旁边
+                // Linux: 通常放在 /usr/share/<app>/resources/config.toml 或可执行文件旁边的 resources 目录
                 return exe_path
                     .parent()
-                    .map(|p| p.join("config.toml"))
+                    .and_then(|p| Some(p.join("resources").join("config.toml")))
                     .unwrap_or_else(|| PathBuf::from("config.toml"));
             }
         }

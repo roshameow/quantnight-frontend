@@ -1,4 +1,4 @@
-name: Build Tauri App (Cross-platform)
+name: Build Tauri App
 
 on:
   push:
@@ -10,13 +10,14 @@ permissions:
   packages: write
   issues: write
 
-jobs:
-  build:
-    strategy:
-      matrix:
-        platform: [macos-latest]
+concurrency:
+  group: tauri-${{ github.ref }}
+  cancel-in-progress: false
 
-    runs-on: ${{ matrix.platform }}
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -30,22 +31,44 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
+          override: true
 
       - name: Install frontend deps
         run: npm ci
 
-      - name: Copy default config
-        run: cp src-tauri/resources/config.toml src-tauri/config.toml
-
-      - name: Ensure resources directory exists
-        run: mkdir -p src-tauri/resources
-
-      - name: Build with tauri
-        uses: tauri-apps/tauri-action@v0
-
+      - name: Build with tauri (macOS)
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: QuantNight ${{ github.ref_name }}
 
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build with tauri (Windows)
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: QuantNight ${{ github.ref_name }}
