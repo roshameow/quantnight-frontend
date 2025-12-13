@@ -14,7 +14,7 @@ jobs:
   build:
     strategy:
       matrix:
-        platform: [macos-latest, windows-latest]  # 去掉 ubuntu-latest
+        platform: [macos-latest, windows-latest]
 
     runs-on: ${{ matrix.platform }}
 
@@ -52,4 +52,3 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: QuantNight ${{ github.ref_name }}
-
