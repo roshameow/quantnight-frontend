@@ -34,6 +34,15 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Generate config file
+        env:
+          MONGODB_REMOTE_URI: ${{ secrets.MONGODB_REMOTE_URI }}
+          PYTHON_WORKING_DIR: ${{ matrix.platform == 'macos-latest' && '/Users/wenliu/Code/python/world_quant_brain' || '/app' }}
+          BASH_WORKING_DIR: ${{ matrix.platform == 'macos-latest' && '/Users/wenliu/Code/python/world_quant_brain' || '/app' }}
+        run: |
+          ./scripts/generate-config.sh
+          cat src-tauri/config.toml
+
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
 
