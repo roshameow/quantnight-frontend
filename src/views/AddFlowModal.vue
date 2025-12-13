@@ -1,7 +1,7 @@
 <template>
   <n-modal v-model:show="visible" title="添加任务流" preset="dialog">
     <div>
-      <n-input v-model:value="flowName" placeholder="输入任务流名称" class="mb-3" />
+      <n-input v-model:value="flowName" placeholder="输入任务流名称" class="mb-3" spellcheck="false" />
       <n-checkbox-group v-model:value="selectedScripts">
         <n-space vertical>
           <n-checkbox

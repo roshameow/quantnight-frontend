@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -73,7 +72,7 @@ pub fn default_config_path() -> PathBuf {
     #[cfg(not(debug_assertions))]
     {
         // 获取当前可执行文件路径
-        if let Ok(exe_path) = env::current_exe() {
+        if let Ok(exe_path) = std::env::current_exe() {
             #[cfg(target_os = "macos")]
             {
                 // macOS: app bundle 中：.app/Contents/MacOS/<binary>

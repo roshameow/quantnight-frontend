@@ -54,6 +54,8 @@ fn main() {
             frontend_config::save_config_js_content, // Add the new command
             frontend_config::get_config_toml_content,
             frontend_config::save_config_toml_content,
+            commands::get_button_mappings,
+            commands::save_button_mappings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

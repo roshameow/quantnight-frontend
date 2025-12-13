@@ -1,14 +1,13 @@
 <template>
   <n-layout>
     <n-layout-header bordered class="app-header">
-      <n-space justify="space-between" align="center">
+      <n-space justify="center" align="center">
         <div class="app-title">
           <div class="title-text">
             <span class="brand">QuantNight</span>
             <span class="subtitle">量化回测平台</span>
           </div>
         </div>
-        <n-button tertiary @click="showSettingsModal = true">设置</n-button>
       </n-space>
     </n-layout-header>
 
@@ -26,18 +25,14 @@
       </n-layout-content>
     </n-layout>
 
-    <SettingsModal v-model:show="showSettingsModal" />
   </n-layout>
 </template>
 
 <script setup>
-import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NSpace, NButton, NMenu } from 'naive-ui'
-import SettingsModal from './modals/SettingsModal.vue'
+import { NLayout, NLayoutHeader, NLayoutSider, NLayoutContent, NSpace, NMenu } from 'naive-ui'
 
 const router = useRouter()
-const showSettingsModal = ref(false)
 
 const menuOptions = [
   {
@@ -55,6 +50,10 @@ const menuOptions = [
   {
     label: '测试巡游',
     key: '/test',
+  },
+  {
+    label: '设置',
+    key: '/settings',
   },
 ]
 

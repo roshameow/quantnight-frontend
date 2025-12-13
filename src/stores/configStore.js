@@ -12,6 +12,7 @@ export const useConfigStore = defineStore('config', () => {
   });
   const dataFilterOptions = ref([]);
   const backendConfig = ref({}); // Will hold the parsed TOML object
+  const buttonMappings = ref([]); // Will hold the button mappings
   const isLoading = ref(true);
   const error = ref(null);
 
@@ -92,8 +93,28 @@ export const useConfigStore = defineStore('config', () => {
 
   async function saveBackendConfig(updatedConfigObject) {
     try {
-      const newTomlContent = TOML.stringify(updatedConfigObject);
+      // Create a complete config object by merging with existing config
+      const completeConfig = {
+        ...backendConfig.value,
+        ...updatedConfigObject
+      };
+      
+      // Ensure we preserve all sections from the original config
+      if (backendConfig.value.mongodb && !updatedConfigObject.mongodb) {
+        completeConfig.mongodb = backendConfig.value.mongodb;
+      }
+      if (backendConfig.value.python && !updatedConfigObject.python) {
+        completeConfig.python = backendConfig.value.python;
+      }
+      if (backendConfig.value.bash && !updatedConfigObject.bash) {
+        completeConfig.bash = backendConfig.value.bash;
+      }
+      
+      console.log('Saving backend config:', completeConfig);
+      const newTomlContent = TOML.stringify(completeConfig);
       await invoke('save_config_toml_content', { content: newTomlContent });
+      // Update the store with the new config
+      backendConfig.value = completeConfig;
     } catch (e) {
       console.error('Failed to save config.toml:', e);
       error.value = 'Failed to save backend configuration.';
@@ -101,19 +122,45 @@ export const useConfigStore = defineStore('config', () => {
     }
   }
 
+  async function fetchButtonMappings() {
+    try {
+      const content = await invoke('get_button_mappings');
+      buttonMappings.value = JSON.parse(content);
+    } catch (e) {
+      console.error('Failed to fetch button mappings:', e);
+      error.value = 'Failed to load button mappings.';
+      buttonMappings.value = [];
+    }
+  }
+
+  async function saveButtonMappings(mappings) {
+    try {
+      await invoke('save_button_mappings', { mappings });
+      // Refresh the button mappings from the store
+      await fetchButtonMappings();
+    } catch (e) {
+      console.error('Failed to save button mappings:', e);
+      error.value = 'Failed to save button mappings.';
+      // Don't throw error, just log it
+    }
+  }
+
   // --- Initial Load ---
   fetchFrontendConfig();
   fetchBackendConfig();
+  fetchButtonMappings();
 
   return {
     paths,
     dataFilterOptions,
     backendConfig,
+    buttonMappings,
     isLoading,
     error,
     fetchFrontendConfig,
     saveFrontendConfig,
     fetchBackendConfig,
-    saveBackendConfig,
+    fetchButtonMappings,
+    saveButtonMappings,
   };
 });

@@ -10,6 +10,7 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
+use toml;
 
 use crate::config::{run_bash_script, run_python_module, AppConfig};
 use crate::mongo_manager::MongoClients;
@@ -489,6 +490,170 @@ pub async fn update_priority_task(task_name: String, config: String, is_remote: 
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[command]
+pub fn get_button_mappings() -> Result<String, String> {
+    let config_path = PathBuf::from("config.toml");
+    let config_content = fs::read_to_string(&config_path).map_err(|e| {
+        eprintln!("Failed to read config.toml from {:?}: {}", config_path, e);
+        e.to_string()
+    })?;
+    
+    // Parse TOML content
+    let config: toml::Value = toml::from_str(&config_content).map_err(|e| {
+        eprintln!("Failed to parse config.toml: {}", e);
+        e.to_string()
+    })?;
+    
+    // Create button mappings from config
+    let mut mappings = Vec::new();
+    
+    // Python scripts
+    if let Some(python) = config.get("python").and_then(|v| v.as_table()) {
+        if let Some(scripts) = python.get("scripts").and_then(|v| v.as_table()) {
+            for (key, value) in scripts {
+                let script_command = if let Some(module) = value.get("module").and_then(|v| v.as_str()) {
+                    format!("python3 -m {}", module)
+                } else {
+                    key.to_string()
+                };
+                
+                let args = if let Some(args_array) = value.get("args").and_then(|v| v.as_array()) {
+                    let args_str: Vec<String> = args_array.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect();
+                    args_str.join(" ")
+                } else {
+                    String::new()
+                };
+                
+                mappings.push(serde_json::json!({
+                    "button_id": key,
+                    "button_label": get_button_label(key),
+                    "script_key": key,
+                    "script_type": "python",
+                    "script_command": format!("{} {}", script_command, args),
+                    "description": get_script_description(key),
+                    "enabled": true
+                }));
+            }
+        }
+    }
+    
+    // Bash scripts
+    if let Some(bash) = config.get("bash").and_then(|v| v.as_table()) {
+        if let Some(scripts) = bash.get("scripts").and_then(|v| v.as_table()) {
+            for (key, value) in scripts {
+                let script_command = if let Some(script) = value.get("script").and_then(|v| v.as_str()) {
+                    format!("bash {}", script)
+                } else if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+                    command.to_string()
+                } else {
+                    key.to_string()
+                };
+                
+                let args = if let Some(args_array) = value.get("args").and_then(|v| v.as_array()) {
+                    let args_str: Vec<String> = args_array.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect();
+                    args_str.join(" ")
+                } else {
+                    String::new()
+                };
+                
+                mappings.push(serde_json::json!({
+                    "button_id": key,
+                    "button_label": get_button_label(key),
+                    "script_key": key,
+                    "script_type": "bash",
+                    "script_command": format!("{} {}", script_command, args),
+                    "description": get_script_description(key),
+                    "enabled": true
+                }));
+            }
+        }
+    }
+    
+    Ok(serde_json::to_string(&mappings).map_err(|e| e.to_string())?)
+}
+
+#[command]
+pub fn save_button_mappings(mappings: String) -> Result<(), String> {
+    // Parse the mappings from JSON
+    let _mappings_value: serde_json::Value = serde_json::from_str(&mappings).map_err(|e| e.to_string())?;
+    
+    // Read the current config.toml
+    let config_path = PathBuf::from("config.toml");
+    let config_content = fs::read_to_string(&config_path).map_err(|e| {
+        eprintln!("Failed to read config.toml from {:?}: {}", config_path, e);
+        e.to_string()
+    })?;
+    
+    // Parse TOML content
+    let mut config: toml::Value = toml::from_str(&config_content).map_err(|e| {
+        eprintln!("Failed to parse config.toml: {}", e);
+        e.to_string()
+    })?;
+    
+    // Update the config with new button mappings
+    // We'll store the mappings as a JSON string in the TOML file
+    if let Some(table) = config.as_table_mut() {
+        // Remove existing button mappings if any
+        table.remove("button_mappings");
+        
+        // Add new button mappings as a string
+        let mut button_mappings_table = toml::value::Table::new();
+        button_mappings_table.insert("mappings".to_string(), toml::Value::String(mappings.clone()));
+        table.insert("button_mappings".to_string(), toml::Value::Table(button_mappings_table));
+    }
+    
+    // Write the updated config back to file
+    let updated_content = toml::to_string_pretty(&config).map_err(|e| {
+        eprintln!("Failed to serialize updated config: {}", e);
+        e.to_string()
+    })?;
+    
+    fs::write(&config_path, updated_content).map_err(|e| {
+        eprintln!("Failed to write config.toml: {}", e);
+        e.to_string()
+    })?;
+    
+    eprintln!("Button mappings saved successfully to config.toml");
+    
+    Ok(())
+}
+
+fn get_button_label(script_key: &str) -> String {
+    match script_key {
+        "generate_list" => "生成列表".to_string(),
+        "sync_remote_task" => "发送到远程".to_string(),
+        "start_task" => "启动".to_string(),
+        "start_super_task" => "启动超级任务".to_string(),
+        "start_priority_task" => "启动优先任务".to_string(),
+        "update_priority_task" => "更新优先任务".to_string(),
+        "pause_task" => "暂停".to_string(),
+        "check_task_status" => "检查任务状态".to_string(),
+        "alpha_correlation" => "Alpha相关性".to_string(),
+        _ => script_key.to_string(),
+    }
+}
+
+fn get_script_description(script_key: &str) -> String {
+    match script_key {
+        "generate_list" => "从模板生成alpha列表".to_string(),
+        "sync_remote_task" => "同步远程任务列表".to_string(),
+        "start_task" => "启动常规任务".to_string(),
+        "start_super_task" => "启动超级任务".to_string(),
+        "start_priority_task" => "启动优先任务".to_string(),
+        "update_priority_task" => "更新优先任务".to_string(),
+        "pause_task" => "暂停运行中的任务".to_string(),
+        "check_task_status" => "检查任务状态".to_string(),
+        "alpha_correlation" => "计算Alpha相关性".to_string(),
+        _ => format!("执行脚本: {}", script_key),
+    }
 }
 
 #[command]
