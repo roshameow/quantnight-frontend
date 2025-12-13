@@ -1,0 +1,54 @@
+# Default configuration for QuantNight
+# This file is used during the build process in GitHub Actions
+
+[mongodb]
+local_uri = "mongodb://localhost:27017"
+remote_uri = "mongodb+srv://username:password@cluster.mongodb.net/database?retryWrites=true&w=majority"
+
+  [mongodb.databases]
+  mission = "simulation_mission"
+  simulation = "simulation_db"
+  alpha = "alpha_db"
+
+[python]
+interpreter = "python3"
+working_dir = "./"
+scripts = { }
+
+[bash]
+working_dir = "./"
+
+[bash.scripts.sync_remote_task]
+command = "bash"
+script = "backend/mongodb/sync_mission_list.sh"
+args = [ "{alpha_mission_list}" ]
+
+[bash.scripts.start_task]
+command = "bash"
+script = "./scripts/start_task.sh"
+args = [ "{task_name}", "{config}" ]
+
+[bash.scripts.start_super_task]
+command = "bash"
+script = "./scripts/start_super_task.sh"
+args = [ "{task_name}", "{config}" ]
+
+[bash.scripts.start_priority_task]
+command = "bash"
+script = "./scripts/start_priority_task.sh"
+args = [ "{task_name}", "{config}" ]
+
+[bash.scripts.update_priority_task]
+command = "bash"
+script = "./scripts/update_priority_task.sh"
+args = [ "{task_name}", "{config}" ]
+
+[bash.scripts.check_task_status]
+command = "bash"
+script = "./scripts/check_tmux_python.sh"
+args = [ "{task_name}" ]
+
+[bash.scripts.pause_task]
+command = "bash"
+script = "./scripts/pause_task.sh"
+args = [ "{task_name}" ]
