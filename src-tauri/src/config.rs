@@ -5,6 +5,7 @@ use std::{
 };
 
 use config::{Config, ConfigError, File};
+use dirs::data_dir;
 use futures_util::future::try_join;
 use serde::Deserialize;
 use tokio::{
@@ -71,6 +72,82 @@ pub fn default_config_path() -> PathBuf {
     }
     #[cfg(not(debug_assertions))]
     {
+        // 在生产环境中，使用用户数据目录
+        if let Some(app_data) = get_user_data_dir() {
+            let config_dir = app_data.join("quantnight");
+            
+            // 确保目录存在
+            if let Err(_) = std::fs::create_dir_all(&config_dir) {
+                // 如果创建失败，回退到旧逻辑
+                return fallback_config_path();
+            }
+            
+            let config_path = config_dir.join("config.toml");
+            
+            // 如果用户配置文件不存在，从默认配置复制
+            if !config_path.exists() {
+                if let Some(default_path) = get_default_config_path() {
+                    if let Ok(default_content) = std::fs::read_to_string(&default_path) {
+                        let _ = std::fs::write(&config_path, default_content);
+                    }
+                }
+            }
+            
+            return config_path;
+        }
+        
+        // 回退到旧逻辑
+        fallback_config_path()
+    }
+}
+
+// 获取用户数据目录
+fn get_user_data_dir() -> Option<PathBuf> {
+    data_dir()
+}
+
+// 获取默认配置文件路径（打包在应用中的）
+fn get_default_config_path() -> Option<PathBuf> {
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(exe_path) = std::env::current_exe() {
+            #[cfg(target_os = "macos")]
+            {
+                // macOS: app bundle 中：.app/Contents/Resources/config.toml
+                if let Some(resources_dir) = exe_path
+                    .parent() // MacOS
+                    .and_then(|p| p.parent()) // Contents
+                    .map(|p| p.join("Resources"))
+                {
+                    return Some(resources_dir.join("config.toml"));
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: 和 .exe 放在同一目录
+                return exe_path
+                    .parent()
+                    .map(|p| p.join("config.toml"));
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Linux: 通常放在 /usr/share/<app>/config.toml 或可执行文件旁边
+                return exe_path
+                    .parent()
+                    .map(|p| p.join("config.toml"));
+            }
+        }
+    }
+    
+    None
+}
+
+// 回退到旧的配置路径逻辑
+fn fallback_config_path() -> PathBuf {
+    #[cfg(not(debug_assertions))]
+    {
         // 获取当前可执行文件路径
         if let Ok(exe_path) = std::env::current_exe() {
             #[cfg(target_os = "macos")]
@@ -103,10 +180,10 @@ pub fn default_config_path() -> PathBuf {
                     .unwrap_or_else(|| PathBuf::from("config.toml"));
             }
         }
-
-        // fallback
-        PathBuf::from("config.toml")
     }
+
+    // fallback
+    PathBuf::from("config.toml")
 }
 
 

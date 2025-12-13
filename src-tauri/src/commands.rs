@@ -11,6 +11,7 @@ use mongodb::{
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 use toml;
+use dirs::data_dir;
 
 use crate::config::{run_bash_script, run_python_module, AppConfig};
 use crate::mongo_manager::MongoClients;
@@ -494,7 +495,7 @@ pub async fn update_priority_task(task_name: String, config: String, is_remote: 
 
 #[command]
 pub fn get_button_mappings() -> Result<String, String> {
-    let config_path = PathBuf::from("config.toml");
+    let config_path = get_config_toml_path()?;
     let config_content = fs::read_to_string(&config_path).map_err(|e| {
         eprintln!("Failed to read config.toml from {:?}: {}", config_path, e);
         e.to_string()
@@ -586,7 +587,7 @@ pub fn save_button_mappings(mappings: String) -> Result<(), String> {
     let _mappings_value: serde_json::Value = serde_json::from_str(&mappings).map_err(|e| e.to_string())?;
     
     // Read the current config.toml
-    let config_path = PathBuf::from("config.toml");
+    let config_path = get_config_toml_path()?;
     let config_content = fs::read_to_string(&config_path).map_err(|e| {
         eprintln!("Failed to read config.toml from {:?}: {}", config_path, e);
         e.to_string()
@@ -624,6 +625,65 @@ pub fn save_button_mappings(mappings: String) -> Result<(), String> {
     eprintln!("Button mappings saved successfully to config.toml");
     
     Ok(())
+}
+
+// Helper function to get the config.toml path (reuse from frontend_config)
+fn get_config_toml_path() -> Result<PathBuf, String> {
+    // In development, use the relative path
+    #[cfg(debug_assertions)]
+    {
+        return Ok(PathBuf::from("./config.toml"));
+    }
+    
+    // In production, use the app data directory
+    #[cfg(not(debug_assertions))]
+    {
+        // 获取用户数据目录
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(home) = std::env::var("HOME") {
+                let config_dir = PathBuf::from(home).join("Library/Application Support/quantnight");
+                
+                // 确保目录存在
+                if let Err(_) = std::fs::create_dir_all(&config_dir) {
+                    return Err("Failed to create config directory".to_string());
+                }
+                
+                return Ok(config_dir.join("config.toml"));
+            }
+        }
+        
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(app_data) = std::env::var("APPDATA") {
+                let config_dir = PathBuf::from(app_data).join("quantnight");
+                
+                // 确保目录存在
+                if let Err(_) = std::fs::create_dir_all(&config_dir) {
+                    return Err("Failed to create config directory".to_string());
+                }
+                
+                return Ok(config_dir.join("config.toml"));
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(home) = std::env::var("HOME") {
+                let config_dir = PathBuf::from(home).join(".local/share/quantnight");
+                
+                // 确保目录存在
+                if let Err(_) = std::fs::create_dir_all(&config_dir) {
+                    return Err("Failed to create config directory".to_string());
+                }
+                
+                return Ok(config_dir.join("config.toml"));
+            }
+        }
+        
+        // 回退到当前目录
+        Ok(PathBuf::from("config.toml"))
+    }
 }
 
 fn get_button_label(script_key: &str) -> String {

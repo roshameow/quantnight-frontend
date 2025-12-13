@@ -34,6 +34,12 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Copy default config
+        run: cp src-tauri/resources/config.toml src-tauri/config.toml
+
+      - name: Ensure resources directory exists
+        run: mkdir -p src-tauri/resources
+
       - name: Build with tauri
         uses: tauri-apps/tauri-action@v0
 
@@ -42,3 +48,4 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: QuantNight ${{ github.ref_name }}
+

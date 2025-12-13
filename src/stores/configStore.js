@@ -57,7 +57,7 @@ export const useConfigStore = defineStore('config', () => {
       dataFilterOptions.value = config.dataFilterOptions || [];
     } catch (e) {
       console.error('Failed to fetch or parse config.js:', e);
-      error.value = 'Failed to load configurations. Please check src/config.js.';
+      error.value = 'Failed to load configurations. Please check the configuration file.';
       paths.value = { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
       dataFilterOptions.value = [];
     } finally {
@@ -75,7 +75,7 @@ export const useConfigStore = defineStore('config', () => {
       await invoke('save_config_js_content', { content: newContent });
     } catch (e) {
       console.error('Failed to save config.js:', e);
-      error.value = 'Failed to save configurations to backend.';
+      error.value = 'Failed to save configurations. Please check if you have write permissions.';
       throw e;
     }
   }
@@ -86,7 +86,7 @@ export const useConfigStore = defineStore('config', () => {
       backendConfig.value = TOML.parse(content);
     } catch (e) {
       console.error('Failed to fetch or parse config.toml:', e);
-      error.value = 'Failed to load backend configuration.';
+      error.value = 'Failed to load backend configuration. Please check if the configuration file exists.';
       backendConfig.value = {};
     }
   }
@@ -150,7 +150,7 @@ export const useConfigStore = defineStore('config', () => {
       }
     } catch (e) {
       console.error('Failed to save config.toml:', e);
-      error.value = 'Failed to save backend configuration.';
+      error.value = 'Failed to save backend configuration. Please check if you have write permissions.';
       throw e;
     }
   }

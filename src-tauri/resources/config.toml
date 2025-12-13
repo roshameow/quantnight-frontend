@@ -3,7 +3,7 @@
 
 [mongodb]
 local_uri = "mongodb://localhost:27017"
-remote_uri = "mongodb+srv://username:password@cluster.mongodb.net/database?retryWrites=true&w=majority"
+remote_uri = "mongodb://localhost:27017"
 
   [mongodb.databases]
   mission = "simulation_mission"

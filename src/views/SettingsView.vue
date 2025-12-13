@@ -1,6 +1,17 @@
 <template>
   <div class="settings-container">
     <n-space vertical size="large">
+      <!-- Configuration Info -->
+      <n-alert type="info" title="配置文件位置" style="margin-bottom: 16px;">
+        在生产环境中，配置文件现在存储在用户数据目录中，确保即使在GitHub release版本中也能修改设置。
+        <br>
+        <strong>macOS:</strong> ~/Library/Application Support/quantnight/
+        <br>
+        <strong>Windows:</strong> %APPDATA%\quantnight\
+        <br>
+        <strong>Linux:</strong> ~/.local/share/quantnight/
+      </n-alert>
+
       <!-- Frontend Configuration (from config.js) -->
       <n-card title="Frontend Configuration (config.js)" size="small">
         <template #header-extra>
@@ -169,6 +180,7 @@ import {
   NSelect,
   NSwitch,
   NH4,
+  NAlert,
   useMessage,
 } from 'naive-ui';
 import { useConfigStore } from '../stores/configStore';
