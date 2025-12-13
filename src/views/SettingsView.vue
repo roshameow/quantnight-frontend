@@ -3,13 +3,24 @@
     <n-space vertical size="large">
       <!-- Configuration Info -->
       <n-alert type="info" title="配置文件位置" style="margin-bottom: 16px;">
-        在生产环境中，配置文件现在存储在用户数据目录中，确保即使在GitHub release版本中也能修改设置。
+        配置文件存储位置：
+        <br>
+        优先位置：用户数据目录
         <br>
         <strong>macOS:</strong> ~/Library/Application Support/quantnight/
         <br>
         <strong>Windows:</strong> %APPDATA%\quantnight\
         <br>
         <strong>Linux:</strong> ~/.local/share/quantnight/
+        <br>
+        <br>
+        回退位置（如果用户数据目录不可用）：
+        <br>
+        <strong>macOS:</strong> .app/Contents/Resources/resources/
+        <br>
+        <strong>Windows:</strong> 与可执行文件同目录的 resources/
+        <br>
+        <strong>Linux:</strong> 与可执行文件同目录的 resources/
       </n-alert>
 
       <!-- Frontend Configuration (from config.js) -->
@@ -51,7 +62,7 @@
       <!-- Backend Configuration (from config.toml) -->
       <n-card title="Backend Configuration (config.toml)" size="small">
         <template #header-extra>
-          <n-tag type="warning" size="small">修改后将重启应用</n-tag>
+          <n-tag type="warning" size="small">修改后需要手动重启应用</n-tag>
         </template>
         <n-card title="MongoDB & Database Settings" size="small" style="margin-bottom: 16px;">
         <div style="display: flex; flex-direction: column; gap: 12px;">
