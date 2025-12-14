@@ -13,7 +13,7 @@ use tauri::{command, State};
 use toml;
 use dirs::data_dir;
 
-use crate::config::{run_bash_script, run_python_module, run_python_script, run_python_command, AppConfig};
+use crate::config::{run_bash_script, run_python_command, AppConfig};
 use crate::mongo_manager::MongoClients;
 
 use serde_json::from_str;
@@ -514,7 +514,9 @@ pub fn get_button_mappings() -> Result<String, String> {
     if let Some(python) = config.get("python").and_then(|v| v.as_table()) {
         if let Some(scripts) = python.get("scripts").and_then(|v| v.as_table()) {
             for (key, value) in scripts {
-                let script_command = if let Some(module) = value.get("module").and_then(|v| v.as_str()) {
+                let script_command = if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+                    command.to_string()
+                } else if let Some(module) = value.get("module").and_then(|v| v.as_str()) {
                     format!("python3 -m {}", module)
                 } else {
                     key.to_string()

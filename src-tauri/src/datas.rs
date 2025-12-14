@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
 use crate::mongo_manager::MongoClients;
-use crate::config::{AppConfig, run_python_module};
+use crate::config::{AppConfig, run_python_command};
 
 
 
@@ -410,7 +410,7 @@ pub async fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppCo
     let mut replacements = HashMap::new();
     replacements.insert("{alpha_ids}", alpha_str.as_str());
 
-    let stdout = run_python_module(&config, "alpha_correlation", &replacements).await?;
+    let stdout = run_python_command(&config, "alpha_correlation", &replacements).await?;
 
     serde_json::from_str(&stdout).map_err(|e| format!("解析 JSON 失败: {}", e))
 }
