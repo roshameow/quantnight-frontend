@@ -13,7 +13,7 @@ use tauri::{command, State};
 use toml;
 use dirs::data_dir;
 
-use crate::config::{run_bash_script, run_python_module, AppConfig};
+use crate::config::{run_bash_script, run_python_module, run_python_script, run_python_command, AppConfig};
 use crate::mongo_manager::MongoClients;
 
 use serde_json::from_str;
@@ -110,7 +110,7 @@ pub async fn generate_list(id: String,clients: State<'_, Arc<MongoClients>>,
     replacements.insert("{name}", name);
     replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
 
-    run_python_module(&config, "generate_list", &replacements).await?;
+    run_python_command(&config, "generate_list", &replacements).await?;
     // 可选：更新状态
     tasks
         .update_one(

@@ -408,3 +408,231 @@ pub async fn run_python_module(
     // 返回 stdout（也可以返回 summary.to_string() 依据上层需要）
     Ok(stdout_lines.join("\n"))
 }
+
+pub async fn run_python_script(
+    config: &AppConfig,
+    script_key: &str,
+    replacements: &HashMap<&str, &str>,
+) -> Result<String, String> {
+    let script_cfg = config
+        .python
+        .scripts
+        .get(script_key)
+        .ok_or_else(|| format!("配置中缺少 {} 脚本定义", script_key))?;
+
+    let script = script_cfg
+        .script
+        .as_ref()
+        .ok_or("script 字段缺失")?;
+
+    // 构造参数：-u 确保 unbuffered 输出、脚本路径
+    let mut final_args = vec!["-u".to_string(), script.to_string()];
+
+    for arg in &script_cfg.args {
+        if arg == "{extra_args}" {
+            if let Some(extra) = replacements.get("{extra_args}") {
+                final_args.extend(extra.split_whitespace().map(|s| s.to_string()));
+            }
+        } else {
+            let mut replaced = arg.clone();
+            for (key, val) in replacements {
+                replaced = replaced.replace(key, val);
+            }
+            final_args.push(replaced);
+        }
+    }
+
+    // 启动子进程，并管道 stdout/stderr
+    let mut child = TokioCommand::new(&config.python.interpreter)
+        .args(&final_args)
+        .current_dir(&config.python.working_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 Python 进程失败：{}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("无法获取 stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("无法获取 stderr pipe")?;
+
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    // 用 channel 累积输出（也可以直接拼接在闭包里）
+    let (out_accum_tx, mut out_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (err_accum_tx, mut err_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // 读取 stdout
+    let out_task = tokio::spawn(async move {
+        while let Ok(Some(line)) = stdout_reader.next_line().await {
+            println!("[python stdout] {}", line);
+            let _ = out_accum_tx.send(line);
+        }
+    });
+
+    // 读取 stderr
+    let err_task = tokio::spawn(async move {
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            eprintln!("[python stderr] {}", line);
+            let _ = err_accum_tx.send(line);
+        }
+    });
+
+    // 可选：加个超时，比如 5 分钟
+    let wait_future = child.wait();
+    let status = match timeout(Duration::from_secs(300), wait_future).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(format!("等待子进程失败: {}", e));
+        }
+        Err(_) => {
+            // 超时，尝试 kill
+            let _ = child.kill().await;
+            return Err("Python 脚本执行超时，已终止".to_string());
+        }
+    };
+
+    // 等两个输出 reader 任务都完成
+    let _ = try_join(out_task, err_task).await;
+
+    // 收集 accumulated 输出
+    let mut stdout_lines = Vec::new();
+    while let Ok(line) = out_accum_rx.try_recv() {
+        stdout_lines.push(line);
+    }
+    let mut stderr_lines = Vec::new();
+    while let Ok(line) = err_accum_rx.try_recv() {
+        stderr_lines.push(line);
+    }
+
+    if !status.success() {
+        return Err(format!(
+            "Python 脚本退出非 0: {:?}\nstderr: {:?}\nstdout: {:?}",
+            status.code(),
+            stderr_lines,
+            stdout_lines
+        ));
+    }
+
+    // 返回 stdout（也可以返回 summary.to_string() 依据上层需要）
+    Ok(stdout_lines.join("\n"))
+}
+
+pub async fn run_python_command(
+    config: &AppConfig,
+    script_key: &str,
+    replacements: &HashMap<&str, &str>,
+) -> Result<String, String> {
+    let script_cfg = config
+        .python
+        .scripts
+        .get(script_key)
+        .ok_or_else(|| format!("配置中缺少 {} 脚本定义", script_key))?;
+
+    let command = script_cfg
+        .command
+        .as_ref()
+        .unwrap_or(&config.python.interpreter);
+
+    // 构造参数：-u 确保 unbuffered 输出
+    let mut final_args = vec!["-u".to_string()];
+
+    for arg in &script_cfg.args {
+        if arg == "{extra_args}" {
+            if let Some(extra) = replacements.get("{extra_args}") {
+                final_args.extend(extra.split_whitespace().map(|s| s.to_string()));
+            }
+        } else {
+            let mut replaced = arg.clone();
+            for (key, val) in replacements {
+                replaced = replaced.replace(key, val);
+            }
+            final_args.push(replaced);
+        }
+    }
+
+    // 启动子进程，并管道 stdout/stderr
+    let mut child = TokioCommand::new(command)
+        .args(&final_args)
+        .current_dir(&config.python.working_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 Python 进程失败：{}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("无法获取 stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("无法获取 stderr pipe")?;
+
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    // 用 channel 累积输出（也可以直接拼接在闭包里）
+    let (out_accum_tx, mut out_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (err_accum_tx, mut err_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // 读取 stdout
+    let out_task = tokio::spawn(async move {
+        while let Ok(Some(line)) = stdout_reader.next_line().await {
+            println!("[python stdout] {}", line);
+            let _ = out_accum_tx.send(line);
+        }
+    });
+
+    // 读取 stderr
+    let err_task = tokio::spawn(async move {
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            eprintln!("[python stderr] {}", line);
+            let _ = err_accum_tx.send(line);
+        }
+    });
+
+    // 可选：加个超时，比如 5 分钟
+    let wait_future = child.wait();
+    let status = match timeout(Duration::from_secs(300), wait_future).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(format!("等待子进程失败: {}", e));
+        }
+        Err(_) => {
+            // 超时，尝试 kill
+            let _ = child.kill().await;
+            return Err("Python 脚本执行超时，已终止".to_string());
+        }
+    };
+
+    // 等两个输出 reader 任务都完成
+    let _ = try_join(out_task, err_task).await;
+
+    // 收集 accumulated 输出
+    let mut stdout_lines = Vec::new();
+    while let Ok(line) = out_accum_rx.try_recv() {
+        stdout_lines.push(line);
+    }
+    let mut stderr_lines = Vec::new();
+    while let Ok(line) = err_accum_rx.try_recv() {
+        stderr_lines.push(line);
+    }
+
+    if !status.success() {
+        return Err(format!(
+            "Python 脚本退出非 0: {:?}\nstderr: {:?}\nstdout: {:?}",
+            status.code(),
+            stderr_lines,
+            stdout_lines
+        ));
+    }
+
+    // 返回 stdout（也可以返回 summary.to_string() 依据上层需要）
+    Ok(stdout_lines.join("\n"))
+}
