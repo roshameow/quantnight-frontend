@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import TaskManager from '../views/TaskManager.vue';
 import DataPage from '../views/DataPage.vue';
+import AnalysisPage from '../views/AnalysisPage.vue';
 import SettingsView from '../views/SettingsView.vue';
 
 const routes = [
@@ -17,6 +18,11 @@ const routes = [
     path: '/data',
     name: 'Data',
     component: DataPage
+  },
+  {
+    path: '/analysis',
+    name: 'Analysis',
+    component: AnalysisPage
   },
   {
     path: '/settings',
