@@ -1,0 +1,586 @@
+<template>
+  <div>
+    <!-- 数据集和查询选择区域 -->
+    <div style="background: #f8f8f8; padding: 16px; border-radius: 8px; margin-bottom: 16px">
+      <n-grid :cols="24" :x-gap="12" :y-gap="12">
+        <!-- 数据集选择 -->
+        <n-grid-item span="6">
+          <n-select
+            v-model:value="selectedCollection"
+            :options="configStore.dataFilterOptions"
+            placeholder="选择数据集"
+            style="width: 100%"
+          />
+        </n-grid-item>
+
+        <!-- 查询输入 -->
+        <n-grid-item span="6">
+          <n-input
+            v-model:value="searchQuery"
+            placeholder="输入查询条件（留空或输入{}查询全部）"
+            clearable
+            style="width: 100%"
+            @keyup.enter="searchAlphas"
+          />
+        </n-grid-item>
+
+        <!-- Region输入 -->
+        <n-grid-item span="4">
+          <n-input
+            v-model:value="region"
+            placeholder="Region"
+            clearable
+            style="width: 100%"
+            @keyup.enter="searchAlphas"
+          />
+        </n-grid-item>
+
+        <!-- Delay输入 -->
+        <n-grid-item span="4">
+          <n-input
+            v-model:value="delay"
+            placeholder="Delay"
+            clearable
+            style="width: 100%"
+            @keyup.enter="searchAlphas"
+          />
+        </n-grid-item>
+
+        <!-- 搜索按钮 -->
+        <n-grid-item span="2">
+          <n-button type="primary" @click="searchAlphas" :loading="searchLoading" style="width: 100%">
+            搜索
+          </n-button>
+        </n-grid-item>
+      </n-grid>
+      
+      <!-- 第二行：清除选择按钮 -->
+      <n-grid :cols="24" :x-gap="12" :y-gap="12" style="margin-top: 8px">
+        <n-grid-item span="24" style="text-align: right">
+          <n-button @click="clearSelections" :disabled="selectedAlphaIds.size === 0">
+            清除选择
+          </n-button>
+        </n-grid-item>
+      </n-grid>
+    </div>
+
+    <!-- 主内容区域：Alpha选择和PNL图表横向并列 -->
+    <div style="display: flex; gap: 16px; background: #f8f8f8; padding: 16px; border-radius: 8px">
+      <!-- Alpha选择区域 -->
+      <div style="width: 120px; flex-shrink: 0">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
+          <h3 style="margin: 0; font-size: 14px">Alpha选择 ({{ selectedAlphaIds.size }}/{{ searchResults.length }})</h3>
+          <n-space size="small" vertical>
+            <n-button size="tiny" @click="exportSelection" :disabled="selectedAlphaIds.size === 0" style="width: 100%">
+              导出选中
+            </n-button>
+            <n-button size="tiny" @click="importSelection" style="width: 100%">
+              导入选择
+            </n-button>
+          </n-space>
+        </div>
+        
+        <div v-if="searchResults.length === 0 && !searchLoading" style="color: #999; text-align: center; padding: 10px; font-size: 12px">
+          暂无搜索结果
+        </div>
+        
+        <div v-else>
+          <!-- 列表框容器 -->
+          <div style="position: relative; border: 1px solid #e0e0e0; border-radius: 4px">
+            <!-- 滚动区域 -->
+            <div style="height: 400px; overflow-y: auto">
+              <div
+                v-for="alpha in searchResults"
+                :key="alpha.id"
+                @click="toggleAlphaSelection(alpha.id)"
+                :style="{
+                  cursor: 'pointer',
+                  padding: '2px 6px',
+                  fontSize: '11px',
+                  backgroundColor: selectedAlphaIds.has(alpha.id) ? getColorForAlpha(alpha.id, true) + '20' : 'transparent',
+                  borderBottom: '1px solid #f0f0f0'
+                }"
+              >
+                <div style="display: flex; align-items: center; justify-content: space-between">
+                  <span>{{ alpha.id }}</span>
+                  <n-checkbox
+                    :checked="selectedAlphaIds.has(alpha.id)"
+                    @update:checked="(checked) => checked ? selectedAlphaIds.add(alpha.id) : selectedAlphaIds.delete(alpha.id)"
+                    @click.stop
+                    size="small"
+                  />
+                </div>
+              </div>
+              
+              <!-- 添加新Alpha的可编辑行 -->
+              <div style="padding: 2px 6px; fontSize: 11px; borderBottom: 1px solid #f0f0f0">
+                <n-input
+                  v-model:value="newAlphaId"
+                  placeholder="输入新Alpha ID"
+                  size="tiny"
+                  style="width: 100%"
+                  @keyup.enter="addAlpha"
+                />
+              </div>
+            </div>
+            
+            <!-- + 和 - 按钮固定在右下角 -->
+            <div v-if="searchResults.length > 0" style="position: absolute; bottom: 0; right: 0; display: flex; gap: 0px">
+              <n-button size="tiny" @click="addAlpha" :disabled="!newAlphaId.trim()" style="min-width: 24px; border-top-right-radius: 0; border-bottom-right-radius: 0; background-color: white; opacity: 1">
+                +
+              </n-button>
+              <n-button size="tiny" @click="removeSelectedAlpha" :disabled="selectedAlphaIds.size === 0" style="min-width: 24px; border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; background-color: white; opacity: 1">
+                -
+              </n-button>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 动态调整按钮 -->
+        <div v-if="searchResults.length > 0" style="margin-top: 8px">
+          <div style="display: flex; gap: 8px">
+            <n-button size="tiny" @click="selectAll" :disabled="searchResults.length === 0" style="flex: 1">
+              全选
+            </n-button>
+            <n-button size="tiny" @click="deselectAll" :disabled="selectedAlphaIds.size === 0" style="flex: 1">
+              全不选
+            </n-button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PNL图表区域 -->
+      <div style="flex: 1; min-width: 0">
+        <h3 style="margin-top: 0; margin-bottom: 12px">PNL对比图</h3>
+        <div v-if="searchResults.length === 0" style="color: #999; text-align: center; padding: 40px">
+          请先搜索Alpha以显示PNL图表
+        </div>
+        <div v-else style="width: 100%; height: 500px">
+          <v-chart :option="chartOption" style="width: 100%; height: 100%" />
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, watch, onMounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import { useConfigStore } from "../stores/configStore";
+import VChart from "vue-echarts";
+import { use } from "echarts/core";
+import { LineChart } from "echarts/charts";
+import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent } from "echarts/components";
+import { CanvasRenderer } from "echarts/renderers";
+import { useMessage, useDialog } from 'naive-ui';
+
+// Register ECharts components
+use([LineChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer]);
+
+// --- State ---
+const configStore = useConfigStore();
+const message = useMessage();
+const dialog = useDialog();
+const selectedCollection = ref("alpha_results");
+const searchQuery = ref("");
+const region = ref("");
+const delay = ref("");
+const searchResults = ref([]);
+const searchLoading = ref(false);
+const selectedAlphaIds = ref(new Set());
+const newAlphaId = ref("");
+const pnlDataMap = ref({});
+const loadingSet = ref(new Set());
+
+// --- Computed ---
+const chartOption = computed(() => {
+  if (searchResults.value.length === 0) return {};
+
+  const series = [];
+  const allDates = new Set();
+
+  // 收集所有日期并准备系列数据
+  searchResults.value.forEach((alpha) => {
+    const pnlData = pnlDataMap.value[alpha.id];
+    if (pnlData && pnlData.length > 0) {
+      pnlData.forEach((point) => {
+        allDates.add(point.date);
+      });
+    }
+  });
+
+  const sortedDates = Array.from(allDates).sort();
+
+  // 为每个Alpha创建系列
+  searchResults.value.forEach((alpha) => {
+    const pnlData = pnlDataMap.value[alpha.id];
+    if (pnlData && pnlData.length > 0) {
+      const alphaName = alpha.id;
+
+      // 创建映射以便快速查找
+      const pnlMap = new Map();
+      pnlData.forEach((point) => {
+        pnlMap.set(point.date, point.pnl);
+      });
+
+      // 创建与所有日期对应的值数组
+      const values = sortedDates.map((date) => pnlMap.get(date) || null);
+
+      const isSelected = selectedAlphaIds.value.has(alpha.id);
+      
+      series.push({
+        name: alphaName,
+        type: "line",
+        data: values,
+        symbol: "none",
+        lineStyle: {
+          width: isSelected ? 2 : 1,
+          color: getColorForAlpha(alpha.id, isSelected),
+        },
+        emphasis: {
+          focus: "series",
+        },
+      });
+    }
+  });
+
+  return {
+    grid: { left: 50, right: 20, top: 40, bottom: 80, containLabel: true },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: {
+        type: "cross",
+      },
+    },
+    legend: {
+      show: false, // 不显示图例，因为Alpha太多时会看不过来
+    },
+    dataZoom: [
+      {
+        type: "inside",
+        start: 0,
+        end: 100,
+      },
+      {
+        start: 0,
+        end: 100,
+      },
+    ],
+    xAxis: {
+      type: "category",
+      data: sortedDates,
+      boundaryGap: false,
+      axisLine: { onZero: false, lineStyle: { color: "#ccc" } },
+      axisLabel: {
+        rotate: 45,
+        fontSize: 10,
+        formatter: (value) => value.slice(0, 7), // 只显示年月
+      },
+    },
+    yAxis: {
+      type: "value",
+      min: "dataMin",
+      max: "dataMax",
+      axisLabel: {
+        fontSize: 10,
+        formatter: (value) => {
+          const absVal = Math.abs(value);
+          if (absVal >= 1e7) return (value / 1e6).toFixed(1) + "M";
+          if (absVal >= 1e4) return (value / 1e3).toFixed(1) + "K";
+          return value.toFixed(1);
+        },
+      },
+      splitLine: { lineStyle: { color: "#eee" } },
+    },
+    series,
+  };
+});
+
+// --- Methods ---
+function getColorForAlpha(alphaId, isSelected = true) {
+  // 为每个Alpha分配一个固定的颜色
+  const colors = [
+    "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de",
+    "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#5D9CEC",
+    "#48CFAD", "#FFCE54", "#A0D468", "#4FC1E9", "#AC92EC"
+  ];
+  
+  // 获取Alpha在搜索结果中的索引
+  const index = searchResults.value.findIndex((a) => a.id === alphaId);
+  const baseColor = colors[index % colors.length];
+  
+  // 如果未选中，则返回较淡的颜色
+  if (!isSelected) {
+    // 将颜色转换为RGBA并降低透明度
+    const hex = baseColor.replace('#', '');
+    const r = parseInt(hex.substring(0, 2), 16);
+    const g = parseInt(hex.substring(2, 4), 16);
+    const b = parseInt(hex.substring(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, 0.3)`;
+  }
+  
+  return baseColor;
+}
+
+async function searchAlphas() {
+  searchLoading.value = true;
+  try {
+    // 如果查询为空或者是{}，则查询所有数据
+    const query = searchQuery.value.trim();
+    const searchParam = (query === "" || query === "{}") ? null : query;
+    const regionParam = region.value.trim() || null;
+    const delayParam = delay.value.trim() ? parseInt(delay.value.trim()) : null;
+    
+    const params = {
+      collection: selectedCollection.value,
+      query: searchParam,
+      region: regionParam,
+      delay: delayParam,
+      page: 1,
+      page_size: 100, // 获取更多结果以便选择
+    };
+
+    console.log("搜索参数:", params);
+    const result = await invoke("get_alpha_results", { params });
+    console.log("搜索结果:", result);
+    searchResults.value = result.data || [];
+    console.log("处理后的搜索结果:", searchResults.value);
+  } catch (e) {
+    console.error("Error searching alphas:", e);
+    searchResults.value = [];
+  } finally {
+    searchLoading.value = false;
+  }
+}
+
+function toggleAlphaSelection(alphaId) {
+  if (selectedAlphaIds.value.has(alphaId)) {
+    selectedAlphaIds.value.delete(alphaId);
+  } else {
+    selectedAlphaIds.value.add(alphaId);
+  }
+}
+
+function removeAlpha(alphaId) {
+  // 从选择中移除
+  selectedAlphaIds.value.delete(alphaId);
+  // 从搜索结果中移除
+  searchResults.value = searchResults.value.filter(alpha => alpha.id !== alphaId);
+}
+
+function clearSelections() {
+  selectedAlphaIds.value.clear();
+}
+
+function selectAll() {
+  searchResults.value.forEach(alpha => {
+    selectedAlphaIds.value.add(alpha.id);
+  });
+  message.success(`已选择全部 ${searchResults.value.length} 个Alpha`);
+}
+
+function deselectAll() {
+  selectedAlphaIds.value.clear();
+  message.success('已清除所有选择');
+}
+
+function addAlpha() {
+  const alphaId = newAlphaId.value.trim();
+  if (!alphaId) return;
+  
+  // 检查是否在搜索结果中存在
+  const exists = searchResults.value.some(alpha => alpha.id === alphaId);
+  if (!exists) {
+    message.warning(`Alpha ID "${alphaId}" 不在当前搜索结果中`);
+    return;
+  }
+  
+  if (selectedAlphaIds.value.has(alphaId)) {
+    message.info(`Alpha ID "${alphaId}" 已在选择中`);
+    return;
+  }
+  
+  selectedAlphaIds.value.add(alphaId);
+  newAlphaId.value = ""; // 清空输入框
+  message.success(`已添加 Alpha ID "${alphaId}"`);
+}
+
+function removeSelectedAlpha() {
+  if (selectedAlphaIds.value.size === 0) {
+    message.warning('请先选择要删除的Alpha');
+    return;
+  }
+  
+  const selectedArray = Array.from(selectedAlphaIds.value);
+  const originalLength = searchResults.value.length;
+  
+  // 从搜索结果中移除选中的Alpha
+  searchResults.value = searchResults.value.filter(alpha => !selectedAlphaIds.value.has(alpha.id));
+  
+  // 清除选择
+  selectedAlphaIds.value.clear();
+  
+  const removedCount = originalLength - searchResults.value.length;
+  message.success(`已从列表中删除 ${removedCount} 个Alpha`);
+}
+
+function clearFilters() {
+  searchQuery.value = "";
+  region.value = "";
+  delay.value = "";
+  searchResults.value = [];
+  selectedAlphaIds.value.clear();
+  pnlDataMap.value = {}; // 清除PNL数据缓存
+}
+
+async function exportSelection() {
+  if (selectedAlphaIds.value.size === 0) {
+    message.warning('请先选择Alpha');
+    return;
+  }
+  
+  try {
+    const selectedIds = Array.from(selectedAlphaIds.value);
+    const dataStr = JSON.stringify(selectedIds, null, 2);
+    const fileName = `alpha_selection_${new Date().toISOString().slice(0, 10)}.json`;
+    
+    // 在Tauri应用中，使用Tauri的API保存文件
+    try {
+      // 使用简化的save_dialog API获取默认路径
+      const defaultPath = await invoke('save_dialog', {
+        defaultPath: fileName,
+        filters: [
+          {
+            name: 'JSON',
+            extensions: ['json']
+          }
+        ]
+      });
+      
+      if (defaultPath) {
+        // 使用Tauri的write_file API写入文件
+        await invoke('write_file', {
+          path: defaultPath,
+          contents: dataStr
+        });
+        message.success(`已导出 ${selectedIds.length} 个Alpha ID`);
+        return;
+      }
+    } catch (tauriError) {
+      console.warn('Tauri API不可用，尝试其他方法:', tauriError);
+    }
+    
+    // 回退到浏览器下载
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    
+    // 延迟清理，确保下载开始
+    setTimeout(() => {
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 100);
+    
+    message.success(`已导出 ${selectedIds.length} 个Alpha ID`);
+  } catch (error) {
+    console.error('导出失败:', error);
+    message.error('导出失败，请重试');
+  }
+}
+
+function importSelection() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const ids = JSON.parse(e.target.result);
+        if (!Array.isArray(ids)) {
+          message.error('导入文件格式错误');
+          return;
+        }
+        
+        // 清除当前选择
+        selectedAlphaIds.value.clear();
+        
+        // 添加导入的ID（只保留在搜索结果中存在的ID）
+        const validIds = ids.filter(id =>
+          searchResults.value.some(alpha => alpha.id === id)
+        );
+        
+        validIds.forEach(id => selectedAlphaIds.value.add(id));
+        
+        const invalidCount = ids.length - validIds.length;
+        if (invalidCount > 0) {
+          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${invalidCount} 个ID不在当前搜索结果中`);
+        } else {
+          message.success(`成功导入 ${validIds.length} 个Alpha ID`);
+        }
+      } catch (error) {
+        message.error('导入文件解析失败');
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+async function loadPNL(id) {
+  if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
+  loadingSet.value.add(id);
+  try {
+    const query = { id, collection: selectedCollection.value };
+    console.log("加载PNL数据，查询参数:", query);
+    const result = await invoke("get_pnl_by_id", { query });
+    console.log(`加载PNL数据成功，Alpha ID: ${id}, 数据点数: ${result.pnl_series?.length || 0}`);
+    pnlDataMap.value[id] = result.pnl_series;
+  } catch (e) {
+    console.error("Error loading PnL:", e);
+    pnlDataMap.value[id] = null;
+  } finally {
+    loadingSet.value.delete(id);
+  }
+}
+
+// --- Watchers ---
+watch(searchResults, (newResults) => {
+  // 为所有搜索结果的Alpha加载PNL数据
+  newResults.forEach((alpha) => {
+    if (!pnlDataMap.value[alpha.id]) {
+      loadPNL(alpha.id);
+    }
+  });
+}, { deep: true });
+
+// --- Lifecycle ---
+onMounted(() => {
+  // 初始化时可以执行一些操作
+});
+
+// 确保在搜索结果更新后加载PNL数据
+watch([searchResults, selectedCollection], () => {
+  if (searchResults.value.length > 0) {
+    searchResults.value.forEach((alpha) => {
+      if (!pnlDataMap.value[alpha.id]) {
+        loadPNL(alpha.id);
+      }
+    });
+  }
+}, { deep: true });
+</script>
+
+<style scoped>
+.n-tag {
+  margin: 4px;
+}
+</style>
