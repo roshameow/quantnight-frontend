@@ -51,6 +51,7 @@ fn main() {
             datas::get_alpha_results,
             datas::get_pnl_by_id,
             datas::compute_correlation,
+            datas::search_alpha_in_all_collections,
             frontend_config::get_config_js_content, // Add new command
             frontend_config::save_config_js_content, // Add new command
             frontend_config::get_config_toml_content,

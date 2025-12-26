@@ -245,7 +245,7 @@ const chartOption = computed(() => {
   });
 
   return {
-    grid: { left: 50, right: 20, top: 40, bottom: 80, containLabel: true },
+    grid: { left: 50, right: 40, top: 40, bottom: 80, containLabel: true },
     tooltip: {
       trigger: "axis",
       axisPointer: {
@@ -264,6 +264,20 @@ const chartOption = computed(() => {
       {
         start: 0,
         end: 100,
+      },
+      {
+        type: "inside", // 添加y轴内部缩放
+        yAxisIndex: 0,
+        start: 0,
+        end: 100,
+      },
+      {
+        type: "slider", // 添加y轴滑动条缩放
+        yAxisIndex: 0,
+        start: 0,
+        end: 100,
+        width: 20, // 滑动条宽度
+        right: 10, // 距离右侧的距离
       },
     ],
     xAxis: {
@@ -384,20 +398,50 @@ function deselectAll() {
   message.success('已清除所有选择');
 }
 
-function addAlpha() {
+async function addAlpha() {
   const alphaId = newAlphaId.value.trim();
   if (!alphaId) return;
   
-  // 检查是否在搜索结果中存在
-  const exists = searchResults.value.some(alpha => alpha.id === alphaId);
-  if (!exists) {
-    message.warning(`Alpha ID "${alphaId}" 不在当前搜索结果中`);
+  // 检查是否已经在选择中
+  if (selectedAlphaIds.value.has(alphaId)) {
+    message.info(`Alpha ID "${alphaId}" 已在选择中`);
+    newAlphaId.value = ""; // 清空输入框
     return;
   }
   
-  if (selectedAlphaIds.value.has(alphaId)) {
-    message.info(`Alpha ID "${alphaId}" 已在选择中`);
-    return;
+  // 检查是否在搜索结果中存在
+  const exists = searchResults.value.some(alpha => alpha.id === alphaId);
+  
+  if (!exists) {
+    // 如果不在搜索结果中，尝试从alpha_db的所有collection中搜索
+    try {
+      const result = await invoke("search_alpha_in_all_collections", { query: { id: alphaId } });
+      if (result) {
+        // 找到了alpha，添加到搜索结果中，并存储collection信息
+        searchResults.value.push({
+          id: alphaId,
+          region: result.region || "Unknown",
+          sharpe: result.sharpe,
+          fitness: result.fitness,
+          returns: result.returns,
+          turnover: result.turnover,
+          margin: result.margin,
+          code: result.code,
+          date_created: result.date_created,
+          collection: result.collection // 存储collection信息
+        });
+        
+        // 加载这个alpha的PNL数据，传入正确的collection
+        loadPNL(alphaId, result.collection);
+      } else {
+        message.warning(`Alpha ID "${alphaId}" 未在alpha_db中找到`);
+        return;
+      }
+    } catch (error) {
+      console.error(`Error searching for alpha ${alphaId}:`, error);
+      message.error(`搜索Alpha ID "${alphaId}" 时出错`);
+      return;
+    }
   }
   
   selectedAlphaIds.value.add(alphaId);
@@ -493,16 +537,16 @@ async function exportSelection() {
   }
 }
 
-function importSelection() {
+async function importSelection() {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.json';
-  input.onchange = (event) => {
+  input.onchange = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
     
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const ids = JSON.parse(e.target.result);
         if (!Array.isArray(ids)) {
@@ -513,16 +557,46 @@ function importSelection() {
         // 清除当前选择
         selectedAlphaIds.value.clear();
         
-        // 添加导入的ID（只保留在搜索结果中存在的ID）
-        const validIds = ids.filter(id =>
-          searchResults.value.some(alpha => alpha.id === id)
-        );
+        // 验证每个ID是否在alpha_db的任何collection中存在
+        const validIds = [];
+        const notFoundIds = [];
         
+        for (const id of ids) {
+          try {
+            const result = await invoke("search_alpha_in_all_collections", { query: { id } });
+            if (result) {
+              validIds.push(id);
+              // 如果这个alpha不在当前搜索结果中，添加到搜索结果
+              if (!searchResults.value.some(alpha => alpha.id === id)) {
+                // 创建一个简化的alpha对象，只包含基本信息，并存储collection信息
+                searchResults.value.push({
+                  id: id,
+                  region: result.region || "Unknown",
+                  sharpe: result.sharpe,
+                  fitness: result.fitness,
+                  returns: result.returns,
+                  turnover: result.turnover,
+                  margin: result.margin,
+                  code: result.code,
+                  date_created: result.date_created,
+                  collection: result.collection // 存储collection信息
+                });
+              }
+            } else {
+              notFoundIds.push(id);
+            }
+          } catch (error) {
+            console.error(`Error searching for alpha ${id}:`, error);
+            notFoundIds.push(id);
+          }
+        }
+        
+        // 添加所有有效的ID到选择中
         validIds.forEach(id => selectedAlphaIds.value.add(id));
         
-        const invalidCount = ids.length - validIds.length;
-        if (invalidCount > 0) {
-          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${invalidCount} 个ID不在当前搜索结果中`);
+        // 显示结果
+        if (notFoundIds.length > 0) {
+          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
         } else {
           message.success(`成功导入 ${validIds.length} 个Alpha ID`);
         }
@@ -535,11 +609,42 @@ function importSelection() {
   input.click();
 }
 
-async function loadPNL(id) {
+async function loadPNL(id, collection = null) {
   if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
   loadingSet.value.add(id);
   try {
-    const query = { id, collection: selectedCollection.value };
+    // 如果没有指定collection，尝试从搜索结果中获取存储的collection信息
+    let queryCollection = collection;
+    
+    if (!queryCollection) {
+      // 首先尝试从搜索结果中获取collection信息
+      const alphaInSearchResults = searchResults.value.find(alpha => alpha.id === id);
+      if (alphaInSearchResults && alphaInSearchResults.collection) {
+        queryCollection = alphaInSearchResults.collection;
+        console.log(`从搜索结果中找到Alpha ${id} 在collection: ${queryCollection}`);
+      } else {
+        // 如果搜索结果中没有，则从alpha_db的所有collection中搜索
+        try {
+          const result = await invoke("search_alpha_in_all_collections", { query: { id } });
+          if (result && result.collection) {
+            queryCollection = result.collection;
+            console.log(`从数据库中找到Alpha ${id} 在collection: ${queryCollection}`);
+          } else {
+            console.error(`Alpha ${id} 未在任何collection中找到`);
+            pnlDataMap.value[id] = null;
+            loadingSet.value.delete(id);
+            return;
+          }
+        } catch (error) {
+          console.error(`Error finding collection for alpha ${id}:`, error);
+          pnlDataMap.value[id] = null;
+          loadingSet.value.delete(id);
+          return;
+        }
+      }
+    }
+    
+    const query = { id, collection: queryCollection };
     console.log("加载PNL数据，查询参数:", query);
     const result = await invoke("get_pnl_by_id", { query });
     console.log(`加载PNL数据成功，Alpha ID: ${id}, 数据点数: ${result.pnl_series?.length || 0}`);

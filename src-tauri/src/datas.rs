@@ -414,3 +414,100 @@ pub async fn compute_correlation(alpha_ids: Vec<String>, config: State<'_, AppCo
 
     serde_json::from_str(&stdout).map_err(|e| format!("解析 JSON 失败: {}", e))
 }
+
+#[derive(Deserialize)]
+pub struct SearchAlphaInAllCollectionsQuery {
+    pub id: String,
+}
+
+#[derive(Serialize)]
+pub struct AlphaInCollectionResult {
+    pub id: String,
+    pub collection: String,
+    pub region: String,
+    pub code: Option<String>,
+    pub sharpe: Option<f64>,
+    pub fitness: Option<f64>,
+    pub returns: Option<f64>,
+    pub turnover: Option<f64>,
+    pub margin: Option<f64>,
+    pub date_created: Option<String>,
+}
+
+#[command]
+pub async fn search_alpha_in_all_collections(
+    query: SearchAlphaInAllCollectionsQuery,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<Option<AlphaInCollectionResult>, String> {
+    let client = &clients.local;
+    let db = client.database(&config.mongodb.databases.alpha);
+    
+    // 获取所有collection名称
+    let collection_names = db.list_collection_names(None).await
+        .map_err(|e| format!("Failed to list collections: {}", e))?;
+    
+    // 在每个collection中搜索指定的alpha ID
+    for coll_name in collection_names {
+        // 跳过系统collection
+        if coll_name.starts_with("system.") {
+            continue;
+        }
+        
+        let collection = db.collection::<mongodb::bson::Document>(&coll_name);
+        let filter = doc! { "id": &query.id };
+        
+        if let Ok(Some(doc)) = collection.find_one(filter, None).await {
+            // 找到了alpha，提取相关信息
+            let id = doc.get_str("id").unwrap_or(&query.id).to_string();
+            
+            let region = match doc.get_document("settings").and_then(|d| d.get_str("region")) {
+                Ok(s) => s.to_string(),
+                Err(_) => "Unknown".to_string(),
+            };
+            
+            let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
+            let code = match alpha_type {
+                "REGULAR" => doc.get_document("regular").ok()
+                    .and_then(|d| d.get_str("code").ok())
+                    .map(|s| s.to_string()),
+                "SUPER" => {
+                    let selection_code = doc.get_document("selection").ok()
+                        .and_then(|d| d.get_str("code").ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let combo_code = doc.get_document("combo").ok()
+                        .and_then(|d| d.get_str("code").ok())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(format!("{}\n{}", selection_code, combo_code))
+                }
+                _ => None,
+            };
+            
+            let is = doc.get_document("is").ok();
+            let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
+            let fitness = is.and_then(|d| d.get_f64("fitness").ok());
+            let turnover = is.and_then(|d| d.get_f64("turnover").ok());
+            let margin = is.and_then(|d| d.get_f64("margin").ok());
+            let returns = is.and_then(|d| d.get_f64("returns").ok());
+            let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
+            
+            return Ok(Some(AlphaInCollectionResult {
+                id,
+                collection: coll_name,
+                region,
+                code,
+                sharpe,
+                fitness,
+                returns,
+                turnover,
+                margin,
+                date_created,
+            }));
+        }
+    }
+    
+    // 在所有collection中都没有找到
+    Ok(None)
+}
