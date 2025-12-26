@@ -48,10 +48,6 @@ const menuOptions = [
     key: '/data',
   },
   {
-    label: '数据分析',
-    key: '/analysis',
-  },
-  {
     label: '测试巡游',
     key: '/test',
   },
