@@ -84,6 +84,87 @@ pub struct PagedResult<T> {
     pub page_size: u32,
 }
 
+fn parse_alpha_document(doc: mongodb::bson::Document) -> Option<AlphaResult> {
+    let id = doc.get_str("id").ok()?.to_string();
+
+    let region = doc.get_document("settings").ok()
+        .and_then(|d| d.get_str("region").ok())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
+    let code = match alpha_type {
+        "REGULAR" => doc.get_document("regular").ok()
+            .and_then(|d| d.get_str("code").ok())
+            .map(|s| s.to_string()),
+        "SUPER" => {
+            let selection_code = doc.get_document("selection").ok()
+                .and_then(|d| d.get_str("code").ok())
+                .unwrap_or("")
+                .to_string();
+            let combo_code = doc.get_document("combo").ok()
+                .and_then(|d| d.get_str("code").ok())
+                .unwrap_or("")
+                .to_string();
+            Some(format!("{}\n{}", selection_code, combo_code))
+        }
+        _ => None,
+    };
+
+    let is = doc.get_document("is").ok();
+    let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
+    let fitness = is.and_then(|d| d.get_f64("fitness").ok());
+    let turnover = is.and_then(|d| d.get_f64("turnover").ok());
+    let margin = is.and_then(|d| d.get_f64("margin").ok());
+    let long_count = is.and_then(|d| d.get_i32("longCount").ok());
+    let short_count = is.and_then(|d| d.get_i32("shortCount").ok());
+    let returns = is.and_then(|d| d.get_f64("returns").ok());
+    let pnl_score = doc.get_f64("pnl_score").ok();
+
+    let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
+
+    let mut sub_universe_sharpe = None;
+    let mut message = None;
+
+    if let Some(checks) = is.and_then(|d| d.get_array("checks").ok()) {
+        for item in checks {
+            if let Some(check_doc) = item.as_document() {
+                if let Ok(result) = check_doc.get_str("result") {
+                    if result == "FAIL" || result == "WARNING" {
+                        if let Ok(name) = check_doc.get_str("name") {
+                            message = Some(match message {
+                                Some(m) => format!("{},{}", m, name),
+                                None => name.to_string(),
+                            });
+                        }
+                    }
+                }
+
+                if check_doc.get_str("name") == Ok("LOW_SUB_UNIVERSE_SHARPE") {
+                    sub_universe_sharpe = check_doc.get_f64("value").ok();
+                }
+            }
+        }
+    }
+
+    Some(AlphaResult {
+        id,
+        region,
+        code,
+        sharpe,
+        fitness,
+        returns,
+        turnover,
+        margin,
+        long_count,
+        short_count,
+        sub_universe_sharpe,
+        message,
+        date_created,
+        pnl_score,
+    })
+}
+
 
 #[command]
 pub async fn get_alpha_results(
@@ -232,88 +313,9 @@ pub async fn get_alpha_results(
     let mut results = Vec::new();
 
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
-
-        let id = match doc.get_str("id") {
-            Ok(s) => s.to_string(),
-            Err(_) => continue,
-        };
-
-        let region = match doc.get_document("settings").and_then(|d| d.get_str("region")) {
-            Ok(s) => s.to_string(),
-            Err(_) => continue,
-        };
-
-        let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
-        let code = match alpha_type {
-            "REGULAR" => doc.get_document("regular").ok()
-                .and_then(|d| d.get_str("code").ok())
-                .map(|s| s.to_string()),
-            "SUPER" => {
-                let selection_code = doc.get_document("selection").ok()
-                    .and_then(|d| d.get_str("code").ok())
-                    .unwrap_or("")
-                    .to_string();
-                let combo_code = doc.get_document("combo").ok()
-                    .and_then(|d| d.get_str("code").ok())
-                    .unwrap_or("")
-                    .to_string();
-                Some(format!("{}\n{}", selection_code, combo_code))
-            }
-            _ => None,
-        };
-
-        let is = doc.get_document("is").ok();
-        let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
-        let fitness = is.and_then(|d| d.get_f64("fitness").ok());
-        let turnover = is.and_then(|d| d.get_f64("turnover").ok());
-        let margin = is.and_then(|d| d.get_f64("margin").ok());
-        let long_count = is.and_then(|d| d.get_i32("longCount").ok());
-        let short_count = is.and_then(|d| d.get_i32("shortCount").ok());
-        let returns = is.and_then(|d| d.get_f64("returns").ok());
-        let pnl_score = doc.get_f64("pnl_score").ok();
-
-        let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
-
-        let mut sub_universe_sharpe = None;
-        let mut message = None;
-
-        if let Some(checks) = is.and_then(|d| d.get_array("checks").ok()) {
-            for item in checks {
-                if let Some(check_doc) = item.as_document() {
-                    if let Ok(result) = check_doc.get_str("result") {
-                        if result == "FAIL" || result == "WARNING" {
-                            if let Ok(name) = check_doc.get_str("name") {
-                                message = Some(match message {
-                                    Some(m) => format!("{},{}", m, name),
-                                    None => name.to_string(),
-                                });
-                            }
-                        }
-                    }
-
-                    if check_doc.get_str("name") == Ok("LOW_SUB_UNIVERSE_SHARPE") {
-                        sub_universe_sharpe = check_doc.get_f64("value").ok();
-                    }
-                }
-            }
+        if let Some(result) = parse_alpha_document(doc) {
+            results.push(result);
         }
-
-        results.push(AlphaResult {
-            id,
-            region,
-            code,
-            sharpe,
-            fitness,
-            returns,
-            turnover,
-            margin,
-            long_count,
-            short_count,
-            sub_universe_sharpe,
-            message,
-            date_created,
-            pnl_score,
-        });
     }
 
     drop(cursor);
@@ -432,6 +434,8 @@ pub struct AlphaInCollectionResult {
     pub turnover: Option<f64>,
     pub margin: Option<f64>,
     pub date_created: Option<String>,
+    pub sub_universe_sharpe: Option<f64>,
+    pub message: Option<String>,
 }
 
 #[command]
@@ -458,53 +462,22 @@ pub async fn search_alpha_in_all_collections(
         let filter = doc! { "id": &query.id };
         
         if let Ok(Some(doc)) = collection.find_one(filter, None).await {
-            // 找到了alpha，提取相关信息
-            let id = doc.get_str("id").unwrap_or(&query.id).to_string();
-            
-            let region = match doc.get_document("settings").and_then(|d| d.get_str("region")) {
-                Ok(s) => s.to_string(),
-                Err(_) => "Unknown".to_string(),
-            };
-            
-            let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
-            let code = match alpha_type {
-                "REGULAR" => doc.get_document("regular").ok()
-                    .and_then(|d| d.get_str("code").ok())
-                    .map(|s| s.to_string()),
-                "SUPER" => {
-                    let selection_code = doc.get_document("selection").ok()
-                        .and_then(|d| d.get_str("code").ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let combo_code = doc.get_document("combo").ok()
-                        .and_then(|d| d.get_str("code").ok())
-                        .unwrap_or("")
-                        .to_string();
-                    Some(format!("{}\n{}", selection_code, combo_code))
-                }
-                _ => None,
-            };
-            
-            let is = doc.get_document("is").ok();
-            let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
-            let fitness = is.and_then(|d| d.get_f64("fitness").ok());
-            let turnover = is.and_then(|d| d.get_f64("turnover").ok());
-            let margin = is.and_then(|d| d.get_f64("margin").ok());
-            let returns = is.and_then(|d| d.get_f64("returns").ok());
-            let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
-            
-            return Ok(Some(AlphaInCollectionResult {
-                id,
-                collection: coll_name,
-                region,
-                code,
-                sharpe,
-                fitness,
-                returns,
-                turnover,
-                margin,
-                date_created,
-            }));
+            if let Some(result) = parse_alpha_document(doc) {
+                return Ok(Some(AlphaInCollectionResult {
+                    id: result.id,
+                    collection: coll_name,
+                    region: result.region,
+                    code: result.code,
+                    sharpe: result.sharpe,
+                    fitness: result.fitness,
+                    returns: result.returns,
+                    turnover: result.turnover,
+                    margin: result.margin,
+                    date_created: result.date_created,
+                    sub_universe_sharpe: result.sub_universe_sharpe,
+                    message: result.message,
+                }));
+            }
         }
     }
     

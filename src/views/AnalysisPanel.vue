@@ -187,7 +187,7 @@
     <div v-if="selectedAlphaIds.size > 0" style="margin-top: 16px; background: #fff; padding: 16px; border-radius: 8px; border: 1px solid #eee;">
       <h3 style="margin-top: 0; margin-bottom: 12px">选中的 Alpha 详情</h3>
       <n-data-table
-        :columns="columns"
+        :columns="filteredColumns"
         :data="selectedAlphaDetails"
         :bordered="false"
         :scroll-x="1200"
@@ -244,6 +244,11 @@ const { columns } = useAlphaTableColumns({
   pnlDataMap,
   loadingSet,
   loadPNL,
+});
+
+const filteredColumns = computed(() => {
+  const excludedKeys = ['message', 'pnl', 'corr_ppac', 'corr_os'];
+  return columns.filter(col => !excludedKeys.includes(col.key));
 });
 
 const selectedAlphaDetails = computed(() => {
@@ -693,6 +698,7 @@ async function addAlpha() {
           turnover: result.turnover,
           margin: result.margin,
           code: result.code,
+          message: result.message,
           date_created: result.date_created,
           collection: result.collection // 存储collection信息
         });
@@ -842,6 +848,7 @@ async function importSelection() {
                   turnover: result.turnover,
                   margin: result.margin,
                   code: result.code,
+                  message: result.message,
                   date_created: result.date_created,
                   collection: result.collection // 存储collection信息
                 });
