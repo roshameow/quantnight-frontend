@@ -156,7 +156,14 @@
           请先搜索Alpha以显示PNL图表
         </div>
         <div v-else style="width: 100%; height: 500px">
-          <v-chart :option="chartOption" style="width: 100%; height: 100%" />
+          <v-chart
+            ref="chartRef"
+            :option="chartOption"
+            style="width: 100%; height: 100%"
+            @click="handleChartClick"
+            @datazoom="handleDataZoom"
+            :autoresize="true"
+          />
         </div>
       </div>
     </div>
@@ -164,7 +171,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfigStore } from "../stores/configStore";
 import VChart from "vue-echarts";
@@ -191,6 +198,14 @@ const selectedAlphaIds = ref(new Set());
 const newAlphaId = ref("");
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
+const chartRef = ref(null);
+// 保存图表缩放状态
+const chartZoomState = ref({
+  xAxisStart: 0,
+  xAxisEnd: 100,
+  yAxisStart: 0,
+  yAxisEnd: 100
+});
 
 // --- Computed ---
 const chartOption = computed(() => {
@@ -240,6 +255,7 @@ const chartOption = computed(() => {
         emphasis: {
           focus: "series",
         },
+        triggerLineEvent: true, // 启用线条点击事件
       });
     }
   });
@@ -258,24 +274,24 @@ const chartOption = computed(() => {
     dataZoom: [
       {
         type: "inside",
-        start: 0,
-        end: 100,
+        start: chartZoomState.value.xAxisStart,
+        end: chartZoomState.value.xAxisEnd,
       },
       {
-        start: 0,
-        end: 100,
+        start: chartZoomState.value.xAxisStart,
+        end: chartZoomState.value.xAxisEnd,
       },
       {
         type: "inside", // 添加y轴内部缩放
         yAxisIndex: 0,
-        start: 0,
-        end: 100,
+        start: chartZoomState.value.yAxisStart,
+        end: chartZoomState.value.yAxisEnd,
       },
       {
         type: "slider", // 添加y轴滑动条缩放
         yAxisIndex: 0,
-        start: 0,
-        end: 100,
+        start: chartZoomState.value.yAxisStart,
+        end: chartZoomState.value.yAxisEnd,
         width: 20, // 滑动条宽度
         right: 10, // 距离右侧的距离
       },
@@ -336,6 +352,119 @@ function getColorForAlpha(alphaId, isSelected = true) {
   return baseColor;
 }
 
+// 处理图表点击事件
+function handleChartClick(params) {
+  // 检查点击的是否是系列（线条）
+  if (params.componentType === 'series') {
+    const alphaId = params.seriesName;
+    
+    // 先获取当前缩放状态
+    let currentZoomState = null;
+    if (chartRef.value) {
+      // vue-echarts的API可能不同，尝试不同的方法
+      let chart = null;
+      
+      // 方法1: 直接使用chartRef.value作为echarts实例
+      if (chartRef.value && typeof chartRef.value.dispatchAction === 'function') {
+        chart = chartRef.value;
+      }
+      // 方法2: 尝试getEchartsInstance方法
+      else if (chartRef.value && typeof chartRef.value.getEchartsInstance === 'function') {
+        chart = chartRef.value.getEchartsInstance();
+      }
+      // 方法3: 尝试$el属性
+      else if (chartRef.value && chartRef.value.$el && chartRef.value.$el.echarts) {
+        chart = chartRef.value.$el.echarts;
+      }
+      
+      if (chart) {
+        try {
+          const option = chart.getOption();
+          if (option && option.dataZoom) {
+            currentZoomState = {
+              xAxisStart: option.dataZoom[0]?.start || 0,
+              xAxisEnd: option.dataZoom[0]?.end || 100,
+              yAxisStart: option.dataZoom[2]?.start || 0,
+              yAxisEnd: option.dataZoom[2]?.end || 100
+            };
+          }
+        } catch (e) {
+          console.warn('获取图表选项失败:', e);
+        }
+      }
+    }
+    
+    // 切换选中状态
+    toggleAlphaSelection(alphaId);
+    
+    // 如果有保存的缩放状态，在下一个tick恢复它
+    if (currentZoomState) {
+      nextTick(() => {
+        if (chartRef.value) {
+          // 尝试获取echarts实例
+          let chart = null;
+          
+          if (chartRef.value && typeof chartRef.value.dispatchAction === 'function') {
+            chart = chartRef.value;
+          } else if (chartRef.value && typeof chartRef.value.getEchartsInstance === 'function') {
+            chart = chartRef.value.getEchartsInstance();
+          } else if (chartRef.value && chartRef.value.$el && chartRef.value.$el.echarts) {
+            chart = chartRef.value.$el.echarts;
+          }
+          
+          if (chart) {
+            try {
+              chart.dispatchAction({
+                type: 'dataZoom',
+                start: currentZoomState.xAxisStart,
+                end: currentZoomState.xAxisEnd,
+                dataZoomIndex: 0
+              });
+              chart.dispatchAction({
+                type: 'dataZoom',
+                start: currentZoomState.yAxisStart,
+                end: currentZoomState.yAxisEnd,
+                dataZoomIndex: 2
+              });
+            } catch (e) {
+              console.warn('恢复缩放状态失败:', e);
+            }
+          }
+        }
+      });
+    }
+  }
+}
+
+// 处理图表缩放事件
+function handleDataZoom(params) {
+  // params可能不是数组，需要检查类型
+  if (!params) return;
+  
+  // 如果params是数组，遍历处理
+  if (Array.isArray(params)) {
+    params.forEach(param => {
+      processZoomParam(param);
+    });
+  } else {
+    // 如果params是单个对象，直接处理
+    processZoomParam(params);
+  }
+}
+
+// 处理单个缩放参数
+function processZoomParam(param) {
+  if (param.dataZoomIndex === 0 || param.dataZoomIndex === 1) {
+    // X轴缩放
+    chartZoomState.value.xAxisStart = param.start;
+    chartZoomState.value.xAxisEnd = param.end;
+  } else if (param.dataZoomIndex === 2 || param.dataZoomIndex === 3) {
+    // Y轴缩放
+    chartZoomState.value.yAxisStart = param.start;
+    chartZoomState.value.yAxisEnd = param.end;
+  }
+}
+
 async function searchAlphas() {
   searchLoading.value = true;
   try {
@@ -384,6 +513,7 @@ function removeAlpha(alphaId) {
 
 function clearSelections() {
   selectedAlphaIds.value.clear();
+  // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function selectAll() {
@@ -391,11 +521,13 @@ function selectAll() {
     selectedAlphaIds.value.add(alpha.id);
   });
   message.success(`已选择全部 ${searchResults.value.length} 个Alpha`);
+  // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function deselectAll() {
   selectedAlphaIds.value.clear();
   message.success('已清除所有选择');
+  // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 async function addAlpha() {
@@ -475,6 +607,13 @@ function clearFilters() {
   searchResults.value = [];
   selectedAlphaIds.value.clear();
   pnlDataMap.value = {}; // 清除PNL数据缓存
+  // 重置缩放状态，因为这是全新的搜索
+  chartZoomState.value = {
+    xAxisStart: 0,
+    xAxisEnd: 100,
+    yAxisStart: 0,
+    yAxisEnd: 100
+  };
 }
 
 async function exportSelection() {
