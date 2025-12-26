@@ -247,7 +247,7 @@ const chartOption = computed(() => {
         name: alphaName,
         type: "line",
         data: values,
-        symbol: "none",
+        symbol: "none", // 改回不显示数据点
         lineStyle: {
           width: isSelected ? 2 : 1,
           color: getColorForAlpha(alpha.id, isSelected),
@@ -263,10 +263,7 @@ const chartOption = computed(() => {
   return {
     grid: { left: 50, right: 40, top: 40, bottom: 80, containLabel: true },
     tooltip: {
-      trigger: "axis",
-      axisPointer: {
-        type: "cross",
-      },
+      show: false, // 完全禁用tooltip
     },
     legend: {
       show: false, // 不显示图例，因为Alpha太多时会看不过来
