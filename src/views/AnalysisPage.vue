@@ -151,7 +151,22 @@
 
       <!-- PNL图表区域 -->
       <div style="flex: 1; min-width: 0">
-        <h3 style="margin-top: 0; margin-bottom: 12px">PNL对比图</h3>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px">
+          <div style="display: flex; align-items: center; gap: 8px">
+            <h3 style="margin: 0">PNL对比图</h3>
+            <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px">
+              (未选中仅显示前30)
+            </n-text>
+          </div>
+          <n-switch v-model:value="showSelectedOnly">
+            <template #checked>
+              仅显示选中
+            </template>
+            <template #unchecked>
+              显示全部
+            </template>
+          </n-switch>
+        </div>
         <div v-if="searchResults.length === 0" style="color: #999; text-align: center; padding: 40px">
           请先搜索Alpha以显示PNL图表
         </div>
@@ -171,7 +186,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, nextTick, markRaw } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfigStore } from "../stores/configStore";
 import VChart from "vue-echarts";
@@ -199,6 +214,7 @@ const newAlphaId = ref("");
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
+const showSelectedOnly = ref(false); // New state to toggle visibility
 // 保存图表缩放状态
 const chartZoomState = ref({
   xAxisStart: 0,
@@ -214,8 +230,34 @@ const chartOption = computed(() => {
   const series = [];
   const allDates = new Set();
 
+  // Filter alphas to display
+  let alphasToDisplay = [];
+  
+  if (showSelectedOnly.value) {
+    // If showing only selected, show all of them (unlimited)
+    alphasToDisplay = searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+  } else {
+    // If showing all:
+    // 1. Identify selected alphas
+    const selected = searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+    // 2. Identify top 30 from search results (default context)
+    const top30 = searchResults.value.slice(0, 30);
+    
+    // 3. Union them
+    const combined = new Map();
+    // Add top 30 first
+    top30.forEach(a => combined.set(a.id, a));
+    // Add selected (overwriting or adding)
+    selected.forEach(a => combined.set(a.id, a));
+    
+    // 4. Convert back to array and sort by original index to maintain list order consistency
+    alphasToDisplay = Array.from(combined.values()).sort((a, b) => {
+      return searchResults.value.indexOf(a) - searchResults.value.indexOf(b);
+    });
+  }
+
   // 收集所有日期并准备系列数据
-  searchResults.value.forEach((alpha) => {
+  alphasToDisplay.forEach((alpha) => {
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
       pnlData.forEach((point) => {
@@ -227,7 +269,7 @@ const chartOption = computed(() => {
   const sortedDates = Array.from(allDates).sort();
 
   // 为每个Alpha创建系列
-  searchResults.value.forEach((alpha) => {
+  alphasToDisplay.forEach((alpha) => {
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
       const alphaName = alpha.id;
@@ -247,13 +289,27 @@ const chartOption = computed(() => {
         name: alphaName,
         type: "line",
         data: values,
-        symbol: "none", // 改回不显示数据点
+        color: getColorForAlpha(alpha.id, isSelected), // 设置系列颜色，确保tooltip指示器颜色一致
+        showSymbol: true, // Show symbol but make it transparent
+        symbol: "circle",
+        symbolSize: 8, // Large enough to be easily hovered
+        itemStyle: {
+          opacity: 0 // Invisible normally
+        },
         lineStyle: {
-          width: isSelected ? 2 : 1,
-          color: getColorForAlpha(alpha.id, isSelected),
+          width: isSelected ? 2.5 : 1, // 稍微加粗选中线
         },
         emphasis: {
           focus: "series",
+          scale: true,
+          itemStyle: {
+            opacity: 1 // Visible on hover
+          },
+          lineStyle: {
+            width: 4, // 悬停时明显加粗
+            shadowBlur: 10,
+            shadowColor: 'rgba(0,0,0,0.3)'
+          }
         },
         triggerLineEvent: true, // 启用线条点击事件
       });
@@ -263,7 +319,56 @@ const chartOption = computed(() => {
   return {
     grid: { left: 50, right: 40, top: 40, bottom: 80, containLabel: true },
     tooltip: {
-      show: false, // 完全禁用tooltip
+      show: true,
+      trigger: 'item',
+      confine: true,
+      enterable: true,
+      appendToBody: true, // Ensure tooltip is not clipped and has correct z-index
+      extraCssText: 'z-index: 9999; box-shadow: 0 0 10px rgba(0,0,0,0.2);',
+      axisPointer: {
+        type: 'line',
+        lineStyle: {
+          color: '#aaa',
+          type: 'dashed'
+        }
+      },
+      formatter: (params) => {
+        const p = Array.isArray(params) ? params[0] : params;
+        if (!p || !p.seriesName) return '';
+
+        const alphaId = p.seriesName;
+        const alpha = searchResults.value.find(a => a.id === alphaId);
+        
+        // Basic display if alpha details not found
+        if (!alpha) {
+          return `<div style="font-weight: bold; padding: 4px;">${alphaId}</div>`;
+        }
+
+        const formatPercent = (val) => val != null ? (val * 100).toFixed(2) + "%" : "--";
+        const formatMargin = (val) => val != null ? (val * 10000).toFixed(2) + "‱" : "--";
+        const formatNum = (val) => val != null ? Number(val).toFixed(3) : "--";
+        const expression = alpha.code || "--";
+        
+        return `
+          <div style="padding: 4px; max-width: 400px;">
+            <div style="font-weight: bold; margin-bottom: 6px; color: ${p.color}; border-bottom: 1px solid #eee; padding-bottom: 4px;">
+              ${alphaId}
+            </div>
+            <div style="font-size: 12px; line-height: 1.6; color: #333;">
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Region:</span> <span style="font-weight: 500;">${alpha.region || '--'}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sharpe:</span> <span style="font-weight: 500;">${alpha.sharpe || '--'}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sub-U Sharpe:</span> <span style="font-weight: 500;">${formatNum(alpha.sub_universe_sharpe)}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(alpha.turnover)}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Margin:</span> <span style="font-weight: 500;">${formatMargin(alpha.margin)}</span></div>
+              
+              <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #eee;">
+                <div style="margin-bottom: 2px; color: #666;">Expression:</div>
+                <div style="font-family: monospace; white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; background: #f5f5f5; padding: 4px; border-radius: 4px;">${expression}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
     },
     legend: {
       show: false, // 不显示图例，因为Alpha太多时会看不过来
@@ -477,7 +582,7 @@ async function searchAlphas() {
       region: regionParam,
       delay: delayParam,
       page: 1,
-      page_size: 100, // 获取更多结果以便选择
+      page_size: 1000, // 获取更多结果以便选择
     };
 
     console.log("搜索参数:", params);
@@ -552,6 +657,7 @@ async function addAlpha() {
           region: result.region || "Unknown",
           sharpe: result.sharpe,
           fitness: result.fitness,
+          sub_universe_sharpe: result.sub_universe_sharpe,
           returns: result.returns,
           turnover: result.turnover,
           margin: result.margin,
@@ -710,6 +816,7 @@ async function importSelection() {
                   region: result.region || "Unknown",
                   sharpe: result.sharpe,
                   fitness: result.fitness,
+                  sub_universe_sharpe: result.sub_universe_sharpe,
                   returns: result.returns,
                   turnover: result.turnover,
                   margin: result.margin,
@@ -784,7 +891,7 @@ async function loadPNL(id, collection = null) {
     console.log("加载PNL数据，查询参数:", query);
     const result = await invoke("get_pnl_by_id", { query });
     console.log(`加载PNL数据成功，Alpha ID: ${id}, 数据点数: ${result.pnl_series?.length || 0}`);
-    pnlDataMap.value[id] = result.pnl_series;
+    pnlDataMap.value[id] = markRaw(result.pnl_series); // Use markRaw to prevent deep reactivity
   } catch (e) {
     console.error("Error loading PnL:", e);
     pnlDataMap.value[id] = null;
