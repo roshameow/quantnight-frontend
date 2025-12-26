@@ -105,7 +105,7 @@
                   <span>{{ alpha.id }}</span>
                   <n-checkbox
                     :checked="selectedAlphaIds.has(alpha.id)"
-                    @update:checked="(checked) => checked ? selectedAlphaIds.add(alpha.id) : selectedAlphaIds.delete(alpha.id)"
+                    @update:checked="toggleAlphaSelection(alpha.id)"
                     @click.stop
                     size="small"
                   />
@@ -202,6 +202,8 @@
 import { ref, computed, watch, onMounted, nextTick, markRaw } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfigStore } from "../stores/configStore";
+import { useAnalysisStore } from "../stores/analysisStore";
+import { storeToRefs } from "pinia";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
 import { LineChart } from "echarts/charts";
@@ -215,27 +217,25 @@ use([LineChart, GridComponent, TooltipComponent, LegendComponent, DataZoomCompon
 
 // --- State ---
 const configStore = useConfigStore();
+const analysisStore = useAnalysisStore();
+const {
+  selectedCollection,
+  searchQuery,
+  region,
+  delay,
+  searchResults,
+  selectedAlphaIds,
+  pnlDataMap,
+  showSelectedOnly,
+  chartZoomState
+} = storeToRefs(analysisStore);
+
 const message = useMessage();
 const dialog = useDialog();
-const selectedCollection = ref("alpha_results");
-const searchQuery = ref("");
-const region = ref("");
-const delay = ref("");
-const searchResults = ref([]);
 const searchLoading = ref(false);
-const selectedAlphaIds = ref(new Set());
 const newAlphaId = ref("");
-const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
-const showSelectedOnly = ref(false); // New state to toggle visibility
-// 保存图表缩放状态
-const chartZoomState = ref({
-  xAxisStart: 0,
-  xAxisEnd: 100,
-  yAxisStart: 0,
-  yAxisEnd: 100
-});
 
 // --- Table Setup ---
 const expandedRowIds = ref(new Set());
@@ -626,11 +626,13 @@ async function searchAlphas() {
 }
 
 function toggleAlphaSelection(alphaId) {
-  if (selectedAlphaIds.value.has(alphaId)) {
-    selectedAlphaIds.value.delete(alphaId);
+  const newSet = new Set(selectedAlphaIds.value);
+  if (newSet.has(alphaId)) {
+    newSet.delete(alphaId);
   } else {
-    selectedAlphaIds.value.add(alphaId);
+    newSet.add(alphaId);
   }
+  selectedAlphaIds.value = newSet;
 }
 
 function removeAlpha(alphaId) {
@@ -641,20 +643,22 @@ function removeAlpha(alphaId) {
 }
 
 function clearSelections() {
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function selectAll() {
+  const newSet = new Set(selectedAlphaIds.value);
   searchResults.value.forEach(alpha => {
-    selectedAlphaIds.value.add(alpha.id);
+    newSet.add(alpha.id);
   });
+  selectedAlphaIds.value = newSet;
   message.success(`已选择全部 ${searchResults.value.length} 个Alpha`);
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function deselectAll() {
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
   message.success('已清除所有选择');
   // 不重置缩放状态，保持用户当前的缩放位置
 }
@@ -706,7 +710,9 @@ async function addAlpha() {
     }
   }
   
-  selectedAlphaIds.value.add(alphaId);
+  const newSet = new Set(selectedAlphaIds.value);
+  newSet.add(alphaId);
+  selectedAlphaIds.value = newSet;
   newAlphaId.value = ""; // 清空输入框
   message.success(`已添加 Alpha ID "${alphaId}"`);
 }
@@ -724,26 +730,14 @@ function removeSelectedAlpha() {
   searchResults.value = searchResults.value.filter(alpha => !selectedAlphaIds.value.has(alpha.id));
   
   // 清除选择
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
   
   const removedCount = originalLength - searchResults.value.length;
   message.success(`已从列表中删除 ${removedCount} 个Alpha`);
 }
 
 function clearFilters() {
-  searchQuery.value = "";
-  region.value = "";
-  delay.value = "";
-  searchResults.value = [];
-  selectedAlphaIds.value.clear();
-  pnlDataMap.value = {}; // 清除PNL数据缓存
-  // 重置缩放状态，因为这是全新的搜索
-  chartZoomState.value = {
-    xAxisStart: 0,
-    xAxisEnd: 100,
-    yAxisStart: 0,
-    yAxisEnd: 100
-  };
+  analysisStore.reset();
 }
 
 async function exportSelection() {
@@ -862,7 +856,9 @@ async function importSelection() {
         }
         
         // 添加所有有效的ID到选择中
-        validIds.forEach(id => selectedAlphaIds.value.add(id));
+        const newSet = new Set(selectedAlphaIds.value);
+        validIds.forEach(id => newSet.add(id));
+        selectedAlphaIds.value = newSet;
         
         // 显示结果
         if (notFoundIds.length > 0) {
