@@ -191,14 +191,18 @@ pub async fn get_alpha_results(
     let mut filters = vec![];
 
     if let Some(q) = &params.query {
-        let escaped = regex::escape(q);
-        filters.push(doc! {
-            "$or": [
-                { "regular.code": { "$regex": &escaped, "$options": "i" } },
-                { "selection.code": { "$regex": &escaped, "$options": "i" } },
-                { "combo.code": { "$regex": &escaped, "$options": "i" } }
-            ]
-        });
+        if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(q) {
+            filters.push(parsed_doc);
+        } else {
+            let escaped = regex::escape(q);
+            filters.push(doc! {
+                "$or": [
+                    { "regular.code": { "$regex": &escaped, "$options": "i" } },
+                    { "selection.code": { "$regex": &escaped, "$options": "i" } },
+                    { "combo.code": { "$regex": &escaped, "$options": "i" } }
+                ]
+            });
+        }
     }
 
     if let Some(messages) = &params.messages_in {
