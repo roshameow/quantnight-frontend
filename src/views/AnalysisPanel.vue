@@ -69,7 +69,7 @@
       <!-- Alpha选择区域 -->
       <div style="width: 120px; flex-shrink: 0">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
-          <h3 style="margin: 0; font-size: 14px">Alpha选择 ({{ selectedAlphaIds.size }}/{{ searchResults.length }})</h3>
+          <h3 style="margin: 0; font-size: 14px">Alpha选择 ({{ visibleSelectedCount }}/{{ searchResults.length }})</h3>
           <n-space size="small" vertical>
             <n-button size="tiny" @click="exportSelection" :disabled="selectedAlphaIds.size === 0" style="width: 100%">
               导出选中
@@ -225,6 +225,7 @@ const {
   delay,
   searchResults,
   selectedAlphaIds,
+  selectedAlphasMap,
   pnlDataMap,
   showSelectedOnly,
   chartZoomState
@@ -252,12 +253,18 @@ const filteredColumns = computed(() => {
 });
 
 const selectedAlphaDetails = computed(() => {
-  return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+  return Array.from(selectedAlphasMap.value.values());
+});
+
+const visibleSelectedCount = computed(() => {
+  if (!searchResults.value) return 0;
+  return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id)).length;
 });
 
 // --- Computed ---
 const chartOption = computed(() => {
-  if (searchResults.value.length === 0) return {};
+  if (!searchResults.value || !pnlDataMap.value) return {};
+  if (searchResults.value.length === 0 && selectedAlphaIds.value.size === 0) return {};
 
   const series = [];
   const allDates = new Set();
@@ -267,11 +274,11 @@ const chartOption = computed(() => {
   
   if (showSelectedOnly.value) {
     // If showing only selected, show all of them (unlimited)
-    alphasToDisplay = searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+    alphasToDisplay = Array.from(selectedAlphasMap.value.values());
   } else {
     // If showing all:
     // 1. Identify selected alphas
-    const selected = searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+    const selected = Array.from(selectedAlphasMap.value.values());
     // 2. Identify top 30 from search results (default context)
     const top30 = searchResults.value.slice(0, 30);
     
@@ -283,13 +290,21 @@ const chartOption = computed(() => {
     selected.forEach(a => combined.set(a.id, a));
     
     // 4. Convert back to array and sort by original index to maintain list order consistency
-    alphasToDisplay = Array.from(combined.values()).sort((a, b) => {
-      return searchResults.value.indexOf(a) - searchResults.value.indexOf(b);
+    alphasToDisplay = Array.from(combined.values())
+        .filter(a => a && a.id) // Filter out any invalid objects
+        .sort((a, b) => {
+            const idxA = searchResults.value.findIndex(x => x.id === a.id);
+            const idxB = searchResults.value.findIndex(x => x.id === b.id);
+            if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+            if (idxA !== -1) return -1; // A is in list, B is not -> A comes first
+            if (idxB !== -1) return 1;  // B is in list, A is not -> B comes first
+            return a.id.localeCompare(b.id); // Both not in list -> sort by ID
     });
   }
 
   // 收集所有日期并准备系列数据
   alphasToDisplay.forEach((alpha) => {
+    if (!alpha || !alpha.id) return;
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
       pnlData.forEach((point) => {
@@ -302,6 +317,7 @@ const chartOption = computed(() => {
 
   // 为每个Alpha创建系列
   alphasToDisplay.forEach((alpha) => {
+    if (!alpha || !alpha.id) return;
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
       const alphaName = alpha.id;
@@ -369,7 +385,11 @@ const chartOption = computed(() => {
         if (!p || !p.seriesName) return '';
 
         const alphaId = p.seriesName;
-        const alpha = searchResults.value.find(a => a.id === alphaId);
+        // Search in searchResults first, then in selectedAlphasMap
+        let alpha = searchResults.value.find(a => a.id === alphaId);
+        if (!alpha && selectedAlphasMap.value.has(alphaId)) {
+            alpha = selectedAlphasMap.value.get(alphaId);
+        }
         
         // Basic display if alpha details not found
         if (!alpha) {
@@ -462,6 +482,8 @@ const chartOption = computed(() => {
 
 // --- Methods ---
 function getColorForAlpha(alphaId, isSelected = true) {
+  if (!alphaId) return "#999"; // Fallback color for invalid ID
+
   // 为每个Alpha分配一个固定的颜色
   const colors = [
     "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de",
@@ -470,7 +492,17 @@ function getColorForAlpha(alphaId, isSelected = true) {
   ];
   
   // 获取Alpha在搜索结果中的索引
-  const index = searchResults.value.findIndex((a) => a.id === alphaId);
+  let index = searchResults.value.findIndex((a) => a.id === alphaId);
+  
+  // 如果不在搜索结果中（例如已选但未在当前页），使用ID的哈希值来分配颜色
+  if (index === -1) {
+    let hash = 0;
+    for (let i = 0; i < alphaId.length; i++) {
+      hash = alphaId.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    index = Math.abs(hash);
+  }
+  
   const baseColor = colors[index % colors.length];
   
   // 如果未选中，则返回较淡的颜色
@@ -620,7 +652,14 @@ async function searchAlphas() {
     console.log("搜索参数:", params);
     const result = await invoke("get_alpha_results", { params });
     console.log("搜索结果:", result);
-    searchResults.value = result.data || [];
+    
+    // Inject collection into each result item so loadPNL knows where to find it
+    const resultsWithCollection = (result.data || []).map(item => ({
+      ...item,
+      collection: selectedCollection.value
+    }));
+    
+    searchResults.value = resultsWithCollection;
     console.log("处理后的搜索结果:", searchResults.value);
   } catch (e) {
     console.error("Error searching alphas:", e);
@@ -631,13 +670,32 @@ async function searchAlphas() {
 }
 
 function toggleAlphaSelection(alphaId) {
-  const newSet = new Set(selectedAlphaIds.value);
-  if (newSet.has(alphaId)) {
-    newSet.delete(alphaId);
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
+
+  if (newIdSet.has(alphaId)) {
+    newIdSet.delete(alphaId);
+    newMap.delete(alphaId);
   } else {
-    newSet.add(alphaId);
+    // Try to find alpha object in searchResults
+    const alpha = searchResults.value.find(a => a.id === alphaId);
+    if (alpha) {
+      newIdSet.add(alphaId);
+      newMap.set(alphaId, alpha);
+    } else {
+        // If not in search results, check if it's already in the map (shouldn't happen if we are toggling, but good for safety)
+        // Or if triggered from chart for an item not in search results but in map?
+        if (newMap.has(alphaId)) {
+             // It's in the map but not in search results? That means it was already selected. 
+             // Logic above says if it has alphaId, delete it. So we are in the else branch (add).
+             // If we are adding and it's not in search results, we can't add it unless we fetch it.
+             // But usually we toggle visible things.
+             console.warn(`Attempted to select Alpha ${alphaId} which is not in search results.`);
+        }
+    }
   }
-  selectedAlphaIds.value = newSet;
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
 }
 
 function removeAlpha(alphaId) {
@@ -716,9 +774,17 @@ async function addAlpha() {
     }
   }
   
-  const newSet = new Set(selectedAlphaIds.value);
-  newSet.add(alphaId);
-  selectedAlphaIds.value = newSet;
+  // Ensure the alpha object is available (it was just added to searchResults if it wasn't there)
+  const alpha = searchResults.value.find(a => a.id === alphaId);
+  if (alpha) {
+    const newIdSet = new Set(selectedAlphaIds.value);
+    const newMap = new Map(selectedAlphasMap.value);
+    newIdSet.add(alphaId);
+    newMap.set(alphaId, alpha);
+    selectedAlphaIds.value = newIdSet;
+    selectedAlphasMap.value = newMap;
+  }
+
   newAlphaId.value = ""; // 清空输入框
   message.success(`已添加 Alpha ID "${alphaId}"`);
 }
@@ -732,11 +798,12 @@ function removeSelectedAlpha() {
   const selectedArray = Array.from(selectedAlphaIds.value);
   const originalLength = searchResults.value.length;
   
-  // 从搜索结果中移除选中的Alpha
+  // 从搜索结果中移除选中的Alpha (Visual removal from list if present)
   searchResults.value = searchResults.value.filter(alpha => !selectedAlphaIds.value.has(alpha.id));
   
   // 清除选择
   selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   
   const removedCount = originalLength - searchResults.value.length;
   message.success(`已从列表中删除 ${removedCount} 个Alpha`);
@@ -863,9 +930,20 @@ async function importSelection() {
         }
         
         // 添加所有有效的ID到选择中
-        const newSet = new Set(selectedAlphaIds.value);
-        validIds.forEach(id => newSet.add(id));
-        selectedAlphaIds.value = newSet;
+        const newIdSet = new Set(selectedAlphaIds.value);
+        const newMap = new Map(selectedAlphasMap.value);
+        
+        validIds.forEach(id => {
+            newIdSet.add(id);
+            // Find the alpha object we just ensured exists in searchResults
+            const alpha = searchResults.value.find(a => a.id === id);
+            if (alpha) {
+                newMap.set(id, alpha);
+            }
+        });
+        
+        selectedAlphaIds.value = newIdSet;
+        selectedAlphasMap.value = newMap;
         
         // 显示结果
         if (notFoundIds.length > 0) {

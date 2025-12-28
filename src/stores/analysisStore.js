@@ -8,6 +8,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
   const delay = ref("");
   const searchResults = ref([]);
   const selectedAlphaIds = ref(new Set());
+  const selectedAlphasMap = ref(new Map()); // Store full alpha objects
   const pnlDataMap = ref({});
   const showSelectedOnly = ref(false);
   const chartZoomState = ref({
@@ -24,6 +25,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     delay.value = "";
     searchResults.value = [];
     selectedAlphaIds.value = new Set();
+    selectedAlphasMap.value = new Map();
     pnlDataMap.value = {};
     showSelectedOnly.value = false;
     chartZoomState.value = {
@@ -41,6 +43,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     delay,
     searchResults,
     selectedAlphaIds,
+    selectedAlphasMap,
     pnlDataMap,
     showSelectedOnly,
     chartZoomState,
