@@ -149,36 +149,47 @@
         </div>
       </div>
 
-      <!-- PNL图表区域 -->
-      <div style="flex: 1; min-width: 0">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px">
-          <div style="display: flex; align-items: center; gap: 8px">
-            <h3 style="margin: 0">PNL对比图</h3>
-            <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px">
-              (未选中仅显示前30)
-            </n-text>
-          </div>
-          <n-switch v-model:value="showSelectedOnly">
+      <!-- Charts Area: PnL and PCA side-by-side -->
+      <div style="flex: 1; min-width: 0;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px;">
+          <h3 style="margin: 0; white-space: nowrap;">数据可视化</h3>
+          <n-button size="tiny" type="primary" @click="calculatePCA" :loading="pcaLoading" :disabled="searchResults.length < 3" style="margin-left: auto;">
+            PCA 聚类分析
+          </n-button>
+          <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px; white-space: nowrap;">
+              (PnL未选中仅显示前30)
+          </n-text>
+          <n-switch v-model:value="showSelectedOnly" style="margin-left: 8px;">
             <template #checked>
-              仅显示选中
+              仅显示选中(PnL)
             </template>
             <template #unchecked>
-              显示全部
+              显示全部(PnL)
             </template>
           </n-switch>
         </div>
-        <div v-if="searchResults.length === 0" style="color: #999; text-align: center; padding: 40px">
-          请先搜索Alpha以显示PNL图表
-        </div>
-        <div v-else style="width: 100%; height: 500px">
-          <v-chart
-            ref="chartRef"
-            :option="chartOption"
-            style="width: 100%; height: 100%"
-            @click="handleChartClick"
-            @datazoom="handleDataZoom"
-            :autoresize="true"
-          />
+        
+        <div style="display: flex; gap: 16px; min-height: 500px;">
+          <div v-if="searchResults.length === 0 && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 40px; width: 100%;">
+            请先搜索Alpha以显示PNL图表
+          </div>
+          <div v-else :style="{width: pcaResults.length > 0 ? '50%' : '100%'}">
+            <v-chart
+              ref="chartRef"
+              :option="chartOption"
+              style="width: 100%; height: 500px"
+              @click="handleChartClick"
+              @datazoom="handleDataZoom"
+              :autoresize="true"
+            />
+          </div>
+          <div v-if="pcaResults.length > 0" style="width: 50%;">
+            <v-chart
+              :option="pcaChartOption"
+              style="width: 100%; height: 500px"
+              :autoresize="true"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -206,14 +217,14 @@ import { useAnalysisStore } from "../stores/analysisStore";
 import { storeToRefs } from "pinia";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
-import { LineChart } from "echarts/charts";
+import { LineChart, ScatterChart } from "echarts/charts";
 import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import { useMessage, useDialog } from 'naive-ui';
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 
 // Register ECharts components
-use([LineChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer]);
+use([LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer]);
 
 // --- State ---
 const configStore = useConfigStore();
@@ -227,6 +238,7 @@ const {
   selectedAlphaIds,
   selectedAlphasMap,
   pnlDataMap,
+  pcaResults,
   showSelectedOnly,
   chartZoomState
 } = storeToRefs(analysisStore);
@@ -237,6 +249,8 @@ const searchLoading = ref(false);
 const newAlphaId = ref("");
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
+const chartMode = ref("pnl"); // 'pnl' | 'pca'
+const pcaLoading = ref(false);
 
 // --- Table Setup ---
 const expandedRowIds = ref(new Set());
@@ -259,6 +273,114 @@ const selectedAlphaDetails = computed(() => {
 const visibleSelectedCount = computed(() => {
   if (!searchResults.value) return 0;
   return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id)).length;
+});
+
+async function calculatePCA() {
+  const alphas = searchResults.value.map(a => ({
+    id: a.id,
+    collection: a.collection || selectedCollection.value // Fallback if missing
+  }));
+  
+  if (alphas.length < 3) {
+    message.warning("至少需要3个Alpha才能进行PCA分析");
+    return;
+  }
+
+  pcaLoading.value = true;
+  try {
+    const res = await invoke("compute_pnl_pca", { request: { alphas } });
+    pcaResults.value = res;
+    message.success("PCA分析完成");
+  } catch(e) {
+    message.error("PCA分析失败: " + e);
+  } finally {
+    pcaLoading.value = false;
+  }
+}
+
+const pcaChartOption = computed(() => {
+  if (!pcaResults.value || pcaResults.value.length === 0) return {};
+  
+  // Group by cluster and selection status
+  const clusteredData = new Map(); // Map<cluster_id, { selected: [], unselected: [] }>
+  pcaResults.value.forEach(p => {
+    if (!clusteredData.has(p.cluster)) {
+        clusteredData.set(p.cluster, { selected: [], unselected: [] });
+    }
+    const isSelected = selectedAlphaIds.value.has(p.id);
+    const targetArray = clusteredData.get(p.cluster);
+    if (isSelected) {
+        targetArray.selected.push([p.x, p.y, p.id]);
+    } else {
+        targetArray.unselected.push([p.x, p.y, p.id]);
+    }
+  });
+
+  const series = [];
+  clusteredData.forEach((data, clusterId) => {
+    // Unselected points (faded)
+    if (data.unselected.length > 0) {
+        series.push({
+            name: `Cluster ${clusterId} (未选中)`,
+            type: 'scatter',
+            data: data.unselected,
+            symbolSize: 8,
+            itemStyle: {
+                opacity: 0.4, // Faded
+            },
+            emphasis: {
+                scale: true,
+                label: {
+                    show: true,
+                    formatter: (param) => param.data[2],
+                    position: 'top'
+                }
+            }
+        });
+    }
+
+    // Selected points (highlighted)
+    if (data.selected.length > 0) {
+        series.push({
+            name: `Cluster ${clusterId} (选中)`,
+            type: 'scatter',
+            data: data.selected,
+            symbolSize: 15, // Larger
+            itemStyle: {
+                color: '#ff7f50', // Distinct color
+                shadowBlur: 10,
+                shadowColor: 'rgba(255,127,80,0.8)',
+                shadowOffsetY: 5
+            },
+            emphasis: {
+                scale: true,
+                label: {
+                    show: true,
+                    formatter: (param) => param.data[2],
+                    position: 'top'
+                }
+            }
+        });
+    }
+  });
+
+
+  return {
+    title: {
+        text: '选中项 PCA 聚类',
+        left: 'center',
+        top: 0
+    },
+    grid: { left: 40, right: 40, top: '15%', bottom: 40 },
+    tooltip: {
+       formatter: (params) => {
+          return `<div style="font-weight:bold">${params.data[2]}</div>Cluster: ${params.seriesName}<br/>(${params.data[0].toFixed(2)}, ${params.data[1].toFixed(2)})`;
+       }
+    },
+    xAxis: { scale: true },
+    yAxis: { scale: true },
+    series
+  };
 });
 
 // --- Computed ---
@@ -632,6 +754,11 @@ function processZoomParam(param) {
 }
 
 async function searchAlphas() {
+  // Clear previous selections and results for a new search
+  selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
+  pcaResults.value = [];
+
   searchLoading.value = true;
   try {
     // 如果查询为空或者是{}，则查询所有数据

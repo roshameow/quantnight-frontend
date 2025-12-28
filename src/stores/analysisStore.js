@@ -10,6 +10,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
   const selectedAlphaIds = ref(new Set());
   const selectedAlphasMap = ref(new Map()); // Store full alpha objects
   const pnlDataMap = ref({});
+  const pcaResults = ref([]); // Store PCA points {id, x, y, cluster}
   const showSelectedOnly = ref(false);
   const chartZoomState = ref({
     xAxisStart: 0,
@@ -27,6 +28,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     selectedAlphaIds.value = new Set();
     selectedAlphasMap.value = new Map();
     pnlDataMap.value = {};
+    pcaResults.value = [];
     showSelectedOnly.value = false;
     chartZoomState.value = {
         xAxisStart: 0,
@@ -45,6 +47,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     selectedAlphaIds,
     selectedAlphasMap,
     pnlDataMap,
+    pcaResults,
     showSelectedOnly,
     chartZoomState,
     reset
