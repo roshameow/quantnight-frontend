@@ -218,13 +218,13 @@ import { storeToRefs } from "pinia";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
 import { LineChart, ScatterChart } from "echarts/charts";
-import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent } from "echarts/components";
+import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, VisualMapComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import { useMessage, useDialog } from 'naive-ui';
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 
 // Register ECharts components
-use([LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer]);
+use([LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, VisualMapComponent, CanvasRenderer]);
 
 // --- State ---
 const configStore = useConfigStore();
@@ -301,85 +301,50 @@ async function calculatePCA() {
 const pcaChartOption = computed(() => {
   if (!pcaResults.value || pcaResults.value.length === 0) return {};
   
-  // Group by cluster and selection status
-  const clusteredData = new Map(); // Map<cluster_id, { selected: [], unselected: [] }>
-  pcaResults.value.forEach(p => {
-    if (!clusteredData.has(p.cluster)) {
-        clusteredData.set(p.cluster, { selected: [], unselected: [] });
-    }
-    const isSelected = selectedAlphaIds.value.has(p.id);
-    const targetArray = clusteredData.get(p.cluster);
-    if (isSelected) {
-        targetArray.selected.push([p.x, p.y, p.id]);
-    } else {
-        targetArray.unselected.push([p.x, p.y, p.id]);
-    }
-  });
-
-  const series = [];
-  clusteredData.forEach((data, clusterId) => {
-    // Unselected points (faded)
-    if (data.unselected.length > 0) {
-        series.push({
-            name: `Cluster ${clusterId} (未选中)`,
-            type: 'scatter',
-            data: data.unselected,
-            symbolSize: 8,
-            itemStyle: {
-                opacity: 0.4, // Faded
-            },
-            emphasis: {
-                scale: true,
-                label: {
-                    show: true,
-                    formatter: (param) => param.data[2],
-                    position: 'top'
-                }
-            }
-        });
-    }
-
-    // Selected points (highlighted)
-    if (data.selected.length > 0) {
-        series.push({
-            name: `Cluster ${clusterId} (选中)`,
-            type: 'scatter',
-            data: data.selected,
-            symbolSize: 15, // Larger
-            itemStyle: {
-                color: '#ff7f50', // Distinct color
-                shadowBlur: 10,
-                shadowColor: 'rgba(255,127,80,0.8)',
-                shadowOffsetY: 5
-            },
-            emphasis: {
-                scale: true,
-                label: {
-                    show: true,
-                    formatter: (param) => param.data[2],
-                    position: 'top'
-                }
-            }
-        });
-    }
-  });
-
+  const scatterData = pcaResults.value.map(p => ({
+      name: p.id,
+      value: [p.x, p.y, selectedAlphaIds.value.has(p.id) ? 1 : 0], // x, y, isSelected
+      cluster: p.cluster,
+  }));
 
   return {
     title: {
-        text: '选中项 PCA 聚类',
+        text: 'PCA 聚类分析',
         left: 'center',
         top: 0
     },
-    grid: { left: 40, right: 40, top: '15%', bottom: 40 },
+    grid: { left: 40, right: '15%', top: '15%', bottom: 40 },
     tooltip: {
        formatter: (params) => {
-          return `<div style="font-weight:bold">${params.data[2]}</div>Cluster: ${params.seriesName}<br/>(${params.data[0].toFixed(2)}, ${params.data[1].toFixed(2)})`;
+          return `<div style="font-weight:bold">${params.data.name}</div>Cluster: ${params.data.cluster}<br/>(${params.data.value[0].toFixed(2)}, ${params.data.value[1].toFixed(2)})`;
        }
     },
     xAxis: { scale: true },
     yAxis: { scale: true },
-    series
+    visualMap: {
+        type: 'piecewise',
+        show: true,
+        dimension: 2, // Map to the third dimension (isSelected)
+        pieces: [
+            {value: 1, label: 'Selected', color: '#ff7f50', symbolSize: 15},
+            {value: 0, label: 'Unselected', color: '#87CEFA', symbolSize: 8, colorAlpha: 0.5},
+        ],
+        right: 10,
+        top: 'center',
+        orient: 'vertical',
+    },
+    series: [{
+        type: 'scatter',
+        data: scatterData,
+        emphasis: {
+            scale: true,
+            label: {
+                show: true,
+                formatter: (param) => param.data.name,
+                position: 'top'
+            }
+        }
+    }]
   };
 });
 
