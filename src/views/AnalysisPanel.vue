@@ -153,10 +153,7 @@
       <div style="flex: 1; min-width: 0;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px;">
           <h3 style="margin: 0; white-space: nowrap;">数据可视化</h3>
-          <n-button size="tiny" type="primary" @click="calculatePCA" :loading="pcaLoading" :disabled="searchResults.length < 3" style="margin-left: auto;">
-            PCA 聚类分析
-          </n-button>
-          <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px; white-space: nowrap;">
+          <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px; white-space: nowrap; margin-left: auto;">
               (PnL未选中仅显示前30)
           </n-text>
           <n-switch v-model:value="showSelectedOnly" style="margin-left: 8px;">
@@ -173,7 +170,7 @@
           <div v-if="searchResults.length === 0 && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 40px; width: 100%;">
             请先搜索Alpha以显示PNL图表
           </div>
-          <div v-else :style="{width: pcaResults.length > 0 ? '50%' : '100%'}">
+          <div v-else :style="{width: pcaAlphas.length > 0 ? '50%' : '100%'}">
             <v-chart
               ref="chartRef"
               :option="chartOption"
@@ -183,7 +180,7 @@
               :autoresize="true"
             />
           </div>
-          <div v-if="pcaResults.length > 0" style="width: 50%;">
+          <div v-if="pcaAlphas.length > 0" style="width: 50%;">
             <v-chart
               :option="pcaChartOption"
               style="width: 100%; height: 500px"
@@ -238,7 +235,6 @@ const {
   selectedAlphaIds,
   selectedAlphasMap,
   pnlDataMap,
-  pcaResults,
   showSelectedOnly,
   chartZoomState
 } = storeToRefs(analysisStore);
@@ -249,8 +245,6 @@ const searchLoading = ref(false);
 const newAlphaId = ref("");
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
-const chartMode = ref("pnl"); // 'pnl' | 'pca'
-const pcaLoading = ref(false);
 
 // --- Table Setup ---
 const expandedRowIds = ref(new Set());
@@ -275,36 +269,45 @@ const visibleSelectedCount = computed(() => {
   return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id)).length;
 });
 
-async function calculatePCA() {
-  const alphas = searchResults.value.map(a => ({
-    id: a.id,
-    collection: a.collection || selectedCollection.value // Fallback if missing
-  }));
-  
-  if (alphas.length < 3) {
-    message.warning("至少需要3个Alpha才能进行PCA分析");
-    return;
-  }
-
-  pcaLoading.value = true;
-  try {
-    const res = await invoke("compute_pnl_pca", { request: { alphas } });
-    pcaResults.value = res;
-    message.success("PCA分析完成");
-  } catch(e) {
-    message.error("PCA分析失败: " + e);
-  } finally {
-    pcaLoading.value = false;
-  }
-}
+const pcaAlphas = computed(() => {
+  return searchResults.value.filter(alpha => 
+    alpha.pca_x != null && alpha.pca_y != null && alpha.cluster_id != null
+  );
+});
 
 const pcaChartOption = computed(() => {
-  if (!pcaResults.value || pcaResults.value.length === 0) return {};
-  
-  const scatterData = pcaResults.value.map(p => ({
+  const pcaAlphas = searchResults.value.filter(alpha => 
+    alpha.pca_x != null && alpha.pca_y != null && alpha.cluster_id != null
+  );
+
+  if (pcaAlphas.length === 0) return {};
+
+  // Group data by cluster_id
+  const clusters = new Map();
+  pcaAlphas.forEach(p => {
+    const clusterId = p.cluster_id;
+    if (!clusters.has(clusterId)) {
+      clusters.set(clusterId, []);
+    }
+    clusters.get(clusterId).push({
       name: p.id,
-      value: [p.x, p.y, selectedAlphaIds.value.has(p.id) ? 1 : 0], // x, y, isSelected
-      cluster: p.cluster,
+      value: [p.pca_x, p.pca_y, selectedAlphaIds.value.has(p.id) ? 1 : 0], // x, y, isSelected
+    });
+  });
+
+  const series = Array.from(clusters.entries()).map(([clusterId, data]) => ({
+    name: `Cluster ${clusterId}`,
+    type: 'scatter',
+    data: data,
+    emphasis: {
+      focus: 'series',
+      scale: true,
+      label: {
+        show: true,
+        formatter: (param) => param.data.name,
+        position: 'top'
+      }
+    }
   }));
 
   return {
@@ -314,40 +317,33 @@ const pcaChartOption = computed(() => {
         top: 0
     },
     grid: { left: 40, right: '15%', top: '15%', bottom: 40 },
+    legend: {
+        right: 10,
+        top: '10%',
+        orient: 'vertical',
+        data: series.map(s => s.name)
+    },
     tooltip: {
        formatter: (params) => {
-          return `<div style="font-weight:bold">${params.data.name}</div>Cluster: ${params.data.cluster}<br/>(${params.data.value[0].toFixed(2)}, ${params.data.value[1].toFixed(2)})`;
+          return `<div style="font-weight:bold">${params.data.name}</div>${params.seriesName}<br/>(${params.data.value[0].toFixed(2)}, ${params.data.value[1].toFixed(2)})`;
        }
     },
     xAxis: { scale: true },
     yAxis: { scale: true },
     visualMap: {
         type: 'piecewise',
-        show: true,
+        show: false, // Can be hidden as legend + style does the job
         dimension: 2, // Map to the third dimension (isSelected)
         pieces: [
-            {value: 1, label: 'Selected', color: '#ff7f50', symbolSize: 15},
-            {value: 0, label: 'Unselected', color: '#87CEFA', symbolSize: 8, colorAlpha: 0.5},
+            // Selected items: solid color, original size
+            {value: 1, colorAlpha: 1}, 
+            // Unselected items: semi-transparent, original size
+            {value: 0, colorAlpha: 0.3},
         ],
-        right: 10,
-        top: 'center',
-        orient: 'vertical',
     },
-    series: [{
-        type: 'scatter',
-        data: scatterData,
-        emphasis: {
-            scale: true,
-            label: {
-                show: true,
-                formatter: (param) => param.data.name,
-                position: 'top'
-            }
-        }
-    }]
+    series
   };
 });
-
 // --- Computed ---
 const chartOption = computed(() => {
   if (!searchResults.value || !pnlDataMap.value) return {};
@@ -722,7 +718,6 @@ async function searchAlphas() {
   // Clear previous selections and results for a new search
   selectedAlphaIds.value = new Set();
   selectedAlphasMap.value = new Map();
-  pcaResults.value = [];
 
   searchLoading.value = true;
   try {
@@ -751,8 +746,8 @@ async function searchAlphas() {
       collection: selectedCollection.value
     }));
     
+    console.log("Full search results from backend:", resultsWithCollection);
     searchResults.value = resultsWithCollection;
-    console.log("处理后的搜索结果:", searchResults.value);
   } catch (e) {
     console.error("Error searching alphas:", e);
     searchResults.value = [];

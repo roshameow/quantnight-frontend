@@ -32,9 +32,11 @@ pub struct AlphaResult {
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
-    pub pnl_score: Option<f64>,   // ✅ 新增
-
-}
+        pub pnl_score: Option<f64>,   // ✅ 新增
+        pub pca_x: Option<f64>,
+        pub pca_y: Option<f64>,
+        pub cluster_id: Option<usize>,
+    }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]  // 前端传字符串时自动匹配
@@ -123,6 +125,22 @@ fn parse_alpha_document(doc: mongodb::bson::Document) -> Option<AlphaResult> {
 
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
 
+    let analysis_doc = doc.get_document("analysis").ok();
+    let (pca_x, pca_y, cluster_id) = if let Some(d) = analysis_doc {
+        d.get_document("embeddings").ok()
+         .and_then(|em| em.get_document("umap_pnl_v1").ok())
+         .map_or((None, None, None), |umap| {
+            let x = umap.get_f64("x").ok();
+            let y = umap.get_f64("y").ok();
+            let cid = umap.get_document("cluster").ok()
+                        .and_then(|c| c.get_i32("id").ok())
+                        .map(|v| v as usize);
+            (x, y, cid)
+         })
+    } else {
+        (None, None, None)
+    };
+    
     let mut sub_universe_sharpe = None;
     let mut message = None;
 
@@ -162,6 +180,9 @@ fn parse_alpha_document(doc: mongodb::bson::Document) -> Option<AlphaResult> {
         message,
         date_created,
         pnl_score,
+        pca_x,
+        pca_y,
+        cluster_id,
     })
 }
 
@@ -440,6 +461,9 @@ pub struct AlphaInCollectionResult {
     pub date_created: Option<String>,
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
+    pub pca_x: Option<f64>,
+    pub pca_y: Option<f64>,
+    pub cluster_id: Option<usize>,
 }
 
 #[command]
@@ -480,6 +504,9 @@ pub async fn search_alpha_in_all_collections(
                     date_created: result.date_created,
                     sub_universe_sharpe: result.sub_universe_sharpe,
                     message: result.message,
+                    pca_x: result.pca_x,
+                    pca_y: result.pca_y,
+                    cluster_id: result.cluster_id,
                 }));
             }
         }
