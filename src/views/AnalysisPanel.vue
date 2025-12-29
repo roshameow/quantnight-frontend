@@ -977,17 +977,23 @@ function clearSelections() {
 }
 
 function selectAll() {
-  const newSet = new Set(selectedAlphaIds.value);
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
   searchResults.value.forEach(alpha => {
-    newSet.add(alpha.id);
+    if (!newIdSet.has(alpha.id)) {
+      newIdSet.add(alpha.id);
+      newMap.set(alpha.id, alpha);
+    }
   });
-  selectedAlphaIds.value = newSet;
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
   message.success(`已选择全部 ${searchResults.value.length} 个Alpha`);
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function deselectAll() {
   selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   message.success('已清除所有选择');
   // 不重置缩放状态，保持用户当前的缩放位置
 }
