@@ -134,10 +134,18 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
           { trigger: "hover", width: 600 },
           {
             trigger: () => {
-              if (!pnlDataMap.value[row.id] && !loadingSet.value.has(row.id)) {
-                loadPNL(row.id);
-              }
-              return h("span", { style: "cursor: pointer; color: #3b82f6" }, "📈 查看");
+              return h(
+                "span",
+                {
+                  style: "cursor: pointer; color: #3b82f6",
+                  onmouseenter: () => {
+                    if (!pnlDataMap.value[row.id] && !loadingSet.value.has(row.id)) {
+                      loadPNL(row.id);
+                    }
+                  },
+                },
+                "📈 查看"
+              );
             },
             default: () => {
               if (loadingSet.value.has(row.id)) return h("div", "Loading...");

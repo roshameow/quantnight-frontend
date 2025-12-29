@@ -353,48 +353,40 @@ const clusterChartOption = computed(() => {
   };
 });
 // --- Computed ---
-const chartOption = computed(() => {
-  if (!searchResults.value || !pnlDataMap.value) return {};
-  if (searchResults.value.length === 0 && selectedAlphaIds.value.size === 0) return {};
+const alphasToDisplay = computed(() => {
+  if (!searchResults.value) return [];
 
-  const series = [];
-  const allDates = new Set();
-
-  // Filter alphas to display
-  let alphasToDisplay = [];
-  
   if (showSelectedOnly.value) {
-    // If showing only selected, show all of them (unlimited)
-    alphasToDisplay = Array.from(selectedAlphasMap.value.values());
+    return Array.from(selectedAlphasMap.value.values());
   } else {
-    // If showing all:
-    // 1. Identify selected alphas
     const selected = Array.from(selectedAlphasMap.value.values());
-    // 2. Identify top 30 from search results (default context)
     const top30 = searchResults.value.slice(0, 30);
     
-    // 3. Union them
     const combined = new Map();
-    // Add top 30 first
     top30.forEach(a => combined.set(a.id, a));
-    // Add selected (overwriting or adding)
     selected.forEach(a => combined.set(a.id, a));
     
-    // 4. Convert back to array and sort by original index to maintain list order consistency
-    alphasToDisplay = Array.from(combined.values())
-        .filter(a => a && a.id) // Filter out any invalid objects
+    return Array.from(combined.values())
+        .filter(a => a && a.id)
         .sort((a, b) => {
             const idxA = searchResults.value.findIndex(x => x.id === a.id);
             const idxB = searchResults.value.findIndex(x => x.id === b.id);
             if (idxA !== -1 && idxB !== -1) return idxA - idxB;
-            if (idxA !== -1) return -1; // A is in list, B is not -> A comes first
-            if (idxB !== -1) return 1;  // B is in list, A is not -> B comes first
-            return a.id.localeCompare(b.id); // Both not in list -> sort by ID
+            if (idxA !== -1) return -1;
+            if (idxB !== -1) return 1;
+            return a.id.localeCompare(b.id);
     });
   }
+});
+
+const chartOption = computed(() => {
+  if (!alphasToDisplay.value || alphasToDisplay.value.length === 0 || !pnlDataMap.value) return {};
+
+  const series = [];
+  const allDates = new Set();
 
   // 收集所有日期并准备系列数据
-  alphasToDisplay.forEach((alpha) => {
+  alphasToDisplay.value.forEach((alpha) => {
     if (!alpha || !alpha.id) return;
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
@@ -407,7 +399,7 @@ const chartOption = computed(() => {
   const sortedDates = Array.from(allDates).sort();
 
   // 为每个Alpha创建系列
-  alphasToDisplay.forEach((alpha) => {
+  alphasToDisplay.value.forEach((alpha) => {
     if (!alpha || !alpha.id) return;
     const pnlData = pnlDataMap.value[alpha.id];
     if (pnlData && pnlData.length > 0) {
@@ -1057,6 +1049,7 @@ async function importSelection() {
 }
 
 async function loadPNL(id, collection = null) {
+  console.trace(`loadPNL called for ID: ${id}`);
   if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
   loadingSet.value.add(id);
   try {
@@ -1105,14 +1098,15 @@ async function loadPNL(id, collection = null) {
 }
 
 // --- Watchers ---
-watch(searchResults, (newResults) => {
-  // 为所有搜索结果的Alpha加载PNL数据
-  newResults.forEach((alpha) => {
-    if (!pnlDataMap.value[alpha.id]) {
-      loadPNL(alpha.id);
-    }
-  });
-}, { deep: true });
+watch(alphasToDisplay, (alphas) => {
+  if (alphas && alphas.length > 0) {
+    alphas.forEach(alpha => {
+      if (alpha && alpha.id && pnlDataMap.value[alpha.id] === undefined) {
+        loadPNL(alpha.id);
+      }
+    });
+  }
+}, { deep: true, immediate: true });
 
 // --- Lifecycle ---
 onMounted(() => {
@@ -1128,17 +1122,6 @@ watch(() => configStore.embeddingOptions, (options) => {
     embedding.value = options[0].value;
   }
 }, { immediate: true });
-
-// 确保在搜索结果更新后加载PNL数据
-watch([searchResults, selectedCollection], () => {
-  if (searchResults.value.length > 0) {
-    searchResults.value.forEach((alpha) => {
-      if (!pnlDataMap.value[alpha.id]) {
-        loadPNL(alpha.id);
-      }
-    });
-  }
-}, { deep: true });
 </script>
 
 <style scoped>
