@@ -197,6 +197,7 @@
               :option="clusterChartOption"
               style="width: 100%; flex: 1"
               :autoresize="true"
+              @click="handleClusterChartClick"
             />
           </div>
         </div>
@@ -208,11 +209,12 @@
       <h3 style="margin-top: 0; margin-bottom: 12px">选中的 Alpha 详情</h3>
       <n-data-table
         :columns="filteredColumns"
-        :data="selectedAlphaDetails"
+        :data="sortedAlphaDetails"
         :bordered="false"
         :scroll-x="1200"
         class="custom-table"
         :row-key="(row) => row.id"
+        @update:sorter="handleSorterChange"
       />
     </div>
   </div>
@@ -258,6 +260,8 @@ const searchLoading = ref(false);
 const newAlphaId = ref("");
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
+const sortKey = ref(null);
+const sortOrder = ref(null);
 
 // --- Table Setup ---
 const expandedRowIds = ref(new Set());
@@ -275,6 +279,35 @@ const filteredColumns = computed(() => {
 
 const selectedAlphaDetails = computed(() => {
   return Array.from(selectedAlphasMap.value.values());
+});
+
+const sortedAlphaDetails = computed(() => {
+  const data = selectedAlphaDetails.value;
+  const key = sortKey.value;
+  const order = sortOrder.value;
+
+  if (key && order) {
+    // Create a shallow copy before sorting to avoid mutating the original source
+    return [...data].sort((a, b) => {
+      const valA = a[key];
+      const valB = b[key];
+      const orderFactor = order === 'ascend' ? 1 : -1;
+
+      // Handle null or undefined values by pushing them to the end
+      if (valA === null || valA === undefined) return 1 * orderFactor;
+      if (valB === null || valB === undefined) return -1 * orderFactor;
+
+      if (typeof valA === 'number' && typeof valB === 'number') {
+        return (valA - valB) * orderFactor;
+      }
+      
+      const strA = String(valA);
+      const strB = String(valB);
+      
+      return strA.localeCompare(strB) * orderFactor;
+    });
+  }
+  return data;
 });
 
 const visibleSelectedCount = computed(() => {
@@ -336,8 +369,20 @@ const clusterChartOption = computed(() => {
           return `<div style="font-weight:bold">${params.data.name}</div>${params.seriesName}<br/>(${params.data.value[0].toFixed(2)}, ${params.data.value[1].toFixed(2)})`;
        }
     },
-    xAxis: { scale: true },
-    yAxis: { scale: true },
+    xAxis: {
+      scale: true,
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { show: false },
+      splitLine: { show: false }
+    },
+    yAxis: {
+      scale: true,
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { show: false },
+      splitLine: { show: false }
+    },
     visualMap: {
         type: 'piecewise',
         show: false, // Can be hidden as legend + style does the job
@@ -349,6 +394,7 @@ const clusterChartOption = computed(() => {
             {value: 0, colorAlpha: 0.3},
         ],
     },
+    roam: 'move', // Enable panning
     series
   };
 });
@@ -564,6 +610,11 @@ const chartOption = computed(() => {
 });
 
 // --- Methods ---
+function handleSorterChange(sorter) {
+  sortKey.value = sorter.columnKey;
+  sortOrder.value = sorter.order;
+}
+
 function getColorForAlpha(alphaId, isSelected = true) {
   if (!alphaId) return "#999"; // Fallback color for invalid ID
 
@@ -681,6 +732,16 @@ function handleChartClick(params) {
           }
         }
       });
+    }
+  }
+}
+
+// 处理聚类图表点击事件
+function handleClusterChartClick(params) {
+  if (params.componentType === 'series' && params.seriesType === 'scatter') {
+    const alphaId = params.data.name;
+    if (alphaId) {
+      toggleAlphaSelection(alphaId);
     }
   }
 }
