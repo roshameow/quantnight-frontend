@@ -90,7 +90,7 @@
             <!-- 滚动区域 -->
             <div style="height: 400px; overflow-y: auto">
               <div
-                v-for="alpha in searchResults"
+                v-for="alpha in sortedAlphaList"
                 :key="alpha.id"
                 @click="toggleAlphaSelection(alpha.id)"
                 :style="{
@@ -183,8 +183,8 @@
           </div>
           <div v-if="clusterAlphas.length > 0" style="width: 50%; display: flex; flex-direction: column;">
             <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px;">
-               <h4 style="margin: 0;">聚类分析</h4>
-               <n-select
+              <h4 style="margin: 0;">聚类分析</h4>
+              <n-select
                 v-model:value="embedding"
                 :options="configStore.embeddingOptions"
                 placeholder="Embedding"
@@ -193,12 +193,20 @@
                 clearable
               />
             </div>
-            <v-chart
-              :option="clusterChartOption"
-              style="width: 100%; flex: 1"
-              :autoresize="true"
-              @click="handleClusterChartClick"
-            />
+            <div style="position: relative; flex: 1;">
+              <v-chart
+                ref="clusterChartRef"
+                :option="clusterChartOption"
+                style="width: 100%; height: 100%;"
+                :autoresize="true"
+                @click="handleClusterChartClick"
+                @datazoom="handleClusterDataZoom"
+              />
+              <n-button-group size="tiny" style="position: absolute; top: 10px; right: 10px; z-index: 1;">
+                <n-button @click="zoomInCluster"> + </n-button>
+                <n-button @click="zoomOutCluster"> - </n-button>
+              </n-button-group>
+            </div>
           </div>
         </div>
       </div>
@@ -260,8 +268,82 @@ const searchLoading = ref(false);
 const newAlphaId = ref("");
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
+const clusterChartRef = ref(null);
 const sortKey = ref(null);
 const sortOrder = ref(null);
+const clusterChartZoomState = ref({
+  xAxisStart: 0,
+  xAxisEnd: 100,
+  yAxisStart: 0,
+  yAxisEnd: 100,
+});
+
+// --- Zoom Methods ---
+function zoomCluster(zoomFactor) {
+  const { xAxisStart, xAxisEnd, yAxisStart, yAxisEnd } = clusterChartZoomState.value;
+
+  const xRange = xAxisEnd - xAxisStart;
+  const yRange = yAxisEnd - yAxisStart;
+
+  const newXRange = xRange * zoomFactor;
+  const newYRange = yRange * zoomFactor;
+
+  const xCenter = (xAxisStart + xAxisEnd) / 2;
+  const yCenter = (yAxisStart + yAxisEnd) / 2;
+
+  let newXStart = xCenter - newXRange / 2;
+  let newXEnd = xCenter + newXRange / 2;
+  let newYStart = yCenter - newYRange / 2;
+  let newYEnd = yCenter + newYRange / 2;
+
+  // Clamp values to the [0, 100] range
+  newXStart = Math.max(0, newXStart);
+  newXEnd = Math.min(100, newXEnd);
+  newYStart = Math.max(0, newYStart);
+  newYEnd = Math.min(100, newYEnd);
+  
+  // Prevent getting stuck if zoomed in too far
+  if (newXEnd - newXStart < 0.01) {
+    newXEnd = newXStart + 0.01;
+  }
+   if (newYEnd - newYStart < 0.01) {
+    newYEnd = newYStart + 0.01;
+  }
+
+  clusterChartZoomState.value = {
+    xAxisStart: newXStart,
+    xAxisEnd: newXEnd,
+    yAxisStart: newYStart,
+    yAxisEnd: newYEnd,
+  };
+}
+
+function zoomInCluster() {
+  zoomCluster(0.8);
+}
+
+function zoomOutCluster() {
+  zoomCluster(1.25);
+}
+
+function handleClusterDataZoom(params) {
+  // This function is called on pan/drag, so we need to update our state.
+  // ECharts can send different payload structures.
+  let zoomPayload = params;
+  if (params.batch) {
+     // Inside datazoom events often come in a batch
+    zoomPayload = params.batch[0];
+  }
+  
+  if (zoomPayload.dataZoomId && zoomPayload.dataZoomId.includes('xAxis')) {
+    clusterChartZoomState.value.xAxisStart = zoomPayload.start;
+    clusterChartZoomState.value.xAxisEnd = zoomPayload.end;
+  }
+  if (zoomPayload.dataZoomId && zoomPayload.dataZoomId.includes('yAxis')) {
+     clusterChartZoomState.value.yAxisStart = zoomPayload.start;
+     clusterChartZoomState.value.yAxisEnd = zoomPayload.end;
+  }
+}
 
 // --- Table Setup ---
 const expandedRowIds = ref(new Set());
@@ -308,6 +390,23 @@ const sortedAlphaDetails = computed(() => {
     });
   }
   return data;
+});
+
+const sortedAlphaList = computed(() => {
+  if (!searchResults.value) return [];
+  
+  return [...searchResults.value].sort((a, b) => {
+    const aIsSelected = selectedAlphaIds.value.has(a.id);
+    const bIsSelected = selectedAlphaIds.value.has(b.id);
+    
+    if (aIsSelected && !bIsSelected) {
+      return -1; // a comes first
+    }
+    if (!aIsSelected && bIsSelected) {
+      return 1; // b comes first
+    }
+    return 0; // maintain original order for items with the same selection status
+  });
 });
 
 const visibleSelectedCount = computed(() => {
@@ -394,7 +493,24 @@ const clusterChartOption = computed(() => {
             {value: 0, colorAlpha: 0.3},
         ],
     },
-    roam: 'move', // Enable panning
+    dataZoom: [
+      {
+        id: 'dataZoomX',
+        type: 'inside',
+        xAxisIndex: 0,
+        zoomOnMouseWheel: false,
+        start: clusterChartZoomState.value.xAxisStart,
+        end: clusterChartZoomState.value.xAxisEnd,
+      },
+      {
+        id: 'dataZoomY',
+        type: 'inside',
+        yAxisIndex: 0,
+        zoomOnMouseWheel: false,
+        start: clusterChartZoomState.value.yAxisStart,
+        end: clusterChartZoomState.value.yAxisEnd,
+      },
+    ],
     series
   };
 });
@@ -856,6 +972,7 @@ function removeAlpha(alphaId) {
 
 function clearSelections() {
   selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
