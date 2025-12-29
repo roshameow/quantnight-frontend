@@ -33,8 +33,8 @@ pub struct AlphaResult {
     pub message: Option<String>,
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
         pub pnl_score: Option<f64>,   // ✅ 新增
-        pub pca_x: Option<f64>,
-        pub pca_y: Option<f64>,
+        pub cluster_x: Option<f64>,
+        pub cluster_y: Option<f64>,
         pub cluster_id: Option<usize>,
     }
 
@@ -126,7 +126,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
 
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
 
-    let (pca_x, pca_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
+    let (cluster_x, cluster_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
         if let Some(key) = embedding_key {
             analysis_doc.get_document("embeddings").ok()
                 .and_then(|em| em.get_document(key).ok())
@@ -184,8 +184,8 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         message,
         date_created,
         pnl_score,
-        pca_x,
-        pca_y,
+        cluster_x,
+        cluster_y,
         cluster_id,
     })
 }
@@ -465,8 +465,8 @@ pub struct AlphaInCollectionResult {
     pub date_created: Option<String>,
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
-    pub pca_x: Option<f64>,
-    pub pca_y: Option<f64>,
+    pub cluster_x: Option<f64>,
+    pub cluster_y: Option<f64>,
     pub cluster_id: Option<usize>,
 }
 
@@ -508,8 +508,8 @@ pub async fn search_alpha_in_all_collections(
                     date_created: result.date_created,
                     sub_universe_sharpe: result.sub_universe_sharpe,
                     message: result.message,
-                    pca_x: result.pca_x,
-                    pca_y: result.pca_y,
+                    cluster_x: result.cluster_x,
+                    cluster_y: result.cluster_y,
                     cluster_id: result.cluster_id,
                 }));
             }

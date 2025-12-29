@@ -170,7 +170,7 @@
           <div v-if="searchResults.length === 0 && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 40px; width: 100%;">
             请先搜索Alpha以显示PNL图表
           </div>
-          <div v-else :style="{width: pcaAlphas.length > 0 ? '50%' : '100%', display: 'flex', 'flex-direction': 'column'}">
+          <div v-else :style="{width: clusterAlphas.length > 0 ? '50%' : '100%', display: 'flex', 'flex-direction': 'column'}">
             <h4 style="margin: 0 0 8px 0; text-align: center;">PnL 对比</h4>
             <v-chart
               ref="chartRef"
@@ -181,9 +181,9 @@
               :autoresize="true"
             />
           </div>
-          <div v-if="pcaAlphas.length > 0" style="width: 50%; display: flex; flex-direction: column;">
+          <div v-if="clusterAlphas.length > 0" style="width: 50%; display: flex; flex-direction: column;">
             <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px;">
-               <h4 style="margin: 0;">PCA 聚类分析</h4>
+               <h4 style="margin: 0;">聚类分析</h4>
                <n-select
                 v-model:value="embedding"
                 :options="configStore.embeddingOptions"
@@ -194,7 +194,7 @@
               />
             </div>
             <v-chart
-              :option="pcaChartOption"
+              :option="clusterChartOption"
               style="width: 100%; flex: 1"
               :autoresize="true"
             />
@@ -282,29 +282,29 @@ const visibleSelectedCount = computed(() => {
   return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id)).length;
 });
 
-const pcaAlphas = computed(() => {
+const clusterAlphas = computed(() => {
   return searchResults.value.filter(alpha => 
-    alpha.pca_x != null && alpha.pca_y != null && alpha.cluster_id != null
+    alpha.cluster_x != null && alpha.cluster_y != null && alpha.cluster_id != null
   );
 });
 
-const pcaChartOption = computed(() => {
-  const pcaAlphas = searchResults.value.filter(alpha => 
-    alpha.pca_x != null && alpha.pca_y != null && alpha.cluster_id != null
+const clusterChartOption = computed(() => {
+  const clusterAlphas = searchResults.value.filter(alpha => 
+    alpha.cluster_x != null && alpha.cluster_y != null && alpha.cluster_id != null
   );
 
-  if (pcaAlphas.length === 0) return {};
+  if (clusterAlphas.length === 0) return {};
 
   // Group data by cluster_id
   const clusters = new Map();
-  pcaAlphas.forEach(p => {
+  clusterAlphas.forEach(p => {
     const clusterId = p.cluster_id;
     if (!clusters.has(clusterId)) {
       clusters.set(clusterId, []);
     }
     clusters.get(clusterId).push({
       name: p.id,
-      value: [p.pca_x, p.pca_y, selectedAlphaIds.value.has(p.id) ? 1 : 0], // x, y, isSelected
+      value: [p.cluster_x, p.cluster_y, selectedAlphaIds.value.has(p.id) ? 1 : 0], // x, y, isSelected
     });
   });
 
