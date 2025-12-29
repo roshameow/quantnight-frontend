@@ -64,6 +64,7 @@ pub struct AlphaQuery {
     pub delay: Option<u32>,
     pub min_returns: Option<f64>,
     pub collection: Option<String>,
+    pub embedding: Option<String>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
     pub sort_field: Option<SortField>,
@@ -86,7 +87,7 @@ pub struct PagedResult<T> {
     pub page_size: u32,
 }
 
-fn parse_alpha_document(doc: mongodb::bson::Document) -> Option<AlphaResult> {
+fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str>) -> Option<AlphaResult> {
     let id = doc.get_str("id").ok()?.to_string();
 
     let region = doc.get_document("settings").ok()
@@ -125,18 +126,21 @@ fn parse_alpha_document(doc: mongodb::bson::Document) -> Option<AlphaResult> {
 
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
 
-    let analysis_doc = doc.get_document("analysis").ok();
-    let (pca_x, pca_y, cluster_id) = if let Some(d) = analysis_doc {
-        d.get_document("embeddings").ok()
-         .and_then(|em| em.get_document("umap_pnl_v1").ok())
-         .map_or((None, None, None), |umap| {
-            let x = umap.get_f64("x").ok();
-            let y = umap.get_f64("y").ok();
-            let cid = umap.get_document("cluster").ok()
-                        .and_then(|c| c.get_i32("id").ok())
-                        .map(|v| v as usize);
-            (x, y, cid)
-         })
+    let (pca_x, pca_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
+        if let Some(key) = embedding_key {
+            analysis_doc.get_document("embeddings").ok()
+                .and_then(|em| em.get_document(key).ok())
+                .map_or((None, None, None), |umap| {
+                    let x = umap.get_f64("x").ok();
+                    let y = umap.get_f64("y").ok();
+                    let cid = umap.get_document("cluster").ok()
+                                .and_then(|c| c.get_i32("id").ok())
+                                .map(|v| v as usize);
+                    (x, y, cid)
+                })
+        } else {
+            (None, None, None)
+        }
     } else {
         (None, None, None)
     };
@@ -338,7 +342,7 @@ pub async fn get_alpha_results(
     let mut results = Vec::new();
 
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
-        if let Some(result) = parse_alpha_document(doc) {
+        if let Some(result) = parse_alpha_document(doc, params.embedding.as_deref()) {
             results.push(result);
         }
     }
@@ -490,7 +494,7 @@ pub async fn search_alpha_in_all_collections(
         let filter = doc! { "id": &query.id };
         
         if let Ok(Some(doc)) = collection.find_one(filter, None).await {
-            if let Some(result) = parse_alpha_document(doc) {
+            if let Some(result) = parse_alpha_document(doc, None) {
                 return Ok(Some(AlphaInCollectionResult {
                     id: result.id,
                     collection: coll_name,

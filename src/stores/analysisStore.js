@@ -3,6 +3,7 @@ import { ref } from 'vue';
 
 export const useAnalysisStore = defineStore('analysis', () => {
   const selectedCollection = ref("alpha_results");
+  const embedding = ref("");
   const searchQuery = ref("");
   const region = ref("");
   const delay = ref("");
@@ -20,6 +21,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
 
   function reset() {
     selectedCollection.value = "alpha_results";
+    embedding.value = "";
     searchQuery.value = "";
     region.value = "";
     delay.value = "";
@@ -38,6 +40,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
 
   return {
     selectedCollection,
+    embedding,
     searchQuery,
     region,
     delay,

@@ -170,20 +170,32 @@
           <div v-if="searchResults.length === 0 && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 40px; width: 100%;">
             请先搜索Alpha以显示PNL图表
           </div>
-          <div v-else :style="{width: pcaAlphas.length > 0 ? '50%' : '100%'}">
+          <div v-else :style="{width: pcaAlphas.length > 0 ? '50%' : '100%', display: 'flex', 'flex-direction': 'column'}">
+            <h4 style="margin: 0 0 8px 0; text-align: center;">PnL 对比</h4>
             <v-chart
               ref="chartRef"
               :option="chartOption"
-              style="width: 100%; height: 500px"
+              style="width: 100%; flex: 1"
               @click="handleChartClick"
               @datazoom="handleDataZoom"
               :autoresize="true"
             />
           </div>
-          <div v-if="pcaAlphas.length > 0" style="width: 50%;">
+          <div v-if="pcaAlphas.length > 0" style="width: 50%; display: flex; flex-direction: column;">
+            <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px;">
+               <h4 style="margin: 0;">PCA 聚类分析</h4>
+               <n-select
+                v-model:value="embedding"
+                :options="configStore.embeddingOptions"
+                placeholder="Embedding"
+                size="tiny"
+                style="width: 160px"
+                clearable
+              />
+            </div>
             <v-chart
               :option="pcaChartOption"
-              style="width: 100%; height: 500px"
+              style="width: 100%; flex: 1"
               :autoresize="true"
             />
           </div>
@@ -228,6 +240,7 @@ const configStore = useConfigStore();
 const analysisStore = useAnalysisStore();
 const {
   selectedCollection,
+  embedding,
   searchQuery,
   region,
   delay,
@@ -311,11 +324,6 @@ const pcaChartOption = computed(() => {
   }));
 
   return {
-    title: {
-        text: 'PCA 聚类分析',
-        left: 'center',
-        top: 0
-    },
     grid: { left: 40, right: '15%', top: '15%', bottom: 40 },
     legend: {
         right: 10,
@@ -729,6 +737,7 @@ async function searchAlphas() {
     
     const params = {
       collection: selectedCollection.value,
+      embedding: embedding?.value || null,
       query: searchParam,
       region: regionParam,
       delay: delayParam,
@@ -1107,8 +1116,18 @@ watch(searchResults, (newResults) => {
 
 // --- Lifecycle ---
 onMounted(() => {
-  // 初始化时可以执行一些操作
+  // Set default embedding if not set
+  if (!embedding.value && configStore.embeddingOptions.length > 0) {
+    embedding.value = configStore.embeddingOptions[0].value;
+  }
 });
+
+// Watch for embedding options loading to set default if still empty
+watch(() => configStore.embeddingOptions, (options) => {
+  if (!embedding.value && options && options.length > 0) {
+    embedding.value = options[0].value;
+  }
+}, { immediate: true });
 
 // 确保在搜索结果更新后加载PNL数据
 watch([searchResults, selectedCollection], () => {

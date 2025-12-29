@@ -47,13 +47,38 @@
 
         <n-card title="Data Filter Options" size="small">
           <div v-for="(option, index) in localDataFilterOptions" :key="index" style="display: flex; align-items: center; margin-bottom: 6px;">
-            <n-input v-model:value="option.label" placeholder="Label" style="margin-right: 8px; width: 120px;" spellcheck="false" size="small" />
-            <n-input v-model:value="option.value" placeholder="Value" style="margin-right: 8px; width: 120px;" spellcheck="false" size="small" />
+            <n-input 
+              :value="option.value" 
+              @update:value="(val) => { option.value = val; option.label = val; }"
+              placeholder="Value" 
+              style="margin-right: 8px; flex: 1;" 
+              spellcheck="false" 
+              size="small" 
+            />
             <n-button @click="removeOption(index)" type="error" ghost size="small">
               Remove
             </n-button>
           </div>
           <n-button @click="addOption" type="primary" ghost style="margin-top: 6px;" size="small">
+            Add Option
+          </n-button>
+        </n-card>
+
+        <n-card title="Embedding Options" size="small">
+          <div v-for="(option, index) in localEmbeddingOptions" :key="index" style="display: flex; align-items: center; margin-bottom: 6px;">
+            <n-input 
+              :value="option.value" 
+              @update:value="(val) => { option.value = val; option.label = val; }"
+              placeholder="Value" 
+              style="margin-right: 8px; flex: 1;" 
+              spellcheck="false" 
+              size="small" 
+            />
+            <n-button @click="removeEmbeddingOption(index)" type="error" ghost size="small">
+              Remove
+            </n-button>
+          </div>
+          <n-button @click="addEmbeddingOption" type="primary" ghost style="margin-top: 6px;" size="small">
             Add Option
           </n-button>
         </n-card>
@@ -206,6 +231,7 @@ const localPaths = ref({
   priorityTemplatePath: '',
 });
 const localDataFilterOptions = ref([]);
+const localEmbeddingOptions = ref([]);
 const editableButtonMappings = ref([]);
 const localMongoConfig = ref({
   local_uri: '',
@@ -229,6 +255,7 @@ onMounted(async () => {
   // Deep copy to avoid direct mutation
   localPaths.value = JSON.parse(JSON.stringify(configStore.paths || {}));
   localDataFilterOptions.value = JSON.parse(JSON.stringify(configStore.dataFilterOptions || []));
+  localEmbeddingOptions.value = JSON.parse(JSON.stringify(configStore.embeddingOptions || []));
   editableButtonMappings.value = JSON.parse(JSON.stringify(configStore.buttonMappings || []));
   
   // Initialize MongoDB and Python configs from backendConfig
@@ -264,6 +291,14 @@ function removeOption(index) {
   localDataFilterOptions.value.splice(index, 1);
 }
 
+function addEmbeddingOption() {
+  localEmbeddingOptions.value.push({ label: '', value: '' });
+}
+
+function removeEmbeddingOption(index) {
+  localEmbeddingOptions.value.splice(index, 1);
+}
+
 async function handleSave() {
   const savePromises = [];
   
@@ -271,15 +306,18 @@ async function handleSave() {
   const frontendConfig = {
     paths: localPaths.value,
     dataFilterOptions: localDataFilterOptions.value,
+    embeddingOptions: localEmbeddingOptions.value,
   };
   
   const frontendChanged = JSON.stringify(frontendConfig.paths) !== JSON.stringify(configStore.paths || {}) ||
-                          JSON.stringify(frontendConfig.dataFilterOptions) !== JSON.stringify(configStore.dataFilterOptions || []);
+                          JSON.stringify(frontendConfig.dataFilterOptions) !== JSON.stringify(configStore.dataFilterOptions || []) ||
+                          JSON.stringify(frontendConfig.embeddingOptions) !== JSON.stringify(configStore.embeddingOptions || []);
   
   if (frontendChanged) {
     configStore.$patch({
       paths: frontendConfig.paths,
       dataFilterOptions: frontendConfig.dataFilterOptions,
+      embeddingOptions: frontendConfig.embeddingOptions,
     });
     savePromises.push(configStore.saveFrontendConfig(frontendConfig));
   }

@@ -42,7 +42,10 @@ import { invoke } from "@tauri-apps/api/core";
 import DataFilters from "../components/data/DataFilters.vue";
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 
+import { useConfigStore } from "../stores/configStore.js";
+
 // --- Reactive State ---
+const configStore = useConfigStore();
 const data = ref([]);
 const corrLoading = ref(false);
 const pnlDataMap = ref({});
@@ -51,6 +54,7 @@ const expandedRowIds = ref(new Set());
 
 const filters = reactive({
   collection: "alpha_results",
+  embedding: "",
   searchQuery: "",
   id: "",
   messages: [], // This is for NIN
@@ -97,6 +101,7 @@ async function fetchData() {
 
   const params = {
     collection: filters.collection || "alpha_results",
+    embedding: filters.embedding || null,
     query: filters.searchQuery.trim() || null,
     id: filters.id.trim() || null,
     messages_nin: filters.messages.length > 0 ? filters.messages : null,
@@ -201,8 +206,19 @@ watch(
 );
 
 onMounted(() => {
+  // Set default embedding if not set
+  if (!filters.embedding && configStore.embeddingOptions.length > 0) {
+    filters.embedding = configStore.embeddingOptions[0].value;
+  }
   fetchData();
 });
+
+watch(() => configStore.embeddingOptions, (options) => {
+  if (!filters.embedding && options && options.length > 0) {
+    filters.embedding = options[0].value;
+    fetchData();
+  }
+}, { immediate: true });
 </script>
 
 <style>

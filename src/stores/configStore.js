@@ -11,6 +11,7 @@ export const useConfigStore = defineStore('config', () => {
     priorityTemplatePath: '',
   });
   const dataFilterOptions = ref([]);
+  const embeddingOptions = ref([]);
   const backendConfig = ref({}); // Will hold the parsed TOML object
   const buttonMappings = ref([]); // Will hold the button mappings
   const isLoading = ref(true);
@@ -55,11 +56,13 @@ export const useConfigStore = defineStore('config', () => {
       const config = _parseContent(content);
       paths.value = config.paths || { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
       dataFilterOptions.value = config.dataFilterOptions || [];
+      embeddingOptions.value = config.embeddingOptions || [];
     } catch (e) {
       console.error('Failed to fetch or parse config.js:', e);
       error.value = 'Failed to load configurations. Please check the configuration file.';
       paths.value = { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
       dataFilterOptions.value = [];
+      embeddingOptions.value = [];
     } finally {
       isLoading.value = false;
     }
@@ -186,6 +189,7 @@ export const useConfigStore = defineStore('config', () => {
   return {
     paths,
     dataFilterOptions,
+    embeddingOptions,
     backendConfig,
     buttonMappings,
     isLoading,
