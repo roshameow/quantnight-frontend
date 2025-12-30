@@ -208,7 +208,22 @@
               </n-button-group>
 
               <!-- Custom Overlay Legend -->
-              <div style="position: absolute; top: 10px; right: 10px; width: 200px; max-height: 80%; z-index: 10; background-color: rgba(255, 255, 255, 0.6); border-radius: 8px; padding: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); display: flex; flex-direction: column;">
+              <div v-if="isLegendCollapsed"
+                   style="position: absolute; top: 10px; right: 10px; z-index: 10; cursor: pointer; display: flex; align-items: center; justify-content: flex-end; gap: 4px; padding: 2px 6px;"
+                   @click="isLegendCollapsed = false">
+                <span style="font-size: 13px; color: #333;">Clusters</span>
+                <n-button text size="tiny" style="font-size: 12px; color: #333;">
+                  ◀
+                </n-button>
+              </div>
+
+              <div v-else
+                   style="position: absolute; top: 10px; right: 10px; width: 200px; max-height: 80%; z-index: 10; background-color: rgba(255, 255, 255, 0.8); border-radius: 8px; padding: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); display: flex; flex-direction: column;">
+                  <div style="display: flex; justify-content: flex-end; align-items: center; cursor: pointer; margin-bottom: 4px; padding: 0 2px;" @click="isLegendCollapsed = true">
+                    <n-button text size="tiny" style="font-size: 12px;">
+                      ▲
+                    </n-button>
+                  </div>
                   <div style="flex: 1; overflow-y: auto;">
                     <div 
                       v-for="item in clusterLegendData" 
@@ -289,6 +304,7 @@ const chartRef = ref(null);
 const clusterChartRef = ref(null);
 const sortKey = ref(null);
 const sortOrder = ref(null);
+const isLegendCollapsed = ref(false); // 控制聚类图例的折叠状态
 const clusterChartZoomState = ref({
   xAxisStart: 0,
   xAxisEnd: 100,
