@@ -2,9 +2,6 @@
 
 QuantNight 是一款专为量化研究与模拟设计的桌面应用，旨在帮助您高效地管理、执行和分析各类量化任务。
 
-<!-- 在此处可以放置一张应用的截图 -->
-<!-- ![QuantNight App Screenshot](link_to_screenshot.png) -->
-
 ---
 
 ## 核心功能
@@ -115,3 +112,7 @@ graph TD
 1.  **下载**: 前往项目的 Releases 页面下载最新的 `.msi` 安装包。
 2.  **安装**: 双击 `.msi` 文件，按照向导完成安装。
 3.  **安全提示**: 首次运行时，如果 Windows SmartScreen 弹出拦截提示，请点击 `更多信息` -> `仍要运行`。
+
+---
+
+![QuantNight Demo](assets/demo.gif)
