@@ -197,15 +197,33 @@
               <v-chart
                 ref="clusterChartRef"
                 :option="clusterChartOption"
-                style="width: 100%; height: 100%;"
+                style="width: 100%; height: 100%; box-sizing: border-box;"
                 :autoresize="true"
                 @click="handleClusterChartClick"
                 @datazoom="handleClusterDataZoom"
               />
-              <n-button-group size="tiny" style="position: absolute; top: 10px; right: 10px; z-index: 1;">
+              <n-button-group size="tiny" style="position: absolute; top: 10px; left: 10px; z-index: 10;">
                 <n-button @click="zoomInCluster"> + </n-button>
                 <n-button @click="zoomOutCluster"> - </n-button>
               </n-button-group>
+
+              <!-- Custom Overlay Legend -->
+              <div style="position: absolute; top: 10px; right: 10px; width: 200px; max-height: 80%; z-index: 10; background-color: rgba(255, 255, 255, 0.6); border-radius: 8px; padding: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); display: flex; flex-direction: column;">
+                  <div style="flex: 1; overflow-y: auto;">
+                    <div 
+                      v-for="item in clusterLegendData" 
+                      :key="item.id"
+                      @mouseover="highlightCluster(item.name)"
+                      @mouseout="downplayCluster(item.name)"
+                      @click="selectAlphasInCluster(item.id)"
+                      style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px; cursor: pointer; padding: 2px; border-radius: 4px;"
+                      class="legend-item"
+                    >
+                      <span :style="{ backgroundColor: item.color, width: '12px', height: '12px', borderRadius: '50%', display: 'inline-block' }"></span>
+                      <span style="font-size: 12px; flex: 1; word-break: break-all;">{{ item.id }} ({{ item.count }})</span>
+                    </div>
+                  </div>
+              </div>
             </div>
           </div>
         </div>
@@ -278,6 +296,54 @@ const clusterChartZoomState = ref({
   yAxisEnd: 100,
 });
 
+// --- Chart Interactivity ---
+function highlightCluster(seriesName) {
+  clusterChartRef.value?.dispatchAction({
+    type: 'highlight',
+    seriesName: seriesName
+  });
+}
+
+function downplayCluster(seriesName) {
+  clusterChartRef.value?.dispatchAction({
+    type: 'downplay',
+    seriesName: seriesName
+  });
+}
+
+function selectAlphasInCluster(clusterId) {
+  const alphasInCluster = searchResults.value.filter(a => a.cluster_id === clusterId);
+  if (alphasInCluster.length === 0) return;
+
+  const alphaIdsInCluster = alphasInCluster.map(a => a.id);
+
+  // Check if all alphas in the cluster are already selected
+  const allSelected = alphaIdsInCluster.every(id => selectedAlphaIds.value.has(id));
+
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
+
+  if (allSelected) {
+    // If all are selected, deselect them
+    alphaIdsInCluster.forEach(id => {
+      newIdSet.delete(id);
+      newMap.delete(id);
+    });
+    message.info(`已取消选择 Cluster ${clusterId} 中的 ${alphaIdsInCluster.length} 个 Alpha`);
+  } else {
+    // If some or none are selected, select all of them
+    alphasInCluster.forEach(alpha => {
+      newIdSet.add(alpha.id);
+      newMap.set(alpha.id, alpha);
+    });
+    message.success(`已选择 Cluster ${clusterId} 中的 ${alphasInCluster.length} 个 Alpha`);
+  }
+
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
+}
+
+
 // --- Zoom Methods ---
 function zoomCluster(zoomFactor) {
   const { xAxisStart, xAxisEnd, yAxisStart, yAxisEnd } = clusterChartZoomState.value;
@@ -303,19 +369,23 @@ function zoomCluster(zoomFactor) {
   newYEnd = Math.min(100, newYEnd);
   
   // Prevent getting stuck if zoomed in too far
-  if (newXEnd - newXStart < 0.01) {
-    newXEnd = newXStart + 0.01;
-  }
-   if (newYEnd - newYStart < 0.01) {
-    newYEnd = newYStart + 0.01;
-  }
+  if (newXEnd - newXStart < 0.01) newXEnd = newXStart + 0.01;
+  if (newYEnd - newYStart < 0.01) newYEnd = newYStart + 0.01;
 
-  clusterChartZoomState.value = {
-    xAxisStart: newXStart,
-    xAxisEnd: newXEnd,
-    yAxisStart: newYStart,
-    yAxisEnd: newYEnd,
-  };
+  // Dispatch actions directly to ECharts
+  clusterChartRef.value?.dispatchAction({
+    type: 'dataZoom',
+    dataZoomId: 'dataZoomX',
+    start: newXStart,
+    end: newXEnd
+  });
+   clusterChartRef.value?.dispatchAction({
+    type: 'dataZoom',
+    dataZoomId: 'dataZoomY',
+    start: newYStart,
+    end: newYEnd
+  });
+  // The @datazoom event will update the clusterChartZoomState ref
 }
 
 function zoomInCluster() {
@@ -328,20 +398,22 @@ function zoomOutCluster() {
 
 function handleClusterDataZoom(params) {
   // This function is called on pan/drag, so we need to update our state.
-  // ECharts can send different payload structures.
-  let zoomPayload = params;
+  const updateZoomState = (payload) => {
+    if (payload.dataZoomId === 'dataZoomX') {
+      clusterChartZoomState.value.xAxisStart = payload.start;
+      clusterChartZoomState.value.xAxisEnd = payload.end;
+    }
+    if (payload.dataZoomId === 'dataZoomY') {
+      clusterChartZoomState.value.yAxisStart = payload.start;
+      clusterChartZoomState.value.yAxisEnd = payload.end;
+    }
+  };
+
   if (params.batch) {
-     // Inside datazoom events often come in a batch
-    zoomPayload = params.batch[0];
-  }
-  
-  if (zoomPayload.dataZoomId && zoomPayload.dataZoomId.includes('xAxis')) {
-    clusterChartZoomState.value.xAxisStart = zoomPayload.start;
-    clusterChartZoomState.value.xAxisEnd = zoomPayload.end;
-  }
-  if (zoomPayload.dataZoomId && zoomPayload.dataZoomId.includes('yAxis')) {
-     clusterChartZoomState.value.yAxisStart = zoomPayload.start;
-     clusterChartZoomState.value.yAxisEnd = zoomPayload.end;
+    // Inside datazoom events often come in a batch
+    params.batch.forEach(updateZoomState);
+  } else {
+    updateZoomState(params);
   }
 }
 
@@ -420,16 +492,49 @@ const clusterAlphas = computed(() => {
   );
 });
 
-const clusterChartOption = computed(() => {
-  const clusterAlphas = searchResults.value.filter(alpha => 
-    alpha.cluster_x != null && alpha.cluster_y != null && alpha.cluster_id != null
-  );
+const clusterLegendData = computed(() => {
+  if (clusterAlphas.value.length === 0) return [];
+  
+  const clusterMap = new Map();
+  clusterAlphas.value.forEach(alpha => {
+    const clusterId = alpha.cluster_id;
+    clusterMap.set(clusterId, (clusterMap.get(clusterId) || 0) + 1);
+  });
+  
+  const colors = [
+    "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de",
+    "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#5D9CEC",
+    "#48CFAD", "#FFCE54", "#A0D468", "#4FC1E9", "#AC92EC"
+  ];
+  let colorIndex = 0;
 
-  if (clusterAlphas.length === 0) return {};
+  // Sort by clusterId if it's a number, otherwise sort by string
+  const sortedClusterIds = Array.from(clusterMap.keys()).sort((a, b) => {
+    if (typeof a === 'number' && typeof b === 'number') {
+      return a - b;
+    }
+    return String(a).localeCompare(String(b));
+  });
+
+  return sortedClusterIds.map(id => {
+    const seriesName = `Cluster ${id}`;
+    const color = colors[colorIndex % colors.length];
+    colorIndex++;
+    return {
+      id: id,
+      count: clusterMap.get(id),
+      name: seriesName,
+      color: color
+    };
+  });
+});
+
+const clusterChartOption = computed(() => {
+  if (clusterAlphas.value.length === 0) return {};
 
   // Group data by cluster_id
   const clusters = new Map();
-  clusterAlphas.forEach(p => {
+  clusterAlphas.value.forEach(p => {
     const clusterId = p.cluster_id;
     if (!clusters.has(clusterId)) {
       clusters.set(clusterId, []);
@@ -440,10 +545,13 @@ const clusterChartOption = computed(() => {
     });
   });
 
-  const series = Array.from(clusters.entries()).map(([clusterId, data]) => ({
-    name: `Cluster ${clusterId}`,
+  const series = clusterLegendData.value.map(legendItem => ({
+    name: legendItem.name,
     type: 'scatter',
-    data: data,
+    data: clusters.get(legendItem.id) || [],
+    itemStyle: {
+      color: legendItem.color
+    },
     emphasis: {
       focus: 'series',
       scale: true,
@@ -456,12 +564,9 @@ const clusterChartOption = computed(() => {
   }));
 
   return {
-    grid: { left: 40, right: '15%', top: '15%', bottom: 40 },
+    grid: { left: 10, right: 10, top: 10, bottom: 20 },
     legend: {
-        right: 10,
-        top: '10%',
-        orient: 'vertical',
-        data: series.map(s => s.name)
+        show: false // Disable the built-in legend
     },
     tooltip: {
        formatter: (params) => {
@@ -484,12 +589,10 @@ const clusterChartOption = computed(() => {
     },
     visualMap: {
         type: 'piecewise',
-        show: false, // Can be hidden as legend + style does the job
-        dimension: 2, // Map to the third dimension (isSelected)
+        show: false,
+        dimension: 2,
         pieces: [
-            // Selected items: solid color, original size
             {value: 1, colorAlpha: 1}, 
-            // Unselected items: semi-transparent, original size
             {value: 0, colorAlpha: 0.3},
         ],
     },
@@ -498,17 +601,11 @@ const clusterChartOption = computed(() => {
         id: 'dataZoomX',
         type: 'inside',
         xAxisIndex: 0,
-        zoomOnMouseWheel: false,
-        start: clusterChartZoomState.value.xAxisStart,
-        end: clusterChartZoomState.value.xAxisEnd,
       },
       {
         id: 'dataZoomY',
         type: 'inside',
         yAxisIndex: 0,
-        zoomOnMouseWheel: false,
-        start: clusterChartZoomState.value.yAxisStart,
-        end: clusterChartZoomState.value.yAxisEnd,
       },
     ],
     series
@@ -1282,6 +1379,12 @@ async function loadPNL(id, collection = null) {
 }
 
 // --- Watchers ---
+watch(embedding, (newValue, oldValue) => {
+  if (newValue !== oldValue && searchResults.value.length > 0) {
+    searchAlphas();
+  }
+});
+
 watch(alphasToDisplay, (alphas) => {
   if (alphas && alphas.length > 0) {
     alphas.forEach(alpha => {
@@ -1311,5 +1414,8 @@ watch(() => configStore.embeddingOptions, (options) => {
 <style scoped>
 .n-tag {
   margin: 4px;
+}
+.legend-item:hover {
+  background-color: #f0f0f0 !important;
 }
 </style>

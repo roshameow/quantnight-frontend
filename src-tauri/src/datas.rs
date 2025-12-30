@@ -35,7 +35,7 @@ pub struct AlphaResult {
         pub pnl_score: Option<f64>,   // ✅ 新增
         pub cluster_x: Option<f64>,
         pub cluster_y: Option<f64>,
-        pub cluster_id: Option<usize>,
+        pub cluster_id: Option<serde_json::Value>,
     }
 
 #[derive(Deserialize)]
@@ -134,8 +134,14 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
                     let x = umap.get_f64("x").ok();
                     let y = umap.get_f64("y").ok();
                     let cid = umap.get_document("cluster").ok()
-                                .and_then(|c| c.get_i32("id").ok())
-                                .map(|v| v as usize);
+                                .and_then(|c| c.get("id"))
+                                .and_then(|id_val| match id_val {
+                                    mongodb::bson::Bson::Int32(i) => Some(serde_json::json!(i)),
+                                    mongodb::bson::Bson::Int64(i) => Some(serde_json::json!(i)),
+                                    mongodb::bson::Bson::Double(f) => Some(serde_json::json!(f)),
+                                    mongodb::bson::Bson::String(s) => Some(serde_json::json!(s)),
+                                    _ => None,
+                                });
                     (x, y, cid)
                 })
         } else {
@@ -467,7 +473,7 @@ pub struct AlphaInCollectionResult {
     pub message: Option<String>,
     pub cluster_x: Option<f64>,
     pub cluster_y: Option<f64>,
-    pub cluster_id: Option<usize>,
+    pub cluster_id: Option<serde_json::Value>,
 }
 
 #[command]
