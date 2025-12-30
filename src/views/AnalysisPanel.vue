@@ -723,7 +723,7 @@ const chartOption = computed(() => {
   });
 
   return {
-    grid: { left: 50, right: 40, top: 40, bottom: 80, containLabel: true },
+    grid: { left: 50, right: 60, top: 40, bottom: 50, containLabel: true },
     tooltip: {
       show: true,
       trigger: 'item',
@@ -786,26 +786,35 @@ const chartOption = computed(() => {
     dataZoom: [
       {
         type: "inside",
+        xAxisIndex: 0,
         start: chartZoomState.value.xAxisStart,
         end: chartZoomState.value.xAxisEnd,
       },
       {
+        type: "slider",
+        xAxisIndex: 0,
         start: chartZoomState.value.xAxisStart,
         end: chartZoomState.value.xAxisEnd,
+        height: 15,
+        bottom: 35, // Adjusted to be closer to x-axis labels
+        showDataShadow: false,
+        showDetail: true, // Show detail
       },
       {
-        type: "inside", // 添加y轴内部缩放
+        type: "inside",
         yAxisIndex: 0,
         start: chartZoomState.value.yAxisStart,
         end: chartZoomState.value.yAxisEnd,
       },
       {
-        type: "slider", // 添加y轴滑动条缩放
+        type: "slider",
         yAxisIndex: 0,
         start: chartZoomState.value.yAxisStart,
         end: chartZoomState.value.yAxisEnd,
-        width: 20, // 滑动条宽度
-        right: 10, // 距离右侧的距离
+        width: 15,
+        right: 40, // Adjusted to be closer to y-axis labels
+        showDataShadow: false,
+        showDetail: true, // Show detail
       },
     ],
     xAxis: {
