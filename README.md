@@ -1,6 +1,8 @@
 # QuantNight 量化任务管理器
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+[English](./README.en.md)
+
+![Version](https://img.shields.io/badge/version-1.2.1-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 [![Vue.js](https://img.shields.io/badge/Built%20with-Vue.js-4FC08D?logo=vue.js)](https://vuejs.org/)
 [![Tauri](https://img.shields.io/badge/Built%20with-Tauri-24C8E2?logo=tauri)](https://tauri.app/)
