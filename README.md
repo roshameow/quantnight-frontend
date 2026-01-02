@@ -1,5 +1,11 @@
 # QuantNight 量化任务管理器
 
+![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+[![Vue.js](https://img.shields.io/badge/Built%20with-Vue.js-4FC08D?logo=vue.js)](https://vuejs.org/)
+[![Tauri](https://img.shields.io/badge/Built%20with-Tauri-24C8E2?logo=tauri)](https://tauri.app/)
+![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macos-lightgrey.svg)
+
 QuantNight 是一款专为量化研究与模拟设计的桌面应用，旨在帮助您高效地管理、执行和分析各类量化任务。
 
 ---
