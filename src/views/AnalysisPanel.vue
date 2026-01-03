@@ -95,13 +95,18 @@
                 }"
               >
                 <div style="display: flex; align-items: center; justify-content: space-between">
-                  <span>{{ alpha.id }}</span>
-                  <n-checkbox
-                    :checked="selectedAlphaIds.has(alpha.id)"
-                    @update:checked="toggleAlphaSelection(alpha.id)"
-                    @click.stop
-                    size="small"
-                  />
+                  <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ alpha.id }}</span>
+                  <div style="display: flex; align-items: center; flex-shrink: 0;">
+                    <n-checkbox
+                      :checked="selectedAlphaIds.has(alpha.id)"
+                      @update:checked="toggleAlphaSelection(alpha.id)"
+                      @click.stop
+                      size="small"
+                    />
+                    <n-button text size="tiny" @click.stop="removeAlpha(alpha.id)" style="margin-left: 4px; padding: 0 4px; font-weight: bold;">
+                      ×
+                    </n-button>
+                  </div>
                 </div>
               </div>
               
@@ -1082,10 +1087,18 @@ function toggleAlphaSelection(alphaId) {
 }
 
 function removeAlpha(alphaId) {
-  // 从选择中移除
-  selectedAlphaIds.value.delete(alphaId);
   // 从搜索结果中移除
   searchResults.value = searchResults.value.filter(alpha => alpha.id !== alphaId);
+
+  // 从选择中移除（如果存在）
+  if (selectedAlphaIds.value.has(alphaId)) {
+    const newIdSet = new Set(selectedAlphaIds.value);
+    const newMap = new Map(selectedAlphasMap.value);
+    newIdSet.delete(alphaId);
+    newMap.delete(alphaId);
+    selectedAlphaIds.value = newIdSet;
+    selectedAlphasMap.value = newMap;
+  }
 }
 
 function clearSelections() {
