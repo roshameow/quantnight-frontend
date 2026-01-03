@@ -1379,17 +1379,63 @@ async function importSelection() {
         
                 
         
-                // 显示结果
+                        
         
-                if (notFoundIds.length > 0) {
+                
         
-                  message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
+                        // After adding all imported alphas, re-fetch with embedding for cluster data
         
-                } else {
+                
         
-                  message.success(`成功导入 ${validIds.length} 个Alpha ID`);
+                        if (searchResults.value.length > 0) {
         
-                }
+                
+        
+                            const allIds = searchResults.value.map(alpha => alpha.id);
+        
+                
+        
+                            const inQuery = { id: { $in: allIds } };
+        
+                
+        
+                            searchQuery.value = JSON.stringify(inQuery);
+        
+                
+        
+                            await searchAlphas();
+        
+                
+        
+                        }
+        
+                
+        
+                
+        
+                
+        
+                        // 显示结果
+        
+                
+        
+                        if (notFoundIds.length > 0) {
+        
+                
+        
+                          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
+        
+                
+        
+                        } else {
+        
+                
+        
+                          message.success(`成功导入 ${validIds.length} 个Alpha ID`);
+        
+                
+        
+                        }
       } catch (error) {
         message.error('导入文件解析失败');
       }
