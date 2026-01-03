@@ -20,7 +20,7 @@
             placeholder="输入查询条件（留空或输入{}查询全部）"
             clearable
             style="width: 100%"
-            @keyup.enter="searchAlphas"
+            @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
 
@@ -31,7 +31,7 @@
             placeholder="Region"
             clearable
             style="width: 100%"
-            @keyup.enter="searchAlphas"
+            @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
 
@@ -42,13 +42,13 @@
             placeholder="Delay"
             clearable
             style="width: 100%"
-            @keyup.enter="searchAlphas"
+            @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
 
         <!-- 搜索按钮 -->
         <n-grid-item span="2">
-          <n-button type="primary" @click="searchAlphas" :loading="searchLoading" style="width: 100%">
+          <n-button type="primary" @click="() => searchAlphas()" :loading="searchLoading" style="width: 100%">
             搜索
           </n-button>
         </n-grid-item>
@@ -241,7 +241,7 @@
                       class="legend-item"
                     >
                       <span :style="{ backgroundColor: item.color, width: '12px', height: '12px', borderRadius: '50%', display: 'inline-block' }"></span>
-                      <span style="font-size: 12px; flex: 1; word-break: break-all;">{{ item.id }} ({{ item.count }})</span>
+                      <span style="font-size: 12px; flex: 1; word-break: break-all;">{{ item.id }} ({{ item.selectedCount }}/{{ item.count }})</span>
                     </div>
                   </div>
               </div>
@@ -520,7 +520,14 @@ const clusterLegendData = computed(() => {
   const clusterMap = new Map();
   clusterAlphas.value.forEach(alpha => {
     const clusterId = alpha.cluster_id;
-    clusterMap.set(clusterId, (clusterMap.get(clusterId) || 0) + 1);
+    if (!clusterMap.has(clusterId)) {
+      clusterMap.set(clusterId, { total: 0, selected: 0 });
+    }
+    const counts = clusterMap.get(clusterId);
+    counts.total++;
+    if (selectedAlphaIds.value.has(alpha.id)) {
+      counts.selected++;
+    }
   });
   
   const colors = [
@@ -542,9 +549,11 @@ const clusterLegendData = computed(() => {
     const seriesName = `Cluster ${id}`;
     const color = colors[colorIndex % colors.length];
     colorIndex++;
+    const counts = clusterMap.get(id);
     return {
       id: id,
-      count: clusterMap.get(id),
+      count: counts.total,
+      selectedCount: counts.selected,
       name: seriesName,
       color: color
     };
@@ -1019,10 +1028,12 @@ function processZoomParam(param) {
   }
 }
 
-async function searchAlphas() {
-  // Clear previous selections and results for a new search
-  selectedAlphaIds.value = new Set();
-  selectedAlphasMap.value = new Map();
+async function searchAlphas(keepSelection = false) {
+  if (!keepSelection) {
+    // Clear previous selections for a new search
+    selectedAlphaIds.value = new Set();
+    selectedAlphasMap.value = new Map();
+  }
 
   searchLoading.value = true;
   try {
@@ -1428,7 +1439,7 @@ async function loadPNL(id, collection = null) {
 // --- Watchers ---
 watch(embedding, (newValue, oldValue) => {
   if (newValue !== oldValue && searchResults.value.length > 0) {
-    searchAlphas();
+    searchAlphas(true); // Keep selection when changing embedding
   }
 });
 
