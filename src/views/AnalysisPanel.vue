@@ -154,17 +154,7 @@
       <div style="flex: 1; min-width: 0;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px;">
           <h3 style="margin: 0; white-space: nowrap;">数据可视化</h3>
-          <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px; white-space: nowrap; margin-left: auto;">
-              (PnL未选中仅显示前30)
-          </n-text>
-          <n-switch v-model:value="showSelectedOnly" style="margin-left: 8px;">
-            <template #checked>
-              仅显示选中(PnL)
-            </template>
-            <template #unchecked>
-              显示全部(PnL)
-            </template>
-          </n-switch>
+
         </div>
         
         <div style="display: flex; gap: 16px; min-height: 500px;">
@@ -172,7 +162,22 @@
             请先搜索Alpha以显示PNL图表
           </div>
           <div v-else :style="{width: clusterAlphas.length > 0 ? '50%' : '100%', display: 'flex', 'flex-direction': 'column'}">
-            <h4 style="margin: 0 0 8px 0; text-align: center;">PnL 对比</h4>
+            <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 8px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; width: 100%; padding-left: 50px; padding-right: 60px; box-sizing: border-box;">
+                <h4 style="margin: 0;">PnL 对比</h4>
+                <n-text v-if="!showSelectedOnly && searchResults.length > 30" type="warning" style="font-size: 12px; white-space: nowrap; margin-left: auto;">
+                    (PnL未选中仅显示前30)
+                </n-text>
+                <n-switch v-model:value="showSelectedOnly" style="margin-left: 8px;">
+                  <template #checked>
+                    仅显示选中(PnL)
+                  </template>
+                  <template #unchecked>
+                    显示全部(PnL)
+                  </template>
+                </n-switch>
+              </div>
+            </div>
             <v-chart
               ref="chartRef"
               :option="chartOption"
