@@ -75,7 +75,7 @@
               导出选中
             </n-button>
             <n-button size="tiny" @click="importSelection" style="width: 100%">
-              导入选择
+              导入列表
             </n-button>
           </n-space>
         </div>
@@ -138,7 +138,7 @@
         
         <!-- 动态调整按钮 -->
         <div v-if="searchResults.length > 0" style="margin-top: 8px">
-          <div style="display: flex; gap: 8px">
+          <div style="display: flex; gap: 8px; margin-bottom: 8px;">
             <n-button size="tiny" @click="selectAll" :disabled="searchResults.length === 0" style="flex: 1">
               全选
             </n-button>
@@ -146,6 +146,9 @@
               全不选
             </n-button>
           </div>
+          <n-button size="tiny" type="error" @click="clearAlphaList" :disabled="searchResults.length === 0" style="width: 100%">
+            清空列表
+          </n-button>
         </div>
       </div>
 
@@ -1098,6 +1101,13 @@ function clearSelections() {
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
+function clearAlphaList() {
+  searchResults.value = [];
+  selectedAlphaIds.value = new Set(); // Also clear selections when clearing the list
+  selectedAlphasMap.value = new Map(); // Also clear selections when clearing the list
+  message.success('已清空 Alpha 列表');
+}
+
 function selectAll() {
   const newIdSet = new Set(selectedAlphaIds.value);
   const newMap = new Map(selectedAlphasMap.value);
@@ -1287,64 +1297,99 @@ async function importSelection() {
         // 清除当前选择
         selectedAlphaIds.value.clear();
         
-        // 验证每个ID是否在alpha_db的任何collection中存在
-        const validIds = [];
-        const notFoundIds = [];
+                // 验证每个ID是否在alpha_db的任何collection中存在
         
-        for (const id of ids) {
-          try {
-            const result = await invoke("search_alpha_in_all_collections", { query: { id } });
-            if (result) {
-              validIds.push(id);
-              // 如果这个alpha不在当前搜索结果中，添加到搜索结果
-              if (!searchResults.value.some(alpha => alpha.id === id)) {
-                // 创建一个简化的alpha对象，只包含基本信息，并存储collection信息
-                searchResults.value.push({
-                  id: id,
-                  region: result.region || "Unknown",
-                  sharpe: result.sharpe,
-                  fitness: result.fitness,
-                  sub_universe_sharpe: result.sub_universe_sharpe,
-                  returns: result.returns,
-                  turnover: result.turnover,
-                  margin: result.margin,
-                  code: result.code,
-                  message: result.message,
-                  date_created: result.date_created,
-                  collection: result.collection // 存储collection信息
+                const searchPromises = ids.map(id => 
+        
+                    invoke("search_alpha_in_all_collections", { query: { id } })
+        
+                        .then(result => ({ id, result }))
+        
+                        .catch(error => {
+        
+                            console.error(`Error searching for alpha ${id}:`, error);
+        
+                            return { id, result: null, error: true };
+        
+                        })
+        
+                );
+        
+                
+        
+                const results = await Promise.all(searchPromises);
+        
+                
+        
+                const validIds = [];
+        
+                const notFoundIds = [];
+        
+        
+        
+                results.forEach(({ id, result, error }) => {
+        
+                    if (result && !error) {
+        
+                        validIds.push(id);
+        
+                        // 如果这个alpha不在当前搜索结果中，添加到搜索结果
+        
+                        if (!searchResults.value.some(alpha => alpha.id === id)) {
+        
+                            // 创建一个简化的alpha对象，只包含基本信息，并存储collection信息
+        
+                            searchResults.value.push({
+        
+                                id: id,
+        
+                                region: result.region || "Unknown",
+        
+                                sharpe: result.sharpe,
+        
+                                fitness: result.fitness,
+        
+                                sub_universe_sharpe: result.sub_universe_sharpe,
+        
+                                returns: result.returns,
+        
+                                turnover: result.turnover,
+        
+                                margin: result.margin,
+        
+                                code: result.code,
+        
+                                message: result.message,
+        
+                                date_created: result.date_created,
+        
+                                collection: result.collection // 存储collection信息
+        
+                            });
+        
+                        }
+        
+                    } else {
+        
+                        notFoundIds.push(id);
+        
+                    }
+        
                 });
-              }
-            } else {
-              notFoundIds.push(id);
-            }
-          } catch (error) {
-            console.error(`Error searching for alpha ${id}:`, error);
-            notFoundIds.push(id);
-          }
-        }
         
-        // 添加所有有效的ID到选择中
-        const newIdSet = new Set(selectedAlphaIds.value);
-        const newMap = new Map(selectedAlphasMap.value);
+                
         
-        validIds.forEach(id => {
-            newIdSet.add(id);
-            // Find the alpha object we just ensured exists in searchResults
-            const alpha = searchResults.value.find(a => a.id === id);
-            if (alpha) {
-                newMap.set(id, alpha);
-            }
-        });
+                // 显示结果
         
-        selectedAlphaIds.value = newIdSet;
-        selectedAlphasMap.value = newMap;
+                if (notFoundIds.length > 0) {
         
-        // 显示结果
-        if (notFoundIds.length > 0) {
-          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
-        } else {
-          message.success(`成功导入 ${validIds.length} 个Alpha ID`);
-        }
+                  message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
+        
+                } else {
+        
+                  message.success(`成功导入 ${validIds.length} 个Alpha ID`);
+        
+                }
       } catch (error) {
         message.error('导入文件解析失败');
       }
