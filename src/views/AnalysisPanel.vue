@@ -1284,7 +1284,7 @@ async function importSelection() {
   input.onchange = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
-    
+
     const reader = new FileReader();
     reader.onload = async (e) => {
       try {
@@ -1293,158 +1293,78 @@ async function importSelection() {
           message.error('导入文件格式错误');
           return;
         }
-        
-        // 清除当前选择
-        selectedAlphaIds.value.clear();
-        
-                // 验证每个ID是否在alpha_db的任何collection中存在
-        
-                const searchPromises = ids.map(id => 
-        
-                    invoke("search_alpha_in_all_collections", { query: { id } })
-        
-                        .then(result => ({ id, result }))
-        
-                        .catch(error => {
-        
-                            console.error(`Error searching for alpha ${id}:`, error);
-        
-                            return { id, result: null, error: true };
-        
-                        })
-        
-                );
-        
-                
-        
-                const results = await Promise.all(searchPromises);
-        
-                
-        
-                const validIds = [];
-        
-                const notFoundIds = [];
-        
-        
-        
-                results.forEach(({ id, result, error }) => {
-        
-                    if (result && !error) {
-        
-                        validIds.push(id);
-        
-                        // 如果这个alpha不在当前搜索结果中，添加到搜索结果
-        
-                        if (!searchResults.value.some(alpha => alpha.id === id)) {
-        
-                            // 创建一个简化的alpha对象，只包含基本信息，并存储collection信息
-        
-                            searchResults.value.push({
-        
-                                id: id,
-        
-                                region: result.region || "Unknown",
-        
-                                sharpe: result.sharpe,
-        
-                                fitness: result.fitness,
-        
-                                sub_universe_sharpe: result.sub_universe_sharpe,
-        
-                                returns: result.returns,
-        
-                                turnover: result.turnover,
-        
-                                margin: result.margin,
-        
-                                code: result.code,
-        
-                                message: result.message,
-        
-                                date_created: result.date_created,
-        
-                                collection: result.collection // 存储collection信息
-        
-                            });
-        
-                        }
-        
-                    } else {
-        
-                        notFoundIds.push(id);
-        
-                    }
-        
-                });
-        
-                
-        
-                        
-        
-                
-        
-                        // After adding all imported alphas, re-fetch with embedding for cluster data
-        
-                
-        
-                        if (searchResults.value.length > 0) {
-        
-                
-        
-                            const allIds = searchResults.value.map(alpha => alpha.id);
-        
-                
-        
-                            const inQuery = { id: { $in: allIds } };
-        
-                
-        
-                            searchQuery.value = JSON.stringify(inQuery);
-        
-                
-        
-                            await searchAlphas();
-        
-                
-        
-                        }
-        
-                
-        
-                
-        
-                
-        
-                        // 显示结果
-        
-                
-        
-                        if (notFoundIds.length > 0) {
-        
-                
-        
-                          message.warning(`成功导入 ${validIds.length} 个Alpha ID，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
-        
-                
-        
-                        } else {
-        
-                
-        
-                          message.success(`成功导入 ${validIds.length} 个Alpha ID`);
-        
-                
-        
-                        }
+
+        searchLoading.value = true;
+        
+        // Step 1: Validate IDs and get their collections
+        const initialSearchPromises = ids.map(id =>
+          invoke("search_alpha_in_all_collections", { query: { id } })
+        );
+        const initialResults = await Promise.all(initialSearchPromises);
+
+        const foundAlphas = initialResults.filter(r => r != null);
+        const notFoundIds = ids.filter(id => !foundAlphas.some(a => a.id === id));
+
+        // Step 2: Group found alphas by collection
+        const alphasByCollection = new Map();
+        foundAlphas.forEach(alpha => {
+          if (!alphasByCollection.has(alpha.collection)) {
+            alphasByCollection.set(alpha.collection, []);
+          }
+          alphasByCollection.get(alpha.collection).push(alpha.id);
+        });
+
+        // Step 3: Fetch full alpha data with embedding, in parallel for each collection
+        const fetchPromises = [];
+        for (const [collection, alphaIds] of alphasByCollection.entries()) {
+          const params = {
+            collection: collection,
+            embedding: embedding?.value || null,
+            query: JSON.stringify({ id: { $in: alphaIds } }),
+            region: null,
+            delay: null,
+            page: 1,
+            page_size: alphaIds.length,
+          };
+          fetchPromises.push(invoke("get_alpha_results", { params }));
+        }
+
+        const pagedResults = await Promise.all(fetchPromises);
+        
+        // Step 4: Combine results and update UI
+        const finalResults = pagedResults.flatMap(p => p.data || []);
+        
+        const resultsWithCollection = finalResults.map((item, index) => {
+            // Find the original collection since get_alpha_results does not return it.
+            const originalAlpha = foundAlphas.find(a => a.id === item.id);
+            return {
+                ...item,
+                collection: originalAlpha ? originalAlpha.collection : 'unknown'
+            };
+        });
+
+        searchResults.value = resultsWithCollection;
+        selectedAlphaIds.value = new Set();
+        selectedAlphasMap.value = new Map();
+
+        // Step 5: Show result message
+        if (notFoundIds.length > 0) {
+          message.warning(`成功导入 ${foundAlphas.length} 个Alpha，${notFoundIds.length} 个ID未在alpha_db中找到: ${notFoundIds.join(', ')}`);
+        } else {
+          message.success(`成功导入 ${foundAlphas.length} 个Alpha`);
+        }
+
       } catch (error) {
-        message.error('导入文件解析失败');
+        console.error("导入失败:", error);
+        message.error('导入文件解析失败或过程中出错');
+      } finally {
+        searchLoading.value = false;
       }
     };
     reader.readAsText(file);
   };
   input.click();
 }
-
 async function loadPNL(id, collection = null) {
   console.trace(`loadPNL called for ID: ${id}`);
   if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
