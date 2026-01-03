@@ -54,14 +54,7 @@
         </n-grid-item>
       </n-grid>
       
-      <!-- 第二行：清除选择按钮 -->
-      <n-grid :cols="24" :x-gap="12" :y-gap="12" style="margin-top: 8px">
-        <n-grid-item span="24" style="text-align: right">
-          <n-button @click="clearSelections" :disabled="selectedAlphaIds.size === 0">
-            清除选择
-          </n-button>
-        </n-grid-item>
-      </n-grid>
+
     </div>
 
     <!-- 主内容区域：Alpha选择和PNL图表横向并列 -->
