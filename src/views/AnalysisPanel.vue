@@ -1035,22 +1035,35 @@ async function searchAlphas(keepSelection = false) {
     selectedAlphasMap.value = new Map();
   }
 
+  let queryToUse = searchQuery.value.trim();
+  let collectionToUse = selectedCollection.value;
+  let regionToUse = region.value.trim() || null;
+  let delayToUse = delay.value.trim() ? parseInt(delay.value.trim()) : null;
+  let pageSize = 1000;
+
+  // If refreshing, build query from existing results, ignoring UI filters
+  if (keepSelection && searchResults.value.length > 0) {
+    const currentAlphaIds = searchResults.value.map(alpha => alpha.id);
+    const inQuery = { id: { $in: currentAlphaIds } };
+    queryToUse = JSON.stringify(inQuery);
+    regionToUse = null;
+    delayToUse = null;
+    pageSize = currentAlphaIds.length;
+  }
+
   searchLoading.value = true;
   try {
     // 如果查询为空或者是{}，则查询所有数据
-    const query = searchQuery.value.trim();
-    const searchParam = (query === "" || query === "{}") ? null : query;
-    const regionParam = region.value.trim() || null;
-    const delayParam = delay.value.trim() ? parseInt(delay.value.trim()) : null;
+    const searchParam = (queryToUse === "" || queryToUse === "{}") ? null : queryToUse;
     
     const params = {
-      collection: selectedCollection.value,
+      collection: collectionToUse,
       embedding: embedding?.value || null,
       query: searchParam,
-      region: regionParam,
-      delay: delayParam,
+      region: regionToUse,
+      delay: delayToUse,
       page: 1,
-      page_size: 1000, // 获取更多结果以便选择
+      page_size: pageSize,
     };
 
     console.log("搜索参数:", params);
@@ -1060,14 +1073,17 @@ async function searchAlphas(keepSelection = false) {
     // Inject collection into each result item so loadPNL knows where to find it
     const resultsWithCollection = (result.data || []).map(item => ({
       ...item,
-      collection: selectedCollection.value
+      collection: collectionToUse
     }));
     
     console.log("Full search results from backend:", resultsWithCollection);
     searchResults.value = resultsWithCollection;
   } catch (e) {
     console.error("Error searching alphas:", e);
-    searchResults.value = [];
+    // On new search, clear results. On refresh, maybe keep old data?
+    if (!keepSelection) {
+      searchResults.value = [];
+    }
   } finally {
     searchLoading.value = false;
   }
