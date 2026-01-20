@@ -223,6 +223,8 @@ pub async fn run_bash_script(
         args.push("--remote".to_string());
     }
 
+    println!("Executing Bash command: {} {}", command, args.join(" "));
+
     // 启动异步进程并管道 stdout/stderr
     let mut child = TokioCommand::new(command)
         .args(&args)
@@ -328,6 +330,8 @@ pub async fn run_python_command(
             final_args.push(replaced);
         }
     }
+
+    println!("Executing Python command: {} {}", command, final_args.join(" "));
 
     // 启动子进程，并管道 stdout/stderr
     let mut child = TokioCommand::new(command)
