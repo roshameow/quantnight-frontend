@@ -11,16 +11,16 @@ remote_uri = "mongodb://localhost:27017"
   alpha = "alpha_db"
 
 [python]
-interpreter = "python3"
+interpreter = "uv"
 working_dir = "./"
 
 [python.scripts.generate_list]
-command = "python3"
-args = ["-m", "backend.mongodb.mongo_datum", "--template", "{template}", "--alpha_filename", "{name}"]
+command = "uv"
+args = ["run", "-m", "backend.mongodb.mongo_datum", "--template", "{template}", "--alpha_filename", "{name}"]
 
 [python.scripts.alpha_correlation]
-command = "python3"
-args = ["-m", "pnl.alpha_correlation", "--alpha_ids={alpha_ids}"]
+command = "uv"
+args = ["run", "-m", "pnl.alpha_correlation", "--alpha_ids={alpha_ids}"]
 
 [bash]
 working_dir = "./"

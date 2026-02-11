@@ -314,8 +314,11 @@ pub async fn run_python_command(
         .as_ref()
         .unwrap_or(&config.python.interpreter);
 
-    // 构造参数：-u 确保 unbuffered 输出
-    let mut final_args = vec!["-u".to_string()];
+    // 构造参数：如果是 python 则添加 -u 确保 unbuffered 输出，如果是 uv 则不添加
+    let mut final_args = Vec::new();
+    if command.contains("python") {
+        final_args.push("-u".to_string());
+    }
 
     for arg in &script_cfg.args {
         if arg == "{extra_args}" {
