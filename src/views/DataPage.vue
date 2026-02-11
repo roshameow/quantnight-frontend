@@ -7,6 +7,9 @@
       <n-tab-pane name="analysis" tab="数据分析">
         <AnalysisPanel />
       </n-tab-pane>
+      <n-tab-pane name="stats" tab="提交统计">
+        <SubmissionStatsPanel />
+      </n-tab-pane>
     </n-tabs>
   </div>
 </template>
@@ -15,6 +18,7 @@
 import { NTabs, NTabPane } from "naive-ui";
 import AlphaTablePanel from "./AlphaTablePanel.vue";
 import AnalysisPanel from "./AnalysisPanel.vue";
+import SubmissionStatsPanel from "./SubmissionStatsPanel.vue";
 </script>
 
 <style scoped>

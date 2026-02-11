@@ -32,16 +32,18 @@ pub struct AlphaResult {
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
-        pub pnl_score: Option<f64>,   // ✅ 新增
-        pub cluster_x: Option<f64>,
-        pub cluster_y: Option<f64>,
-        pub cluster_id: Option<serde_json::Value>,
-    }
+    pub date_submitted: Option<String>,  // ✅ 新增提交日期
+    pub pnl_score: Option<f64>,   // ✅ 新增
+    pub cluster_x: Option<f64>,
+    pub cluster_y: Option<f64>,
+    pub cluster_id: Option<serde_json::Value>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]  // 前端传字符串时自动匹配
 pub enum SortField {
     DateCreated,
+    DateSubmitted,
     Sharpe,
     Returns,
     Turnover,
@@ -125,6 +127,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     let pnl_score = doc.get_f64("pnl_score").ok();
 
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
+    let date_submitted = doc.get_str("dateSubmitted").ok().map(|s| s.to_string());
 
     let (cluster_x, cluster_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
         if let Some(key) = embedding_key {
@@ -189,6 +192,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         sub_universe_sharpe,
         message,
         date_created,
+        date_submitted,
         pnl_score,
         cluster_x,
         cluster_y,
@@ -309,6 +313,7 @@ pub async fn get_alpha_results(
         let order = params.sort_order.unwrap_or(-1);
         let mongo_field = match field {
             SortField::DateCreated => "dateCreated",
+            SortField::DateSubmitted => "dateSubmitted",
             SortField::Sharpe => "is.sharpe",
             SortField::Returns => "is.returns",
             SortField::Turnover => "is.turnover",
@@ -457,7 +462,7 @@ pub struct SearchAlphaInAllCollectionsQuery {
     pub id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct AlphaInCollectionResult {
     pub id: String,
     pub collection: String,
@@ -469,11 +474,65 @@ pub struct AlphaInCollectionResult {
     pub turnover: Option<f64>,
     pub margin: Option<f64>,
     pub date_created: Option<String>,
+    pub date_submitted: Option<String>, // ✅ 新增提交日期
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
     pub cluster_x: Option<f64>,
     pub cluster_y: Option<f64>,
     pub cluster_id: Option<serde_json::Value>,
+}
+
+#[command]
+pub async fn get_submission_stats(
+    collection: Option<String>,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<Vec<mongodb::bson::Document>, String> {
+    let client = &clients.local;
+    let db = client.database(&config.mongodb.databases.alpha);
+
+    let coll_name = collection
+        .as_deref()
+        .and_then(|s| sanitize_collection_name(s))
+        .unwrap_or_else(|| "alpha_results".to_string());
+    let coll = db.collection::<mongodb::bson::Document>(&coll_name);
+
+    let pipeline = vec![
+        doc! {
+            "$project": {
+                "region": { "$ifNull": ["$settings.region", "Unknown"] },
+                "month": { "$substr": [{ "$ifNull": ["$dateSubmitted", "$dateCreated"] }, 0, 7] },
+                "sharpe": "$is.sharpe",
+                "fitness": "$is.fitness",
+                "turnover": "$is.turnover",
+                "returns": "$is.returns",
+                "margin": "$is.margin",
+            }
+        },
+        doc! {
+            "$group": {
+                "_id": { "month": "$month", "region": "$region" },
+                "count": { "$sum": 1 },
+                "avg_sharpe": { "$avg": "$sharpe" },
+                "avg_fitness": { "$avg": "$fitness" },
+                "avg_turnover": { "$avg": "$turnover" },
+                "avg_returns": { "$avg": "$returns" },
+                "avg_margin": { "$avg": "$margin" },
+            }
+        },
+        doc! {
+            "$sort": { "_id.month": -1, "_id.region": 1 }
+        }
+    ];
+
+    let mut cursor = coll.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+
+    while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        results.push(doc);
+    }
+
+    Ok(results)
 }
 
 #[command]
@@ -512,6 +571,7 @@ pub async fn search_alpha_in_all_collections(
                     turnover: result.turnover,
                     margin: result.margin,
                     date_created: result.date_created,
+                    date_submitted: result.date_submitted,
                     sub_universe_sharpe: result.sub_universe_sharpe,
                     message: result.message,
                     cluster_x: result.cluster_x,
