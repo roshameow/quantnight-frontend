@@ -10,10 +10,10 @@ remote_uri = "mongodb://localhost:27017"
   simulation = "simulation_db"
   alpha = "alpha_db"
 
-[python]
-interpreter = "uv"
+[env]
 working_dir = "./"
 
+[python]
 [python.scripts.generate_list]
 command = "uv"
 args = ["run", "-m", "backend.mongodb.mongo_datum", "--template", "{template}", "--alpha_filename", "{name}", "{extra_args}"]
@@ -23,8 +23,6 @@ command = "uv"
 args = ["run", "-m", "pnl.alpha_correlation", "--alpha_ids={alpha_ids}"]
 
 [bash]
-working_dir = "./"
-
 [bash.scripts.sync_remote_task]
 command = "bash"
 script = "backend/mongodb/sync_mission_list.sh"

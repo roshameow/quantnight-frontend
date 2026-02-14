@@ -117,15 +117,11 @@
         </div>
         </n-card>
 
-        <n-card title="Python Settings" size="small" style="margin-bottom: 16px;">
+        <n-card title="Environment Settings" size="small" style="margin-bottom: 16px;">
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
-            <span style="width: 140px; margin-right: 8px;">Interpreter:</span>
-            <n-input v-model:value="localPythonConfig.interpreter" spellcheck="false" size="small" style="flex: 1;" />
-          </div>
-          <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Working Directory:</span>
-            <n-input v-model:value="localPythonConfig.working_dir" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localEnvConfig.working_dir" spellcheck="false" size="small" style="flex: 1;" />
           </div>
         </div>
         </n-card>
@@ -242,8 +238,7 @@ const localMongoConfig = ref({
     alpha: ''
   }
 });
-const localPythonConfig = ref({
-  interpreter: '',
+const localEnvConfig = ref({
   working_dir: ''
 });
 
@@ -258,7 +253,7 @@ onMounted(async () => {
   localEmbeddingOptions.value = JSON.parse(JSON.stringify(configStore.embeddingOptions || []));
   editableButtonMappings.value = JSON.parse(JSON.stringify(configStore.buttonMappings || []));
   
-  // Initialize MongoDB and Python configs from backendConfig
+  // Initialize MongoDB and Env configs from backendConfig
   if (configStore.backendConfig.mongodb) {
     localMongoConfig.value = {
       local_uri: configStore.backendConfig.mongodb.local_uri || '',
@@ -271,16 +266,15 @@ onMounted(async () => {
     };
   }
   
-  if (configStore.backendConfig.python) {
-    localPythonConfig.value = {
-      interpreter: configStore.backendConfig.python.interpreter || '',
-      working_dir: configStore.backendConfig.python.working_dir || ''
+  if (configStore.backendConfig.env) {
+    localEnvConfig.value = {
+      working_dir: configStore.backendConfig.env.working_dir || ''
     };
   }
   
   // Debug logging for initialization
   console.log('Initialized localMongoConfig:', localMongoConfig.value);
-  console.log('Initialized localPythonConfig:', localPythonConfig.value);
+  console.log('Initialized localEnvConfig:', localEnvConfig.value);
 });
 
 function addOption() {
@@ -330,19 +324,18 @@ async function handleSave() {
                           localMongoConfig.value.databases.simulation !== (configStore.backendConfig.mongodb?.databases?.simulation || '') ||
                           localMongoConfig.value.databases.alpha !== (configStore.backendConfig.mongodb?.databases?.alpha || '');
                           
-  const pythonChanged = localPythonConfig.value.interpreter !== (configStore.backendConfig.python?.interpreter || '') ||
-                        localPythonConfig.value.working_dir !== (configStore.backendConfig.python?.working_dir || '');
-  
-  const backendChanged = mongoDbChanged || pythonChanged;
+  const envChanged = localEnvConfig.value.working_dir !== (configStore.backendConfig.env?.working_dir || '');
+
+  const backendChanged = mongoDbChanged || envChanged;
   
   console.log('mongoDbChanged:', mongoDbChanged);
-  console.log('pythonChanged:', pythonChanged);
+  console.log('envChanged:', envChanged);
   console.log('backendChanged result:', backendChanged);
   
   if (backendChanged) {
     const backendConfig = {
       mongodb: localMongoConfig.value,
-      python: localPythonConfig.value
+      env: localEnvConfig.value
     };
     savePromises.push(configStore.saveBackendConfig(backendConfig));
   }

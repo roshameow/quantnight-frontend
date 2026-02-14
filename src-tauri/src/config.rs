@@ -25,15 +25,17 @@ pub struct ScriptConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PythonConfig {
-    pub interpreter: String,
-    pub working_dir: String,
     pub scripts: HashMap<String, ScriptConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BashConfig {
-    pub working_dir: String,
     pub scripts: HashMap<String, ScriptConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EnvConfig {
+    pub working_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -52,6 +54,7 @@ pub struct MongoConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
+    pub env: EnvConfig,
     pub python: PythonConfig,
     pub bash: BashConfig,
     pub mongodb: MongoConfig,
@@ -228,7 +231,7 @@ pub async fn run_bash_script(
     // 启动异步进程并管道 stdout/stderr
     let mut child = TokioCommand::new(command)
         .args(&args)
-        .current_dir(&app_config.bash.working_dir)
+        .current_dir(&app_config.env.working_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -312,7 +315,7 @@ pub async fn run_python_command(
     let command = script_cfg
         .command
         .as_ref()
-        .unwrap_or(&config.python.interpreter);
+        .ok_or_else(|| format!("脚本 {} 缺少 command 配置", script_key))?;
 
     // 构造参数：如果是 python 则添加 -u 确保 unbuffered 输出，如果是 uv 则不添加
     let mut final_args = Vec::new();
@@ -339,7 +342,7 @@ pub async fn run_python_command(
     // 启动子进程，并管道 stdout/stderr
     let mut child = TokioCommand::new(command)
         .args(&final_args)
-        .current_dir(&config.python.working_dir)
+        .current_dir(&config.env.working_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

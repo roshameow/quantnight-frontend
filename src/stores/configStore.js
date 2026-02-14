@@ -97,33 +97,53 @@ export const useConfigStore = defineStore('config', () => {
   async function saveBackendConfig(updatedConfigObject) {
     try {
       // Create a complete config object by merging with existing config
-      const completeConfig = {
-        ...backendConfig.value,
-        ...updatedConfigObject
-      };
+      const completeConfig = JSON.parse(JSON.stringify(backendConfig.value));
       
-      // Ensure we preserve all sections from the original config
-      if (backendConfig.value.mongodb && !updatedConfigObject.mongodb) {
-        completeConfig.mongodb = backendConfig.value.mongodb;
+      // Merge MongoDB
+      if (updatedConfigObject.mongodb) {
+        completeConfig.mongodb = {
+          ...completeConfig.mongodb,
+          ...updatedConfigObject.mongodb,
+          databases: {
+            ...completeConfig.mongodb?.databases,
+            ...updatedConfigObject.mongodb?.databases
+          }
+        };
       }
-      if (backendConfig.value.python && !updatedConfigObject.python) {
-        completeConfig.python = backendConfig.value.python;
-      }
-      if (backendConfig.value.bash && !updatedConfigObject.bash) {
-        completeConfig.bash = backendConfig.value.bash;
-      }
-      
-      // Ensure python.scripts exists and is an object
-      if (completeConfig.python && !completeConfig.python.scripts) {
-        completeConfig.python.scripts = {};
-      }
-      
-      // Ensure bash.scripts exists and is an object
-      if (completeConfig.bash && !completeConfig.bash.scripts) {
-        completeConfig.bash.scripts = {};
+
+      // Merge Env
+      if (updatedConfigObject.env) {
+        completeConfig.env = {
+          ...completeConfig.env,
+          ...updatedConfigObject.env
+        };
       }
       
-      console.log('Saving backend config:', completeConfig);
+      // Preserve Python scripts (working_dir is now in env)
+      if (updatedConfigObject.python) {
+        completeConfig.python = {
+          ...completeConfig.python,
+          ...updatedConfigObject.python,
+          scripts: completeConfig.python?.scripts || {}
+        };
+      } else if (completeConfig.python) {
+        // Ensure scripts are preserved even if python isn't in updatedConfigObject
+        completeConfig.python.scripts = completeConfig.python.scripts || {};
+      }
+      
+      // Preserve Bash scripts (working_dir is now in env)
+      if (updatedConfigObject.bash) {
+        completeConfig.bash = {
+          ...completeConfig.bash,
+          ...updatedConfigObject.bash,
+          scripts: completeConfig.bash?.scripts || {}
+        };
+      } else if (completeConfig.bash) {
+        // Ensure scripts are preserved even if bash isn't in updatedConfigObject
+        completeConfig.bash.scripts = completeConfig.bash.scripts || {};
+      }
+      
+      console.log('Saving backend config (merged):', completeConfig);
       
       // Validate the config before serializing
       if (!completeConfig.mongodb || !completeConfig.mongodb.databases) {
@@ -136,11 +156,6 @@ export const useConfigStore = defineStore('config', () => {
       // Check if there were actual changes before updating the store
       const hasChanges = JSON.stringify(completeConfig) !== JSON.stringify(backendConfig.value);
       
-      // Debug logging
-      console.log('saveBackendConfig - hasChanges:', hasChanges);
-      console.log('saveBackendConfig - completeConfig:', completeConfig);
-      console.log('saveBackendConfig - backendConfig.value:', backendConfig.value);
-      
       await invoke('save_config_toml_content', { content: newTomlContent });
       
       // Update the store with the new config
@@ -148,7 +163,6 @@ export const useConfigStore = defineStore('config', () => {
       
       // Only restart if there were actual changes to backend config
       if (hasChanges) {
-        // Restart the application to apply backend configuration changes
         await invoke('restart_app');
       }
     } catch (e) {
