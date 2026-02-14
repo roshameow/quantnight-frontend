@@ -88,7 +88,7 @@
       :isSuper="getIsSuper(selectedTask)"
       :isPriority="getIsPriority(selectedTask)"
       @start-task="handleStartTask"
-      @start-super-task="handleStartTask"
+      @start-super-task="handleStartSuperTask"
       @start-priority-task="handlePriorityStartTask"
     />
     <UpdateTaskModal
@@ -307,6 +307,17 @@ const handleStartTask = async ({ taskName, config, isRemote }) => {
   } catch (err) {
     console.error("启动任务失败", err);
     message.error("任务启动失败");
+  }
+};
+
+const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
+  try {
+    await invoke("start_super_task", { taskName, config: JSON.stringify(config), isRemote });
+    message.success("Super 任务启动成功");
+    fetchTasks();
+  } catch (err) {
+    console.error("启动 Super 任务失败", err);
+    message.error("Super 任务启动失败");
   }
 };
 
