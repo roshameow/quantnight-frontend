@@ -16,7 +16,7 @@ working_dir = "./"
 
 [python.scripts.generate_list]
 command = "uv"
-args = ["run", "-m", "backend.mongodb.mongo_datum", "--template", "{template}", "--alpha_filename", "{name}"]
+args = ["run", "-m", "backend.mongodb.mongo_datum", "--template", "{template}", "--alpha_filename", "{name}", "{extra_args}"]
 
 [python.scripts.alpha_correlation]
 command = "uv"

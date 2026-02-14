@@ -22,12 +22,13 @@
       :bordered="false"
       size="small"
       class="stats-table"
+      :row-key="(row) => row.key"
     />
 
     <n-modal
       v-model:show="showAlphaList"
       preset="card"
-      :title="`Alpha 列表 - ${selectedMonth} - ${selectedRegion}`"
+      :title="`Alpha 列表 - ${selectedMonth} ${selectedRegion ? '- ' + selectedRegion : ''}`"
       style="width: 90%; max-width: 1200px"
     >
       <div style="height: 600px; overflow: auto">
@@ -92,19 +93,15 @@ const alphaColumns = alphaColumnsRaw.filter(col => col.key !== 'pnl');
 
 const columns = [
   {
-    title: '月份',
-    key: 'month',
-    sorter: 'default'
-  },
-  {
-    title: '区域',
-    key: 'region',
-    sorter: 'default'
+    title: '时间/区域',
+    key: 'label',
+    render(row) {
+      return row.region || row.month;
+    }
   },
   {
     title: '提交个数',
     key: 'count',
-    sorter: (rowA, rowB) => rowA.count - rowB.count,
     render(row) {
       return h(
         NButton,
@@ -120,32 +117,27 @@ const columns = [
   {
     title: '平均 Sharpe',
     key: 'avg_sharpe',
-    render: (row) => row.avg_sharpe?.toFixed(3) ?? '--',
-    sorter: (rowA, rowB) => (rowA.avg_sharpe || 0) - (rowB.avg_sharpe || 0)
+    render: (row) => row.avg_sharpe?.toFixed(3) ?? '--'
   },
   {
     title: '平均 Fitness',
     key: 'avg_fitness',
-    render: (row) => row.avg_fitness?.toFixed(3) ?? '--',
-    sorter: (rowA, rowB) => (rowA.avg_fitness || 0) - (rowB.avg_fitness || 0)
+    render: (row) => row.avg_fitness?.toFixed(3) ?? '--'
   },
   {
     title: '平均 Returns',
     key: 'avg_returns',
-    render: (row) => row.avg_returns != null ? (row.avg_returns * 100).toFixed(2) + '%' : '--',
-    sorter: (rowA, rowB) => (rowA.avg_returns || 0) - (rowB.avg_returns || 0)
+    render: (row) => row.avg_returns != null ? (row.avg_returns * 100).toFixed(2) + '%' : '--'
   },
   {
     title: '平均 Turnover',
     key: 'avg_turnover',
-    render: (row) => row.avg_turnover != null ? (row.avg_turnover * 100).toFixed(2) + '%' : '--',
-    sorter: (rowA, rowB) => (rowA.avg_turnover || 0) - (rowB.avg_turnover || 0)
+    render: (row) => row.avg_turnover != null ? (row.avg_turnover * 100).toFixed(2) + '%' : '--'
   },
   {
     title: '平均 Margin',
     key: 'avg_margin',
-    render: (row) => row.avg_margin != null ? (row.avg_margin * 10000).toFixed(2) + '‱' : '--',
-    sorter: (rowA, rowB) => (rowA.avg_margin || 0) - (rowB.avg_margin || 0)
+    render: (row) => row.avg_margin != null ? (row.avg_margin * 10000).toFixed(2) + '‱' : '--'
   }
 ];
 
@@ -155,16 +147,62 @@ async function fetchStats() {
     const result = await invoke('get_submission_stats', {
       collection: selectedCollection.value
     });
-    statsData.value = result.map(doc => ({
-      month: doc._id.month,
-      region: doc._id.region,
-      count: doc.count,
-      avg_sharpe: doc.avg_sharpe,
-      avg_fitness: doc.avg_fitness,
-      avg_turnover: doc.avg_turnover,
-      avg_returns: doc.avg_returns,
-      avg_margin: doc.avg_margin
-    }));
+    
+    // Group by month
+    const monthGroups = {};
+    result.forEach(doc => {
+      const month = doc._id.month || 'Unknown';
+      if (!monthGroups[month]) {
+        monthGroups[month] = {
+          month,
+          count: 0,
+          avg_sharpe: 0,
+          avg_fitness: 0,
+          avg_turnover: 0,
+          avg_returns: 0,
+          avg_margin: 0,
+          children: []
+        };
+      }
+      
+      const regionData = {
+        key: `${month}-${doc._id.region}`,
+        month,
+        region: doc._id.region,
+        count: doc.count,
+        avg_sharpe: doc.avg_sharpe,
+        avg_fitness: doc.avg_fitness,
+        avg_turnover: doc.avg_turnover,
+        avg_returns: doc.avg_returns,
+        avg_margin: doc.avg_margin
+      };
+      
+      monthGroups[month].children.push(regionData);
+      
+      // Accumulate totals for the month row
+      monthGroups[month].count += doc.count;
+      monthGroups[month].avg_sharpe += (doc.avg_sharpe || 0) * doc.count;
+      monthGroups[month].avg_fitness += (doc.avg_fitness || 0) * doc.count;
+      monthGroups[month].avg_turnover += (doc.avg_turnover || 0) * doc.count;
+      monthGroups[month].avg_returns += (doc.avg_returns || 0) * doc.count;
+      monthGroups[month].avg_margin += (doc.avg_margin || 0) * doc.count;
+    });
+
+    // Finalize averages and convert to array
+    statsData.value = Object.values(monthGroups).map(m => {
+      if (m.count > 0) {
+        m.avg_sharpe /= m.count;
+        m.avg_fitness /= m.count;
+        m.avg_turnover /= m.count;
+        m.avg_returns /= m.count;
+        m.avg_margin /= m.count;
+      }
+      return {
+        ...m,
+        key: m.month
+      };
+    }).sort((a, b) => b.month.localeCompare(a.month)); // Sort months descending
+
   } catch (e) {
     console.error('Failed to fetch stats:', e);
   } finally {
@@ -174,31 +212,33 @@ async function fetchStats() {
 
 async function viewAlphaList(month, region) {
   selectedMonth.value = month;
-  selectedRegion.value = region;
+  selectedRegion.value = region || '';
   showAlphaList.value = true;
   alphaLoading.value = true;
   alphaListData.value = [];
 
   try {
-    // Build query to match month and region
-    // Month is prefix of dateSubmitted or dateCreated
-    const query = {
-      $and: [
-        { "settings.region": region },
-        {
-          $or: [
-            { "dateSubmitted": { $regex: `^${month}` } },
-            { $and: [{ "dateSubmitted": { $exists: false } }, { "dateCreated": { $regex: `^${month}` } }] }
-          ]
-        }
-      ]
-    };
+    // Build query to match month and optionally region
+    const conditions = [
+      {
+        $or: [
+          { "dateSubmitted": { $regex: `^${month}` } },
+          { $and: [{ "dateSubmitted": { $exists: false } }, { "dateCreated": { $regex: `^${month}` } }] }
+        ]
+      }
+    ];
+    
+    if (region) {
+      conditions.push({ "settings.region": region });
+    }
+
+    const query = { $and: conditions };
 
     const params = {
       collection: selectedCollection.value,
       query: JSON.stringify(query),
       page: 1,
-      page_size: 1000 // Get many for this view
+      page_size: 1000
     };
 
     const result = await invoke('get_alpha_results', { params });
