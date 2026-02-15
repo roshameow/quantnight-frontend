@@ -226,9 +226,28 @@ pub async fn get_alpha_results(
     let mut filters = vec![];
 
     if let Some(q) = &params.query {
-        if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(q) {
+        let q_trimmed = q.trim();
+        let mut parsed_ok = false;
+        
+        // Try parsing as-is first
+        if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(q_trimmed) {
             filters.push(parsed_doc);
-        } else {
+            parsed_ok = true;
+        } else if q_trimmed.starts_with('{') && q_trimmed.ends_with('}') {
+            // If it looks like JSON but failed, try cleaning trailing commas
+            // This is a simple regex-based cleanup for trailing commas in objects and arrays
+            let re = regex::Regex::new(r",\s*([\]}])").unwrap();
+            let cleaned_q = re.replace_all(q_trimmed, "$1").to_string();
+            
+            if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(&cleaned_q) {
+                filters.push(parsed_doc);
+                parsed_ok = true;
+            } else {
+                return Err("Invalid JSON query format. Please check for syntax errors.".to_string());
+            }
+        }
+
+        if !parsed_ok {
             let escaped = regex::escape(q);
             filters.push(doc! {
                 "$or": [
