@@ -31,6 +31,7 @@ fn main() {
     });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(mongo_clients.clone()) // 注册 Arc<MongoClients>
         .manage(config)
         .invoke_handler(tauri::generate_handler![

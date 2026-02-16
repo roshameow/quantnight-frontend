@@ -1266,49 +1266,24 @@ async function exportSelection() {
     const dataStr = JSON.stringify(selectedIds, null, 2);
     const fileName = `alpha_selection_${new Date().toISOString().slice(0, 10)}.json`;
     
-    // 在Tauri应用中，使用Tauri的API保存文件
-    try {
-      // 使用简化的save_dialog API获取默认路径
-      const defaultPath = await invoke('save_dialog', {
-        defaultPath: fileName,
-        filters: [
-          {
-            name: 'JSON',
-            extensions: ['json']
-          }
-        ]
+    // Use Tauri's save_dialog to let user pick location and name
+    const filePath = await invoke('save_dialog', {
+      defaultPath: fileName,
+      filters: [
+        {
+          name: 'JSON',
+          extensions: ['json']
+        }
+      ]
+    });
+    
+    if (filePath) {
+      await invoke('write_file', {
+        path: filePath,
+        contents: dataStr
       });
-      
-      if (defaultPath) {
-        // 使用Tauri的write_file API写入文件
-        await invoke('write_file', {
-          path: defaultPath,
-          contents: dataStr
-        });
-        message.success(`已导出 ${selectedIds.length} 个Alpha ID`);
-        return;
-      }
-    } catch (tauriError) {
-      console.warn('Tauri API不可用，尝试其他方法:', tauriError);
+      message.success(`已导出 ${selectedIds.length} 个Alpha ID`);
     }
-    
-    // 回退到浏览器下载
-    const dataBlob = new Blob([dataStr], { type: 'application/json' });
-    const url = URL.createObjectURL(dataBlob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = fileName;
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    
-    // 延迟清理，确保下载开始
-    setTimeout(() => {
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    }, 100);
-    
-    message.success(`已导出 ${selectedIds.length} 个Alpha ID`);
   } catch (error) {
     console.error('导出失败:', error);
     message.error('导出失败，请重试');
