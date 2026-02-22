@@ -59,6 +59,7 @@ const filters = reactive({
   id: "",
   messages: [], // This is for NIN
   messagesIn: [], // This is for IN
+  classificationsIn: [], // This is for classifications IN
   region: "",
   delay: null,
   days: null,
@@ -106,6 +107,7 @@ async function fetchData() {
     id: filters.id.trim() || null,
     messages_nin: filters.messages.length > 0 ? filters.messages : null,
     messages_in: filters.messagesIn.length > 0 ? filters.messagesIn : null,
+    classifications_in: filters.classificationsIn.length > 0 ? filters.classificationsIn : null,
     region: filters.region || null,
     delay: filters.delay ? parseInt(filters.delay) : null,
     days_within: filters.days ? parseInt(filters.days) : null,

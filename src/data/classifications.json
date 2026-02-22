@@ -1,0 +1,26 @@
+[
+  {
+    "id": "DATA_USAGE:SINGLE_DATA_SET",
+    "name": "Single Data Set Alpha"
+  },
+  {
+    "id": "DATA_USAGE:EXTERNAL_DATA",
+    "name": "External Data"
+  },
+  {
+    "id": "DATA_USAGE:FINANCIAL_DATA",
+    "name": "Financial Data"
+  },
+  {
+    "id": "THEME:MEAN_REVERSION",
+    "name": "Mean Reversion"
+  },
+  {
+    "id": "THEME:MOMENTUM",
+    "name": "Momentum"
+  },
+  {
+    "id": "THEME:SENTIMENT",
+    "name": "Sentiment"
+  }
+]

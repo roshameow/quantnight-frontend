@@ -103,6 +103,16 @@
             placeholder="Include Messages"
             style="width: 400px"
           />
+          <n-select
+            :value="modelValue.classificationsIn"
+            multiple
+            clearable
+            :virtual-scroll="false"
+            @update:value="updateFilter('classificationsIn', $event)"
+            :options="classificationOptions"
+            placeholder="Include Classifications"
+            style="width: 400px"
+          />
         </n-space>
       </n-grid-item>
 
@@ -118,6 +128,7 @@
 
 <script setup>
 import messagesData from '../../data/messages.json';
+import classificationsData from '../../data/classifications.json';
 import { useConfigStore } from '../../stores/configStore';
 
 const configStore = useConfigStore();
@@ -135,6 +146,7 @@ const props = defineProps({
 
 const excludeMessageOptions = messagesData.exclude.map(msg => ({ label: msg, value: msg }));
 const includeMessageOptions = messagesData.include.map(msg => ({ label: msg, value: msg }));
+const classificationOptions = classificationsData.map(c => ({ label: c.name, value: c.id }));
 
 const emit = defineEmits(["update:modelValue", "calculateCorr"]);
 

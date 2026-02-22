@@ -37,6 +37,7 @@ pub struct AlphaResult {
     pub cluster_x: Option<f64>,
     pub cluster_y: Option<f64>,
     pub cluster_id: Option<serde_json::Value>,
+    pub classifications: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +59,7 @@ pub struct AlphaQuery {
     pub id: Option<String>,
     pub messages_in: Option<Vec<String>>, // Renamed from messages
     pub messages_nin: Option<Vec<String>>, // Added for exclusion
+    pub classifications_in: Option<Vec<String>>, // Added for classifications
     pub region: Option<String>,
     pub days_within: Option<u32>,
     pub min_turnover: Option<f64>,
@@ -129,6 +131,18 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
     let date_submitted = doc.get_str("dateSubmitted").ok().map(|s| s.to_string());
 
+    let classifications = doc.get_array("classifications").ok().map(|arr| {
+        arr.iter().filter_map(|bson| {
+            if let Some(doc) = bson.as_document() {
+                let id = doc.get_str("id").unwrap_or("").to_string();
+                let name = doc.get_str("name").unwrap_or("").to_string();
+                Some(serde_json::json!({ "id": id, "name": name }))
+            } else {
+                None
+            }
+        }).collect()
+    });
+
     let (cluster_x, cluster_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
         if let Some(key) = embedding_key {
             analysis_doc.get_document("embeddings").ok()
@@ -197,6 +211,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         cluster_x,
         cluster_y,
         cluster_id,
+        classifications,
     })
 }
 
@@ -281,6 +296,18 @@ pub async fn get_alpha_results(
                             "name": { "$in": messages },
                             "result": { "$in": ["FAIL", "WARNING"] }
                         }
+                    }
+                }
+            });
+        }
+    }
+
+    if let Some(classifications) = &params.classifications_in {
+        if !classifications.is_empty() {
+            filters.push(doc! {
+                "classifications": {
+                    "$elemMatch": {
+                        "id": { "$in": classifications }
                     }
                 }
             });
