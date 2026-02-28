@@ -12,6 +12,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
   const selectedAlphasMap = ref(new Map()); // Store full alpha objects
   const pnlDataMap = ref({});
   const showSelectedOnly = ref(false);
+  const showAveragePnL = ref(false);
   const chartZoomState = ref({
     xAxisStart: 0,
     xAxisEnd: 100,
@@ -30,6 +31,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     selectedAlphasMap.value = new Map();
     pnlDataMap.value = {};
     showSelectedOnly.value = false;
+    showAveragePnL.value = false;
     chartZoomState.value = {
         xAxisStart: 0,
         xAxisEnd: 100,
@@ -49,6 +51,7 @@ export const useAnalysisStore = defineStore('analysis', () => {
     selectedAlphasMap,
     pnlDataMap,
     showSelectedOnly,
+    showAveragePnL,
     chartZoomState,
     reset
   };

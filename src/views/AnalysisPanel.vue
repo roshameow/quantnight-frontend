@@ -176,6 +176,14 @@
                     显示全部(PnL)
                   </template>
                 </n-switch>
+                <n-switch v-model:value="showAveragePnL" style="margin-left: 8px;">
+                  <template #checked>
+                    显示平均PnL
+                  </template>
+                  <template #unchecked>
+                    不显示平均PnL
+                  </template>
+                </n-switch>
               </div>
             </div>
             <v-chart
@@ -298,6 +306,7 @@ const {
   selectedAlphasMap,
   pnlDataMap,
   showSelectedOnly,
+  showAveragePnL,
   chartZoomState
 } = storeToRefs(analysisStore);
 
@@ -737,6 +746,52 @@ const chartOption = computed(() => {
     }
   });
 
+  // Calculate Average PnL if enabled and there are selected alphas
+  if (showAveragePnL.value) {
+    const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+    if (selectedAlphas.length > 0) {
+      // Pre-calculate maps for selected alphas to speed up lookup
+      const alphaPnLMaps = selectedAlphas.map(alpha => {
+        const pnlData = pnlDataMap.value[alpha.id];
+        const m = new Map();
+        if (pnlData) {
+          pnlData.forEach(p => m.set(p.date, p.pnl));
+        }
+        return m;
+      });
+
+      const avgPnLValues = sortedDates.map(date => {
+        let sum = 0;
+        let count = 0;
+        alphaPnLMaps.forEach(m => {
+          const val = m.get(date);
+          if (val != null) {
+            sum += val;
+            count++;
+          }
+        });
+        return count > 0 ? sum / count : null;
+      });
+
+      series.push({
+        name: "Average PnL",
+        type: "line",
+        data: avgPnLValues,
+        color: "#000",
+        z: 10, // Ensure it's on top
+        lineStyle: {
+          width: 3,
+          type: 'dashed'
+        },
+        emphasis: {
+          lineStyle: {
+            width: 5
+          }
+        }
+      });
+    }
+  }
+
   return {
     grid: { left: 50, right: 60, top: 40, bottom: 50, containLabel: true },
     tooltip: {
@@ -758,6 +813,24 @@ const chartOption = computed(() => {
         if (!p || !p.seriesName) return '';
 
         const alphaId = p.seriesName;
+
+        // Special handling for Average PnL
+        if (alphaId === "Average PnL") {
+          return `
+            <div style="padding: 4px; max-width: 400px;">
+              <div style="font-weight: bold; margin-bottom: 6px; color: ${p.color}; border-bottom: 1px solid #eee; padding-bottom: 4px;">
+                Average PnL
+              </div>
+              <div style="font-size: 12px; line-height: 1.6; color: #333;">
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Average value:</span> 
+                  <span style="font-weight: 500;">${p.value != null ? Number(p.value).toFixed(2) : '--'}</span>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+
         // Search in searchResults first, then in selectedAlphasMap
         let alpha = searchResults.value.find(a => a.id === alphaId);
         if (!alpha && selectedAlphasMap.value.has(alphaId)) {
