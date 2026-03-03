@@ -63,6 +63,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             class: ["regular-cell", isExpanded ? "expanded" : ""],
             style: { cursor: "pointer" },
             onClick: () => {
+              if (window.getSelection().toString()) return;
               isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
             },
           },
@@ -117,6 +118,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             class: ["message-cell", isExpanded ? "expanded" : ""],
             style: { cursor: "pointer" },
             onClick: () => {
+              if (window.getSelection().toString()) return;
               isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
             },
           },
