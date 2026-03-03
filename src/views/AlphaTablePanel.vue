@@ -43,6 +43,7 @@ import DataFilters from "../components/data/DataFilters.vue";
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 
 import { useConfigStore } from "../stores/configStore.js";
+import "../assets/table-styles.css";
 
 // --- Reactive State ---
 const configStore = useConfigStore();
@@ -230,110 +231,6 @@ watch(() => configStore.embeddingOptions, (options) => {
   --n-padding-left: 8px !important;
   --n-padding-right: 8px !important;
   --n-font-size: 13px !important;
-}
-
-/* Increase specificity to ensure styles are applied */
-.n-data-table.custom-table {
-  --n-font-size: 12px !important; /* Use a more appropriate font size */
-}
-
-.n-data-table.custom-table th,
-.n-data-table.custom-table td {
-  padding: 0px 0px; /* Optional: adjust padding for better spacing */
-}
-
-.n-data-table.custom-table .n-data-table-tr--expanded .n-data-table-td {
-  height: auto !important;
-  white-space: normal !important;
-  overflow: visible !important;
-}
-
-/* 保证展开行内容的高度自适应 */
-.n-data-table.custom-table .n-data-table-tr--expanded .n-data-table-td {
-  height: auto !important; /* 自适应内容高度 */
-  white-space: normal !important; /* 使内容显示完全 */
-  overflow: visible !important; /* 显示所有内容 */
-}
-
-/* 展开行的默认样式 */
-.n-data-table-tr--expanded {
-  display: table-row !important; /* 确保展开行可见 */
-}
-
-/* 限制表头高度最多两行，并显示省略号 */
-.custom-table th .n-data-table-th__title {
-  max-height: 2.6em; /* 控制最多两行（行高 * 2） */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-line-clamp: 2; /* 限制最多两行 */
-  -webkit-box-orient: vertical;
-  line-height: 1.3em; /* 行高，适配 max-height */
-  font-size: 12px; /* 可自定义字体大小 */
-  white-space: normal !important;
-  word-break: break-word;
-}
-
-/* 默认显示为单行省略号 */
-.regular-cell {
-  max-width: 300px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-/* 展开时显示全部内容，支持换行 */
-.regular-cell.expanded {
-  white-space: normal !important;
-  word-break: break-word;
-  overflow: visible;
-}
-
-.message-cell.expanded {
-  white-space: normal !important;
-  word-break: break-word;
-  overflow: visible;
-}
-
-.message-cell {
-  font-size: 12px !important;
-}
-
-/* 确保展开后的内容能够正常显示 */
-.custom-table .n-data-table-wrapper .n-data-table-table .n-data-table-td {
-  max-width: 300px !important; /* 控制最大宽度 */
-  height: 25px !important; /* 默认最小高度 */
-  min-height: 25px !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  white-space: nowrap !important;
-  word-wrap: break-word !important;
-}
-
-/* Apply styles directly to table cells */
-/* 更具体的选择器来确保覆盖样式 */
-.custom-table .n-data-table-wrapper .n-data-table-table .n-data-table-td {
-  max-width: 300px !important;
-  height: 25px !important;
-  min-height: 25px !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  white-space: nowrap !important;
-  position: relative !important;
-  word-wrap: break-word !important;
-}
-
-/* Adjust the font size at the root level of the table */
-.custom-table {
-  --n-font-size: 12px !important;
-}
-
-/* On hover, show full content */
-.custom-table .n-td:hover {
-  white-space: normal;
-  word-break: break-word;
-  background-color: #f5f5f5; /* Optional: highlight on hover */
-  z-index: 10;
 }
 
 /* 

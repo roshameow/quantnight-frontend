@@ -288,6 +288,7 @@ import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, Vi
 import { CanvasRenderer } from "echarts/renderers";
 import { useMessage, useDialog } from 'naive-ui';
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
+import "../assets/table-styles.css";
 
 // Register ECharts components
 use([LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, VisualMapComponent, CanvasRenderer]);

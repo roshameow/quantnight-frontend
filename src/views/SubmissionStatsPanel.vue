@@ -56,6 +56,9 @@
           :loading="alphaLoading"
           :bordered="false"
           size="small"
+          class="custom-table"
+          :scroll-x="1200"
+          :row-key="(row) => row.id"
         />
       </div>
     </n-modal>
@@ -68,6 +71,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { NButton, NSpace, NSelect, NDataTable, NModal, NSlider, NText, NTag } from 'naive-ui';
 import { useConfigStore } from '../stores/configStore';
 import { useAlphaTableColumns } from '../composables/useAlphaTableColumns';
+import '../assets/table-styles.css';
 
 const configStore = useConfigStore();
 const loading = ref(false);
@@ -215,7 +219,7 @@ const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
 
-const { columns: alphaColumnsRaw } = useAlphaTableColumns({
+const { columns: alphaColumns } = useAlphaTableColumns({
   expandedRowIds,
   pnlDataMap,
   loadingSet,
@@ -235,8 +239,6 @@ const { columns: alphaColumnsRaw } = useAlphaTableColumns({
     }
   }
 });
-
-const alphaColumns = alphaColumnsRaw.filter(col => col.key !== 'pnl');
 
 const columns = [
   {

@@ -1,0 +1,75 @@
+/* Shared styles for NDataTable with .custom-table class */
+
+.n-data-table.custom-table {
+  --n-font-size: 12px !important;
+}
+
+.n-data-table.custom-table th,
+.n-data-table.custom-table td {
+  padding: 0px 0px;
+}
+
+/* Header styling: max 2 lines with ellipsis */
+.custom-table th .n-data-table-th__title {
+  max-height: 2.6em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.3em;
+  font-size: 12px;
+  white-space: normal !important;
+  word-break: break-word;
+}
+
+/* Cell styling: fixed height and ellipsis */
+.custom-table .n-data-table-wrapper .n-data-table-table .n-data-table-td {
+  max-width: 300px !important;
+  height: 25px !important;
+  min-height: 25px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  position: relative !important;
+  word-wrap: break-word !important;
+}
+
+/* Expanded row adjustments */
+.n-data-table.custom-table .n-data-table-tr--expanded .n-data-table-td {
+  height: auto !important;
+  white-space: normal !important;
+  overflow: visible !important;
+}
+
+/* Hover effect to show full content */
+.custom-table .n-td:hover {
+  white-space: normal;
+  word-break: break-word;
+  background-color: #f5f5f5;
+  z-index: 10;
+}
+
+/* Specific cell classes used in useAlphaTableColumns */
+.regular-cell {
+  max-width: 300px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.regular-cell.expanded {
+  white-space: normal !important;
+  word-break: break-word;
+  overflow: visible;
+}
+
+.message-cell {
+  font-size: 12px !important;
+}
+
+.message-cell.expanded {
+  white-space: normal !important;
+  word-break: break-word;
+  overflow: visible;
+}
