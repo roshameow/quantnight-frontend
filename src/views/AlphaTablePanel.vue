@@ -7,6 +7,17 @@
       @calculate-corr="calculateCorr"
     />
 
+    <div style="background: #f8f8f8; padding: 8px 16px; border-radius: 8px; margin-bottom: 6px; display: flex; align-items: center; gap: 12px;">
+      <span style="font-size: 13px; color: #666;">显示详情:</span>
+      <n-checkbox-group v-model:value="visibleColumns">
+        <n-space>
+          <n-checkbox v-for="opt in columnOptions" :key="opt.value" :value="opt.value">
+            {{ opt.label }}
+          </n-checkbox>
+        </n-space>
+      </n-checkbox-group>
+    </div>
+
     <!-- Table + Pagination Container -->
     <div style="display: flex; flex-direction: column">
       <n-data-table
@@ -52,6 +63,15 @@ const corrLoading = ref(false);
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
+const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
+
+const columnOptions = [
+  { label: 'Score', value: 'score' },
+  { label: 'Universe', value: 'universe' },
+  { label: 'PnL', value: 'pnl' },
+  { label: 'Message', value: 'message' },
+  { label: 'Correlation', value: 'corr' },
+];
 
 const filters = reactive({
   collection: "alpha_results",
@@ -91,6 +111,7 @@ const { columns } = useAlphaTableColumns({
   pnlDataMap,
   loadingSet,
   loadPNL,
+  visibleColumns,
 });
 
 // --- Data Fetching ---

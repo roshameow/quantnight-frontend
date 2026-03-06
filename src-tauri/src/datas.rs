@@ -21,6 +21,7 @@ use crate::config::{AppConfig, run_python_command};
 pub struct AlphaResult {
     pub id: String,  // 原来是 ObjectId，改为 String
     pub region: String,
+    pub universe: Option<String>,
     pub code: Option<String>,
     pub sharpe: Option<f64>,
     pub fitness: Option<f64>,
@@ -94,10 +95,15 @@ pub struct PagedResult<T> {
 fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str>) -> Option<AlphaResult> {
     let id = doc.get_str("id").ok()?.to_string();
 
-    let region = doc.get_document("settings").ok()
+    let settings = doc.get_document("settings").ok();
+    let region = settings
         .and_then(|d| d.get_str("region").ok())
         .unwrap_or("Unknown")
         .to_string();
+
+    let universe = settings
+        .and_then(|d| d.get_str("universe").ok())
+        .map(|s| s.to_string());
 
     let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
     let code = match alpha_type {
@@ -195,6 +201,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     Some(AlphaResult {
         id,
         region,
+        universe,
         code,
         sharpe,
         fitness,

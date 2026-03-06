@@ -1,4 +1,4 @@
-import { h } from "vue";
+import { h, computed } from "vue";
 import { NPopover } from "naive-ui";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
@@ -50,8 +50,8 @@ function getPNLOption(series) {
 }
 
 // The Composable function
-export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, loadPNL }) {
-  const columns = [
+export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, loadPNL, visibleColumns }) {
+  const allColumns = [
     {
       title: "Regular",
       key: "code",
@@ -73,6 +73,26 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     },
     { title: "ID", key: "id" },
     { title: "Region", key: "region" },
+    {
+      title: "Universe",
+      key: "universe",
+      render(row) {
+        const key = "univ-" + row.id;
+        const isExpanded = expandedRowIds.value.has(key);
+        return h(
+          "div",
+          {
+            class: ["regular-cell", isExpanded ? "expanded" : ""],
+            style: { cursor: "pointer" },
+            onClick: () => {
+              if (window.getSelection().toString()) return;
+              isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
+            },
+          },
+          row.universe || "--"
+        );
+      },
+    },
     {
       title: "Score",
       key: "pnl_score",
@@ -174,5 +194,20 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     },
   ];
 
+  const columns = computed(() => {
+    if (!visibleColumns || !visibleColumns.value) return allColumns;
+
+    return allColumns.filter(col => {
+      // Logic for visibility
+      if (col.key === 'pnl_score') return visibleColumns.value.includes('score');
+      if (col.key === 'universe') return visibleColumns.value.includes('universe');
+      if (col.key === 'message') return visibleColumns.value.includes('message');
+      if (col.key === 'pnl') return visibleColumns.value.includes('pnl');
+      if (col.key === 'corr_ppac' || col.key === 'corr_os') return visibleColumns.value.includes('corr');
+      return true;
+    });
+  });
+
   return { columns };
 }
+

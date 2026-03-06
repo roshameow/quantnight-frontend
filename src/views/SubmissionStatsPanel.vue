@@ -218,6 +218,7 @@ const alphaLoading = ref(false);
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
+const visibleColumns = ref(['score', 'universe', 'pnl', 'message']);
 
 const { columns: alphaColumns } = useAlphaTableColumns({
   expandedRowIds,
@@ -237,7 +238,8 @@ const { columns: alphaColumns } = useAlphaTableColumns({
     } finally {
       loadingSet.value.delete(id);
     }
-  }
+  },
+  visibleColumns
 });
 
 const columns = [

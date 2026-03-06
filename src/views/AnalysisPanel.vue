@@ -261,7 +261,19 @@
 
     <!-- Selected Alphas Table -->
     <div v-if="selectedAlphaIds.size > 0" style="margin-top: 16px; background: #fff; padding: 16px; border-radius: 8px; border: 1px solid #eee;">
-      <h3 style="margin-top: 0; margin-bottom: 12px">选中的 Alpha 详情</h3>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px">
+        <h3 style="margin: 0">选中的 Alpha 详情</h3>
+        <div style="display: flex; align-items: center; gap: 12px; background: #f8f8f8; padding: 4px 12px; border-radius: 4px;">
+          <span style="font-size: 13px; color: #666;">显示详情:</span>
+          <n-checkbox-group v-model:value="visibleColumns">
+            <n-space>
+              <n-checkbox v-for="opt in columnOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </n-checkbox>
+            </n-space>
+          </n-checkbox-group>
+        </div>
+      </div>
       <n-data-table
         :columns="filteredColumns"
         :data="sortedAlphaDetails"
@@ -327,6 +339,16 @@ const clusterChartZoomState = ref({
   yAxisStart: 0,
   yAxisEnd: 100,
 });
+
+const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
+
+const columnOptions = [
+  { label: 'Score', value: 'score' },
+  { label: 'Universe', value: 'universe' },
+  { label: 'PnL', value: 'pnl' },
+  { label: 'Message', value: 'message' },
+  { label: 'Correlation', value: 'corr' },
+];
 
 // --- Chart Interactivity ---
 function highlightCluster(seriesName) {
@@ -456,11 +478,12 @@ const { columns } = useAlphaTableColumns({
   pnlDataMap,
   loadingSet,
   loadPNL,
+  visibleColumns,
 });
 
 const filteredColumns = computed(() => {
   const excludedKeys = ['message', 'pnl', 'corr_ppac', 'corr_os'];
-  return columns.filter(col => !excludedKeys.includes(col.key));
+  return columns.value.filter(col => !excludedKeys.includes(col.key));
 });
 
 const selectedAlphaDetails = computed(() => {
