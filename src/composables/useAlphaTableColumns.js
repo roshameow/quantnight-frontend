@@ -86,12 +86,17 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             style: { cursor: "pointer" },
             onClick: () => {
               if (window.getSelection().toString()) return;
-              isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
+              isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(key);
             },
           },
           row.universe || "--"
         );
       },
+    },
+    {
+      title: "Neutralization",
+      key: "neutralization",
+      render: (row) => row.neutralization || "--",
     },
     {
       title: "Score",
@@ -201,6 +206,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       // Logic for visibility
       if (col.key === 'pnl_score') return visibleColumns.value.includes('score');
       if (col.key === 'universe') return visibleColumns.value.includes('universe');
+      if (col.key === 'neutralization') return visibleColumns.value.includes('neutralization');
       if (col.key === 'message') return visibleColumns.value.includes('message');
       if (col.key === 'pnl') return visibleColumns.value.includes('pnl');
       if (col.key === 'corr_ppac' || col.key === 'corr_os') return visibleColumns.value.includes('corr');

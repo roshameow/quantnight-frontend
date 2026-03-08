@@ -345,6 +345,7 @@ const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
 const columnOptions = [
   { label: 'Score', value: 'score' },
   { label: 'Universe', value: 'universe' },
+  { label: 'Neutralization', value: 'neutralization' },
   { label: 'PnL', value: 'pnl' },
   { label: 'Message', value: 'message' },
   { label: 'Correlation', value: 'corr' },

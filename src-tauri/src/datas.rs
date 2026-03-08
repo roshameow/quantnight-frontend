@@ -22,6 +22,7 @@ pub struct AlphaResult {
     pub id: String,  // 原来是 ObjectId，改为 String
     pub region: String,
     pub universe: Option<String>,
+    pub neutralization: Option<String>,
     pub code: Option<String>,
     pub sharpe: Option<f64>,
     pub fitness: Option<f64>,
@@ -103,6 +104,10 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
 
     let universe = settings
         .and_then(|d| d.get_str("universe").ok())
+        .map(|s| s.to_string());
+
+    let neutralization = settings
+        .and_then(|d| d.get_str("neutralization").ok())
         .map(|s| s.to_string());
 
     let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
@@ -202,6 +207,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         id,
         region,
         universe,
+        neutralization,
         code,
         sharpe,
         fitness,
