@@ -36,6 +36,8 @@ pub struct AlphaResult {
     pub date_created: Option<String>,    // ✅ 新增字段，使用字符串存时间戳
     pub date_submitted: Option<String>,  // ✅ 新增提交日期
     pub pnl_score: Option<f64>,   // ✅ 新增
+    pub os_sharpe: Option<f64>,
+    pub os_fitness: Option<f64>,
     pub cluster_x: Option<f64>,
     pub cluster_y: Option<f64>,
     pub cluster_id: Option<serde_json::Value>,
@@ -139,6 +141,10 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     let returns = is.and_then(|d| d.get_f64("returns").ok());
     let pnl_score = doc.get_f64("pnl_score").ok();
 
+    let os = doc.get_document("os").ok();
+    let os_sharpe = os.and_then(|d| d.get("sharpe")).and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
+    let os_fitness = os.and_then(|d| d.get("fitness")).and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
+
     let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
     let date_submitted = doc.get_str("dateSubmitted").ok().map(|s| s.to_string());
 
@@ -221,6 +227,8 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         date_created,
         date_submitted,
         pnl_score,
+        os_sharpe,
+        os_fitness,
         cluster_x,
         cluster_y,
         cluster_id,
@@ -257,26 +265,66 @@ pub async fn get_alpha_results(
         let q_trimmed = q.trim();
         let mut parsed_ok = false;
         
-        // Try parsing as-is first
-        if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(q_trimmed) {
-            filters.push(parsed_doc);
-            parsed_ok = true;
-        } else if q_trimmed.starts_with('{') && q_trimmed.ends_with('}') {
-            // If it looks like JSON but failed, try cleaning trailing commas
-            // This is a simple regex-based cleanup for trailing commas in objects and arrays
-            let re = regex::Regex::new(r",\s*([\]}])").unwrap();
-            let cleaned_q = re.replace_all(q_trimmed, "$1").to_string();
+        if !q_trimmed.is_empty() {
+            println!("Incoming query: {}", q_trimmed);
+            // 1. Normalize smart quotes (common on macOS) and Python-style values
+            let mut normalized_q = q_trimmed
+                .replace('“', "\"")
+                .replace('”', "\"")
+                .replace('‘', "'")
+                .replace('’', "'");
             
-            if let Ok(parsed_doc) = serde_json::from_str::<mongodb::bson::Document>(&cleaned_q) {
-                filters.push(parsed_doc);
-                parsed_ok = true;
-            } else {
-                return Err("Invalid JSON query format. Please check for syntax errors.".to_string());
+            let re_true = regex::Regex::new(r"\bTrue\b").unwrap();
+            let re_false = regex::Regex::new(r"\bFalse\b").unwrap();
+            let re_none = regex::Regex::new(r"\bNone\b").unwrap();
+            
+            normalized_q = re_true.replace_all(&normalized_q, "true").to_string();
+            normalized_q = re_false.replace_all(&normalized_q, "false").to_string();
+            normalized_q = re_none.replace_all(&normalized_q, "null").to_string();
+
+            // 2. Smart wrap: if it looks like an object (contains :) but lacks braces, wrap it
+            if !normalized_q.starts_with('{') && normalized_q.contains(':') {
+                normalized_q = format!("{{{}}}", normalized_q);
+            }
+
+            // 3. Automatically quote unquoted keys (e.g. $or -> "$or", os.sharpe -> "os.sharpe")
+            // Match keys that are not already quoted.
+            let re_keys = regex::Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap();
+            normalized_q = re_keys.replace_all(&normalized_q, "$1\"$2\":").to_string();
+            // Fix double quotes if they were already partially quoted
+            normalized_q = normalized_q.replace("\"\"", "\"");
+
+            println!("Normalized query: {}", normalized_q);
+
+            // 4. Robust parsing
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&normalized_q) {
+                if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
+                    if let Some(parsed_doc) = bson_val.as_document() {
+                        filters.push(parsed_doc.clone());
+                        parsed_ok = true;
+                    }
+                }
+            }
+            
+            // 5. Fallback: If parsing failed and it has braces, try cleaning trailing commas
+            if !parsed_ok && normalized_q.starts_with('{') && normalized_q.ends_with('}') {
+                let re_comma = regex::Regex::new(r",\s*([\]}])").unwrap();
+                let cleaned_q = re_comma.replace_all(&normalized_q, "$1").to_string();
+                
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
+                    if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
+                        if let Some(parsed_doc) = bson_val.as_document() {
+                            filters.push(parsed_doc.clone());
+                            parsed_ok = true;
+                        }
+                    }
+                }
             }
         }
 
-        if !parsed_ok {
-            let escaped = regex::escape(q);
+        if !parsed_ok && !q_trimmed.is_empty() {
+            println!("JSON parsing failed, falling back to regex search");
+            let escaped = regex::escape(q_trimmed);
             filters.push(doc! {
                 "$or": [
                     { "regular.code": { "$regex": &escaped, "$options": "i" } },
@@ -362,6 +410,7 @@ pub async fn get_alpha_results(
     } else {
         doc! { "$and": filters }
     };
+    println!("Final Mongo filter: {:?}", filter);
     println!("⏱ filter build took {:?}", t_filter.elapsed());
     println!("Mongo filter: {:?}", filter);
 
@@ -534,6 +583,8 @@ pub struct AlphaInCollectionResult {
     pub margin: Option<f64>,
     pub date_created: Option<String>,
     pub date_submitted: Option<String>, // ✅ 新增提交日期
+    pub os_sharpe: Option<f64>,
+    pub os_fitness: Option<f64>,
     pub sub_universe_sharpe: Option<f64>,
     pub message: Option<String>,
     pub cluster_x: Option<f64>,
@@ -631,6 +682,8 @@ pub async fn search_alpha_in_all_collections(
                     margin: result.margin,
                     date_created: result.date_created,
                     date_submitted: result.date_submitted,
+                    os_sharpe: result.os_sharpe,
+                    os_fitness: result.os_fitness,
                     sub_universe_sharpe: result.sub_universe_sharpe,
                     message: result.message,
                     cluster_x: result.cluster_x,

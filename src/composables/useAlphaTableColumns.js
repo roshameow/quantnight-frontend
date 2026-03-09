@@ -106,6 +106,8 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     },
     { title: "Sharpe", key: "sharpe", sorter: true },
     { title: "Fitness", key: "fitness", sorter: true },
+    { title: "OS Sharpe", key: "os_sharpe", sorter: true },
+    { title: "OS Fitness", key: "os_fitness", sorter: true },
     {
       title: "Returns",
       key: "returns",
@@ -205,6 +207,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     return allColumns.filter(col => {
       // Logic for visibility
       if (col.key === 'pnl_score') return visibleColumns.value.includes('score');
+      if (col.key === 'os_sharpe' || col.key === 'os_fitness') return visibleColumns.value.includes('os');
       if (col.key === 'universe') return visibleColumns.value.includes('universe');
       if (col.key === 'neutralization') return visibleColumns.value.includes('neutralization');
       if (col.key === 'message') return visibleColumns.value.includes('message');
