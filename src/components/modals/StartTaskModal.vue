@@ -1,15 +1,13 @@
 <template>
   <n-modal v-model:show="show" title="启动任务配置" preset="dialog">
     <n-form :model="form" label-placement="top">
-      <n-form-item label="配置 JSON">
-        <n-input
-          type="textarea"
-          v-model:value="form.config"
-          autosize
-          spellcheck="false"
-        />
-      </n-form-item>
-    </n-form>
+                  <n-form-item label="配置 JSON">
+                    <n-input
+                      type="textarea"
+                      v-model:value="form.config"
+                      autosize
+                    />
+                  </n-form-item>    </n-form>
     <template #action>
       <n-button @click="onCancel">取消</n-button>
       <n-button type="primary" @click="onConfirm">启动</n-button>

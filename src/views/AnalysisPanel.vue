@@ -20,7 +20,7 @@
             placeholder="输入查询条件（留空或输入{}查询全部）"
             clearable
             style="width: 100%"
-            spellcheck="false"
+           
             @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
@@ -32,7 +32,7 @@
             placeholder="Region"
             clearable
             style="width: 100%"
-            spellcheck="false"
+           
             @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
@@ -44,7 +44,7 @@
             placeholder="Delay"
             clearable
             style="width: 100%"
-            spellcheck="false"
+           
             @keyup.enter="() => searchAlphas()"
           />
         </n-grid-item>
@@ -120,7 +120,7 @@
                   placeholder="输入新Alpha ID"
                   size="tiny"
                   style="width: 100%"
-                  spellcheck="false"
+                 
                   @keyup.enter="addAlpha"
                 />
               </div>

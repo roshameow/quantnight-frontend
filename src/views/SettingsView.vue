@@ -32,27 +32,27 @@
           <div style="display: flex; flex-direction: column; gap: 6px;">
             <div style="display: flex; align-items: center; margin-bottom: 6px;">
               <span style="width: 140px; margin-right: 8px;">Super Template Path:</span>
-              <n-input spellcheck="false" v-model:value="localPaths.superTemplatePath" spellcheck="false" size="small" style="flex: 1;" />
+              <n-input v-model:value="localPaths.superTemplatePath" size="small" style="flex: 1;" />
             </div>
             <div style="display: flex; align-items: center; margin-bottom: 6px;">
               <span style="width: 140px; margin-right: 8px;">Template Path:</span>
-              <n-input spellcheck="false" v-model:value="localPaths.templatePath" spellcheck="false" size="small" style="flex: 1;" />
+              <n-input v-model:value="localPaths.templatePath" size="small" style="flex: 1;" />
             </div>
             <div style="display: flex; align-items: center; margin-bottom: 6px;">
               <span style="width: 140px; margin-right: 8px;">Priority Template Path:</span>
-              <n-input spellcheck="false" v-model:value="localPaths.priorityTemplatePath" spellcheck="false" size="small" style="flex: 1;" />
+              <n-input v-model:value="localPaths.priorityTemplatePath" size="small" style="flex: 1;" />
             </div>
           </div>
         </n-card>
 
         <n-card title="Data Filter Options" size="small">
           <div v-for="(option, index) in localDataFilterOptions" :key="index" style="display: flex; align-items: center; margin-bottom: 6px;">
-            <n-input spellcheck="false" 
+            <n-input 
               :value="option.value" 
               @update:value="(val) => { option.value = val; option.label = val; }"
               placeholder="Value" 
               style="margin-right: 8px; flex: 1;" 
-              spellcheck="false" 
+              
               size="small" 
             />
             <n-button @click="removeOption(index)" type="error" ghost size="small">
@@ -66,12 +66,12 @@
 
         <n-card title="Embedding Options" size="small">
           <div v-for="(option, index) in localEmbeddingOptions" :key="index" style="display: flex; align-items: center; margin-bottom: 6px;">
-            <n-input spellcheck="false" 
+            <n-input 
               :value="option.value" 
               @update:value="(val) => { option.value = val; option.label = val; }"
               placeholder="Value" 
               style="margin-right: 8px; flex: 1;" 
-              spellcheck="false" 
+              
               size="small" 
             />
             <n-button @click="removeEmbeddingOption(index)" type="error" ghost size="small">
@@ -94,25 +94,25 @@
           <n-h4 style="margin-bottom: 8px;">MongoDB Connection</n-h4>
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Local URI:</span>
-            <n-input spellcheck="false" v-model:value="localMongoConfig.local_uri" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localMongoConfig.local_uri" size="small" style="flex: 1;" />
           </div>
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Remote URI:</span>
-            <n-input spellcheck="false" v-model:value="localMongoConfig.remote_uri" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localMongoConfig.remote_uri" size="small" style="flex: 1;" />
           </div>
           
           <n-h4 style="margin-bottom: 8px; margin-top: 8px;">Database Names</n-h4>
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Mission DB:</span>
-            <n-input spellcheck="false" v-model:value="localMongoConfig.databases.mission" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localMongoConfig.databases.mission" size="small" style="flex: 1;" />
           </div>
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Simulation DB:</span>
-            <n-input spellcheck="false" v-model:value="localMongoConfig.databases.simulation" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localMongoConfig.databases.simulation" size="small" style="flex: 1;" />
           </div>
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Alpha DB:</span>
-            <n-input spellcheck="false" v-model:value="localMongoConfig.databases.alpha" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localMongoConfig.databases.alpha" size="small" style="flex: 1;" />
           </div>
         </div>
         </n-card>
@@ -121,7 +121,7 @@
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <div style="display: flex; align-items: center; margin-bottom: 6px;">
             <span style="width: 140px; margin-right: 8px;">Working Directory:</span>
-            <n-input spellcheck="false" v-model:value="localEnvConfig.working_dir" spellcheck="false" size="small" style="flex: 1;" />
+            <n-input v-model:value="localEnvConfig.working_dir" size="small" style="flex: 1;" />
           </div>
         </div>
         </n-card>
@@ -142,7 +142,7 @@
           <tbody>
             <tr v-for="(mapping, index) in editableButtonMappings" :key="mapping.button_id">
               <td style="font-size: 12px;">
-                <n-input spellcheck="false" v-model:value="mapping.button_label" size="tiny" spellcheck="false" />
+                <n-input v-model:value="mapping.button_label" size="tiny" />
               </td>
               <td>
                 <n-select v-model:value="mapping.script_type" size="tiny" style="width: 70px;" :options="[
@@ -151,18 +151,18 @@
                 ]" />
               </td>
               <td>
-                <n-input spellcheck="false" v-model:value="mapping.script_key" size="tiny" spellcheck="false" />
+                <n-input v-model:value="mapping.script_key" size="tiny" />
               </td>
               <td>
                 <n-tooltip trigger="hover" :style="{ maxWidth: '400px' }">
                   <template #trigger>
-                    <n-input spellcheck="false" v-model:value="mapping.script_command" size="tiny" spellcheck="false" />
+                    <n-input v-model:value="mapping.script_command" size="tiny" />
                   </template>
                   {{ mapping.script_command }}
                 </n-tooltip>
               </td>
               <td style="font-size: 12px;">
-                <n-input spellcheck="false" v-model:value="mapping.description" size="tiny" spellcheck="false" />
+                <n-input v-model:value="mapping.description" size="tiny" />
               </td>
               <td>
                 <n-switch v-model:value="mapping.enabled" size="small" />

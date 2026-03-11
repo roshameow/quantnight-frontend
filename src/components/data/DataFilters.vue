@@ -20,28 +20,28 @@
             placeholder="🔍 Search Regular"
             clearable
             style="width: 280px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.id"
             @update:value="updateFilter('id', $event)"
             placeholder="ID"
             style="width: 80px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.region"
             @update:value="updateFilter('region', $event)"
             placeholder="Region"
             style="width: 100px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.delay"
             @update:value="updateFilter('delay', $event)"
             placeholder="Delay"
             style="width: 100px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.days"
@@ -49,7 +49,7 @@
             placeholder="Days Before"
             type="number"
             style="width: 130px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.minTurnover"
@@ -57,7 +57,7 @@
             placeholder="Min Turnover (%)"
             type="number"
             style="width: 130px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.maxTurnover"
@@ -65,7 +65,7 @@
             placeholder="Max Turnover (%)"
             type="number"
             style="width: 130px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.minMargin"
@@ -73,7 +73,7 @@
             placeholder="Min Margin (‱)"
             type="number"
             style="width: 130px"
-            spellcheck="false"
+           
           />
           <n-input
             :value="modelValue.minReturn"
@@ -81,7 +81,7 @@
             placeholder="Min Return (‱)"
             type="number"
             style="width: 130px"
-            spellcheck="false"
+           
           />
           <n-select
             :value="modelValue.messages"

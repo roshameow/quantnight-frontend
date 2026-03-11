@@ -10,7 +10,7 @@
         <n-input
           v-model:value="form.taskName"
           placeholder="请输入任务名称"
-          spellcheck="false"
+         
         />
       </n-form-item>
 
@@ -18,7 +18,7 @@
         <n-input
           v-model:value="form.templatePath"
           placeholder="模版路径"
-          spellcheck="false"
+         
         />
       </n-form-item>
 
