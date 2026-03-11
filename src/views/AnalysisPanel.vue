@@ -73,11 +73,11 @@
           </n-space>
         </div>
         
-        <div v-if="searchResults.length === 0 && !searchLoading" style="color: #999; text-align: center; padding: 10px; font-size: 12px">
+        <div v-if="searchResults.length === 0 && !searchLoading && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 10px; font-size: 12px">
           暂无搜索结果
         </div>
         
-        <div v-else>
+        <div>
           <!-- 列表框容器 -->
           <div style="position: relative; border: 1px solid #e0e0e0; border-radius: 4px">
             <!-- 滚动区域 -->
@@ -123,7 +123,7 @@
             </div>
             
             <!-- + 和 - 按钮固定在右下角 -->
-            <div v-if="searchResults.length > 0" style="position: absolute; bottom: 0; right: 0; display: flex; gap: 0px">
+            <div style="position: absolute; bottom: 0; right: 0; display: flex; gap: 0px">
               <n-button size="tiny" @click="addAlpha" :disabled="!newAlphaId.trim()" style="min-width: 24px; border-top-right-radius: 0; border-bottom-right-radius: 0; background-color: white; opacity: 1">
                 +
               </n-button>
@@ -135,7 +135,7 @@
         </div>
         
         <!-- 动态调整按钮 -->
-        <div v-if="searchResults.length > 0" style="margin-top: 8px">
+        <div style="margin-top: 8px">
           <div style="display: flex; gap: 8px; margin-bottom: 8px;">
             <n-button size="tiny" @click="selectAll" :disabled="searchResults.length === 0" style="flex: 1">
               全选
@@ -144,7 +144,7 @@
               全不选
             </n-button>
           </div>
-          <n-button size="tiny" type="error" @click="clearAlphaList" :disabled="searchResults.length === 0" style="width: 100%">
+          <n-button size="tiny" type="error" @click="clearAlphaList" :disabled="searchResults.length === 0 && selectedAlphaIds.size === 0" style="width: 100%">
             清空列表
           </n-button>
         </div>
