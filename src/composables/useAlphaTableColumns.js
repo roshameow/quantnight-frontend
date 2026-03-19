@@ -104,10 +104,30 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       sorter: true,
       render: (row) => (row.pnl_score != null ? Math.round(row.pnl_score).toLocaleString() : "--"),
     },
-    { title: "Sharpe", key: "sharpe", sorter: true },
-    { title: "Fitness", key: "fitness", sorter: true },
-    { title: "OS Sharpe", key: "os_sharpe", sorter: true },
-    { title: "OS Fitness", key: "os_fitness", sorter: true },
+    { 
+      title: "Sharpe", 
+      key: "sharpe", 
+      sorter: true,
+      render: (row) => (row.sharpe != null ? Number(row.sharpe).toFixed(2) : "--")
+    },
+    { 
+      title: "Fitness", 
+      key: "fitness", 
+      sorter: true,
+      render: (row) => (row.fitness != null ? Number(row.fitness).toFixed(2) : "--")
+    },
+    { 
+      title: "OS Sharpe", 
+      key: "os_sharpe", 
+      sorter: true,
+      render: (row) => (row.os_sharpe != null ? Number(row.os_sharpe).toFixed(2) : "--")
+    },
+    { 
+      title: "OS Fitness", 
+      key: "os_fitness", 
+      sorter: true,
+      render: (row) => (row.os_fitness != null ? Number(row.os_fitness).toFixed(2) : "--")
+    },
     {
       title: "Returns",
       key: "returns",

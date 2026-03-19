@@ -7,6 +7,7 @@ mod datas;
 mod mongo_manager;
 mod frontend_config; // Add new module
 mod file_commands; // Add file commands module
+mod metrics; // Add metrics module
 
 use std::env;
 use std::path::PathBuf;
@@ -63,6 +64,7 @@ fn main() {
             commands::restart_app,
             file_commands::save_dialog, // Add file dialog command
             file_commands::write_file, // Add write file command
+            metrics::calculate_pnl_metrics, // Add metrics calculation command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -326,6 +326,7 @@ const {
   chartZoomState
 } = storeToRefs(analysisStore);
 
+const averageMetrics = ref({ sharpe: 0, returns: 0 });
 const message = useMessage();
 const dialog = useDialog();
 const searchLoading = ref(false);
@@ -546,34 +547,41 @@ const selectedAlphaDetails = computed(() => {
 });
 
 const sortedAlphaDetails = computed(() => {
-  const data = selectedAlphaDetails.value;
+  let data = selectedAlphaDetails.value;
   const key = sortKey.value;
   const order = sortOrder.value;
 
+  let sortedData = [...data];
   if (key && order) {
-    // Create a shallow copy before sorting to avoid mutating the original source
-    return [...data].sort((a, b) => {
+    sortedData.sort((a, b) => {
       const valA = a[key];
       const valB = b[key];
       const orderFactor = order === 'ascend' ? 1 : -1;
 
-      // Handle null or undefined values by pushing them to the end
       if (valA === null || valA === undefined) return 1 * orderFactor;
       if (valB === null || valB === undefined) return -1 * orderFactor;
 
       if (typeof valA === 'number' && typeof valB === 'number') {
         return (valA - valB) * orderFactor;
       }
-      
-      const strA = String(valA);
-      const strB = String(valB);
-      
-      return strA.localeCompare(strB) * orderFactor;
+      return String(valA).localeCompare(String(valB)) * orderFactor;
     });
   }
-  return data;
-});
 
+  // Prepend Average row if enabled
+  if (showAveragePnL.value && averageMetrics.value.sharpe !== 0) {
+    const avgRow = {
+      id: 'avg_row',
+      code: 'Avg (Selected)',
+      sharpe: averageMetrics.value.sharpe,
+      returns: averageMetrics.value.returns,
+      // 其他字段保持 undefined 以渲染为 "--"
+    };
+    return [avgRow, ...sortedData];
+  }
+
+  return sortedData;
+});
 const sortedAlphaList = computed(() => {
   if (!searchResults.value) return [];
   
@@ -1590,6 +1598,89 @@ watch(embedding, (newValue, oldValue) => {
     searchAlphas(true); // Keep selection when changing embedding
   }
 });
+
+watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
+  if (!showAveragePnL.value || selectedAlphaIds.value.size === 0) {
+    averageMetrics.value = { sharpe: 0, returns: 0 };
+    return;
+  }
+
+  const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
+  if (selectedAlphas.length === 0) {
+    averageMetrics.value = { sharpe: 0, returns: 0 };
+    return;
+  }
+
+  // Find all dates
+  const allDates = new Set();
+  selectedAlphas.forEach((alpha) => {
+    const pnlData = pnlDataMap.value[alpha.id];
+    if (pnlData && pnlData.length > 0) {
+      pnlData.forEach((point) => {
+        allDates.add(point.date);
+      });
+    }
+  });
+
+  if (allDates.size === 0) {
+    averageMetrics.value = { sharpe: 0, returns: 0 };
+    return;
+  }
+
+  const sortedDates = Array.from(allDates).sort();
+
+  // Pre-calculate maps for selected alphas to speed up lookup
+  const alphaPnLMaps = selectedAlphas.map(alpha => {
+    const pnlData = pnlDataMap.value[alpha.id];
+    const m = new Map();
+    if (pnlData) {
+      pnlData.forEach(p => m.set(p.date, p.pnl));
+    }
+    return m;
+  });
+
+  const avgPnLSeries = sortedDates.map(date => {
+    let sum = 0;
+    let count = 0;
+    alphaPnLMaps.forEach(m => {
+      const val = m.get(date);
+      if (val != null) {
+        sum += val;
+        count++;
+      }
+    });
+    return {
+      date,
+      pnl: count > 0 ? sum / count : 0 // Fallback to 0 if no data
+    };
+  });
+
+  if (avgPnLSeries.length < 2) {
+    averageMetrics.value = { sharpe: 0, returns: 0 };
+    return;
+  }
+
+  try {
+    const result = await invoke("calculate_pnl_metrics", { pnlSeries: avgPnLSeries });
+    
+    // 计算选中项的 returns 平均值，以确保单位和格式与 metadata 一致
+    const validReturns = selectedAlphas
+      .map(a => a.returns)
+      .filter(r => r != null && typeof r === 'number');
+    
+    const avgReturn = validReturns.length > 0 
+      ? validReturns.reduce((sum, r) => sum + r, 0) / validReturns.length 
+      : 0;
+
+    averageMetrics.value = {
+      sharpe: result.sharpe,
+      returns: avgReturn
+    };
+  } catch (e) {
+    console.error("Error calculating average metrics:", e);
+    averageMetrics.value = { sharpe: 0, returns: 0 };
+  }
+}, { deep: true, immediate: true });
 
 watch(alphasToDisplay, (alphas) => {
   if (alphas && alphas.length > 0) {
