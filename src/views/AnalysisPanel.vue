@@ -2,62 +2,59 @@
   <div>
     <!-- 数据集和查询选择区域 -->
     <div style="background: #f8f8f8; padding: 16px; border-radius: 8px; margin-bottom: 16px">
-      <n-grid :cols="24" :x-gap="12" :y-gap="12">
+      <div style="display: flex; align-items: center; gap: 12px;">
         <!-- 数据集选择 -->
-        <n-grid-item span="6">
+        <div style="width: 160px; flex-shrink: 0;">
           <n-select
             v-model:value="selectedCollection"
             :options="configStore.dataFilterOptions"
             placeholder="选择数据集"
             style="width: 100%"
           />
-        </n-grid-item>
+        </div>
 
-        <!-- 查询输入 -->
-        <n-grid-item span="6">
-          <n-input
+        <!-- 查询输入 - 自动占据剩余空间 -->
+        <div style="flex: 1; min-width: 200px;">
+          <n-auto-complete
             v-model:value="searchQuery"
-            placeholder="输入查询条件（留空或输入{}查询全部）"
+            :options="historyOptions"
+            :render-label="renderLabel"
+            placeholder="输入查询条件（回车搜索）"
             clearable
-            style="width: 100%"
-           
+            @select="handleHistorySelect"
             @keyup.enter="() => searchAlphas()"
           />
-        </n-grid-item>
+        </div>
 
         <!-- Region输入 -->
-        <n-grid-item span="4">
+        <div style="width: 100px; flex-shrink: 0;">
           <n-input
             v-model:value="region"
             placeholder="Region"
             clearable
             style="width: 100%"
-           
             @keyup.enter="() => searchAlphas()"
           />
-        </n-grid-item>
+        </div>
 
         <!-- Delay输入 -->
-        <n-grid-item span="4">
+        <div style="width: 80px; flex-shrink: 0;">
           <n-input
             v-model:value="delay"
             placeholder="Delay"
             clearable
             style="width: 100%"
-           
             @keyup.enter="() => searchAlphas()"
           />
-        </n-grid-item>
+        </div>
 
         <!-- 搜索按钮 -->
-        <n-grid-item span="2">
+        <div style="width: 100px; flex-shrink: 0;">
           <n-button type="primary" @click="() => searchAlphas()" :loading="searchLoading" style="width: 100%">
             搜索
           </n-button>
-        </n-grid-item>
-      </n-grid>
-      
-
+        </div>
+      </div>
     </div>
 
     <!-- 主内容区域：Alpha选择和PNL图表横向并列 -->
@@ -292,17 +289,18 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, nextTick, markRaw } from "vue";
+import { ref, computed, watch, onMounted, nextTick, markRaw, h } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfigStore } from "../stores/configStore";
 import { useAnalysisStore } from "../stores/analysisStore";
+import { useQueryStore } from "../stores/queryStore";
 import { storeToRefs } from "pinia";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
 import { LineChart, ScatterChart } from "echarts/charts";
 import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, VisualMapComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
-import { useMessage, useDialog } from 'naive-ui';
+import { useMessage, useDialog, NButton } from 'naive-ui';
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 import "../assets/table-styles.css";
 
@@ -312,6 +310,7 @@ use([LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, 
 // --- State ---
 const configStore = useConfigStore();
 const analysisStore = useAnalysisStore();
+const queryStore = useQueryStore();
 const {
   selectedCollection,
   embedding,
@@ -330,7 +329,57 @@ const {
 const message = useMessage();
 const dialog = useDialog();
 const searchLoading = ref(false);
+const newQueryName = ref("");
 const newAlphaId = ref("");
+
+const historyOptions = computed(() => {
+  const queries = queryStore.getQueriesByType('analysis');
+  if (queries.length === 0) {
+    return [{ label: '暂无历史记录', value: '', disabled: true }];
+  }
+  // 只返回有意义的查询字符串，并确保 value 是字符串
+  return queries
+    .filter(q => q.label && q.label !== 'All Data') 
+    .map(q => ({
+      label: q.label,
+      value: q.label, // n-auto-complete 选中后会将此值填入 input
+      id: q.id        // 保留 ID 用于删除
+    }));
+});
+
+const renderLabel = (option) => {
+  if (option.disabled) return option.label;
+  
+  return h('div', { 
+    style: 'display: flex; align-items: flex-start; justify-content: space-between; width: 100%; min-width: 300px; padding: 4px 0;' 
+  }, [
+    h('span', { 
+      style: 'flex: 1; white-space: normal; word-break: break-all; line-height: 1.4; padding-right: 8px;' 
+    }, option.label),
+    h(NButton, {
+      quaternary: true,
+      circle: true,
+      size: 'tiny',
+      type: 'error',
+      style: 'flex-shrink: 0;',
+      onClick: (e) => {
+        e.stopPropagation();
+        // 通过 option 中保留的 id 进行删除
+        queryStore.removeQuery(option.id);
+        message.success('已删除历史查询');
+      }
+    }, {
+      default: () => '×'
+    })
+  ]);
+};
+
+const handleHistorySelect = (value) => {
+  if (!value) return;
+  // 直接赋值，n-auto-complete 会自动更新绑定的 searchQuery
+  searchQuery.value = value;
+  message.success(`已加载历史查询内容`);
+};
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
 const clusterChartRef = ref(null);
@@ -1143,6 +1192,11 @@ async function searchAlphas(keepSelection = false) {
   let regionToUse = region.value.trim() || null;
   let delayToUse = delay.value.trim() ? parseInt(delay.value.trim()) : null;
   let pageSize = 1000;
+
+  // 只保存搜索框内的字符串到历史记录
+  if (!keepSelection && queryToUse && queryToUse !== "{}") {
+    queryStore.addQuery('analysis', queryToUse);
+  }
 
   // If refreshing, build query from existing results, ignoring UI filters
   if (keepSelection && searchResults.value.length > 0) {
