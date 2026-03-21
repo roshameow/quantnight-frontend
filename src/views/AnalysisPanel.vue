@@ -586,12 +586,24 @@ const sortedAlphaDetails = computed(() => {
   return sortedData;
 });
 const sortedAlphaList = computed(() => {
-  if (!searchResults.value) return [];
-  
-  return [...searchResults.value].sort((a, b) => {
+  const combinedMap = new Map();
+
+  // Add search results first
+  if (searchResults.value) {
+    searchResults.value.forEach(a => combinedMap.set(a.id, a));
+  }
+
+  // Add all selected alphas (to ensure ones added via right-click show up)
+  if (selectedAlphasMap.value) {
+    selectedAlphasMap.value.forEach(a => combinedMap.set(a.id, a));
+  }
+
+  const combinedList = Array.from(combinedMap.values());
+
+  return combinedList.sort((a, b) => {
     const aIsSelected = selectedAlphaIds.value.has(a.id);
     const bIsSelected = selectedAlphaIds.value.has(b.id);
-    
+
     if (aIsSelected && !bIsSelected) {
       return -1; // a comes first
     }
@@ -601,10 +613,8 @@ const sortedAlphaList = computed(() => {
     return 0; // maintain original order for items with the same selection status
   });
 });
-
 const visibleSelectedCount = computed(() => {
-  if (!searchResults.value) return 0;
-  return searchResults.value.filter(alpha => selectedAlphaIds.value.has(alpha.id)).length;
+  return selectedAlphaIds.value.size;
 });
 
 const clusterAlphas = computed(() => {

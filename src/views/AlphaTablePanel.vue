@@ -20,6 +20,16 @@
 
     <!-- Table + Pagination Container -->
     <div style="display: flex; flex-direction: column">
+      <n-dropdown
+        placement="bottom-start"
+        trigger="manual"
+        :x="xRef"
+        :y="yRef"
+        :options="options"
+        :show="showDropdownRef"
+        :on-clickoutside="onClickoutside"
+        @select="handleMenuSelect"
+      />
       <n-data-table
         :columns="columns"
         :data="data"
@@ -27,6 +37,7 @@
         :scroll-x="1200"
         class="custom-table"
         :row-key="(row) => row.id"
+        :row-props="rowProps"
         remote
         @update:sorter="handleSorterUpdate"
       />
@@ -48,22 +59,76 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, reactive } from "vue";
+import { ref, watch, onMounted, reactive, nextTick } from "vue";
+import { useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import DataFilters from "../components/data/DataFilters.vue";
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
 
 import { useConfigStore } from "../stores/configStore.js";
+import { useAnalysisStore } from "../stores/analysisStore.js";
 import "../assets/table-styles.css";
 
 // --- Reactive State ---
 const configStore = useConfigStore();
+const analysisStore = useAnalysisStore();
+const message = useMessage();
 const data = ref([]);
 const corrLoading = ref(false);
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
 const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
+
+// Context Menu State
+const showDropdownRef = ref(false);
+const xRef = ref(0);
+const yRef = ref(0);
+const selectedRow = ref(null);
+const options = [
+  {
+    label: "添加到数据分析",
+    key: "add-to-analysis",
+  }
+];
+
+const rowProps = (row) => {
+  return {
+    onContextmenu: (e) => {
+      e.preventDefault();
+      showDropdownRef.value = false;
+      nextTick().then(() => {
+        showDropdownRef.value = true;
+        xRef.value = e.clientX;
+        yRef.value = e.clientY;
+        selectedRow.value = row;
+      });
+    }
+  };
+};
+
+const handleMenuSelect = (key) => {
+  showDropdownRef.value = false;
+  if (key === "add-to-analysis" && selectedRow.value) {
+    const alpha = selectedRow.value;
+    
+    // In Pinia store with setup syntax, state properties are refs
+    if (analysisStore.selectedAlphaIds.has(alpha.id)) {
+      message.info(`Alpha ${alpha.id} 已在分析列表中`);
+    } else {
+      // Add to set and map
+      // We need to trigger reactivity by creating new instances or using methods that Vue tracks
+      analysisStore.selectedAlphaIds.add(alpha.id);
+      analysisStore.selectedAlphasMap.set(alpha.id, alpha);
+      
+      message.success(`已将 Alpha ${alpha.id} 添加到数据分析`);
+    }
+  }
+};
+
+const onClickoutside = () => {
+  showDropdownRef.value = false;
+};
 
 const columnOptions = [
   { label: 'Score', value: 'score' },

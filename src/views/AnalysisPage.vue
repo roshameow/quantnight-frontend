@@ -83,17 +83,17 @@
           </n-space>
         </div>
         
-        <div v-if="searchResults.length === 0 && !searchLoading" style="color: #999; text-align: center; padding: 10px; font-size: 12px">
+        <div v-if="searchResults.length === 0 && !searchLoading && selectedAlphaIds.size === 0" style="color: #999; text-align: center; padding: 10px; font-size: 12px">
           暂无搜索结果
         </div>
         
-        <div v-else>
+        <div>
           <!-- 列表框容器 -->
           <div style="position: relative; border: 1px solid #e0e0e0; border-radius: 4px">
             <!-- 滚动区域 -->
             <div style="height: 400px; overflow-y: auto">
               <div
-                v-for="alpha in searchResults"
+                v-for="alpha in sortedAlphaList"
                 :key="alpha.id"
                 @click="toggleAlphaSelection(alpha.id)"
                 :style="{
@@ -108,7 +108,7 @@
                   <span>{{ alpha.id }}</span>
                   <n-checkbox
                     :checked="selectedAlphaIds.has(alpha.id)"
-                    @update:checked="(checked) => checked ? selectedAlphaIds.add(alpha.id) : selectedAlphaIds.delete(alpha.id)"
+                    @update:checked="toggleAlphaSelection(alpha.id)"
                     @click.stop
                     size="small"
                   />
@@ -193,6 +193,8 @@
 import { ref, computed, watch, onMounted, nextTick, markRaw } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfigStore } from "../stores/configStore";
+import { useAnalysisStore } from "../stores/analysisStore";
+import { storeToRefs } from "pinia";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
 import { LineChart } from "echarts/charts";
@@ -205,29 +207,57 @@ use([LineChart, GridComponent, TooltipComponent, LegendComponent, DataZoomCompon
 
 // --- State ---
 const configStore = useConfigStore();
+const analysisStore = useAnalysisStore();
+const {
+  selectedCollection,
+  searchQuery,
+  region,
+  delay,
+  searchResults,
+  selectedAlphaIds,
+  selectedAlphasMap,
+  pnlDataMap,
+  showSelectedOnly,
+  chartZoomState
+} = storeToRefs(analysisStore);
+
 const message = useMessage();
 const dialog = useDialog();
-const selectedCollection = ref("alpha_results");
-const searchQuery = ref("");
-const region = ref("");
-const delay = ref("");
-const searchResults = ref([]);
 const searchLoading = ref(false);
-const selectedAlphaIds = ref(new Set());
 const newAlphaId = ref("");
-const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const chartRef = ref(null);
-const showSelectedOnly = ref(false); // New state to toggle visibility
-// 保存图表缩放状态
-const chartZoomState = ref({
-  xAxisStart: 0,
-  xAxisEnd: 100,
-  yAxisStart: 0,
-  yAxisEnd: 100
-});
 
 // --- Computed ---
+const sortedAlphaList = computed(() => {
+  const combinedMap = new Map();
+  
+  // Add search results first
+  if (searchResults.value) {
+    searchResults.value.forEach(a => combinedMap.set(a.id, a));
+  }
+  
+  // Add all selected alphas (to ensure ones added via right-click show up)
+  if (selectedAlphasMap.value) {
+    selectedAlphasMap.value.forEach(a => combinedMap.set(a.id, a));
+  }
+  
+  const combinedList = Array.from(combinedMap.values());
+  
+  return combinedList.sort((a, b) => {
+    const aIsSelected = selectedAlphaIds.value.has(a.id);
+    const bIsSelected = selectedAlphaIds.value.has(b.id);
+    
+    if (aIsSelected && !bIsSelected) {
+      return -1; // a comes first
+    }
+    if (!aIsSelected && bIsSelected) {
+      return 1; // b comes first
+    }
+    return 0; // maintain original order for items with the same selection status
+  });
+});
+
 const chartOption = computed(() => {
   if (searchResults.value.length === 0) return {};
 
@@ -604,35 +634,61 @@ async function searchAlphas() {
 }
 
 function toggleAlphaSelection(alphaId) {
-  if (selectedAlphaIds.value.has(alphaId)) {
-    selectedAlphaIds.value.delete(alphaId);
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
+
+  if (newIdSet.has(alphaId)) {
+    newIdSet.delete(alphaId);
+    newMap.delete(alphaId);
   } else {
-    selectedAlphaIds.value.add(alphaId);
+    // Try to find alpha object in searchResults
+    const alpha = searchResults.value.find(a => a.id === alphaId);
+    if (alpha) {
+      newIdSet.add(alphaId);
+      newMap.set(alphaId, alpha);
+    } else {
+      newIdSet.add(alphaId);
+    }
   }
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
 }
 
 function removeAlpha(alphaId) {
   // 从选择中移除
-  selectedAlphaIds.value.delete(alphaId);
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
+  newIdSet.delete(alphaId);
+  newMap.delete(alphaId);
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
+  
   // 从搜索结果中移除
   searchResults.value = searchResults.value.filter(alpha => alpha.id !== alphaId);
 }
 
 function clearSelections() {
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function selectAll() {
+  const newIdSet = new Set(selectedAlphaIds.value);
+  const newMap = new Map(selectedAlphasMap.value);
   searchResults.value.forEach(alpha => {
-    selectedAlphaIds.value.add(alpha.id);
+    newIdSet.add(alpha.id);
+    newMap.set(alpha.id, alpha);
   });
+  selectedAlphaIds.value = newIdSet;
+  selectedAlphasMap.value = newMap;
   message.success(`已选择全部 ${searchResults.value.length} 个Alpha`);
   // 不重置缩放状态，保持用户当前的缩放位置
 }
 
 function deselectAll() {
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   message.success('已清除所有选择');
   // 不重置缩放状态，保持用户当前的缩放位置
 }
@@ -649,15 +705,15 @@ async function addAlpha() {
   }
   
   // 检查是否在搜索结果中存在
-  const exists = searchResults.value.some(alpha => alpha.id === alphaId);
+  let alpha = searchResults.value.find(alpha => alpha.id === alphaId);
   
-  if (!exists) {
+  if (!alpha) {
     // 如果不在搜索结果中，尝试从alpha_db的所有collection中搜索
     try {
       const result = await invoke("search_alpha_in_all_collections", { query: { id: alphaId } });
       if (result) {
         // 找到了alpha，添加到搜索结果中，并存储collection信息
-        searchResults.value.push({
+        alpha = {
           id: alphaId,
           region: result.region || "Unknown",
           sharpe: result.sharpe,
@@ -669,7 +725,8 @@ async function addAlpha() {
           code: result.code,
           date_created: result.date_created,
           collection: result.collection // 存储collection信息
-        });
+        };
+        searchResults.value.push(alpha);
         
         // 加载这个alpha的PNL数据，传入正确的collection
         loadPNL(alphaId, result.collection);
@@ -684,7 +741,15 @@ async function addAlpha() {
     }
   }
   
-  selectedAlphaIds.value.add(alphaId);
+  if (alpha) {
+    const newIdSet = new Set(selectedAlphaIds.value);
+    const newMap = new Map(selectedAlphasMap.value);
+    newIdSet.add(alphaId);
+    newMap.set(alphaId, alpha);
+    selectedAlphaIds.value = newIdSet;
+    selectedAlphasMap.value = newMap;
+  }
+  
   newAlphaId.value = ""; // 清空输入框
   message.success(`已添加 Alpha ID "${alphaId}"`);
 }
@@ -695,33 +760,18 @@ function removeSelectedAlpha() {
     return;
   }
   
-  const selectedArray = Array.from(selectedAlphaIds.value);
-  const originalLength = searchResults.value.length;
-  
   // 从搜索结果中移除选中的Alpha
   searchResults.value = searchResults.value.filter(alpha => !selectedAlphaIds.value.has(alpha.id));
   
   // 清除选择
-  selectedAlphaIds.value.clear();
+  selectedAlphaIds.value = new Set();
+  selectedAlphasMap.value = new Map();
   
-  const removedCount = originalLength - searchResults.value.length;
-  message.success(`已从列表中删除 ${removedCount} 个Alpha`);
+  message.success(`已从列表中删除选中的 Alpha`);
 }
 
 function clearFilters() {
-  searchQuery.value = "";
-  region.value = "";
-  delay.value = "";
-  searchResults.value = [];
-  selectedAlphaIds.value.clear();
-  pnlDataMap.value = {}; // 清除PNL数据缓存
-  // 重置缩放状态，因为这是全新的搜索
-  chartZoomState.value = {
-    xAxisStart: 0,
-    xAxisEnd: 100,
-    yAxisStart: 0,
-    yAxisEnd: 100
-  };
+  analysisStore.reset();
 }
 
 async function exportSelection() {
