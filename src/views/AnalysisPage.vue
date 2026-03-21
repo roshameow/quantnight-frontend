@@ -361,6 +361,7 @@ const chartOption = computed(() => {
             <div style="font-size: 12px; line-height: 1.6; color: #333;">
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Region:</span> <span style="font-weight: 500;">${alpha.region || '--'}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sharpe:</span> <span style="font-weight: 500;">${alpha.sharpe || '--'}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Fitness:</span> <span style="font-weight: 500;">${formatNum(alpha.fitness)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sub-U Sharpe:</span> <span style="font-weight: 500;">${formatNum(alpha.sub_universe_sharpe)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(alpha.turnover)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Margin:</span> <span style="font-weight: 500;">${formatMargin(alpha.margin)}</span></div>

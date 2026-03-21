@@ -326,7 +326,7 @@ const {
   chartZoomState
 } = storeToRefs(analysisStore);
 
-const averageMetrics = ref({ sharpe: 0, returns: 0 });
+const averageMetrics = ref({ sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 });
 const message = useMessage();
 const dialog = useDialog();
 const searchLoading = ref(false);
@@ -575,6 +575,9 @@ const sortedAlphaDetails = computed(() => {
       code: 'Avg (Selected)',
       sharpe: averageMetrics.value.sharpe,
       returns: averageMetrics.value.returns,
+      turnover: averageMetrics.value.turnover,
+      margin: averageMetrics.value.margin,
+      fitness: averageMetrics.value.fitness,
       // 其他字段保持 undefined 以渲染为 "--"
     };
     return [avgRow, ...sortedData];
@@ -903,6 +906,10 @@ const chartOption = computed(() => {
 
         // Special handling for Average PnL
         if (alphaId === "Average PnL") {
+          const formatPercent = (val) => val != null ? (val * 100).toFixed(2) + "%" : "--";
+          const formatMargin = (val) => val != null ? (val * 10000).toFixed(2) + "‱" : "--";
+          const formatNum = (val) => val != null ? Number(val).toFixed(3) : "--";
+
           return `
             <div style="padding: 4px; max-width: 400px;">
               <div style="font-weight: bold; margin-bottom: 6px; color: ${p.color}; border-bottom: 1px solid #eee; padding-bottom: 4px;">
@@ -910,8 +917,23 @@ const chartOption = computed(() => {
               </div>
               <div style="font-size: 12px; line-height: 1.6; color: #333;">
                 <div style="display: flex; justify-content: space-between; gap: 15px;">
-                  <span>Average value:</span> 
+                  <span>Value:</span> 
                   <span style="font-weight: 500;">${p.value != null ? Number(p.value).toFixed(2) : '--'}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px; margin-top: 4px; padding-top: 4px; border-top: 1px dashed #eee;">
+                  <span>Sharpe:</span> <span style="font-weight: 500;">${formatNum(averageMetrics.value.sharpe)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Fitness:</span> <span style="font-weight: 500;">${formatNum(averageMetrics.value.fitness)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Returns:</span> <span style="font-weight: 500;">${formatPercent(averageMetrics.value.returns)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(averageMetrics.value.turnover)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Margin:</span> <span style="font-weight: 500;">${formatMargin(averageMetrics.value.margin)}</span>
                 </div>
               </div>
             </div>
@@ -942,6 +964,7 @@ const chartOption = computed(() => {
             <div style="font-size: 12px; line-height: 1.6; color: #333;">
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Region:</span> <span style="font-weight: 500;">${alpha.region || '--'}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sharpe:</span> <span style="font-weight: 500;">${alpha.sharpe || '--'}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Fitness:</span> <span style="font-weight: 500;">${formatNum(alpha.fitness)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sub-U Sharpe:</span> <span style="font-weight: 500;">${formatNum(alpha.sub_universe_sharpe)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(alpha.turnover)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Margin:</span> <span style="font-weight: 500;">${formatMargin(alpha.margin)}</span></div>
@@ -1601,13 +1624,13 @@ watch(embedding, (newValue, oldValue) => {
 
 watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   if (!showAveragePnL.value || selectedAlphaIds.value.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
     return;
   }
 
   const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
   if (selectedAlphas.length === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
     return;
   }
 
@@ -1623,7 +1646,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (allDates.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
     return;
   }
 
@@ -1656,7 +1679,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (avgPnLSeries.length < 2) {
-    averageMetrics.value = { sharpe: 0, returns: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
     return;
   }
 
@@ -1672,13 +1695,30 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
       ? validReturns.reduce((sum, r) => sum + r, 0) / validReturns.length 
       : 0;
 
+    const validTurnovers = selectedAlphas
+      .map(a => a.turnover)
+      .filter(t => t != null && typeof t === 'number');
+    
+    const avgTurnover = validTurnovers.length > 0
+      ? validTurnovers.reduce((sum, t) => sum + t, 0) / validTurnovers.length
+      : 0;
+
+    // Margin = (Return * 2) / Turnover / 1000
+    const avgMargin = avgTurnover > 0 ? ((avgReturn * 2) / avgTurnover) / 1000 : 0;
+
+    // Fitness = Sharpe * sqrt(abs(Returns) / Max(Turnover, 0.125))
+    const avgFitness = result.sharpe * Math.sqrt(Math.abs(avgReturn) / Math.max(avgTurnover, 0.125));
+
     averageMetrics.value = {
       sharpe: result.sharpe,
-      returns: avgReturn
+      returns: avgReturn,
+      turnover: avgTurnover,
+      margin: avgMargin,
+      fitness: avgFitness
     };
   } catch (e) {
     console.error("Error calculating average metrics:", e);
-    averageMetrics.value = { sharpe: 0, returns: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
   }
 }, { deep: true, immediate: true });
 
