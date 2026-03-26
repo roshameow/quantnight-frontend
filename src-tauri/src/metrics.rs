@@ -11,17 +11,36 @@ pub struct PnlPoint {
 pub struct MetricsResponse {
     pub sharpe: f64,
     pub returns: f64,
+    pub drawdown: f64,
 }
 
 #[command]
 pub fn calculate_pnl_metrics(pnl_series: Vec<PnlPoint>) -> Result<MetricsResponse, String> {
     if pnl_series.len() < 2 {
-        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0 });
+        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0 });
     }
 
     // Ensure it's sorted by date
     let mut sorted_pnl = pnl_series;
     sorted_pnl.sort_by(|a, b| a.date.cmp(&b.date));
+
+    // Calculate Max Drawdown
+    // Default capital is assumed to be 10M as per common quant standards if PnL is absolute
+    let capital = 10_000_000.0;
+    let mut max_drawdown_abs = 0.0;
+    if !sorted_pnl.is_empty() {
+        let mut peak = sorted_pnl[0].pnl;
+        for point in &sorted_pnl {
+            if point.pnl > peak {
+                peak = point.pnl;
+            }
+            let dd = peak - point.pnl;
+            if dd > max_drawdown_abs {
+                max_drawdown_abs = dd;
+            }
+        }
+    }
+    let max_drawdown_pct = max_drawdown_abs / capital;
 
     // Calculate daily PnL (daily returns)
     let mut daily_pnl = Vec::new();
@@ -30,7 +49,7 @@ pub fn calculate_pnl_metrics(pnl_series: Vec<PnlPoint>) -> Result<MetricsRespons
     }
 
     if daily_pnl.is_empty() {
-        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0 });
+        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: max_drawdown_pct });
     }
 
     let n = daily_pnl.len() as f64;
@@ -52,11 +71,12 @@ pub fn calculate_pnl_metrics(pnl_series: Vec<PnlPoint>) -> Result<MetricsRespons
         0.0
     };
 
-    // Annualized Return = mean_daily_pnl * 252
-    let annualized_return = mean_pnl * 252.0;
+    // Annualized Return = (mean_daily_pnl * 252) / capital
+    let annualized_return = (mean_pnl * 252.0) / capital;
 
     Ok(MetricsResponse {
         sharpe,
         returns: annualized_return,
+        drawdown: max_drawdown_pct,
     })
 }

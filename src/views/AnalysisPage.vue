@@ -395,6 +395,7 @@ const chartOption = computed(() => {
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sub-U Sharpe:</span> <span style="font-weight: 500;">${formatNum(alpha.sub_universe_sharpe)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(alpha.turnover)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Margin:</span> <span style="font-weight: 500;">${formatMargin(alpha.margin)}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Drawdown:</span> <span style="font-weight: 500;">${formatPercent(alpha.drawdown)}</span></div>
               
               <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #eee;">
                 <div style="margin-bottom: 2px; color: #666;">Expression:</div>

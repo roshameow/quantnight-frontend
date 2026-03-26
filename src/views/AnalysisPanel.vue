@@ -326,7 +326,7 @@ const {
   chartZoomState
 } = storeToRefs(analysisStore);
 
-const averageMetrics = ref({ sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 });
+const averageMetrics = ref({ sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 });
 const message = useMessage();
 const dialog = useDialog();
 const searchLoading = ref(false);
@@ -579,6 +579,7 @@ const sortedAlphaDetails = computed(() => {
       turnover: averageMetrics.value.turnover,
       margin: averageMetrics.value.margin,
       fitness: averageMetrics.value.fitness,
+      drawdown: averageMetrics.value.drawdown,
       // 其他字段保持 undefined 以渲染为 "--"
     };
     return [avgRow, ...sortedData];
@@ -946,6 +947,9 @@ const chartOption = computed(() => {
                 <div style="display: flex; justify-content: space-between; gap: 15px;">
                   <span>Margin:</span> <span style="font-weight: 500;">${formatMargin(averageMetrics.value.margin)}</span>
                 </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Drawdown:</span> <span style="font-weight: 500;">${formatPercent(averageMetrics.value.drawdown)}</span>
+                </div>
               </div>
             </div>
           `;
@@ -979,6 +983,7 @@ const chartOption = computed(() => {
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Sub-U Sharpe:</span> <span style="font-weight: 500;">${formatNum(alpha.sub_universe_sharpe)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Turnover:</span> <span style="font-weight: 500;">${formatPercent(alpha.turnover)}</span></div>
               <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Margin:</span> <span style="font-weight: 500;">${formatMargin(alpha.margin)}</span></div>
+              <div style="display: flex; justify-content: space-between; gap: 15px;"><span>Drawdown:</span> <span style="font-weight: 500;">${formatPercent(alpha.drawdown)}</span></div>
               
               <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #eee;">
                 <div style="margin-bottom: 2px; color: #666;">Expression:</div>
@@ -1635,13 +1640,13 @@ watch(embedding, (newValue, oldValue) => {
 
 watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   if (!showAveragePnL.value || selectedAlphaIds.value.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
     return;
   }
 
   const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
   if (selectedAlphas.length === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
     return;
   }
 
@@ -1657,7 +1662,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (allDates.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
     return;
   }
 
@@ -1690,7 +1695,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (avgPnLSeries.length < 2) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
     return;
   }
 
@@ -1725,11 +1730,12 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
       returns: avgReturn,
       turnover: avgTurnover,
       margin: avgMargin,
-      fitness: avgFitness
+      fitness: avgFitness,
+      drawdown: result.drawdown
     };
   } catch (e) {
     console.error("Error calculating average metrics:", e);
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
   }
 }, { deep: true, immediate: true });
 
