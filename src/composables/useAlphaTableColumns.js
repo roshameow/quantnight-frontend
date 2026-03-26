@@ -104,6 +104,12 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       sorter: true,
       render: (row) => (row.pnl_score != null ? Math.round(row.pnl_score).toLocaleString() : "--"),
     },
+    {
+      title: "IS Score",
+      key: "is_score",
+      sorter: true,
+      render: (row) => (row.is_score != null ? Math.round(row.is_score).toLocaleString() : "--"),
+    },
     { 
       title: "Sharpe", 
       key: "sharpe", 
@@ -233,6 +239,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     return allColumns.filter(col => {
       // Logic for visibility
       if (col.key === 'pnl_score') return visibleColumns.value.includes('score');
+      if (col.key === 'is_score') return visibleColumns.value.includes('is_score');
       if (col.key === 'drawdown') return visibleColumns.value.includes('drawdown');
       if (col.key === 'os_sharpe' || col.key === 'os_fitness') return visibleColumns.value.includes('os');
       if (col.key === 'universe') return visibleColumns.value.includes('universe');

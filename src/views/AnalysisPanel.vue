@@ -326,7 +326,7 @@ const {
   chartZoomState
 } = storeToRefs(analysisStore);
 
-const averageMetrics = ref({ sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 });
+const averageMetrics = ref({ sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 });
 const message = useMessage();
 const dialog = useDialog();
 const searchLoading = ref(false);
@@ -394,10 +394,11 @@ const clusterChartZoomState = ref({
   yAxisEnd: 100,
 });
 
-const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
+const visibleColumns = ref(['score', 'is_score', 'pnl', 'message', 'corr']);
 
 const columnOptions = [
   { label: 'Score', value: 'score' },
+  { label: 'IS Score', value: 'is_score' },
   { label: 'OS Stats', value: 'os' },
   { label: 'Universe', value: 'universe' },
   { label: 'Neutralization', value: 'neutralization' },
@@ -580,6 +581,7 @@ const sortedAlphaDetails = computed(() => {
       margin: averageMetrics.value.margin,
       fitness: averageMetrics.value.fitness,
       drawdown: averageMetrics.value.drawdown,
+      is_score: averageMetrics.value.predictedScore,
       // 其他字段保持 undefined 以渲染为 "--"
     };
     return [avgRow, ...sortedData];
@@ -949,6 +951,9 @@ const chartOption = computed(() => {
                 </div>
                 <div style="display: flex; justify-content: space-between; gap: 15px;">
                   <span>Drawdown:</span> <span style="font-weight: 500;">${formatPercent(averageMetrics.value.drawdown)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; gap: 15px;">
+                  <span>Predicted IS Score:</span> <span style="font-weight: 500;">${formatNum(averageMetrics.value.predictedScore)}</span>
                 </div>
               </div>
             </div>
@@ -1640,13 +1645,13 @@ watch(embedding, (newValue, oldValue) => {
 
 watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   if (!showAveragePnL.value || selectedAlphaIds.value.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
     return;
   }
 
   const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
   if (selectedAlphas.length === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
     return;
   }
 
@@ -1662,7 +1667,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (allDates.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
     return;
   }
 
@@ -1695,14 +1700,12 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   });
 
   if (avgPnLSeries.length < 2) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
     return;
   }
 
   try {
-    const result = await invoke("calculate_pnl_metrics", { pnlSeries: avgPnLSeries });
-    
-    // 计算选中项的 returns 平均值，以确保单位和格式与 metadata 一致
+    // 先计算平均 Returns 和 Turnover，因为评分预测需要这些参数
     const validReturns = selectedAlphas
       .map(a => a.returns)
       .filter(r => r != null && typeof r === 'number');
@@ -1719,6 +1722,12 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
       ? validTurnovers.reduce((sum, t) => sum + t, 0) / validTurnovers.length
       : 0;
 
+    const result = await invoke("calculate_pnl_metrics", { 
+      pnlSeries: avgPnLSeries, 
+      avgTurnover: avgTurnover,
+      avgReturns: avgReturn
+    });
+
     // Margin = (Return * 2) / Turnover / 1000
     const avgMargin = avgTurnover > 0 ? ((avgReturn * 2) / avgTurnover) / 1000 : 0;
 
@@ -1731,11 +1740,12 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
       turnover: avgTurnover,
       margin: avgMargin,
       fitness: avgFitness,
-      drawdown: result.drawdown
+      drawdown: result.drawdown,
+      predictedScore: result.predicted_score
     };
   } catch (e) {
     console.error("Error calculating average metrics:", e);
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0 };
+    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
   }
 }, { deep: true, immediate: true });
 
