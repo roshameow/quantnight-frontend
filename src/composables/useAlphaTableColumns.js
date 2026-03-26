@@ -146,6 +146,12 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       sorter: true,
       render: (row) => (row.margin != null ? (row.margin * 10000).toFixed(2) + "‱" : "--"),
     },
+    { 
+      title: "Drawdown", 
+      key: "drawdown", 
+      sorter: true,
+      render: (row) => (row.drawdown != null ? (row.drawdown * 100).toFixed(2) + "%" : "--")
+    },
     { title: "Sub-U Sharpe", key: "sub_universe_sharpe", sorter: true, width: 70 },
     {
       title: "Date Created",
@@ -227,6 +233,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     return allColumns.filter(col => {
       // Logic for visibility
       if (col.key === 'pnl_score') return visibleColumns.value.includes('score');
+      if (col.key === 'drawdown') return visibleColumns.value.includes('drawdown');
       if (col.key === 'os_sharpe' || col.key === 'os_fitness') return visibleColumns.value.includes('os');
       if (col.key === 'universe') return visibleColumns.value.includes('universe');
       if (col.key === 'neutralization') return visibleColumns.value.includes('neutralization');

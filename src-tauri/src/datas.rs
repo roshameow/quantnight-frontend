@@ -26,6 +26,7 @@ pub struct AlphaResult {
     pub code: Option<String>,
     pub sharpe: Option<f64>,
     pub fitness: Option<f64>,
+    pub drawdown: Option<f64>,
     pub returns: Option<f64>,            // ✅ 新增字段
     pub turnover: Option<f64>,
     pub margin: Option<f64>,
@@ -134,6 +135,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     let is = doc.get_document("is").ok();
     let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
     let fitness = is.and_then(|d| d.get_f64("fitness").ok());
+    let drawdown = is.and_then(|d| d.get_f64("drawdown").ok());
     let turnover = is.and_then(|d| d.get_f64("turnover").ok());
     let margin = is.and_then(|d| d.get_f64("margin").ok());
     let long_count = is.and_then(|d| d.get_i32("longCount").ok());
@@ -217,6 +219,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         code,
         sharpe,
         fitness,
+        drawdown,
         returns,
         turnover,
         margin,
@@ -578,6 +581,7 @@ pub struct AlphaInCollectionResult {
     pub code: Option<String>,
     pub sharpe: Option<f64>,
     pub fitness: Option<f64>,
+    pub drawdown: Option<f64>,
     pub returns: Option<f64>,
     pub turnover: Option<f64>,
     pub margin: Option<f64>,
@@ -614,6 +618,7 @@ pub async fn get_submission_stats(
                 "month": { "$substr": [{ "$ifNull": ["$dateSubmitted", "$dateCreated"] }, 0, 7] },
                 "sharpe": "$is.sharpe",
                 "fitness": "$is.fitness",
+                "drawdown": "$is.drawdown",
                 "turnover": "$is.turnover",
                 "returns": "$is.returns",
                 "margin": "$is.margin",
@@ -625,6 +630,7 @@ pub async fn get_submission_stats(
                 "count": { "$sum": 1 },
                 "avg_sharpe": { "$avg": "$sharpe" },
                 "avg_fitness": { "$avg": "$fitness" },
+                "avg_drawdown": { "$avg": "$drawdown" },
                 "avg_turnover": { "$avg": "$turnover" },
                 "avg_returns": { "$avg": "$returns" },
                 "avg_margin": { "$avg": "$margin" },
@@ -677,6 +683,7 @@ pub async fn search_alpha_in_all_collections(
                     code: result.code,
                     sharpe: result.sharpe,
                     fitness: result.fitness,
+                    drawdown: result.drawdown,
                     returns: result.returns,
                     turnover: result.turnover,
                     margin: result.margin,

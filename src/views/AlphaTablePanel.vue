@@ -135,6 +135,7 @@ const columnOptions = [
   { label: 'OS Stats', value: 'os' },
   { label: 'Universe', value: 'universe' },
   { label: 'Neutralization', value: 'neutralization' },
+  { label: 'Drawdown', value: 'drawdown' },
   { label: 'PnL', value: 'pnl' },
   { label: 'Message', value: 'message' },
   { label: 'Correlation', value: 'corr' },
