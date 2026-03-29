@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use tauri::command;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PnlPoint {
     pub date: String,
     pub pnl: f64,
@@ -48,23 +49,67 @@ fn predict_wqb_score(sharpe: f64, turnover: f64, returns: f64, drawdown: f64) ->
 
 #[command]
 pub fn calculate_pnl_metrics(
-    pnl_series: Vec<PnlPoint>, 
+    pnl_series_list: Vec<Vec<PnlPoint>>, 
     avg_turnover: f64, 
     avg_returns: f64
 ) -> Result<MetricsResponse, String> {
-    if pnl_series.len() < 2 {
+    if pnl_series_list.is_empty() {
         return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
     }
 
-    let mut sorted_pnl = pnl_series;
-    sorted_pnl.sort_by(|a, b| a.date.cmp(&b.date));
+    // 1. Collect all unique dates across all series
+    let mut all_dates = BTreeMap::new();
+    for series in &pnl_series_list {
+        for point in series {
+            all_dates.insert(point.date.clone(), 0.0);
+        }
+    }
+
+    if all_dates.is_empty() {
+        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
+    }
+
+    // 2. Align and Forward-fill to calculate average PnL
+    let mut averaged_pnl = Vec::new();
+    let num_series = pnl_series_list.len() as f64;
+    
+    let mut last_pnls = vec![0.0; pnl_series_list.len()];
+    let mut sorted_series: Vec<Vec<PnlPoint>> = pnl_series_list.clone();
+    for series in &mut sorted_series {
+        series.sort_by(|a, b| a.date.cmp(&b.date));
+    }
+    
+    let mut pointers = vec![0; sorted_series.len()];
+
+    for (date, _) in all_dates {
+        let mut sum_pnl = 0.0;
+        for i in 0..sorted_series.len() {
+            let series = &sorted_series[i];
+            
+            while pointers[i] < series.len() && series[pointers[i]].date == date {
+                last_pnls[i] = series[pointers[i]].pnl;
+                pointers[i] += 1;
+            }
+            // else: use last_pnls[i] which is the last seen PnL (forward-fill)
+            
+            sum_pnl += last_pnls[i];
+        }
+        averaged_pnl.push(PnlPoint {
+            date,
+            pnl: sum_pnl / num_series,
+        });
+    }
+
+    if averaged_pnl.len() < 2 {
+        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
+    }
 
     let capital = 10_000_000.0;
     
-    // 1. Max Drawdown (Absolute -> Pct)
+    // 3. Max Drawdown (Absolute -> Pct)
     let mut max_drawdown_abs = 0.0;
-    let mut peak = sorted_pnl[0].pnl;
-    for point in &sorted_pnl {
+    let mut peak = averaged_pnl[0].pnl;
+    for point in &averaged_pnl {
         if point.pnl > peak {
             peak = point.pnl;
         }
@@ -75,10 +120,10 @@ pub fn calculate_pnl_metrics(
     }
     let max_drawdown_pct = max_drawdown_abs / capital;
 
-    // 2. Daily Returns for Sharpe
+    // 4. Daily Returns for Sharpe
     let mut daily_pnl = Vec::new();
-    for i in 1..sorted_pnl.len() {
-        daily_pnl.push(sorted_pnl[i].pnl - sorted_pnl[i-1].pnl);
+    for i in 1..averaged_pnl.len() {
+        daily_pnl.push(averaged_pnl[i].pnl - averaged_pnl[i-1].pnl);
     }
 
     let n = daily_pnl.len() as f64;
@@ -91,7 +136,7 @@ pub fn calculate_pnl_metrics(
         .sum::<f64>() / n;
     let std_dev = variance.sqrt();
 
-    // 3. Sharpe for Display (252 days)
+    // 5. Sharpe for Display (252 days)
     let af_metrics = 252.0f64;
     let raw_sharpe = if std_dev > 0.0 {
         (mean_pnl / std_dev) * af_metrics.sqrt()
@@ -99,19 +144,16 @@ pub fn calculate_pnl_metrics(
         0.0
     };
     
-    // 4. Calculate native returns of the curve (for internal use, not display)
+    // 6. Calculate native returns of the curve (for internal use, not display)
     let raw_returns_series = (mean_pnl * af_metrics) / capital;
 
-    // 5. PRECISE UI ROUNDING FOR SCORE PREDICTION
-    // We match what the user sees in the UI. 
-    // sharpe and drawdown come from this curve calculation.
-    // turnover and returns come from the metadata average passed from frontend.
+    // 7. PRECISE UI ROUNDING FOR SCORE PREDICTION
     let sharpe_input = (raw_sharpe * 100.0).round() / 100.0;
     let drawdown_input = (max_drawdown_pct * 10000.0).round() / 10000.0;
     let turnover_input = (avg_turnover * 10000.0).round() / 10000.0;
     let returns_input = (avg_returns * 10000.0).round() / 10000.0;
 
-    // 6. Predict Score
+    // 8. Predict Score
     let predicted_score = predict_wqb_score(sharpe_input, turnover_input, returns_input, drawdown_input);
 
     Ok(MetricsResponse {

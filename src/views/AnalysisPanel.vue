@@ -852,10 +852,14 @@ const chartOption = computed(() => {
 
   // Calculate Average PnL if enabled and there are selected alphas
   if (showAveragePnL.value) {
-    const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
-    if (selectedAlphas.length > 0) {
+    const selectedAlphasForAvg = alphasToDisplay.value.filter(alpha => 
+        selectedAlphaIds.value.has(alpha.id) && 
+        pnlDataMap.value[alpha.id] && 
+        pnlDataMap.value[alpha.id].length > 0
+    );
+    if (selectedAlphasForAvg.length > 0) {
       // Pre-calculate maps for selected alphas to speed up lookup
-      const alphaPnLMaps = selectedAlphas.map(alpha => {
+      const alphaPnLMaps = selectedAlphasForAvg.map(alpha => {
         const pnlData = pnlDataMap.value[alpha.id];
         const m = new Map();
         if (pnlData) {
@@ -864,17 +868,17 @@ const chartOption = computed(() => {
         return m;
       });
 
+      const lastPnls = new Array(alphaPnLMaps.length).fill(0);
       const avgPnLValues = sortedDates.map(date => {
         let sum = 0;
-        let count = 0;
-        alphaPnLMaps.forEach(m => {
+        alphaPnLMaps.forEach((m, i) => {
           const val = m.get(date);
           if (val != null) {
-            sum += val;
-            count++;
+            lastPnls[i] = val;
           }
+          sum += lastPnls[i];
         });
-        return count > 0 ? sum / count : null;
+        return sum / alphaPnLMaps.length;
       });
 
       series.push({
@@ -1650,59 +1654,14 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
   }
 
   const selectedAlphas = alphasToDisplay.value.filter(alpha => selectedAlphaIds.value.has(alpha.id));
-  if (selectedAlphas.length === 0) {
+  const alphasWithPnL = selectedAlphas.filter(alpha => pnlDataMap.value[alpha.id] && pnlDataMap.value[alpha.id].length > 0);
+  
+  if (alphasWithPnL.length === 0) {
     averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
     return;
   }
 
-  // Find all dates
-  const allDates = new Set();
-  selectedAlphas.forEach((alpha) => {
-    const pnlData = pnlDataMap.value[alpha.id];
-    if (pnlData && pnlData.length > 0) {
-      pnlData.forEach((point) => {
-        allDates.add(point.date);
-      });
-    }
-  });
-
-  if (allDates.size === 0) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
-    return;
-  }
-
-  const sortedDates = Array.from(allDates).sort();
-
-  // Pre-calculate maps for selected alphas to speed up lookup
-  const alphaPnLMaps = selectedAlphas.map(alpha => {
-    const pnlData = pnlDataMap.value[alpha.id];
-    const m = new Map();
-    if (pnlData) {
-      pnlData.forEach(p => m.set(p.date, p.pnl));
-    }
-    return m;
-  });
-
-  const avgPnLSeries = sortedDates.map(date => {
-    let sum = 0;
-    let count = 0;
-    alphaPnLMaps.forEach(m => {
-      const val = m.get(date);
-      if (val != null) {
-        sum += val;
-        count++;
-      }
-    });
-    return {
-      date,
-      pnl: count > 0 ? sum / count : 0 // Fallback to 0 if no data
-    };
-  });
-
-  if (avgPnLSeries.length < 2) {
-    averageMetrics.value = { sharpe: 0, returns: 0, turnover: 0, margin: 0, fitness: 0, drawdown: 0, predictedScore: 0 };
-    return;
-  }
+  const allPnLData = alphasWithPnL.map(alpha => pnlDataMap.value[alpha.id]);
 
   try {
     // 先计算平均 Returns 和 Turnover，因为评分预测需要这些参数
@@ -1723,7 +1682,7 @@ watch([showAveragePnL, selectedAlphaIds, pnlDataMap], async () => {
       : 0;
 
     const result = await invoke("calculate_pnl_metrics", { 
-      pnlSeries: avgPnLSeries, 
+      pnlSeriesList: allPnLData, 
       avgTurnover: avgTurnover,
       avgReturns: avgReturn
     });
