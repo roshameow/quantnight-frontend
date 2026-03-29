@@ -104,12 +104,22 @@ pub fn calculate_pnl_metrics(
         return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
     }
 
+    // 3. Trim leading zeros (Official WQB calculation often starts from the first non-zero PnL)
+    let first_non_zero_idx = averaged_pnl.iter().position(|p| p.pnl.abs() > 1e-9).unwrap_or(0);
+    let trimmed_pnl = &averaged_pnl[first_non_zero_idx..];
+
+    if trimmed_pnl.len() < 2 {
+        return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
+    }
+
     let capital = 10_000_000.0;
     
-    // 3. Max Drawdown (Absolute -> Pct)
+    // 4. Max Drawdown (Absolute -> Pct)
+    // Drawdown should ideally be calculated on the full series to be conservative, 
+    // but for metrics alignment we use the trimmed series.
     let mut max_drawdown_abs = 0.0;
-    let mut peak = averaged_pnl[0].pnl;
-    for point in &averaged_pnl {
+    let mut peak = trimmed_pnl[0].pnl;
+    for point in trimmed_pnl {
         if point.pnl > peak {
             peak = point.pnl;
         }
@@ -120,10 +130,10 @@ pub fn calculate_pnl_metrics(
     }
     let max_drawdown_pct = max_drawdown_abs / capital;
 
-    // 4. Daily Returns for Sharpe
+    // 5. Daily Returns for Sharpe
     let mut daily_pnl = Vec::new();
-    for i in 1..averaged_pnl.len() {
-        daily_pnl.push(averaged_pnl[i].pnl - averaged_pnl[i-1].pnl);
+    for i in 1..trimmed_pnl.len() {
+        daily_pnl.push(trimmed_pnl[i].pnl - trimmed_pnl[i-1].pnl);
     }
 
     let n = daily_pnl.len() as f64;
@@ -136,15 +146,15 @@ pub fn calculate_pnl_metrics(
         .sum::<f64>() / n;
     let std_dev = variance.sqrt();
 
-    // 5. Sharpe for Display (252 days)
-    let af_metrics = 252.0f64;
+    // 6. Sharpe for Display (250 days - aligned with WQB)
+    let af_metrics = 250.0f64;
     let raw_sharpe = if std_dev > 0.0 {
         (mean_pnl / std_dev) * af_metrics.sqrt()
     } else {
         0.0
     };
     
-    // 6. Calculate native returns of the curve (for internal use, not display)
+    // 7. Calculate native returns of the curve (for internal use, not display)
     let raw_returns_series = (mean_pnl * af_metrics) / capital;
 
     // 7. PRECISE UI ROUNDING FOR SCORE PREDICTION
