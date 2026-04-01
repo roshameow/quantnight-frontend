@@ -104,46 +104,52 @@ pub fn calculate_pnl_metrics(
         return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
     }
 
-    // 3. Trim leading zeros (Official WQB calculation often starts from the first non-zero PnL)
-    let first_non_zero_idx = averaged_pnl.iter().position(|p| p.pnl.abs() > 1e-9).unwrap_or(0);
-    let trimmed_pnl = &averaged_pnl[first_non_zero_idx..];
+    // 3. Trim leading zeros in PnL series
+    // Official WQB metrics seem to start from the first day with non-zero cumulative PnL.
+    let first_non_zero_pnl_idx = averaged_pnl.iter().position(|p| p.pnl.abs() > 1e-9).unwrap_or(0);
+    let trimmed_pnl = &averaged_pnl[first_non_zero_pnl_idx..];
 
-    if trimmed_pnl.len() < 2 {
+    if trimmed_pnl.is_empty() {
         return Ok(MetricsResponse { sharpe: 0.0, returns: 0.0, drawdown: 0.0, predicted_score: 0.0 });
+    }
+
+    // 4. Daily Returns: The first day's return is (PnL[0] - 0)
+    let mut daily_pnl = Vec::new();
+    let mut last_pnl = 0.0;
+    for point in trimmed_pnl {
+        daily_pnl.push(point.pnl - last_pnl);
+        last_pnl = point.pnl;
     }
 
     let capital = 10_000_000.0;
     
-    // 4. Max Drawdown (Absolute -> Pct)
-    // Drawdown should ideally be calculated on the full series to be conservative, 
-    // but for metrics alignment we use the trimmed series.
+    // 5. Max Drawdown (Absolute -> Pct)
     let mut max_drawdown_abs = 0.0;
-    let mut peak = trimmed_pnl[0].pnl;
+    let mut peak = 0.0;
     for point in trimmed_pnl {
-        if point.pnl > peak {
-            peak = point.pnl;
+        let pnl = point.pnl;
+        if pnl > peak {
+            peak = pnl;
         }
-        let dd = peak - point.pnl;
+        let dd = peak - pnl;
         if dd > max_drawdown_abs {
             max_drawdown_abs = dd;
         }
     }
     let max_drawdown_pct = max_drawdown_abs / capital;
 
-    // 5. Daily Returns for Sharpe
-    let mut daily_pnl = Vec::new();
-    for i in 1..trimmed_pnl.len() {
-        daily_pnl.push(trimmed_pnl[i].pnl - trimmed_pnl[i-1].pnl);
-    }
-
     let n = daily_pnl.len() as f64;
     let sum_pnl: f64 = daily_pnl.iter().sum();
     let mean_pnl = sum_pnl / n;
 
-    // Use Population Standard Deviation (like np.std with ddof=0)
-    let variance = daily_pnl.iter()
-        .map(|&x| (x - mean_pnl).powi(2))
-        .sum::<f64>() / n;
+    // Use Sample Standard Deviation (like np.std with ddof=1) to match WQB rounding
+    let variance = if n > 1.0 {
+        daily_pnl.iter()
+            .map(|&x| (x - mean_pnl).powi(2))
+            .sum::<f64>() / (n - 1.0)
+    } else {
+        0.0
+    };
     let std_dev = variance.sqrt();
 
     // 6. Sharpe for Display (250 days - aligned with WQB)

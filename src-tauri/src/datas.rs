@@ -240,6 +240,69 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
 }
 
 
+fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
+    let q_trimmed = q.trim();
+    if q_trimmed.is_empty() {
+        return None;
+    }
+
+    println!("Incoming query: {}", q_trimmed);
+    
+    // 1. Normalize smart quotes (common on macOS) and Python-style values
+    let mut normalized_q = q_trimmed
+        .replace('“', "\"")
+        .replace('”', "\"")
+        .replace('‘', "'")
+        .replace('’', "'");
+    
+    let re_true = regex::Regex::new(r"\bTrue\b").unwrap();
+    let re_false = regex::Regex::new(r"\bFalse\b").unwrap();
+    let re_none = regex::Regex::new(r"\bNone\b").unwrap();
+    let re_int = regex::Regex::new(r"\b(?:int|NumberInt)\((\d+)\)").unwrap();
+    let re_float = regex::Regex::new(r"\b(?:float|NumberDecimal)\(([\d\.]+)\)").unwrap();
+    
+    normalized_q = re_true.replace_all(&normalized_q, "true").to_string();
+    normalized_q = re_false.replace_all(&normalized_q, "false").to_string();
+    normalized_q = re_none.replace_all(&normalized_q, "null").to_string();
+    normalized_q = re_int.replace_all(&normalized_q, "$1").to_string();
+    normalized_q = re_float.replace_all(&normalized_q, "$1").to_string();
+
+    // 2. Smart wrap: if it looks like an object (contains :) but lacks braces, wrap it
+    if !normalized_q.starts_with('{') && normalized_q.contains(':') {
+        normalized_q = format!("{{{}}}", normalized_q);
+    }
+
+    // 3. Automatically quote unquoted keys (e.g. $or -> "$or", os.sharpe -> "os.sharpe")
+    let re_keys = regex::Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap();
+    normalized_q = re_keys.replace_all(&normalized_q, "$1\"$2\":").to_string();
+    normalized_q = normalized_q.replace("\"\"", "\"");
+
+    println!("Normalized query: {}", normalized_q);
+
+    // 4. Robust parsing
+    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&normalized_q) {
+        if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
+            if let Some(parsed_doc) = bson_val.as_document() {
+                return Some(parsed_doc.clone());
+            }
+        }
+    }
+    
+    // 5. Fallback: Clean trailing commas
+    let re_comma = regex::Regex::new(r",\s*([\]}])").unwrap();
+    let cleaned_q = re_comma.replace_all(&normalized_q, "$1").to_string();
+    
+    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
+        if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
+            if let Some(parsed_doc) = bson_val.as_document() {
+                return Some(parsed_doc.clone());
+            }
+        }
+    }
+
+    None
+}
+
 #[command]
 pub async fn get_alpha_results(
     params: AlphaQuery,
@@ -265,69 +328,11 @@ pub async fn get_alpha_results(
     let mut filters = vec![];
 
     if let Some(q) = &params.query {
-        let q_trimmed = q.trim();
-        let mut parsed_ok = false;
-        
-        if !q_trimmed.is_empty() {
-            println!("Incoming query: {}", q_trimmed);
-            // 1. Normalize smart quotes (common on macOS) and Python-style values
-            let mut normalized_q = q_trimmed
-                .replace('“', "\"")
-                .replace('”', "\"")
-                .replace('‘', "'")
-                .replace('’', "'");
-            
-            let re_true = regex::Regex::new(r"\bTrue\b").unwrap();
-            let re_false = regex::Regex::new(r"\bFalse\b").unwrap();
-            let re_none = regex::Regex::new(r"\bNone\b").unwrap();
-            
-            normalized_q = re_true.replace_all(&normalized_q, "true").to_string();
-            normalized_q = re_false.replace_all(&normalized_q, "false").to_string();
-            normalized_q = re_none.replace_all(&normalized_q, "null").to_string();
-
-            // 2. Smart wrap: if it looks like an object (contains :) but lacks braces, wrap it
-            if !normalized_q.starts_with('{') && normalized_q.contains(':') {
-                normalized_q = format!("{{{}}}", normalized_q);
-            }
-
-            // 3. Automatically quote unquoted keys (e.g. $or -> "$or", os.sharpe -> "os.sharpe")
-            // Match keys that are not already quoted.
-            let re_keys = regex::Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap();
-            normalized_q = re_keys.replace_all(&normalized_q, "$1\"$2\":").to_string();
-            // Fix double quotes if they were already partially quoted
-            normalized_q = normalized_q.replace("\"\"", "\"");
-
-            println!("Normalized query: {}", normalized_q);
-
-            // 4. Robust parsing
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&normalized_q) {
-                if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
-                    if let Some(parsed_doc) = bson_val.as_document() {
-                        filters.push(parsed_doc.clone());
-                        parsed_ok = true;
-                    }
-                }
-            }
-            
-            // 5. Fallback: If parsing failed and it has braces, try cleaning trailing commas
-            if !parsed_ok && normalized_q.starts_with('{') && normalized_q.ends_with('}') {
-                let re_comma = regex::Regex::new(r",\s*([\]}])").unwrap();
-                let cleaned_q = re_comma.replace_all(&normalized_q, "$1").to_string();
-                
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
-                    if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
-                        if let Some(parsed_doc) = bson_val.as_document() {
-                            filters.push(parsed_doc.clone());
-                            parsed_ok = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !parsed_ok && !q_trimmed.is_empty() {
+        if let Some(parsed_doc) = parse_query_to_bson(q) {
+            filters.push(parsed_doc);
+        } else if !q.trim().is_empty() {
             println!("JSON parsing failed, falling back to regex search");
-            let escaped = regex::escape(q_trimmed);
+            let escaped = regex::escape(q.trim());
             filters.push(doc! {
                 "$or": [
                     { "regular.code": { "$regex": &escaped, "$options": "i" } },
@@ -599,6 +604,7 @@ pub struct AlphaInCollectionResult {
 #[command]
 pub async fn get_submission_stats(
     collection: Option<String>,
+    query: Option<String>,
     clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,
 ) -> Result<Vec<mongodb::bson::Document>, String> {
@@ -611,7 +617,23 @@ pub async fn get_submission_stats(
         .unwrap_or_else(|| "alpha_results".to_string());
     let coll = db.collection::<mongodb::bson::Document>(&coll_name);
 
+    let mut filters = vec![];
+    if let Some(q) = query {
+        if let Some(parsed_doc) = parse_query_to_bson(&q) {
+            filters.push(parsed_doc);
+        }
+    }
+
+    let filter = if filters.is_empty() {
+        doc! {}
+    } else {
+        doc! { "$and": filters }
+    };
+
     let pipeline = vec![
+        doc! {
+            "$match": filter
+        },
         doc! {
             "$project": {
                 "region": { "$ifNull": ["$settings.region", "Unknown"] },

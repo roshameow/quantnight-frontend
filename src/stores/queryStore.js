@@ -12,9 +12,9 @@ export const useQueryStore = defineStore('query', () => {
     let queryValue = "";
     let filters = null;
 
-    if (type === 'analysis') {
-      queryValue = typeof data === 'string' ? data.trim() : (data.searchQuery || "").trim();
-      if (!queryValue || queryValue === "{}") return;
+    if (type === 'analysis' || type === 'submission') {
+      queryValue = typeof data === 'string' ? data.trim() : (data.searchQuery || data.query || "").trim();
+      if (!queryValue || queryValue === "{}" || queryValue === "") return;
     } else {
       filters = JSON.parse(JSON.stringify(data));
       queryValue = filters.searchQuery || filters.query || "";
@@ -22,7 +22,7 @@ export const useQueryStore = defineStore('query', () => {
 
     // 检查是否已存在
     const exists = savedQueries.value.some(q => 
-      q.type === type && (type === 'analysis' ? q.value === queryValue : JSON.stringify(q.filters) === JSON.stringify(filters))
+      q.type === type && ( (type === 'analysis' || type === 'submission') ? q.value === queryValue : JSON.stringify(q.filters) === JSON.stringify(filters))
     );
 
     if (exists) return;

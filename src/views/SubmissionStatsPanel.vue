@@ -1,35 +1,57 @@
 <template>
   <div class="submission-stats-container">
     <div class="header">
-      <n-space align="center">
-        <n-select
-          v-model:value="selectedCollection"
-          :options="configStore.dataFilterOptions"
-          placeholder="选择数据集"
-          style="width: 200px"
-          @update:value="fetchStats"
-        />
-        <n-button type="primary" @click="fetchStats" :loading="loading">
-          刷新统计
-        </n-button>
-        
-        <div v-if="uniqueMonths.length > 0" style="width: 300px; margin-left: 24px">
-          <n-space vertical size="small">
-            <n-text depth="3" style="font-size: 12px">
-              3个月统计窗口: 
-              <n-tag v-for="m in selectedMonthsNames" :key="m" size="tiny" style="margin-right: 4px" type="success">
-                {{ m }}
-              </n-tag>
-            </n-text>
-            <n-slider
-              v-model:value="windowStartIndex"
-              :max="maxWindowIndex"
-              :step="1"
-              :tooltip="false"
+      <div style="background: #f8f8f8; padding: 16px; border-radius: 8px; margin-bottom: 16px">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <!-- 数据集选择 -->
+          <div style="width: 160px; flex-shrink: 0;">
+            <n-select
+              v-model:value="selectedCollection"
+              :options="configStore.dataFilterOptions"
+              placeholder="选择数据集"
+              style="width: 100%"
+              @update:value="fetchStats"
             />
-          </n-space>
+          </div>
+
+          <!-- 查询输入 -->
+          <div style="flex: 1; min-width: 200px;">
+            <n-auto-complete
+              v-model:value="searchQuery"
+              :options="historyOptions"
+              :render-label="renderLabel"
+              placeholder="输入查询条件 (JSON, 回车搜索)"
+              clearable
+              @select="handleHistorySelect"
+              @keyup.enter="fetchStats"
+            />
+          </div>
+
+          <!-- 搜索按钮 -->
+          <div style="width: 100px; flex-shrink: 0;">
+            <n-button type="primary" @click="fetchStats" :loading="loading" style="width: 100%">
+              刷新统计
+            </n-button>
+          </div>
+          
+          <div v-if="uniqueMonths.length > 0" style="width: 300px; margin-left: 24px">
+            <n-space vertical size="small">
+              <n-text depth="3" style="font-size: 12px">
+                3个月统计窗口: 
+                <n-tag v-for="m in selectedMonthsNames" :key="m" size="tiny" style="margin-right: 4px" type="success">
+                  {{ m }}
+                </n-tag>
+              </n-text>
+              <n-slider
+                v-model:value="windowStartIndex"
+                :max="maxWindowIndex"
+                :step="1"
+                :tooltip="false"
+              />
+            </n-space>
+          </div>
         </div>
-      </n-space>
+      </div>
     </div>
 
     <n-data-table
@@ -68,18 +90,72 @@
 <script setup>
 import { ref, onMounted, h, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { NButton, NSpace, NSelect, NDataTable, NModal, NSlider, NText, NTag } from 'naive-ui';
+import { NButton, NSpace, NSelect, NDataTable, NModal, NSlider, NText, NTag, NAutoComplete } from 'naive-ui';
 import { useConfigStore } from '../stores/configStore';
+import { useQueryStore } from '../stores/queryStore';
 import { useAlphaTableColumns } from '../composables/useAlphaTableColumns';
 import '../assets/table-styles.css';
 
 const configStore = useConfigStore();
+const queryStore = useQueryStore();
+
 const loading = ref(false);
 const selectedCollection = ref('alpha_results');
+const searchQuery = ref('');
 const statsData = ref([]);
 const rawStatsResult = ref([]);
 
 const windowStartIndex = ref(0);
+
+// --- Query History Logic ---
+const historyOptions = computed(() => {
+  const queries = queryStore.getQueriesByType('submission');
+  if (queries.length === 0) {
+    return [{ label: '暂无历史记录', value: '', disabled: true }];
+  }
+  return queries
+    .filter(q => q.label && q.label !== 'All Data') 
+    .map(q => ({
+      label: q.label,
+      value: q.label,
+      id: q.id
+    }));
+});
+
+const handleHistorySelect = (value) => {
+  if (!value) return;
+  searchQuery.value = value;
+  fetchStats();
+};
+
+const removeQuery = (id) => {
+  queryStore.removeQuery(id);
+};
+
+const renderLabel = (option) => {
+  if (option.disabled) return option.label;
+  
+  return h('div', { 
+    style: 'display: flex; align-items: flex-start; justify-content: space-between; width: 100%; min-width: 300px; padding: 4px 0;' 
+  }, [
+    h('span', { 
+      style: 'flex: 1; white-space: normal; word-break: break-all; line-height: 1.4; padding-right: 8px;' 
+    }, option.label),
+    h(NButton, {
+      quaternary: true,
+      circle: true,
+      size: 'tiny',
+      type: 'error',
+      style: 'flex-shrink: 0;',
+      onClick: (e) => {
+        e.stopPropagation();
+        removeQuery(option.id);
+      }
+    }, {
+      default: () => '×'
+    })
+  ]);
+};
 
 const uniqueMonths = computed(() => {
   const months = statsData.value.map(m => m.month);
@@ -106,8 +182,6 @@ const rowClassName = (row) => {
   const windowNames = selectedMonthsNames.value;
   if (windowNames.includes(row.month)) {
     let classes = 'selected-month-row';
-    // Mark the start and end of the window for specific borders
-    // Since it's sorted descending, windowNames[0] is the top row
     if (row.month === windowNames[0] && !row.region) {
       classes += ' window-start';
     }
@@ -294,9 +368,15 @@ const columns = [
 
 async function fetchStats() {
   loading.value = true;
+  const q = searchQuery.value.trim();
+  if (q && q !== '{}') {
+    queryStore.addQuery('submission', q);
+  }
+
   try {
     const result = await invoke('get_submission_stats', {
-      collection: selectedCollection.value
+      collection: selectedCollection.value,
+      query: q || null
     });
     
     rawStatsResult.value = result;
@@ -396,6 +476,16 @@ async function viewAlphaList(month, region) {
     }
     if (region) {
       conditions.push({ "settings.region": region });
+    }
+
+    // Add search query conditions if present
+    const q = searchQuery.value.trim();
+    if (q && q !== '{}') {
+      try {
+        conditions.push(JSON.parse(q));
+      } catch (e) {
+        console.error("Failed to parse search query JSON:", e);
+      }
     }
 
     const query = conditions.length > 0 ? { $and: conditions } : {};
