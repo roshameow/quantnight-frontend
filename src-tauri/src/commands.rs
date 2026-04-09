@@ -85,7 +85,7 @@ pub async fn create_task(
 
 
 #[command]
-pub async fn generate_list(id: String,clients: State<'_, Arc<MongoClients>>,
+pub async fn generate_list(id: String, auth_profile: String, clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,) -> Result<(), String> {
 
     let client = &clients.local;
@@ -108,6 +108,7 @@ pub async fn generate_list(id: String,clients: State<'_, Arc<MongoClients>>,
     let mut replacements = HashMap::new();
     replacements.insert("{template}", template);
     replacements.insert("{name}", name);
+    replacements.insert("{auth_profile}", &auth_profile);
     replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
 
     run_python_command(&config, "generate_list", &replacements).await?;
