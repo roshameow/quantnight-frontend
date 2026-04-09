@@ -327,17 +327,31 @@ pub async fn start_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
+    let client = &clients.local;
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    let task_doc = tasks
+        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "任务未找到".to_string())?;
+
+    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
+    let is_remote_str = if is_remote { "true" } else { "false" };
+
     let (_, _) = run_bash_script(
         "start_task",
-        &[("task_name", &task_name), ("config", &config)],
+        &[
+            ("task_name", &task_name),
+            ("config", &config),
+            ("is_remote", is_remote_str),
+            ("auth_profile", auth_profile),
+        ],
         is_remote,
         &app_config,
     )
     .await?;
-
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
 
     // 解析 config 并准备写入 mission_config
     let mut set_doc = doc! { "status": "running" };
@@ -369,25 +383,43 @@ pub async fn start_task(
     Ok(())
 }
 
-
 #[command]
-pub async fn start_super_task(task_name: String, config: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
+pub async fn start_super_task(
+    task_name: String,
+    config: String,
+    is_remote: bool,
+    clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let client = &clients.local;
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    let task_doc = tasks
+        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "任务未找到".to_string())?;
+
+    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
+    let is_remote_str = if is_remote { "true" } else { "false" };
+
     let (_, _) = run_bash_script(
         "start_super_task",
-        &[("task_name", &task_name), ("config", &config)],
+        &[
+            ("task_name", &task_name),
+            ("config", &config),
+            ("is_remote", is_remote_str),
+            ("auth_profile", auth_profile),
+        ],
         is_remote,
         &app_config,
     )
     .await?;
 
-    let client = &clients.local;
-
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
     tasks
         .update_one(
-            doc! { "name": &task_name , "status": { "$ne": "deactive" }},
+            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
             doc! { "$set": { "status": "running" } },
             None,
         )
@@ -405,18 +437,32 @@ pub async fn start_priority_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
+    let client = &clients.local;
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    let task_doc = tasks
+        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "任务未找到".to_string())?;
+
+    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
+    let is_remote_str = if is_remote { "true" } else { "false" };
+
     // 调用后端脚本启动任务
     let (_, _) = run_bash_script(
         "start_priority_task",
-        &[("task_name", &task_name), ("config", &config)],
+        &[
+            ("task_name", &task_name),
+            ("config", &config),
+            ("is_remote", is_remote_str),
+            ("auth_profile", auth_profile),
+        ],
         is_remote,
         &app_config,
     )
     .await?;
-
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
 
     // 解析 config 并准备写入 mission_config
     let mut set_doc = doc! { "status": "running" };
@@ -471,27 +517,44 @@ pub async fn check_task_status(
 }
 
 #[command]
-pub async fn update_priority_task(task_name: String, config: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
-
-
+pub async fn update_priority_task(
+    task_name: String,
+    config: String,
+    is_remote: bool,
+    clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>,
+) -> Result<(), String> {
     println!("Received config: {}", config); // 打印 config 内容
+
+    let client = &clients.local;
+    let db = client.database("simulation_mission");
+    let tasks = db.collection::<Document>("tasks");
+
+    let task_doc = tasks
+        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "任务未找到".to_string())?;
+
+    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
+    let is_remote_str = if is_remote { "true" } else { "false" };
 
     let (_, _) = run_bash_script(
         "update_priority_task",
-        &[("task_name", &task_name), ("config", &config)],
+        &[
+            ("task_name", &task_name),
+            ("config", &config),
+            ("is_remote", is_remote_str),
+            ("auth_profile", auth_profile),
+        ],
         is_remote,
         &app_config,
     )
     .await?;
 
-    let client = &clients.local;
-
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
     tasks
         .update_one(
-            doc! { "name": &task_name , "status": { "$ne": "deactive" }},
+            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
             doc! { "$set": { "status": "running" } },
             None,
         )

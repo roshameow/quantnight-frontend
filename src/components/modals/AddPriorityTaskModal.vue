@@ -14,6 +14,13 @@
         />
       </n-form-item>
 
+      <n-form-item label="Auth Profile">
+        <n-input
+          v-model:value="form.authProfile"
+          placeholder="请输入 Auth Profile (默认 user1)"
+        />
+      </n-form-item>
+
       <n-form-item label="添加模板路径（可选）">
         <n-input
           v-model:value="form.priorityTemplatePath"
@@ -68,6 +75,7 @@ import { AppConfig } from "@/config";
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
+  authProfile: "user1",
   configText: "", // 预填入 JSON 字符串
   priorityTemplatePath: AppConfig.paths.priorityTemplatePath,
   templateFilename: "",
@@ -142,6 +150,7 @@ const handleSubmit = () => {
       config: parsedConfig,
       template: form.value.templateCode || "",
       templatefile: form.value.templateFilename || "",
+      auth_profile: form.value.authProfile || "user1",
       status: "pending",
       createdAt: new Date(),
     };
