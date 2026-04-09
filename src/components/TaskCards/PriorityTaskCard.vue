@@ -29,15 +29,23 @@
       Params: {{ priorityConfig.filter_params ?? "-" }}
     </div>
 
-    <n-switch
-      :value="task.isRemote"
-      @update:value="(val) => $emit('update:isRemote', val)"
-      :checked-value="true"
-      :unchecked-value="false"
-    >
-      <template #checked>远程</template>
-      <template #unchecked>本地</template>
-    </n-switch>
+    <n-space align="center" style="margin-top: 2px">
+      <n-switch
+        :value="task.isRemote"
+        @update:value="(val) => $emit('update:isRemote', val)"
+        :checked-value="true"
+        :unchecked-value="false"
+      >
+        <template #checked>远程</template>
+        <template #unchecked>本地</template>
+      </n-switch>
+      <n-tag v-if="task.auth_profile" size="small" :bordered="false" type="info" style="background-color: #e3f2fd; color: #1976d2;">
+        {{ task.auth_profile }}
+      </n-tag>
+      <n-tag v-else size="small" :bordered="false" type="info" style="background-color: #e3f2fd; color: #1976d2;">
+        user1
+      </n-tag>
+    </n-space>
     <n-space style="margin-top: 10px" justify="center">
       <n-button size="small" type="success" @click="$emit('start')">
         <template #icon>>></template>启动

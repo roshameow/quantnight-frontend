@@ -14,6 +14,13 @@
         />
       </n-form-item>
 
+      <n-form-item label="Auth Profile">
+        <n-input
+          v-model:value="form.authProfile"
+          placeholder="请输入 Auth Profile (默认 user1)"
+        />
+      </n-form-item>
+
       <n-form-item label="添加模板路径（可选）">
         <n-input
           v-model:value="form.templatePath"
@@ -87,6 +94,7 @@ const message = useMessage();
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
+  authProfile: "user1",
   templatePath: AppConfig.paths.superTemplatePath || '',
   templateFilename: "",
   templateCode: "",
@@ -137,6 +145,7 @@ const handleSubmit = () => {
       name: form.value.taskName,
       template: form.value.templateCode,
       templatefile: form.value.templateFilename,
+      auth_profile: form.value.authProfile || "user1",
       status: "pending",
       createdAt: new Date(),
       isSuper: true, // ✅ 加上这一行

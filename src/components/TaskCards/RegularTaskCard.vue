@@ -41,7 +41,7 @@
         </div>
       </template>
     </div>
-    <n-space style="margin-top: 2px">
+    <n-space align="center" style="margin-top: 2px">
       <n-switch
         :value="task.isRemote"
         @update:value="(val) => $emit('update:isRemote', val)"
@@ -51,6 +51,13 @@
         <template #checked>远程</template>
         <template #unchecked>本地</template>
       </n-switch>
+      <n-tag v-if="task.auth_profile" size="small" :bordered="false" type="info" style="background-color: #e0f2f1; color: #00796b;">
+        {{ task.auth_profile }}
+      </n-tag>
+      <n-tag v-else size="small" :bordered="false" type="info" style="background-color: #e0f2f1; color: #00796b;">
+        user1
+      </n-tag>
+    </n-space>
       <n-space wrap size="small" style="margin-top: 10px">
         <n-button size="small" @click="$emit('view')">
           <template #icon>[ ]</template>查看
@@ -79,9 +86,8 @@
           <template #icon>x</template>删除
         </n-button>
       </n-space>
-    </n-space>
-  </n-card>
-</template>
+    </n-card>
+  </template>
 
 <script setup>
 import { computed } from 'vue';

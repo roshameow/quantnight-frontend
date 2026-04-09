@@ -24,6 +24,7 @@ pub struct NewTask {
     pub name: String,
     pub template: String,
     pub templatefile: String,
+    pub auth_profile: Option<String>,
     pub status: Option<String>,
     pub is_remote: Option<bool>,
     pub task_type: Option<String>,
@@ -35,6 +36,7 @@ pub struct CreatedTask {
     pub name: String,
     pub template: String,
     pub templatefile: String,
+    pub auth_profile: Option<String>,
     pub status: String,
     pub is_remote: Option<bool>,
     pub task_type: Option<String>,
@@ -52,11 +54,13 @@ pub async fn create_task(
     let status = new_task.status.unwrap_or_else(|| "waiting".to_string());
     let is_remote = new_task.is_remote.unwrap_or(false);
     let task_type = new_task.task_type.clone().unwrap_or_else(|| "regular".to_string());
+    let auth_profile = new_task.auth_profile.clone().unwrap_or_else(|| "user1".to_string());
 
     let task_doc = doc! {
         "name": &new_task.name,
         "template": &new_task.template,
         "templatefile": &new_task.templatefile,
+        "auth_profile": &auth_profile,
         "status": &status,
         "isRemote": is_remote,
         "taskType": &task_type,
@@ -77,6 +81,7 @@ pub async fn create_task(
         name: new_task.name,
         template: new_task.template,
         templatefile: new_task.templatefile,
+        auth_profile: Some(auth_profile),
         status,
         is_remote: Some(is_remote),
         task_type: Some(task_type),
@@ -85,7 +90,7 @@ pub async fn create_task(
 
 
 #[command]
-pub async fn generate_list(id: String, auth_profile: String, clients: State<'_, Arc<MongoClients>>,
+pub async fn generate_list(id: String, clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,) -> Result<(), String> {
 
     let client = &clients.local;
@@ -102,13 +107,14 @@ pub async fn generate_list(id: String, auth_profile: String, clients: State<'_, 
     // 从任务中读取 template 和 name 字段
     let template = task_doc.get_str("templatefile").map_err(|_| "任务中缺少 template 字段".to_string())?;
     let name = task_doc.get_str("name").map_err(|_| "任务中缺少 name 字段".to_string())?;
+    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
     let task_type = task_doc.get_str("taskType").unwrap_or("regular"); // 默认为 regular
     let is_super = task_type.eq_ignore_ascii_case("super");
     // 执行python脚本
     let mut replacements = HashMap::new();
     replacements.insert("{template}", template);
     replacements.insert("{name}", name);
-    replacements.insert("{auth_profile}", &auth_profile);
+    replacements.insert("{auth_profile}", auth_profile);
     replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
 
     run_python_command(&config, "generate_list", &replacements).await?;
@@ -207,6 +213,7 @@ pub struct Task {
     pub name: String,
     pub template: String,
     pub templatefile: String,
+    pub auth_profile: Option<String>,
     pub status: String,
     #[serde(rename = "isRemote")] // 👈 加上这个
     pub is_remote: Option<bool>, // 可选字段

@@ -103,13 +103,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch, computed, h } from "vue";
+import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore } from "../stores/taskStore";
 import { storeToRefs } from "pinia";
-import { useMessage, useDialog, NInput } from "naive-ui";
+import { useMessage, useDialog } from "naive-ui";
 
 // Import new components
 import TaskManagerToolbar from "../components/TaskCards/TaskManagerToolbar.vue";
@@ -196,33 +196,14 @@ const handleTaskProgressUpdate = (progress) => {
 const getObjectId = (id) => (typeof id === "object" && "$oid" in id ? id.$oid : id);
 
 const generateList = async (id) => {
-  const authProfile = ref('user1');
-  dialog.info({
-    title: "设置 Auth Profile",
-    content: () =>
-      h(NInput, {
-        defaultValue: authProfile.value,
-        placeholder: "请输入 Auth Profile",
-        "onUpdate:value": (val) => {
-          authProfile.value = val;
-        },
-      }),
-    positiveText: "确定",
-    negativeText: "取消",
-    onPositiveClick: async () => {
-      try {
-        await invoke("generate_list", {
-          id: getObjectId(id),
-          authProfile: authProfile.value || "user1",
-        });
-        message.success("生成列表任务已提交");
-        fetchTasks();
-      } catch (err) {
-        console.error("生成列表失败", err);
-        message.error("生成列表失败: " + err);
-      }
-    },
-  });
+  try {
+    await invoke("generate_list", { id: getObjectId(id) });
+    message.success("生成列表任务已提交");
+    fetchTasks();
+  } catch (err) {
+    console.error("生成列表失败", err);
+    message.error("生成列表失败: " + err);
+  }
 };
 
 const syncRemoteTask = async (taskName) => {
