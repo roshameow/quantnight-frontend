@@ -24,13 +24,18 @@
       </div>
     </template>
     <div v-if="progress">
-      <div>
-        任务进度：
-        {{ (progress?.success ?? 0) - (progress?.priority_success ?? 0) }}+
-        {{ progress?.priority_success ?? 0 }}
-        /
-        {{ (progress?.total ?? 0) - (progress?.priority_total ?? 0) }}+
-        {{ progress?.priority_total ?? 0 }}
+      <div style="font-size: 12px; margin-bottom: 4px">
+        <n-text type="success" title="成功 (普通+插队)">
+          ✓ {{ (progress?.success ?? 0) - (progress?.priority_success ?? 0) }}+{{ progress?.priority_success ?? 0 }}
+        </n-text>
+        &nbsp;|&nbsp;
+        <n-text type="error" title="失败 (普通+插队)">
+          ✗ {{ (progress?.error ?? 0) - (progress?.priority_error ?? 0) }}+{{ progress?.priority_error ?? 0 }}
+        </n-text>
+        &nbsp;|&nbsp;
+        <n-text depth="3" title="总计 (普通+插队)">
+          Σ {{ (progress?.total ?? 0) - (progress?.priority_total ?? 0) }}+{{ progress?.priority_total ?? 0 }}
+        </n-text>
       </div>
     </div>
     <div v-if="task.status === 'running'">
@@ -111,33 +116,49 @@ const getStatusType = (status) =>
 const progressBarStyle = computed(() => {
   const p = props.progress || {};
   const success = typeof p.success === "number" ? p.success : 0;
+  const error = typeof p.error === "number" ? p.error : 0;
   const total = typeof p.total === "number" && p.total > 0 ? p.total : 1;
   const priority_success = typeof p.priority_success === "number" ? p.priority_success : 0;
+  const priority_error = typeof p.priority_error === "number" ? p.priority_error : 0;
 
   const nonPrioritySuccess = Math.max(success - priority_success, 0);
+  const nonPriorityError = Math.max(error - priority_error, 0);
+  
   const greenPercent = (nonPrioritySuccess / total) * 100;
-  const redPercent = (priority_success / total) * 100;
+  const redPercent = (nonPriorityError / total) * 100;
+  const pGreenPercent = (priority_success / total) * 100;
+  const pRedPercent = (priority_error / total) * 100;
 
   const isSuper = props.task.taskType === "super";
   const mainColor = isSuper ? "#64b5f6" : "#a1e3a1";
-  const priorityColor = "#caa969";
+  const errorColor = "#ff5252";
+  const pMainColor = "#caa969";
+  const pErrorColor = "#ffb74d";
   const bgColor = "#f0f0f0";
 
   const layers = [];
   const sizes = [];
   const positions = [];
 
-  if (total > 1) {
-    layers.push(`linear-gradient(to right, ${mainColor}, ${mainColor})`);
-    sizes.push(`${greenPercent}% 100%`);
-    positions.push(`left top`);
-  }
+  // Layer 1: Normal Success
+  layers.push(`linear-gradient(to right, ${mainColor}, ${mainColor})`);
+  sizes.push(`${greenPercent}% 100%`);
+  positions.push(`left top`);
 
-  if (total > 1) {
-    layers.push(`linear-gradient(to right, ${priorityColor}, ${priorityColor})`);
-    sizes.push(`${redPercent}% 100%`);
-    positions.push(`${greenPercent}% 0`);
-  }
+  // Layer 2: Normal Error
+  layers.push(`linear-gradient(to right, ${errorColor}, ${errorColor})`);
+  sizes.push(`${redPercent}% 100%`);
+  positions.push(`${greenPercent}% 0`);
+
+  // Layer 3: Priority Success
+  layers.push(`linear-gradient(to right, ${pMainColor}, ${pMainColor})`);
+  sizes.push(`${pGreenPercent}% 100%`);
+  positions.push(`${greenPercent + redPercent}% 0`);
+
+  // Layer 4: Priority Error
+  layers.push(`linear-gradient(to right, ${pErrorColor}, ${pErrorColor})`);
+  sizes.push(`${pRedPercent}% 100%`);
+  positions.push(`${greenPercent + redPercent + pGreenPercent}% 0`);
 
   return {
     position: "absolute",

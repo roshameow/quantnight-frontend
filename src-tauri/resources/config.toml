@@ -31,22 +31,22 @@ args = [ "{alpha_mission_list}" ]
 [bash.scripts.start_task]
 command = "bash"
 script = "./scripts/start_task.sh"
-args = [ "{task_name}", "{config}", "{is_remote}", "{auth_profile}" ]
+args = [ "{task_name}", "'{config}'", "{is_remote}", "{auth_profile}" ]
 
 [bash.scripts.start_super_task]
 command = "bash"
 script = "./scripts/start_super_task.sh"
-args = [ "{task_name}", "{config}", "{is_remote}", "{auth_profile}" ]
+args = [ "{task_name}", "'{config}'", "{is_remote}", "{auth_profile}" ]
 
 [bash.scripts.start_priority_task]
 command = "bash"
 script = "./scripts/start_priority_task.sh"
-args = [ "{task_name}", "{config}", "{is_remote}", "{auth_profile}" ]
+args = [ "{task_name}", "'{config}'", "{is_remote}", "{auth_profile}" ]
 
 [bash.scripts.update_priority_task]
 command = "bash"
 script = "./scripts/update_priority_task.sh"
-args = [ "{task_name}", "{config}", "{is_remote}", "{auth_profile}" ]
+args = [ "{task_name}", "'{config}'", "{is_remote}", "{auth_profile}" ]
 
 [bash.scripts.check_task_status]
 command = "bash"

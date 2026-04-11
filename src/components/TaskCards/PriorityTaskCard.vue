@@ -8,6 +8,7 @@
   >
     <template #header>
       <div class="card-header">
+        <div class="progress-background" :style="progressBarStyle" />
         <div class="header-content">
           <span class="task-name">{{ task.name }}</span>
           <n-tag :type="getStatusType(task.status)" size="small" round>
@@ -17,6 +18,21 @@
       </div>
     </template>
 
+    <div v-if="progress" style="margin-bottom: 4px">
+      <div style="font-size: 12px; margin-bottom: 2px">
+        <n-text type="success" title="成功">
+          ✓ {{ progress?.success ?? 0 }}
+        </n-text>
+        &nbsp;|&nbsp;
+        <n-text type="error" title="失败">
+          ✗ {{ progress?.error ?? 0 }}
+        </n-text>
+        &nbsp;|&nbsp;
+        <n-text depth="3" title="总计">
+          Σ {{ progress?.total ?? 0 }}
+        </n-text>
+      </div>
+    </div>
     <div>
       任务状态：
       {{ taskRuntimeStatus ?? "未知" }}
@@ -75,9 +91,56 @@ const props = defineProps({
     type: String,
     default: "未知",
   },
+  progress: {
+    type: Object,
+    default: () => ({}),
+  },
 });
 
 defineEmits(['update:isRemote', 'start', 'update', 'pause', 'delete']);
+
+const progressBarStyle = computed(() => {
+  const p = props.progress || {};
+  const success = typeof p.success === "number" ? p.success : 0;
+  const error = typeof p.error === "number" ? p.error : 0;
+  const total = typeof p.total === "number" && p.total > 0 ? p.total : 1;
+
+  const greenPercent = (success / total) * 100;
+  const redPercent = (error / total) * 100;
+
+  const mainColor = "#ffb74d"; // Orange for priority success
+  const errorColor = "#ff5252"; // Red for error
+  const bgColor = "#fffaf2"; // Light orange background
+
+  const layers = [];
+  const sizes = [];
+  const positions = [];
+
+  layers.push(`linear-gradient(to right, ${mainColor}, ${mainColor})`);
+  sizes.push(`${greenPercent}% 100%`);
+  positions.push(`left top`);
+
+  layers.push(`linear-gradient(to right, ${errorColor}, ${errorColor})`);
+  sizes.push(`${redPercent}% 100%`);
+  positions.push(`${greenPercent}% 0`);
+
+  return {
+    position: "absolute",
+    top: "0",
+    left: "0",
+    height: "100%",
+    width: "100%",
+    zIndex: 0,
+    borderRadius: "10px 10px 0 0",
+    overflow: "hidden",
+    pointerEvents: "none",
+    backgroundColor: bgColor,
+    backgroundImage: layers.join(", "),
+    backgroundSize: sizes.join(", "),
+    backgroundPosition: positions.join(", "),
+    backgroundRepeat: "no-repeat",
+  };
+});
 
 // Helper function to safely get nested properties
 function getNested(obj, pathArray) {
@@ -116,12 +179,24 @@ const getStatusType = (status) =>
 .card-header {
   position: relative;
   width: 100%;
+  height: 40px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
   box-sizing: border-box;
   z-index: 1;
+}
+.progress-background {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  background-color: #f0f0f0;
+  z-index: 0;
+  border-radius: 10px 10px 0 0;
+  pointer-events: none;
 }
 .header-content {
   position: relative;

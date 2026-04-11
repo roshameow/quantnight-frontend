@@ -24,8 +24,10 @@ use crate::config::AppConfig;
 struct TaskProgress {
     collection: String,
     success: usize,
+    error: usize,
     total: usize,
     priority_success: Option<usize>,
+    priority_error: Option<usize>,
     priority_total: Option<usize>,
     is_remote: bool,
 }
@@ -136,11 +138,17 @@ pub async fn emit_progress_for_collection(
             // 所有任务总数
             "total": { "$sum": 1 },
             "success": { "$sum": { "$cond": [ { "$eq": ["$status", "success"] }, 1, 0 ] } },
+            "error": { "$sum": { "$cond": [ { "$in": ["$status", ["fail", "error"]] }, 1, 0 ] } },
             // priority 条件统计
             "priority_total": { "$sum": { "$cond": [ { "$gt": ["$priority", 0] }, 1, 0 ] } },
             "priority_success": { "$sum": { "$cond": [
                 { "$and": [
                     { "$eq": ["$status", "success"] },
+                    { "$gt": ["$priority", 0] }
+                ]}, 1, 0] } },
+            "priority_error": { "$sum": { "$cond": [
+                { "$and": [
+                    { "$in": ["$status", ["fail", "error"]] },
                     { "$gt": ["$priority", 0] }
                 ]}, 1, 0] } },
         }}
@@ -150,24 +158,28 @@ pub async fn emit_progress_for_collection(
         .aggregate(pipeline, None)
         .await
         .context("Mongo aggregate failed")?;
-    let (total, success, priority_total, priority_success) = if let Some(Ok(doc)) = agg_cursor.next().await {
+    let (total, success, error, priority_total, priority_success, priority_error) = if let Some(Ok(doc)) = agg_cursor.next().await {
         (
             doc.get_i32("total").unwrap_or(0) as usize,
             doc.get_i32("success").unwrap_or(0) as usize,
+            doc.get_i32("error").unwrap_or(0) as usize,
             doc.get_i32("priority_total").unwrap_or(0) as usize,
             doc.get_i32("priority_success").unwrap_or(0) as usize,
+            doc.get_i32("priority_error").unwrap_or(0) as usize,
         )
     } else {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0)
     };
 
     // ④ emit
     let payload = TaskProgress {
         collection: collection_name.clone(),
         success,
+        error,
         total,
         is_remote,
         priority_success: Some(priority_success),
+        priority_error: Some(priority_error),
         priority_total: Some(priority_total),
     };
 

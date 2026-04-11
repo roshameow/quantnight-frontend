@@ -28,6 +28,7 @@
           >
             <PriorityTaskCard
               :task="task"
+              :progress="taskProgressMap[task.name]"
               :task-runtime-status="taskRuntimeStatus[task.name]"
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @start="openStartModal(task)"

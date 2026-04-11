@@ -21,8 +21,10 @@ export const useTaskStore = defineStore('task', () => {
     // 保证更新触发响应式
     taskProgressMap.value[progress.collection] = {
       success: progress.success,
+      error: progress.error ?? 0,
       total: progress.total,
       priority_success: progress.priority_success ?? 0,
+      priority_error: progress.priority_error ?? 0,
       priority_total: progress.priority_total ?? 0,
       is_remote: progress.is_remote ?? false,
     }
@@ -32,7 +34,7 @@ export const useTaskStore = defineStore('task', () => {
   const initializeProgressForTasks = (tasksList) => {
     tasksList.forEach((task) => {
       if (!taskProgressMap.value[task.name]) {
-        taskProgressMap.value[task.name] = { success: 0, total: 0, priority_success: 0, priority_total: 0, is_remote: false }
+        taskProgressMap.value[task.name] = { success: 0, error: 0, total: 0, priority_success: 0, priority_error: 0, priority_total: 0, is_remote: false }
         console.log("Progress initialized for task", task.name)
       }
     })
