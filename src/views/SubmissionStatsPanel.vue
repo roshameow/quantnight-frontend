@@ -336,8 +336,8 @@ const columns = [
     title: '提交个数',
     key: 'count',
     render(row) {
-      return h('div', { style: 'display: flex; align-items: center; gap: 8px' }, [
-        // Regular count container with fixed width to align the next element
+      return h('div', { style: 'display: flex; align-items: center; gap: 12px' }, [
+        // Regular count: fixed width, right aligned
         h('div', { style: 'width: 40px; display: flex; justify-content: flex-end' }, [
           h(
             NButton,
@@ -349,16 +349,18 @@ const columns = [
             { default: () => row.count }
           )
         ]),
-        // Super count (plain blue text, no background)
-        row.super_count > 0 ? h(
-          NButton,
-          {
-            text: true,
-            style: 'color: #2080f0',
-            onClick: () => viewAlphaList(row.month, row.region, 'SUPER')
-          },
-          { default: () => row.super_count }
-        ) : null
+        // Super count: fixed width, right aligned, plain blue text
+        h('div', { style: 'width: 30px; display: flex; justify-content: flex-end' }, [
+          row.super_count > 0 ? h(
+            NButton,
+            {
+              text: true,
+              style: 'color: #2080f0',
+              onClick: () => viewAlphaList(row.month, row.region, 'SUPER')
+            },
+            { default: () => row.super_count }
+          ) : null
+        ])
       ]);
     }
   },
