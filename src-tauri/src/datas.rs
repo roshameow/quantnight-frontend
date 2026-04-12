@@ -642,6 +642,7 @@ pub async fn get_submission_stats(
             "$project": {
                 "region": { "$ifNull": ["$settings.region", "Unknown"] },
                 "month": { "$substr": [{ "$ifNull": ["$dateSubmitted", "$dateCreated"] }, 0, 7] },
+                "alpha_type": { "$ifNull": ["$type", "REGULAR"] },
                 "sharpe": "$is.sharpe",
                 "fitness": "$is.fitness",
                 "drawdown": "$is.drawdown",
@@ -653,13 +654,30 @@ pub async fn get_submission_stats(
         doc! {
             "$group": {
                 "_id": { "month": "$month", "region": "$region" },
-                "count": { "$sum": 1 },
-                "avg_sharpe": { "$avg": "$sharpe" },
-                "avg_fitness": { "$avg": "$fitness" },
-                "avg_drawdown": { "$avg": "$drawdown" },
-                "avg_turnover": { "$avg": "$turnover" },
-                "avg_returns": { "$avg": "$returns" },
-                "avg_margin": { "$avg": "$margin" },
+                "count": {
+                    "$sum": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, 1, 0] }
+                },
+                "super_count": {
+                    "$sum": { "$cond": [{ "$eq": ["$alpha_type", "SUPER"] }, 1, 0] }
+                },
+                "avg_sharpe": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$sharpe", "$$REMOVE"] }
+                },
+                "avg_fitness": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$fitness", "$$REMOVE"] }
+                },
+                "avg_drawdown": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$drawdown", "$$REMOVE"] }
+                },
+                "avg_turnover": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$turnover", "$$REMOVE"] }
+                },
+                "avg_returns": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$returns", "$$REMOVE"] }
+                },
+                "avg_margin": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$margin", "$$REMOVE"] }
+                },
             }
         },
         doc! {

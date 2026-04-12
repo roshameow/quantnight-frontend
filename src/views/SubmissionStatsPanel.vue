@@ -198,6 +198,7 @@ function calculateGroupedSummary(docs, label) {
   
   const regionGroups = {};
   let totalCount = 0;
+  let totalSuperCount = 0;
   let weightedSharpe = 0;
   let weightedFitness = 0;
   let weightedTurnover = 0;
@@ -210,6 +211,7 @@ function calculateGroupedSummary(docs, label) {
       regionGroups[region] = {
         region,
         count: 0,
+        super_count: 0,
         avg_sharpe: 0,
         avg_fitness: 0,
         avg_turnover: 0,
@@ -219,19 +221,24 @@ function calculateGroupedSummary(docs, label) {
     }
     
     const r = regionGroups[region];
-    r.count += doc.count;
-    r.avg_sharpe += (doc.avg_sharpe || 0) * doc.count;
-    r.avg_fitness += (doc.avg_fitness || 0) * doc.count;
-    r.avg_turnover += (doc.avg_turnover || 0) * doc.count;
-    r.avg_returns += (doc.avg_returns || 0) * doc.count;
-    r.avg_margin += (doc.avg_margin || 0) * doc.count;
+    const docCount = doc.count || 0;
+    const docSuperCount = doc.super_count || 0;
+
+    r.count += docCount;
+    r.super_count += docSuperCount;
+    r.avg_sharpe += (doc.avg_sharpe || 0) * docCount;
+    r.avg_fitness += (doc.avg_fitness || 0) * docCount;
+    r.avg_turnover += (doc.avg_turnover || 0) * docCount;
+    r.avg_returns += (doc.avg_returns || 0) * docCount;
+    r.avg_margin += (doc.avg_margin || 0) * docCount;
     
-    totalCount += doc.count;
-    weightedSharpe += (doc.avg_sharpe || 0) * doc.count;
-    weightedFitness += (doc.avg_fitness || 0) * doc.count;
-    weightedTurnover += (doc.avg_turnover || 0) * doc.count;
-    weightedReturns += (doc.avg_returns || 0) * doc.count;
-    weightedMargin += (doc.avg_margin || 0) * doc.count;
+    totalCount += docCount;
+    totalSuperCount += docSuperCount;
+    weightedSharpe += (doc.avg_sharpe || 0) * docCount;
+    weightedFitness += (doc.avg_fitness || 0) * docCount;
+    weightedTurnover += (doc.avg_turnover || 0) * docCount;
+    weightedReturns += (doc.avg_returns || 0) * docCount;
+    weightedMargin += (doc.avg_margin || 0) * docCount;
   });
 
   const children = Object.values(regionGroups).map(r => {
@@ -250,17 +257,18 @@ function calculateGroupedSummary(docs, label) {
     };
   }).sort((a, b) => a.region.localeCompare(b.region));
 
-  if (totalCount === 0) return null;
+  if (totalCount === 0 && totalSuperCount === 0) return null;
 
   return {
     key: label,
     month: label,
     count: totalCount,
-    avg_sharpe: weightedSharpe / totalCount,
-    avg_fitness: weightedFitness / totalCount,
-    avg_turnover: weightedTurnover / totalCount,
-    avg_returns: weightedReturns / totalCount,
-    avg_margin: weightedMargin / totalCount,
+    super_count: totalSuperCount,
+    avg_sharpe: totalCount > 0 ? weightedSharpe / totalCount : 0,
+    avg_fitness: totalCount > 0 ? weightedFitness / totalCount : 0,
+    avg_turnover: totalCount > 0 ? weightedTurnover / totalCount : 0,
+    avg_returns: totalCount > 0 ? weightedReturns / totalCount : 0,
+    avg_margin: totalCount > 0 ? weightedMargin / totalCount : 0,
     children
   };
 }
@@ -328,15 +336,30 @@ const columns = [
     title: '提交个数',
     key: 'count',
     render(row) {
-      return h(
-        NButton,
-        {
-          text: true,
-          type: 'primary',
-          onClick: () => viewAlphaList(row.month, row.region)
-        },
-        { default: () => row.count }
-      );
+      return h('div', { style: 'display: flex; align-items: center; gap: 8px' }, [
+        // Regular count container with fixed width to align the next element
+        h('div', { style: 'width: 40px; display: flex; justify-content: flex-end' }, [
+          h(
+            NButton,
+            {
+              text: true,
+              type: 'primary',
+              onClick: () => viewAlphaList(row.month, row.region, 'REGULAR')
+            },
+            { default: () => row.count }
+          )
+        ]),
+        // Super count (plain blue text, no background)
+        row.super_count > 0 ? h(
+          NButton,
+          {
+            text: true,
+            style: 'color: #2080f0',
+            onClick: () => viewAlphaList(row.month, row.region, 'SUPER')
+          },
+          { default: () => row.super_count }
+        ) : null
+      ]);
     }
   },
   {
@@ -388,6 +411,7 @@ async function fetchStats() {
         monthGroups[month] = {
           month,
           count: 0,
+          super_count: 0,
           avg_sharpe: 0,
           avg_fitness: 0,
           avg_turnover: 0,
@@ -401,7 +425,8 @@ async function fetchStats() {
         key: `${month}-${doc._id.region}`,
         month,
         region: doc._id.region,
-        count: doc.count,
+        count: doc.count || 0,
+        super_count: doc.super_count || 0,
         avg_sharpe: doc.avg_sharpe,
         avg_fitness: doc.avg_fitness,
         avg_turnover: doc.avg_turnover,
@@ -411,12 +436,14 @@ async function fetchStats() {
       
       monthGroups[month].children.push(regionData);
       
-      monthGroups[month].count += doc.count;
-      monthGroups[month].avg_sharpe += (doc.avg_sharpe || 0) * doc.count;
-      monthGroups[month].avg_fitness += (doc.avg_fitness || 0) * doc.count;
-      monthGroups[month].avg_turnover += (doc.avg_turnover || 0) * doc.count;
-      monthGroups[month].avg_returns += (doc.avg_returns || 0) * doc.count;
-      monthGroups[month].avg_margin += (doc.avg_margin || 0) * doc.count;
+      const docCount = doc.count || 0;
+      monthGroups[month].count += docCount;
+      monthGroups[month].super_count += (doc.super_count || 0);
+      monthGroups[month].avg_sharpe += (doc.avg_sharpe || 0) * docCount;
+      monthGroups[month].avg_fitness += (doc.avg_fitness || 0) * docCount;
+      monthGroups[month].avg_turnover += (doc.avg_turnover || 0) * docCount;
+      monthGroups[month].avg_returns += (doc.avg_returns || 0) * docCount;
+      monthGroups[month].avg_margin += (doc.avg_margin || 0) * docCount;
     });
 
     statsData.value = Object.values(monthGroups).map(m => {
@@ -441,9 +468,11 @@ async function fetchStats() {
   }
 }
 
-async function viewAlphaList(month, region) {
+async function viewAlphaList(month, region, alphaType) {
   selectedMonth.value = month;
   selectedRegion.value = region || '';
+  if (alphaType) selectedRegion.value += ` (${alphaType})`;
+
   showAlphaList.value = true;
   alphaLoading.value = true;
   alphaListData.value = [];
@@ -476,6 +505,9 @@ async function viewAlphaList(month, region) {
     }
     if (region) {
       conditions.push({ "settings.region": region });
+    }
+    if (alphaType) {
+      conditions.push({ "type": alphaType });
     }
 
     // Add search query conditions if present
