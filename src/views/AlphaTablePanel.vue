@@ -156,6 +156,7 @@ const filters = reactive({
   maxTurnover: null,
   minMargin: null,
   minReturn: null,
+  type: "REGULAR",
 });
 
 const onFiltersUpdate = (newFilters) => {
@@ -207,6 +208,7 @@ async function fetchData() {
       filters.maxTurnover != null ? parseFloat(filters.maxTurnover) / 100 : null,
     min_margin: filters.minMargin != null ? parseFloat(filters.minMargin) / 10000 : null,
     min_returns: filters.minReturn != null ? parseFloat(filters.minReturn) / 100 : null,
+    alpha_type: filters.type || null,
     page: pagination.value.page,
     page_size: pagination.value.pageSize,
     sort_field: sortState.value.field,

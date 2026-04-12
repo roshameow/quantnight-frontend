@@ -72,6 +72,7 @@ pub struct AlphaQuery {
     pub min_margin: Option<f64>,
     pub delay: Option<u32>,
     pub min_returns: Option<f64>,
+    pub alpha_type: Option<String>,
     pub collection: Option<String>,
     pub embedding: Option<String>,
     pub page: Option<u32>,
@@ -411,6 +412,9 @@ pub async fn get_alpha_results(
         filters.push(doc! {
             "$expr": { "$gte": [ { "$abs": "$is.returns" }, min_returns ] }
         });
+    }
+    if let Some(alpha_type) = &params.alpha_type {
+        filters.push(doc! { "type": alpha_type });
     }
 
     let filter = if filters.is_empty() {

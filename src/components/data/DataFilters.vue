@@ -5,14 +5,27 @@
     <n-grid :cols="24" :x-gap="12" :y-gap="8" item-responsive responsive="screen">
       <!-- Left side: Inputs -->
       <n-grid-item span="22 m:20 l:21">
-        <n-select
-          :value="modelValue.collection"
-          @update:value="updateFilter('collection', $event)"
-          :options="configStore.dataFilterOptions"
-          placeholder="Collection"
-          style="width: 160px"
-        />
+        <!-- Top row: Collection and Type toggle -->
+        <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 12px;">
+          <n-select
+            :value="modelValue.collection"
+            @update:value="updateFilter('collection', $event)"
+            :options="configStore.dataFilterOptions"
+            placeholder="Collection"
+            style="width: 160px"
+          />
 
+          <n-radio-group
+            :value="modelValue.type"
+            @update:value="updateFilter('type', $event)"
+            name="alpha-type"
+          >
+            <n-radio-button value="REGULAR">REGULAR</n-radio-button>
+            <n-radio-button value="SUPER">SUPER</n-radio-button>
+          </n-radio-group>
+        </div>
+
+        <!-- Remaining filters -->
         <n-space align="center" wrap :size="[12, 12]">
           <n-input
             :value="modelValue.searchQuery"
@@ -20,7 +33,6 @@
             placeholder="🔍 Search Regular"
             clearable
             style="width: 280px"
-           
           />
           <n-input
             :value="modelValue.id"
