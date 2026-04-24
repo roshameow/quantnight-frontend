@@ -11,6 +11,8 @@ remote_uri = "mongodb://localhost:27017"
   alpha = "alpha_db"
   dataset = "dataset_db"
   dataset_collection = "datasets_all"
+  datafield = "data_db"
+  datafield_collection = "datafields_all"
 
 [env]
 working_dir = "./"

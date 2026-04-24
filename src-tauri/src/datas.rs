@@ -336,6 +336,101 @@ pub struct DatasetQuery {
     pub region: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DatafieldRegionData {
+    pub region: String,
+    pub delay: i32,
+    pub universe: String,
+    pub coverage: Option<f64>,
+    pub alpha_count: Option<i32>,
+    pub user_count: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Datafield {
+    pub id: String,
+    pub description: Option<String>,
+    pub r#type: Option<String>,
+    pub category: Option<JsonValue>,
+    pub subcategory: Option<JsonValue>,
+    pub dataset: Option<JsonValue>,
+    pub data: Vec<DatafieldRegionData>,
+}
+
+#[derive(Deserialize)]
+pub struct DatafieldQuery {
+    pub dataset_id: String,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub search: Option<String>,
+    pub region: Option<String>,
+}
+
+#[command]
+pub async fn get_datafields(
+    params: DatafieldQuery,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<PagedResult<Datafield>, String> {
+    let client = &clients.local;
+    let db_name = config.mongodb.databases.datafield.as_deref().unwrap_or("data_db");
+    let coll_name = config.mongodb.databases.datafield_collection.as_deref().unwrap_or("datafields_all");
+    
+    let db = client.database(db_name);
+    let collection = db.collection::<mongodb::bson::Document>(coll_name);
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(50);
+    let skip = ((page - 1) * page_size) as u64;
+
+    let mut filters = vec![
+        doc! { "dataset.id": &params.dataset_id }
+    ];
+    
+    if let Some(search) = &params.search {
+        if !search.is_empty() {
+            let escaped = regex::escape(search.trim());
+            filters.push(doc! {
+                "$or": [
+                    { "id": { "$regex": &escaped, "$options": "i" } },
+                    { "description": { "$regex": &escaped, "$options": "i" } }
+                ]
+            });
+        }
+    }
+
+    if let Some(region) = &params.region {
+        if !region.is_empty() {
+            filters.push(doc! { "data.region": region });
+        }
+    }
+
+    let filter = doc! { "$and": filters };
+
+    let find_options = FindOptions::builder()
+        .skip(skip)
+        .limit(page_size as i64)
+        .build();
+
+    let total = collection.count_documents(filter.clone(), None).await.map_err(|e| e.to_string())?;
+    let mut cursor = collection.find(filter, find_options).await.map_err(|e| e.to_string())?;
+    
+    let mut results = Vec::new();
+    while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        if let Ok(field) = mongodb::bson::from_document::<Datafield>(doc) {
+            results.push(field);
+        }
+    }
+
+    Ok(PagedResult {
+        data: results,
+        total,
+        page,
+        page_size,
+    })
+}
+
 #[command]
 pub async fn get_datasets(
     params: DatasetQuery,
