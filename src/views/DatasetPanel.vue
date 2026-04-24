@@ -4,36 +4,58 @@
     <div v-if="viewMode === 'datasets'">
       <div class="header">
         <div style="background: #f8f8f8; padding: 16px; border-radius: 8px; margin-bottom: 16px">
-          <div style="display: flex; align-items: center; gap: 12px;">
-            <!-- 地区选择 -->
-            <div style="width: 200px; flex-shrink: 0;">
-              <n-select
-                v-model:value="selectedRegion"
-                :options="regionOptions"
-                placeholder="选择地区"
-                clearable
-                style="width: 100%"
-                @update:value="handleSearch"
-              />
+          <n-space vertical size="medium">
+            <!-- Top Row: General Search -->
+            <div style="display: flex; align-items: center; gap: 12px;">
+              <div style="flex: 1;">
+                <n-input
+                  v-model:value="filters.searchText"
+                  placeholder="General Search (Name, ID, Description)"
+                  clearable
+                />
+              </div>
             </div>
 
-            <!-- 搜索输入 -->
-            <div style="flex: 1; min-width: 200px;">
-              <n-input
-                v-model:value="searchText"
-                placeholder="搜索数据集名称或ID (回车搜索)"
-                clearable
-                @keyup.enter="handleSearch"
-              />
+            <!-- Bottom Row: Specific Filters -->
+            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+              <div style="width: 150px;">
+                <n-input v-model:value="filters.filterId" placeholder="ID" clearable size="small" />
+              </div>
+              <div style="width: 180px;">
+                <n-input v-model:value="filters.filterName" placeholder="Name" clearable size="small" />
+              </div>
+              <div style="width: 150px;">
+                <n-select
+                  v-model:value="filters.filterCategory"
+                  :options="categoryOptions"
+                  placeholder="Category"
+                  clearable
+                  size="small"
+                />
+              </div>
+              <div style="width: 130px;">
+                <n-select
+                  v-model:value="filters.selectedRegion"
+                  :options="regionOptions"
+                  placeholder="Region"
+                  clearable
+                  size="small"
+                />
+              </div>
+              <div style="width: 150px;">
+                <n-input v-model:value="filters.filterUniverse" placeholder="Universe" clearable size="small" />
+              </div>
+              <div style="width: 100px;">
+                <n-select
+                  v-model:value="filters.filterDelay"
+                  :options="delayOptions"
+                  placeholder="Delay"
+                  clearable
+                  size="small"
+                />
+              </div>
             </div>
-
-            <!-- 刷新按钮 -->
-            <div style="width: 100px; flex-shrink: 0;">
-              <n-button type="primary" @click="handleSearch" :loading="loading" style="width: 100%">
-                查询
-              </n-button>
-            </div>
-          </div>
+          </n-space>
         </div>
       </div>
 
@@ -50,6 +72,7 @@
         :pagination="pagination"
         @update:page="handlePageChange"
         @update:page-size="handlePageSizeChange"
+        @update:sorter="handleSorterChange"
         :row-props="datasetRowProps"
       />
     </div>
@@ -63,7 +86,7 @@
               <template #icon>
                 <span>←</span>
               </template>
-              返回
+              Back
             </n-button>
             
             <div style="flex: 1; display: flex; align-items: center; gap: 8px; overflow: hidden">
@@ -75,7 +98,7 @@
             <div style="width: 250px;">
               <n-input
                 v-model:value="fieldSearchText"
-                placeholder="搜索字段 ID 或描述"
+                placeholder="Search Field ID or Description"
                 clearable
                 size="small"
                 @keyup.enter="handleFieldSearch"
@@ -83,7 +106,7 @@
             </div>
             
             <n-button type="primary" size="small" @click="handleFieldSearch" :loading="loading">
-              搜索字段
+              Search Fields
             </n-button>
           </div>
         </div>
@@ -119,9 +142,47 @@ const datasets = ref([]);
 const currentDataset = ref(null);
 const datafields = ref([]);
 
-const selectedRegion = ref(null);
-const searchText = ref('');
+const filters = reactive({
+  searchText: '',
+  filterId: '',
+  filterName: '',
+  filterCategory: null,
+  selectedRegion: null,
+  filterUniverse: '',
+  filterDelay: null,
+});
+
 const fieldSearchText = ref('');
+const currentSorter = ref(null);
+const expandedRowIds = ref(new Set());
+
+const delayOptions = [
+  { label: 'Delay 0', value: 0 },
+  { label: 'Delay 1', value: 1 },
+];
+
+const categoryOptions = [
+  'Analyst', 'Broker', 'Earnings', 'Fundamental', 'Imbalance', 'Insiders', 
+  'Institutions', 'Macro', 'Model', 'News', 'Option', 'Other', 
+  'Price Volume', 'Risk', 'Sentiment', 'Short Interest', 'Social Media'
+].map(c => ({ label: c, value: c }));
+
+// Debounced watcher for filters
+let debounceTimer = null;
+watch(filters, () => {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    handleSearch();
+  }, 300);
+}, { deep: true });
+
+// Also watch field search
+watch(fieldSearchText, () => {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    handleFieldSearch();
+  }, 300);
+});
 
 // Pagination for Datasets
 const pagination = reactive({
@@ -131,7 +192,7 @@ const pagination = reactive({
   pageSizes: [20, 50, 100, 200],
   itemCount: 0,
   prefix ({ itemCount }) {
-    return `共 ${itemCount} 个数据集`;
+    return `Total ${itemCount} items`;
   }
 });
 
@@ -143,44 +204,73 @@ const fieldPagination = reactive({
   pageSizes: [50, 100, 200, 500],
   itemCount: 0,
   prefix ({ itemCount }) {
-    return `共 ${itemCount} 个字段`;
+    return `Total ${itemCount} fields`;
   }
 });
 
 const regionOptions = [
-  { label: 'USA (美国)', value: 'USA' },
-  { label: 'JPN (日本)', value: 'JPN' },
-  { label: 'EUR (欧洲)', value: 'EUR' },
-  { label: 'HKG (香港)', value: 'HKG' },
-  { label: 'CHN (中国)', value: 'CHN' },
-  { label: 'AMR (美洲)', value: 'AMR' },
-  { label: 'ASI (亚洲)', value: 'ASI' },
-  { label: 'GLB (全球)', value: 'GLB' },
-  { label: 'KOR (韩国)', value: 'KOR' },
-  { label: 'IND (印度)', value: 'IND' },
+  { label: 'USA', value: 'USA' },
+  { label: 'JPN', value: 'JPN' },
+  { label: 'EUR', value: 'EUR' },
+  { label: 'HKG', value: 'HKG' },
+  { label: 'CHN', value: 'CHN' },
+  { label: 'AMR', value: 'AMR' },
+  { label: 'ASI', value: 'ASI' },
+  { label: 'GLB', value: 'GLB' },
+  { label: 'KOR', value: 'KOR' },
+  { label: 'IND', value: 'IND' },
 ];
 
 const datasetColumns = [
   {
+    title: 'Action',
+    key: 'actions',
+    width: 70,
+    render(row) {
+      return h(
+        NButton,
+        {
+          size: 'tiny',
+          secondary: true,
+          type: 'primary',
+          onClick: () => enterDataset(row)
+        },
+        { default: () => 'Enter' }
+      );
+    }
+  },
+  {
     title: 'ID',
     key: 'id',
     width: 120,
+    sorter: true,
     render(row) {
       return h('div', { class: 'regular-cell', style: 'font-family: monospace; font-size: 11px' }, row.id);
     }
   },
   {
-    title: '名称',
+    title: 'Name',
     key: 'name',
     width: 180,
+    sorter: true,
     render(row) {
-      return h('div', { class: 'regular-cell' }, [
-        h(NText, { strong: true, style: 'font-size: 12px' }, { default: () => row.name })
-      ]);
+      const isExpanded = expandedRowIds.value.has('name-' + row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete('name-' + row.id) : expandedRowIds.value.add('name-' + row.id);
+          },
+        },
+        [h(NText, { strong: true, style: 'font-size: 12px' }, { default: () => row.name })]
+      );
     }
   },
   {
-    title: '分类',
+    title: 'Category',
     key: 'category',
     width: 100,
     render(row) {
@@ -188,29 +278,52 @@ const datasetColumns = [
     }
   },
   {
-    title: '可用地区',
-    key: 'regions',
-    width: 300,
+    title: 'Fields',
+    key: 'totalFieldCount',
+    width: 80,
+    align: 'right',
+    sorter: true,
     render(row) {
-      const displayData = selectedRegion.value 
-        ? row.data.filter(d => d.region === selectedRegion.value)
+      const sum = row.data.reduce((acc, d) => acc + (d.fieldCount || 0), 0);
+      return h('div', { style: 'font-size: 11px' }, sum > 0 ? sum : '--');
+    }
+  },
+  {
+    title: 'Alphas',
+    key: 'totalAlphaCount',
+    width: 80,
+    align: 'right',
+    sorter: true,
+    render(row) {
+      const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
+      return h('div', { style: 'font-size: 11px' }, sum > 0 ? sum : '--');
+    }
+  },
+  {
+    title: 'Regions',
+    key: 'regions',
+    width: 200,
+    render(row) {
+      const displayData = filters.selectedRegion 
+        ? row.data.filter(d => d.region === filters.selectedRegion)
         : row.data;
 
       return h('div', { style: 'display: flex; flex-wrap: nowrap; gap: 4px; overflow: hidden' }, 
         displayData.map(d => {
           const content = h('div', { style: 'padding: 4px; font-size: 12px' }, [
-            h('div', `地区: ${d.region}`),
-            h('div', `延时: ${d.delay}`),
-            h('div', `股票池: ${d.universe}`),
-            d.coverage ? h('div', `覆盖度: ${(d.coverage * 100).toFixed(2)}%`) : null,
-            d.fieldCount ? h('div', `字段数: ${d.fieldCount}`) : null,
-            d.alphaCount ? h('div', `Alpha数: ${d.alphaCount}`) : null,
+            h('div', `Region: ${d.region}`),
+            h('div', `Delay: ${d.delay}`),
+            h('div', `Universe: ${d.universe}`),
+            d.coverage ? h('div', `Coverage: ${(d.coverage * 100).toFixed(2)}%`) : null,
+            d.fieldCount ? h('div', `Field Count: ${d.fieldCount}`) : null,
+            d.alphaCount ? h('div', `Alpha Count: ${d.alphaCount}`) : null,
+            d.userCount !== undefined ? h('div', `User Count: ${d.userCount}`) : null,
           ]);
 
           return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
             trigger: () => h(NTag, { 
               size: 'tiny', 
-              type: d.region === selectedRegion.value ? 'success' : 'default',
+              type: d.region === filters.selectedRegion ? 'success' : 'default',
               style: 'cursor: help; margin: 0'
             }, { 
               default: () => `${d.region}` 
@@ -222,17 +335,30 @@ const datasetColumns = [
     }
   },
   {
-    title: '描述',
+    title: 'Description',
     key: 'description',
     render(row) {
-      return h('div', { class: 'regular-cell', style: 'font-size: 11px' }, row.description);
+      const isExpanded = expandedRowIds.value.has(row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: (e) => {
+            e.stopPropagation();
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
+          },
+        },
+        row.description || '--'
+      );
     }
   }
 ];
 
 const datafieldColumns = [
   {
-    title: '字段 ID',
+    title: 'Field ID',
     key: 'id',
     width: 200,
     render(row) {
@@ -240,7 +366,7 @@ const datafieldColumns = [
     }
   },
   {
-    title: '类型',
+    title: 'Type',
     key: 'type',
     width: 80,
     render(row) {
@@ -248,18 +374,19 @@ const datafieldColumns = [
     }
   },
   {
-    title: '地区覆盖',
+    title: 'Region Coverage',
     key: 'regions',
     width: 300,
     render(row) {
       return h('div', { style: 'display: flex; flex-wrap: nowrap; gap: 4px; overflow: hidden' }, 
         row.data.map(d => {
           const content = h('div', { style: 'padding: 4px; font-size: 12px' }, [
-            h('div', `地区: ${d.region}`),
-            h('div', `延时: ${d.delay}`),
-            h('div', `股票池: ${d.universe}`),
-            d.coverage ? h('div', `覆盖度: ${(d.coverage * 100).toFixed(2)}%`) : null,
-            d.alphaCount ? h('div', `Alpha数: ${d.alphaCount}`) : null,
+            h('div', `Region: ${d.region}`),
+            h('div', `Delay: ${d.delay}`),
+            h('div', `Universe: ${d.universe}`),
+            d.coverage ? h('div', `Coverage: ${(d.coverage * 100).toFixed(2)}%`) : null,
+            d.alphaCount ? h('div', `Alpha Count: ${d.alphaCount}`) : null,
+            d.userCount !== undefined ? h('div', `User Count: ${d.userCount}`) : null,
           ]);
 
           return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
@@ -276,21 +403,28 @@ const datafieldColumns = [
     }
   },
   {
-    title: '描述',
+    title: 'Description',
     key: 'description',
     render(row) {
-      return h('div', { class: 'regular-cell', style: 'font-size: 11px' }, row.description);
+      const isExpanded = expandedRowIds.value.has(row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
+          },
+        },
+        row.description || '--'
+      );
     }
   }
 ];
 
 const datasetRowProps = (row) => {
-  return {
-    style: 'cursor: pointer',
-    onClick: () => {
-      enterDataset(row);
-    }
-  };
+  return {};
 };
 
 async function fetchDatasets() {
@@ -299,8 +433,15 @@ async function fetchDatasets() {
     const params = {
       page: pagination.page,
       page_size: pagination.pageSize,
-      search: searchText.value.trim() || null,
-      region: selectedRegion.value || null
+      search: filters.searchText.trim() || null,
+      id: filters.filterId.trim() || null,
+      name: filters.filterName.trim() || null,
+      category: filters.filterCategory || null,
+      region: filters.selectedRegion || null,
+      universe: filters.filterUniverse.trim() || null,
+      delay: filters.filterDelay !== null ? filters.filterDelay : null,
+      sort_field: currentSorter.value?.columnKey || null,
+      sort_order: currentSorter.value?.order === 'descend' ? -1 : (currentSorter.value?.order === 'ascend' ? 1 : null)
     };
     
     const result = await invoke('get_datasets', { params });
@@ -322,7 +463,7 @@ async function fetchDatafields() {
       page: fieldPagination.page,
       page_size: fieldPagination.pageSize,
       search: fieldSearchText.value.trim() || null,
-      region: selectedRegion.value || null
+      region: filters.selectedRegion || null
     };
     
     const result = await invoke('get_datafields', { params });
@@ -362,6 +503,11 @@ function handlePageSizeChange(pageSize) {
 
 function handleSearch() {
   pagination.page = 1;
+  fetchDatasets();
+}
+
+function handleSorterChange(sorter) {
+  currentSorter.value = sorter;
   fetchDatasets();
 }
 

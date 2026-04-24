@@ -333,7 +333,14 @@ pub struct DatasetQuery {
     pub page: Option<u32>,
     pub page_size: Option<u32>,
     pub search: Option<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub category: Option<String>,
     pub region: Option<String>,
+    pub universe: Option<String>,
+    pub delay: Option<i32>,
+    pub sort_field: Option<String>,
+    pub sort_order: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -456,16 +463,49 @@ pub async fn get_datasets(
             filters.push(doc! {
                 "$or": [
                     { "name": { "$regex": &escaped, "$options": "i" } },
-                    { "id": { "$regex": &escaped, "$options": "i" } }
+                    { "id": { "$regex": &escaped, "$options": "i" } },
+                    { "description": { "$regex": &escaped, "$options": "i" } }
                 ]
             });
         }
     }
 
+    if let Some(id) = &params.id {
+        if !id.is_empty() {
+            filters.push(doc! { "id": { "$regex": regex::escape(id.trim()), "$options": "i" } });
+        }
+    }
+
+    if let Some(name) = &params.name {
+        if !name.is_empty() {
+            filters.push(doc! { "name": { "$regex": regex::escape(name.trim()), "$options": "i" } });
+        }
+    }
+
+    if let Some(cat) = &params.category {
+        if !cat.is_empty() {
+            filters.push(doc! { "category.name": { "$regex": regex::escape(cat.trim()), "$options": "i" } });
+        }
+    }
+
+    // Data-level filters (nested in data array)
+    let mut data_filters = vec![];
     if let Some(region) = &params.region {
         if !region.is_empty() {
-            filters.push(doc! { "data.region": region });
+            data_filters.push(doc! { "region": region });
         }
+    }
+    if let Some(universe) = &params.universe {
+        if !universe.is_empty() {
+            data_filters.push(doc! { "universe": { "$regex": regex::escape(universe.trim()), "$options": "i" } });
+        }
+    }
+    if let Some(delay) = params.delay {
+        data_filters.push(doc! { "delay": delay });
+    }
+
+    if !data_filters.is_empty() {
+        filters.push(doc! { "data": { "$elemMatch": { "$and": data_filters } } });
     }
 
     let filter = if filters.is_empty() {
@@ -474,13 +514,32 @@ pub async fn get_datasets(
         doc! { "$and": filters }
     };
 
-    let find_options = FindOptions::builder()
-        .skip(skip)
-        .limit(page_size as i64)
-        .build();
+    let sort_field = params.sort_field.as_deref().unwrap_or("id");
+    let sort_order = params.sort_order.unwrap_or(1);
 
-    let total = collection.count_documents(filter.clone(), None).await.map_err(|e| e.to_string())?;
-    let mut cursor = collection.find(filter, find_options).await.map_err(|e| e.to_string())?;
+    let mongo_sort_field = match sort_field {
+        "id" => "id",
+        "name" => "name",
+        "totalFieldCount" => "totalFieldCount",
+        "totalAlphaCount" => "totalAlphaCount",
+        _ => "id",
+    };
+
+    let pipeline = vec![
+        doc! { "$match": filter.clone() },
+        doc! {
+            "$addFields": {
+                "totalFieldCount": { "$sum": "$data.fieldCount" },
+                "totalAlphaCount": { "$sum": "$data.alphaCount" }
+            }
+        },
+        doc! { "$sort": { mongo_sort_field: sort_order } },
+        doc! { "$skip": skip as i64 },
+        doc! { "$limit": page_size as i64 },
+    ];
+
+    let total = collection.count_documents(filter, None).await.map_err(|e| e.to_string())?;
+    let mut cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
     
     let mut results = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
