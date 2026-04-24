@@ -9,6 +9,8 @@ remote_uri = "mongodb://localhost:27017"
   mission = "simulation_mission"
   simulation = "simulation_db"
   alpha = "alpha_db"
+  dataset = "dataset_db"
+  dataset_collection = "datasets_all"
 
 [env]
 working_dir = "./"

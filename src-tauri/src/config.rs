@@ -43,6 +43,8 @@ pub struct DatabaseNames {
     pub mission: String,
     pub simulation: String,
     pub alpha: String,
+    pub dataset: Option<String>,
+    pub dataset_collection: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

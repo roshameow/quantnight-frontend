@@ -15,6 +15,8 @@ use tauri::{command, State};
 use crate::mongo_manager::MongoClients;
 use crate::config::{AppConfig, run_python_command};
 
+use serde_json::Value as JsonValue;
+
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -302,6 +304,102 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
     }
 
     None
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetRegionData {
+    pub region: String,
+    pub delay: i32,
+    pub universe: String,
+    pub coverage: Option<f64>,
+    pub field_count: Option<i32>,
+    pub alpha_count: Option<i32>,
+    pub user_count: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Dataset {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<JsonValue>,
+    pub subcategory: Option<JsonValue>,
+    pub data: Vec<DatasetRegionData>,
+}
+
+#[derive(Deserialize)]
+pub struct DatasetQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub search: Option<String>,
+    pub region: Option<String>,
+}
+
+#[command]
+pub async fn get_datasets(
+    params: DatasetQuery,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<PagedResult<Dataset>, String> {
+    let client = &clients.local;
+    let db_name = config.mongodb.databases.dataset.as_deref().unwrap_or("dataset_db");
+    let coll_name = config.mongodb.databases.dataset_collection.as_deref().unwrap_or("datasets_all");
+    
+    let db = client.database(db_name);
+    let collection = db.collection::<mongodb::bson::Document>(coll_name);
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(50);
+    let skip = ((page - 1) * page_size) as u64;
+
+    let mut filters = vec![];
+    
+    if let Some(search) = &params.search {
+        if !search.is_empty() {
+            let escaped = regex::escape(search.trim());
+            filters.push(doc! {
+                "$or": [
+                    { "name": { "$regex": &escaped, "$options": "i" } },
+                    { "id": { "$regex": &escaped, "$options": "i" } }
+                ]
+            });
+        }
+    }
+
+    if let Some(region) = &params.region {
+        if !region.is_empty() {
+            filters.push(doc! { "data.region": region });
+        }
+    }
+
+    let filter = if filters.is_empty() {
+        doc! {}
+    } else {
+        doc! { "$and": filters }
+    };
+
+    let find_options = FindOptions::builder()
+        .skip(skip)
+        .limit(page_size as i64)
+        .build();
+
+    let total = collection.count_documents(filter.clone(), None).await.map_err(|e| e.to_string())?;
+    let mut cursor = collection.find(filter, find_options).await.map_err(|e| e.to_string())?;
+    
+    let mut results = Vec::new();
+    while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        if let Ok(dataset) = mongodb::bson::from_document::<Dataset>(doc) {
+            results.push(dataset);
+        }
+    }
+
+    Ok(PagedResult {
+        data: results,
+        total,
+        page,
+        page_size,
+    })
 }
 
 #[command]

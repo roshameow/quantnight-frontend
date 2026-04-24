@@ -114,6 +114,14 @@
             <span style="width: 140px; margin-right: 8px;">Alpha DB:</span>
             <n-input v-model:value="localMongoConfig.databases.alpha" size="small" style="flex: 1;" />
           </div>
+          <div style="display: flex; align-items: center; margin-bottom: 6px;">
+            <span style="width: 140px; margin-right: 8px;">Dataset DB:</span>
+            <n-input v-model:value="localMongoConfig.databases.dataset" size="small" style="flex: 1;" />
+          </div>
+          <div style="display: flex; align-items: center; margin-bottom: 6px;">
+            <span style="width: 140px; margin-right: 8px;">Dataset Collection:</span>
+            <n-input v-model:value="localMongoConfig.databases.dataset_collection" size="small" style="flex: 1;" />
+          </div>
         </div>
         </n-card>
 
@@ -235,7 +243,9 @@ const localMongoConfig = ref({
   databases: {
     mission: '',
     simulation: '',
-    alpha: ''
+    alpha: '',
+    dataset: '',
+    dataset_collection: ''
   }
 });
 const localEnvConfig = ref({
@@ -261,7 +271,9 @@ onMounted(async () => {
       databases: {
         mission: configStore.backendConfig.mongodb.databases?.mission || '',
         simulation: configStore.backendConfig.mongodb.databases?.simulation || '',
-        alpha: configStore.backendConfig.mongodb.databases?.alpha || ''
+        alpha: configStore.backendConfig.mongodb.databases?.alpha || '',
+        dataset: configStore.backendConfig.mongodb.databases?.dataset || '',
+        dataset_collection: configStore.backendConfig.mongodb.databases?.dataset_collection || ''
       }
     };
   }
@@ -322,7 +334,9 @@ async function handleSave() {
                           localMongoConfig.value.remote_uri !== (configStore.backendConfig.mongodb?.remote_uri || '') ||
                           localMongoConfig.value.databases.mission !== (configStore.backendConfig.mongodb?.databases?.mission || '') ||
                           localMongoConfig.value.databases.simulation !== (configStore.backendConfig.mongodb?.databases?.simulation || '') ||
-                          localMongoConfig.value.databases.alpha !== (configStore.backendConfig.mongodb?.databases?.alpha || '');
+                          localMongoConfig.value.databases.alpha !== (configStore.backendConfig.mongodb?.databases?.alpha || '') ||
+                          localMongoConfig.value.databases.dataset !== (configStore.backendConfig.mongodb?.databases?.dataset || '') ||
+                          localMongoConfig.value.databases.dataset_collection !== (configStore.backendConfig.mongodb?.databases?.dataset_collection || '');
                           
   const envChanged = localEnvConfig.value.working_dir !== (configStore.backendConfig.env?.working_dir || '');
 

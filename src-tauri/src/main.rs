@@ -51,6 +51,7 @@ fn main() {
             commands::check_task_status,
             watcher::frontend_ready,  // 确保此命令通过前端调用
             datas::get_alpha_results,
+            datas::get_datasets,
             datas::get_pnl_by_id,
             datas::get_submission_stats,
             datas::compute_correlation,
