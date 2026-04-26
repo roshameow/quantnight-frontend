@@ -1,55 +1,75 @@
 <template>
   <div class="dataset-panel-container">
+    <!-- Top Persistent JOINT Filters -->
+    <div style="background: #f8f8f8; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+      <div style="display: flex; align-items: center; gap: 8px; padding: 4px 8px; border: 1px dashed #ccc; border-radius: 4px; background: rgba(0,0,0,0.02)">
+        <span style="font-size: 11px; color: #888; font-weight: bold; writing-mode: vertical-lr; transform: rotate(180deg); padding: 2px 0;">JOINT</span>
+        <div style="width: 110px;">
+          <n-select
+            v-model:value="filters.selectedRegion"
+            :options="regionOptions"
+            placeholder="Region"
+            clearable
+            size="small"
+          />
+        </div>
+        <div style="width: 130px;">
+          <n-input v-model:value="filters.filterUniverse" placeholder="Universe" clearable size="small" />
+        </div>
+        <div style="width: 90px;">
+          <n-select
+            v-model:value="filters.filterDelay"
+            :options="delayOptions"
+            placeholder="Delay"
+            clearable
+            size="small"
+          />
+        </div>
+      </div>
+
+      <!-- Quick stats or info can go here if needed -->
+      <div v-if="viewMode === 'datafields'" style="display: flex; align-items: center; gap: 8px; border-left: 1px solid #ddd; padding-left: 16px; overflow: hidden">
+        <n-button size="small" @click="backToDatasets">
+          <template #icon><span>←</span></template>
+          Back
+        </n-button>
+        <div style="display: flex; align-items: center; gap: 8px; overflow: hidden">
+          <n-text strong style="font-size: 14px; white-space: nowrap">{{ currentDataset?.name }}</n-text>
+          <n-text depth="3" style="font-size: 11px; white-space: nowrap">({{ currentDataset?.id }})</n-text>
+        </div>
+      </div>
+    </div>
+
     <!-- Dataset View -->
     <div v-if="viewMode === 'datasets'">
       <div class="header">
         <div style="background: #f8f8f8; padding: 16px; border-radius: 8px; margin-bottom: 16px">
           <n-space vertical size="medium">
-            <!-- Top Row: General Search -->
+            <!-- Row: General Search -->
             <div style="display: flex; align-items: center; gap: 12px;">
               <div style="flex: 1;">
                 <n-input
                   v-model:value="filters.searchText"
                   placeholder="General Search (Name, ID, Description)"
                   clearable
+                  size="small"
                 />
               </div>
             </div>
 
-            <!-- Bottom Row: Specific Filters -->
+            <!-- Row: Specific Filters -->
             <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-              <div style="width: 150px;">
+              <div style="width: 120px;">
                 <n-input v-model:value="filters.filterId" placeholder="ID" clearable size="small" />
               </div>
-              <div style="width: 180px;">
+              <div style="width: 150px;">
                 <n-input v-model:value="filters.filterName" placeholder="Name" clearable size="small" />
               </div>
-              <div style="width: 150px;">
+              <div style="width: 130px;">
                 <n-select
                   v-model:value="filters.filterCategory"
                   :options="categoryOptions"
                   placeholder="Category"
-                  clearable
-                  size="small"
-                />
-              </div>
-              <div style="width: 130px;">
-                <n-select
-                  v-model:value="filters.selectedRegion"
-                  :options="regionOptions"
-                  placeholder="Region"
-                  clearable
-                  size="small"
-                />
-              </div>
-              <div style="width: 150px;">
-                <n-input v-model:value="filters.filterUniverse" placeholder="Universe" clearable size="small" />
-              </div>
-              <div style="width: 100px;">
-                <n-select
-                  v-model:value="filters.filterDelay"
-                  :options="delayOptions"
-                  placeholder="Delay"
                   clearable
                   size="small"
                 />
@@ -68,7 +88,7 @@
         size="small"
         class="custom-table"
         :row-key="(row) => row.id"
-        max-height="calc(100vh - 280px)"
+        max-height="calc(100vh - 350px)"
         :pagination="pagination"
         @update:page="handlePageChange"
         @update:page-size="handlePageSizeChange"
@@ -82,32 +102,15 @@
       <div class="header">
         <div style="background: #f8f8f8; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px">
           <div style="display: flex; align-items: center; gap: 16px;">
-            <n-button size="small" @click="backToDatasets">
-              <template #icon>
-                <span>←</span>
-              </template>
-              Back
-            </n-button>
-            
-            <div style="flex: 1; display: flex; align-items: center; gap: 8px; overflow: hidden">
-              <n-text strong style="font-size: 16px; white-space: nowrap">{{ currentDataset?.name }}</n-text>
-              <n-text depth="3" style="font-size: 12px; white-space: nowrap">({{ currentDataset?.id }})</n-text>
-            </div>
-
             <!-- 搜索字段 -->
-            <div style="width: 250px;">
+            <div style="flex: 1;">
               <n-input
                 v-model:value="fieldSearchText"
                 placeholder="Search Field ID or Description"
                 clearable
                 size="small"
-                @keyup.enter="handleFieldSearch"
               />
             </div>
-            
-            <n-button type="primary" size="small" @click="handleFieldSearch" :loading="loading">
-              Search Fields
-            </n-button>
           </div>
         </div>
       </div>
@@ -121,7 +124,7 @@
         size="small"
         class="custom-table"
         :row-key="(row) => row.id"
-        max-height="calc(100vh - 250px)"
+        max-height="calc(100vh - 300px)"
         :pagination="fieldPagination"
         @update:page="handleFieldPageChange"
         @update:page-size="handleFieldPageSizeChange"
@@ -167,6 +170,15 @@ const categoryOptions = [
   'Price Volume', 'Risk', 'Sentiment', 'Short Interest', 'Social Media'
 ].map(c => ({ label: c, value: c }));
 
+const isMatchingTag = (d) => {
+  if (filters.selectedRegion && d.region !== filters.selectedRegion) return false;
+  if (filters.filterUniverse && !d.universe.toLowerCase().includes(filters.filterUniverse.toLowerCase())) return false;
+  if (filters.filterDelay !== null && d.delay !== filters.filterDelay) return false;
+  
+  // Return true if any filter is active and matches
+  return !!(filters.selectedRegion || filters.filterUniverse || filters.filterDelay !== null);
+};
+
 // Debounced watcher for filters
 let debounceTimer = null;
 watch(filters, () => {
@@ -187,7 +199,7 @@ watch(fieldSearchText, () => {
 // Pagination for Datasets
 const pagination = reactive({
   page: 1,
-  pageSize: 50,
+  pageSize: 20,
   showSizePicker: true,
   pageSizes: [20, 50, 100, 200],
   itemCount: 0,
@@ -199,9 +211,9 @@ const pagination = reactive({
 // Pagination for Datafields
 const fieldPagination = reactive({
   page: 1,
-  pageSize: 50,
+  pageSize: 20,
   showSizePicker: true,
-  pageSizes: [50, 100, 200, 500],
+  pageSizes: [20, 50, 100, 200, 500],
   itemCount: 0,
   prefix ({ itemCount }) {
     return `Total ${itemCount} fields`;
@@ -223,29 +235,24 @@ const regionOptions = [
 
 const datasetColumns = [
   {
-    title: 'Action',
-    key: 'actions',
-    width: 70,
-    render(row) {
-      return h(
-        NButton,
-        {
-          size: 'tiny',
-          secondary: true,
-          type: 'primary',
-          onClick: () => enterDataset(row)
-        },
-        { default: () => 'Enter' }
-      );
-    }
-  },
-  {
     title: 'ID',
     key: 'id',
     width: 120,
     sorter: true,
     render(row) {
-      return h('div', { class: 'regular-cell', style: 'font-family: monospace; font-size: 11px' }, row.id);
+      const isExpanded = expandedRowIds.value.has('id-' + row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer', fontFamily: 'monospace', fontSize: '11px' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete('id-' + row.id) : expandedRowIds.value.add('id-' + row.id);
+          },
+        },
+        row.id
+      );
     }
   },
   {
@@ -274,13 +281,46 @@ const datasetColumns = [
     key: 'category',
     width: 100,
     render(row) {
-      return h('div', { class: 'regular-cell' }, row.category?.name || '--');
+      const isExpanded = expandedRowIds.value.has('cat-' + row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete('cat-' + row.id) : expandedRowIds.value.add('cat-' + row.id);
+          },
+        },
+        row.category?.name || '--'
+      );
+    }
+  },
+  {
+    title: 'Description',
+    key: 'description',
+    minWidth: 250, // Fluid column to take up remaining space
+    render(row) {
+      const isExpanded = expandedRowIds.value.has(row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', 'no-max-width', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: (e) => {
+            e.stopPropagation();
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
+          },
+        },
+        row.description || '--'
+      );
     }
   },
   {
     title: 'Fields',
     key: 'totalFieldCount',
-    width: 80,
+    width: 70,
     align: 'right',
     sorter: true,
     render(row) {
@@ -291,12 +331,12 @@ const datasetColumns = [
   {
     title: 'Alphas',
     key: 'totalAlphaCount',
-    width: 80,
+    width: 90,
     align: 'right',
     sorter: true,
     render(row) {
       const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
-      return h('div', { style: 'font-size: 11px' }, sum > 0 ? sum : '--');
+      return h('div', { style: { fontSize: '11px', paddingRight: '20px' } }, sum > 0 ? sum : '--');
     }
   },
   {
@@ -304,11 +344,26 @@ const datasetColumns = [
     key: 'regions',
     width: 200,
     render(row) {
-      const displayData = filters.selectedRegion 
-        ? row.data.filter(d => d.region === filters.selectedRegion)
-        : row.data;
+      const isExpanded = expandedRowIds.value.has('reg-' + row.id);
+      // Don't filter the tags being displayed - show all regions the dataset has
+      const displayData = row.data;
 
-      return h('div', { style: 'display: flex; flex-wrap: nowrap; gap: 4px; overflow: hidden' }, 
+      return h(
+        'div', 
+        { 
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { 
+            display: 'flex', 
+            flexWrap: isExpanded ? 'wrap' : 'nowrap', 
+            gap: '4px', 
+            overflow: 'hidden',
+            cursor: 'pointer',
+            paddingLeft: '12px' // Add gap from previous column
+          },
+          onClick: () => {
+            isExpanded ? expandedRowIds.value.delete('reg-' + row.id) : expandedRowIds.value.add('reg-' + row.id);
+          }
+        }, 
         displayData.map(d => {
           const content = h('div', { style: 'padding: 4px; font-size: 12px' }, [
             h('div', `Region: ${d.region}`),
@@ -323,7 +378,8 @@ const datasetColumns = [
           return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
             trigger: () => h(NTag, { 
               size: 'tiny', 
-              type: d.region === filters.selectedRegion ? 'success' : 'default',
+              // Highlight the region tag only if it matches all active filters (Region/Universe/Delay)
+              type: isMatchingTag(d) ? 'success' : 'default',
               style: 'cursor: help; margin: 0'
             }, { 
               default: () => `${d.region}` 
@@ -335,22 +391,19 @@ const datasetColumns = [
     }
   },
   {
-    title: 'Description',
-    key: 'description',
+    title: 'Action',
+    key: 'actions',
+    width: 70,
     render(row) {
-      const isExpanded = expandedRowIds.value.has(row.id);
       return h(
-        'div',
+        NButton,
         {
-          class: ['regular-cell', isExpanded ? 'expanded' : ''],
-          style: { cursor: 'pointer' },
-          onClick: (e) => {
-            e.stopPropagation();
-            if (window.getSelection().toString()) return;
-            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
-          },
+          size: 'tiny',
+          secondary: true,
+          type: 'primary',
+          onClick: () => enterDataset(row)
         },
-        row.description || '--'
+        { default: () => 'Enter' }
       );
     }
   }
@@ -362,7 +415,19 @@ const datafieldColumns = [
     key: 'id',
     width: 200,
     render(row) {
-      return h('div', { class: 'regular-cell', style: 'font-family: monospace; font-size: 11px; font-weight: bold' }, row.id);
+      const isExpanded = expandedRowIds.value.has('fid-' + row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer', fontFamily: 'monospace', fontSize: '11px', fontWeight: 'bold' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete('fid-' + row.id) : expandedRowIds.value.add('fid-' + row.id);
+          },
+        },
+        row.id
+      );
     }
   },
   {
@@ -378,7 +443,22 @@ const datafieldColumns = [
     key: 'regions',
     width: 300,
     render(row) {
-      return h('div', { style: 'display: flex; flex-wrap: nowrap; gap: 4px; overflow: hidden' }, 
+      const isExpanded = expandedRowIds.value.has('reg-' + row.id);
+      return h(
+        'div', 
+        { 
+          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          style: { 
+            display: 'flex', 
+            flexWrap: isExpanded ? 'wrap' : 'nowrap', 
+            gap: '4px', 
+            overflow: 'hidden',
+            cursor: 'pointer'
+          },
+          onClick: () => {
+            isExpanded ? expandedRowIds.value.delete('reg-' + row.id) : expandedRowIds.value.add('reg-' + row.id);
+          }
+        }, 
         row.data.map(d => {
           const content = h('div', { style: 'padding: 4px; font-size: 12px' }, [
             h('div', `Region: ${d.region}`),
@@ -392,6 +472,8 @@ const datafieldColumns = [
           return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
             trigger: () => h(NTag, { 
               size: 'tiny', 
+              // Highlight the matching tag in datafield view too
+              type: isMatchingTag(d) ? 'success' : 'default',
               style: 'cursor: help; margin: 0'
             }, { 
               default: () => `${d.region}` 
@@ -410,7 +492,7 @@ const datafieldColumns = [
       return h(
         'div',
         {
-          class: ['regular-cell', isExpanded ? 'expanded' : ''],
+          class: ['regular-cell', 'no-max-width', isExpanded ? 'expanded' : ''],
           style: { cursor: 'pointer' },
           onClick: () => {
             if (window.getSelection().toString()) return;
@@ -463,7 +545,9 @@ async function fetchDatafields() {
       page: fieldPagination.page,
       page_size: fieldPagination.pageSize,
       search: fieldSearchText.value.trim() || null,
-      region: filters.selectedRegion || null
+      region: filters.selectedRegion || null,
+      universe: filters.filterUniverse.trim() || null,
+      delay: filters.filterDelay !== null ? filters.filterDelay : null,
     };
     
     const result = await invoke('get_datafields', { params });

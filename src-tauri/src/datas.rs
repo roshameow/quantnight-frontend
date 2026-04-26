@@ -313,9 +313,9 @@ pub struct DatasetRegionData {
     pub delay: i32,
     pub universe: String,
     pub coverage: Option<f64>,
-    pub field_count: Option<i32>,
-    pub alpha_count: Option<i32>,
-    pub user_count: Option<i32>,
+    pub field_count: Option<f64>,
+    pub alpha_count: Option<f64>,
+    pub user_count: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -350,8 +350,8 @@ pub struct DatafieldRegionData {
     pub delay: i32,
     pub universe: String,
     pub coverage: Option<f64>,
-    pub alpha_count: Option<i32>,
-    pub user_count: Option<i32>,
+    pub alpha_count: Option<f64>,
+    pub user_count: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -372,6 +372,8 @@ pub struct DatafieldQuery {
     pub page_size: Option<u32>,
     pub search: Option<String>,
     pub region: Option<String>,
+    pub universe: Option<String>,
+    pub delay: Option<i32>,
 }
 
 #[command]
@@ -407,15 +409,30 @@ pub async fn get_datafields(
         }
     }
 
+    // JOINT data-level filters
+    let mut data_filters = vec![];
     if let Some(region) = &params.region {
         if !region.is_empty() {
-            filters.push(doc! { "data.region": region });
+            data_filters.push(doc! { "region": region });
         }
+    }
+    if let Some(universe) = &params.universe {
+        if !universe.is_empty() {
+            data_filters.push(doc! { "universe": { "$regex": regex::escape(universe.trim()), "$options": "i" } });
+        }
+    }
+    if let Some(delay) = params.delay {
+        data_filters.push(doc! { "delay": delay });
+    }
+
+    if !data_filters.is_empty() {
+        filters.push(doc! { "data": { "$elemMatch": { "$and": data_filters } } });
     }
 
     let filter = doc! { "$and": filters };
 
     let find_options = FindOptions::builder()
+        .projection(doc! { "description_embedding": 0, "embedding": 0 })
         .skip(skip)
         .limit(page_size as i64)
         .build();
@@ -488,7 +505,7 @@ pub async fn get_datasets(
         }
     }
 
-    // Data-level filters (nested in data array)
+    // Data-level filters: use $elemMatch to ensure conditions match within the same element
     let mut data_filters = vec![];
     if let Some(region) = &params.region {
         if !region.is_empty() {
@@ -533,6 +550,7 @@ pub async fn get_datasets(
                 "totalAlphaCount": { "$sum": "$data.alphaCount" }
             }
         },
+        doc! { "$project": { "description_embedding": 0, "embedding": 0 } },
         doc! { "$sort": { mongo_sort_field: sort_order } },
         doc! { "$skip": skip as i64 },
         doc! { "$limit": page_size as i64 },

@@ -58,6 +58,10 @@
   text-overflow: ellipsis;
 }
 
+.no-max-width {
+  max-width: none !important;
+}
+
 .regular-cell.expanded {
   white-space: normal !important;
   word-break: break-word;
