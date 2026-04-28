@@ -194,23 +194,33 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
     let mut message = None;
 
     if let Some(checks) = is.and_then(|d| d.get_array("checks").ok()) {
+        let mut msg_parts = Vec::new();
         for item in checks {
             if let Some(check_doc) = item.as_document() {
-                if let Ok(result) = check_doc.get_str("result") {
-                    if result == "FAIL" || result == "WARNING" {
-                        if let Ok(name) = check_doc.get_str("name") {
-                            message = Some(match message {
-                                Some(m) => format!("{},{}", m, name),
-                                None => name.to_string(),
-                            });
-                        }
-                    }
+                let name = check_doc.get_str("name").unwrap_or("");
+                let result = check_doc.get_str("result").unwrap_or("");
+                
+                let limit = check_doc.get("limit").and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
+                let value = check_doc.get("value").and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
+                
+                if name == "LOW_SUB_UNIVERSE_SHARPE" {
+                    sub_universe_sharpe = value;
                 }
 
-                if check_doc.get_str("name") == Ok("LOW_SUB_UNIVERSE_SHARPE") {
-                    sub_universe_sharpe = check_doc.get_f64("value").ok();
+                if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
+                    let part = if let (Some(l), Some(v)) = (limit, value) {
+                        format!("{}({:.2}/{:.2})", name, v, l)
+                    } else if let Ok(m) = check_doc.get_str("message") {
+                        format!("{}:{}", name, m)
+                    } else {
+                        name.to_string()
+                    };
+                    msg_parts.push(part);
                 }
             }
+        }
+        if !msg_parts.is_empty() {
+            message = Some(msg_parts.join(","));
         }
     }
 
