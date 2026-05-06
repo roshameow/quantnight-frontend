@@ -921,6 +921,7 @@ pub async fn get_submission_stats(
         doc! {
             "$project": {
                 "region": { "$ifNull": ["$settings.region", "Unknown"] },
+                "delay": { "$ifNull": ["$settings.delay", 0] },
                 "month": { "$substr": [{ "$ifNull": ["$dateSubmitted", "$dateCreated"] }, 0, 7] },
                 "alpha_type": { "$ifNull": ["$type", "REGULAR"] },
                 "sharpe": "$is.sharpe",
@@ -933,7 +934,7 @@ pub async fn get_submission_stats(
         },
         doc! {
             "$group": {
-                "_id": { "month": "$month", "region": "$region" },
+                "_id": { "month": "$month", "region": "$region", "delay": "$delay" },
                 "count": {
                     "$sum": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, 1, 0] }
                 },
@@ -961,7 +962,7 @@ pub async fn get_submission_stats(
             }
         },
         doc! {
-            "$sort": { "_id.month": -1, "_id.region": 1 }
+            "$sort": { "_id.month": -1, "_id.region": 1, "_id.delay": 1 }
         }
     ];
 

@@ -68,7 +68,7 @@
     <n-modal
       v-model:show="showAlphaList"
       preset="card"
-      :title="`Alpha 列表 - ${selectedMonth} ${selectedRegion ? '- ' + selectedRegion : ''}`"
+      :title="`Alpha 列表 - ${selectedMonth} ${selectedRegion ? '- ' + selectedRegion : ''}${selectedDelay !== null ? ' - Delay ' + selectedDelay : ''}`"
       style="width: 90%; max-width: 1200px"
     >
       <div style="height: 600px; overflow: auto">
@@ -196,7 +196,7 @@ const rowClassName = (row) => {
 function calculateGroupedSummary(docs, label) {
   if (!docs || docs.length === 0) return null;
   
-  const regionGroups = {};
+  const groups = {}; // Key will be region-delay
   let totalCount = 0;
   let totalSuperCount = 0;
   let weightedSharpe = 0;
@@ -207,9 +207,13 @@ function calculateGroupedSummary(docs, label) {
   
   docs.forEach(doc => {
     const region = doc._id.region || 'Unknown';
-    if (!regionGroups[region]) {
-      regionGroups[region] = {
+    const delay = doc._id.delay || 0;
+    const groupKey = `${region}-${delay}`;
+    
+    if (!groups[groupKey]) {
+      groups[groupKey] = {
         region,
+        delay,
         count: 0,
         super_count: 0,
         avg_sharpe: 0,
@@ -220,17 +224,17 @@ function calculateGroupedSummary(docs, label) {
       };
     }
     
-    const r = regionGroups[region];
+    const g = groups[groupKey];
     const docCount = doc.count || 0;
     const docSuperCount = doc.super_count || 0;
 
-    r.count += docCount;
-    r.super_count += docSuperCount;
-    r.avg_sharpe += (doc.avg_sharpe || 0) * docCount;
-    r.avg_fitness += (doc.avg_fitness || 0) * docCount;
-    r.avg_turnover += (doc.avg_turnover || 0) * docCount;
-    r.avg_returns += (doc.avg_returns || 0) * docCount;
-    r.avg_margin += (doc.avg_margin || 0) * docCount;
+    g.count += docCount;
+    g.super_count += docSuperCount;
+    g.avg_sharpe += (doc.avg_sharpe || 0) * docCount;
+    g.avg_fitness += (doc.avg_fitness || 0) * docCount;
+    g.avg_turnover += (doc.avg_turnover || 0) * docCount;
+    g.avg_returns += (doc.avg_returns || 0) * docCount;
+    g.avg_margin += (doc.avg_margin || 0) * docCount;
     
     totalCount += docCount;
     totalSuperCount += docSuperCount;
@@ -241,21 +245,25 @@ function calculateGroupedSummary(docs, label) {
     weightedMargin += (doc.avg_margin || 0) * docCount;
   });
 
-  const children = Object.values(regionGroups).map(r => {
-    if (r.count > 0) {
-      r.avg_sharpe /= r.count;
-      r.avg_fitness /= r.count;
-      r.avg_turnover /= r.count;
-      r.avg_returns /= r.count;
-      r.avg_margin /= r.count;
+  const children = Object.values(groups).map(g => {
+    if (g.count > 0) {
+      g.avg_sharpe /= g.count;
+      g.avg_fitness /= g.count;
+      g.avg_turnover /= g.count;
+      g.avg_returns /= g.count;
+      g.avg_margin /= g.count;
     }
     return {
-      ...r,
-      key: `${label}-${r.region}`,
+      ...g,
+      key: `${label}-${g.region}-${g.delay}`,
       month: label,
       is_summary_child: true
     };
-  }).sort((a, b) => a.region.localeCompare(b.region));
+  }).sort((a, b) => {
+    const regionComp = a.region.localeCompare(b.region);
+    if (regionComp !== 0) return regionComp;
+    return a.delay - b.delay;
+  });
 
   if (totalCount === 0 && totalSuperCount === 0) return null;
 
@@ -294,6 +302,7 @@ const combinedStatsData = computed(() => {
 const showAlphaList = ref(false);
 const selectedMonth = ref('');
 const selectedRegion = ref('');
+const selectedDelay = ref(null);
 const alphaListData = ref([]);
 const alphaLoading = ref(false);
 
@@ -326,10 +335,17 @@ const { columns: alphaColumns } = useAlphaTableColumns({
 
 const columns = [
   {
-    title: '时间/区域',
+    title: '时间 / 区域 / Delay',
     key: 'label',
     render(row) {
-      return row.region || row.month;
+      if (row.region) {
+        return h('span', [
+          h('span', row.region),
+          '-',
+          h('span', { style: 'color: #999' }, row.delay)
+        ]);
+      }
+      return row.month;
     }
   },
   {
@@ -344,7 +360,7 @@ const columns = [
             {
               text: true,
               type: 'primary',
-              onClick: () => viewAlphaList(row.month, row.region, 'REGULAR')
+              onClick: () => viewAlphaList(row.month, row.region, row.delay, 'REGULAR')
             },
             { default: () => row.count }
           )
@@ -356,7 +372,7 @@ const columns = [
             {
               text: true,
               style: 'color: #2080f0',
-              onClick: () => viewAlphaList(row.month, row.region, 'SUPER')
+              onClick: () => viewAlphaList(row.month, row.region, row.delay, 'SUPER')
             },
             { default: () => row.super_count }
           ) : null
@@ -424,9 +440,10 @@ async function fetchStats() {
       }
       
       const regionData = {
-        key: `${month}-${doc._id.region}`,
+        key: `${month}-${doc._id.region}-${doc._id.delay}`,
         month,
         region: doc._id.region,
+        delay: doc._id.delay,
         count: doc.count || 0,
         super_count: doc.super_count || 0,
         avg_sharpe: doc.avg_sharpe,
@@ -456,7 +473,11 @@ async function fetchStats() {
         m.avg_returns /= m.count;
         m.avg_margin /= m.count;
       }
-      m.children.sort((a, b) => a.region.localeCompare(b.region));
+      m.children.sort((a, b) => {
+        const regionComp = a.region.localeCompare(b.region);
+        if (regionComp !== 0) return regionComp;
+        return a.delay - b.delay;
+      });
       return {
         ...m,
         key: m.month
@@ -470,9 +491,10 @@ async function fetchStats() {
   }
 }
 
-async function viewAlphaList(month, region, alphaType) {
+async function viewAlphaList(month, region, delay, alphaType) {
   selectedMonth.value = month;
   selectedRegion.value = region || '';
+  selectedDelay.value = (delay !== undefined && delay !== null) ? delay : null;
   if (alphaType) selectedRegion.value += ` (${alphaType})`;
 
   showAlphaList.value = true;
@@ -507,6 +529,9 @@ async function viewAlphaList(month, region, alphaType) {
     }
     if (region) {
       conditions.push({ "settings.region": region });
+    }
+    if (delay !== undefined && delay !== null) {
+      conditions.push({ "settings.delay": delay });
     }
     if (alphaType) {
       conditions.push({ "type": alphaType });
