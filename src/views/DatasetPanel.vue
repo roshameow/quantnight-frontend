@@ -64,6 +64,9 @@
               <div style="width: 120px;">
                 <n-input v-model:value="filters.filterId" placeholder="ID" clearable size="small" />
               </div>
+              <div style="width: 120px;">
+                <n-input v-model:value="filters.filterFieldId" placeholder="Field ID" clearable size="small" />
+              </div>
               <div style="width: 150px;">
                 <n-input v-model:value="filters.filterName" placeholder="Name" clearable size="small" />
               </div>
@@ -152,6 +155,7 @@ const datafields = ref([]);
 const filters = reactive({
   searchText: '',
   filterId: '',
+  filterFieldId: '',
   filterName: '',
   filterCategory: null,
   selectedRegion: null,
@@ -460,18 +464,28 @@ const datafieldColumns = [
     }
   },
   {
+    title: 'Date Coverage',
+    key: 'dateCoverage',
+    width: 100,
+    align: 'right',
+    render(row) {
+      return h('div', { 
+        style: row.dateCoverage != null ? 'font-size: 11px; color: #18a058' : 'font-size: 11px; color: #999' 
+      }, row.dateCoverage != null ? `${(row.dateCoverage * 100).toFixed(2)}%` : '--');
+    }
+  },
+  {
     title: 'Alphas',
     key: 'alphaCount',
     width: 70,
     align: 'right',
     sorter: true,
     render(row) {
-      const matchingData = row.data.find(d => isMatchingTag(d));
-      if (matchingData && matchingData.alphaCount != null) {
-        return h('div', { style: 'font-size: 11px; font-weight: bold; color: #18a058' }, matchingData.alphaCount);
-      }
       const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
-      return h('div', { style: 'font-size: 11px; color: #999' }, sum > 0 ? sum : '--');
+      const matchingData = row.data.find(d => isMatchingTag(d));
+      return h('div', { 
+        style: matchingData ? 'font-size: 11px; font-weight: bold; color: #18a058' : 'font-size: 11px; color: #999' 
+      }, sum > 0 ? sum : '--');
     }
   },
   {
@@ -554,6 +568,7 @@ async function fetchDatasets() {
       search: filters.searchText.trim() || null,
       id: filters.filterId.trim() || null,
       name: filters.filterName.trim() || null,
+      field_id: filters.filterFieldId.trim() || null,
       category: filters.filterCategory || null,
       region: filters.selectedRegion || null,
       universe: filters.filterUniverse.trim() || null,

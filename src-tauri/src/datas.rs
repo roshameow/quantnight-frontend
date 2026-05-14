@@ -345,6 +345,7 @@ pub struct DatasetQuery {
     pub search: Option<String>,
     pub id: Option<String>,
     pub name: Option<String>,
+    pub field_id: Option<String>,
     pub category: Option<String>,
     pub region: Option<String>,
     pub universe: Option<String>,
@@ -372,6 +373,8 @@ pub struct Datafield {
     pub category: Option<JsonValue>,
     pub subcategory: Option<JsonValue>,
     pub dataset: Option<JsonValue>,
+    #[serde(rename = "dateCoverage")]
+    pub date_coverage: Option<f64>,
     pub data: Vec<DatafieldRegionData>,
 }
 
@@ -446,24 +449,55 @@ pub async fn get_datafields(
     let sort_field = params.sort_field.as_deref().unwrap_or("id");
     let sort_order = params.sort_order.unwrap_or(1);
 
-    let mongo_sort_field = match sort_field {
-        "alphaCount" => "totalAlphaCount",
-        "id" => "id",
-        _ => "id",
-    };
+    let mut add_fields = doc! {};
+    let mongo_sort_field;
 
-    let pipeline = vec![
-        doc! { "$match": filter.clone() },
-        doc! {
-            "$addFields": {
-                "totalAlphaCount": { "$sum": "$data.alphaCount" }
-            }
+    match sort_field {
+        "alphaCount" => {
+            // Always sort by total sum across all regions
+            add_fields.insert("sortValue", doc! { "$sum": "$data.alphaCount" });
+            mongo_sort_field = "sortValue";
         },
-        doc! { "$project": { "description_embedding": 0, "embedding": 0 } },
-        doc! { "$sort": { mongo_sort_field: sort_order } },
-        doc! { "$skip": skip as i64 },
-        doc! { "$limit": page_size as i64 },
+        "coverage" => {
+            if let Some(reg) = &params.region {
+                add_fields.insert("sortValue", doc! {
+                    "$reduce": {
+                        "input": "$data",
+                        "initialValue": 0,
+                        "in": {
+                            "$cond": [
+                                { "$eq": ["$$this.region", reg] },
+                                { "$add": ["$$value", { "$ifNull": ["$$this.coverage", 0] }] },
+                                "$$value"
+                            ]
+                        }
+                    }
+                });
+            } else {
+                add_fields.insert("sortValue", doc! { "$max": "$data.coverage" });
+            }
+            mongo_sort_field = "sortValue";
+        },
+        "id" => {
+            mongo_sort_field = "id";
+        },
+        _ => {
+            mongo_sort_field = "id";
+        }
+    }
+
+    let mut pipeline = vec![
+        doc! { "$match": filter.clone() },
     ];
+
+    if !add_fields.is_empty() {
+        pipeline.push(doc! { "$addFields": add_fields });
+    }
+
+    pipeline.push(doc! { "$project": { "description_embedding": 0, "embedding": 0 } });
+    pipeline.push(doc! { "$sort": { mongo_sort_field: sort_order } });
+    pipeline.push(doc! { "$skip": skip as i64 });
+    pipeline.push(doc! { "$limit": page_size as i64 });
 
     let total = collection.count_documents(filter, None).await.map_err(|e| e.to_string())?;
     let mut cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
@@ -518,6 +552,32 @@ pub async fn get_datasets(
     if let Some(id) = &params.id {
         if !id.is_empty() {
             filters.push(doc! { "id": { "$regex": regex::escape(id.trim()), "$options": "i" } });
+        }
+    }
+
+    if let Some(field_id) = &params.field_id {
+        if !field_id.is_empty() {
+            let df_db_name = config.mongodb.databases.datafield.as_deref().unwrap_or("data_db");
+            let df_coll_name = config.mongodb.databases.datafield_collection.as_deref().unwrap_or("datafields_all");
+            let df_coll = client.database(df_db_name).collection::<mongodb::bson::Document>(df_coll_name);
+            
+            let df_filter = doc! { "id": { "$regex": regex::escape(field_id.trim()), "$options": "i" } };
+            let mut cursor = df_coll.find(df_filter, None).await.map_err(|e| e.to_string())?;
+            
+            let mut dataset_ids = Vec::new();
+            while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+                if let Ok(ds) = doc.get_document("dataset") {
+                    if let Ok(ds_id) = ds.get_str("id") {
+                        dataset_ids.push(ds_id.to_string());
+                    }
+                }
+            }
+            
+            if dataset_ids.is_empty() {
+                filters.push(doc! { "id": "__NONE__" });
+            } else {
+                filters.push(doc! { "id": { "$in": dataset_ids } });
+            }
         }
     }
 
