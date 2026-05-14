@@ -453,28 +453,42 @@ pub async fn get_datafields(
     let mongo_sort_field;
 
     match sort_field {
-        "alphaCount" => {
-            // Always sort by total sum across all regions
-            add_fields.insert("sortValue", doc! { "$sum": "$data.alphaCount" });
-            mongo_sort_field = "sortValue";
-        },
-        "coverage" => {
+        "alphaCount" | "coverage" => {
+            let mut filter_conds = vec![];
             if let Some(reg) = &params.region {
+                filter_conds.push(doc! { "$eq": ["$$this.region", reg] });
+            }
+            if let Some(univ) = &params.universe {
+                if !univ.is_empty() {
+                    filter_conds.push(doc! { "$regexMatch": { "input": "$$this.universe", "regex": regex::escape(univ.trim()), "options": "i" } });
+                }
+            }
+            if let Some(delay) = params.delay {
+                filter_conds.push(doc! { "$eq": ["$$this.delay", delay] });
+            }
+
+            if filter_conds.is_empty() {
+                // No filters: sort by total sum for alphas or max for coverage
+                if sort_field == "alphaCount" {
+                    add_fields.insert("sortValue", doc! { "$sum": "$data.alphaCount" });
+                } else {
+                    add_fields.insert("sortValue", doc! { "$max": "$data.coverage" });
+                }
+            } else {
+                // With filters: sort by the sum of matching entries (usually one entry)
+                let field_name = if sort_field == "alphaCount" { "alphaCount" } else { "coverage" };
                 add_fields.insert("sortValue", doc! {
                     "$reduce": {
-                        "input": "$data",
-                        "initialValue": 0,
-                        "in": {
-                            "$cond": [
-                                { "$eq": ["$$this.region", reg] },
-                                { "$add": ["$$value", { "$ifNull": ["$$this.coverage", 0] }] },
-                                "$$value"
-                            ]
-                        }
+                        "input": {
+                            "$filter": {
+                                "input": "$data",
+                                "cond": { "$and": filter_conds }
+                            }
+                        },
+                        "initialValue": 0.0,
+                        "in": { "$add": ["$$value", { "$ifNull": [format!("$$this.{}", field_name), 0.0] }] }
                     }
                 });
-            } else {
-                add_fields.insert("sortValue", doc! { "$max": "$data.coverage" });
             }
             mongo_sort_field = "sortValue";
         },

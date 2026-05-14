@@ -452,6 +452,7 @@ const datafieldColumns = [
     key: 'coverage',
     width: 90,
     align: 'right',
+    sorter: true,
     render(row) {
       // Find data matching current JOINT filters
       const matchingData = row.data.find(d => isMatchingTag(d));
@@ -481,11 +482,12 @@ const datafieldColumns = [
     align: 'right',
     sorter: true,
     render(row) {
-      const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
       const matchingData = row.data.find(d => isMatchingTag(d));
-      return h('div', { 
-        style: matchingData ? 'font-size: 11px; font-weight: bold; color: #18a058' : 'font-size: 11px; color: #999' 
-      }, sum > 0 ? sum : '--');
+      if (matchingData && matchingData.alphaCount != null) {
+        return h('div', { style: 'font-size: 11px; font-weight: bold; color: #18a058' }, matchingData.alphaCount);
+      }
+      const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
+      return h('div', { style: 'font-size: 11px; color: #999' }, sum > 0 ? sum : '--');
     }
   },
   {
