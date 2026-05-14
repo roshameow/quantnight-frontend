@@ -384,6 +384,8 @@ pub struct DatafieldQuery {
     pub region: Option<String>,
     pub universe: Option<String>,
     pub delay: Option<i32>,
+    pub sort_field: Option<String>,
+    pub sort_order: Option<i32>,
 }
 
 #[command]
@@ -441,14 +443,30 @@ pub async fn get_datafields(
 
     let filter = doc! { "$and": filters };
 
-    let find_options = FindOptions::builder()
-        .projection(doc! { "description_embedding": 0, "embedding": 0 })
-        .skip(skip)
-        .limit(page_size as i64)
-        .build();
+    let sort_field = params.sort_field.as_deref().unwrap_or("id");
+    let sort_order = params.sort_order.unwrap_or(1);
 
-    let total = collection.count_documents(filter.clone(), None).await.map_err(|e| e.to_string())?;
-    let mut cursor = collection.find(filter, find_options).await.map_err(|e| e.to_string())?;
+    let mongo_sort_field = match sort_field {
+        "alphaCount" => "totalAlphaCount",
+        "id" => "id",
+        _ => "id",
+    };
+
+    let pipeline = vec![
+        doc! { "$match": filter.clone() },
+        doc! {
+            "$addFields": {
+                "totalAlphaCount": { "$sum": "$data.alphaCount" }
+            }
+        },
+        doc! { "$project": { "description_embedding": 0, "embedding": 0 } },
+        doc! { "$sort": { mongo_sort_field: sort_order } },
+        doc! { "$skip": skip as i64 },
+        doc! { "$limit": page_size as i64 },
+    ];
+
+    let total = collection.count_documents(filter, None).await.map_err(|e| e.to_string())?;
+    let mut cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
     
     let mut results = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {

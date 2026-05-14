@@ -11,6 +11,7 @@
             placeholder="Region"
             clearable
             size="small"
+            :virtual-scroll="false"
           />
         </div>
         <div style="width: 130px;">
@@ -23,6 +24,7 @@
             placeholder="Delay"
             clearable
             size="small"
+            :virtual-scroll="false"
           />
         </div>
       </div>
@@ -72,6 +74,7 @@
                   placeholder="Category"
                   clearable
                   size="small"
+                  :virtual-scroll="false"
                 />
               </div>
             </div>
@@ -128,6 +131,7 @@
         :pagination="fieldPagination"
         @update:page="handleFieldPageChange"
         @update:page-size="handleFieldPageSizeChange"
+        @update:sorter="handleFieldSorterChange"
       />
     </div>
   </div>
@@ -157,6 +161,7 @@ const filters = reactive({
 
 const fieldSearchText = ref('');
 const currentSorter = ref(null);
+const currentFieldSorter = ref(null);
 const expandedRowIds = ref(new Set());
 
 const delayOptions = [
@@ -279,7 +284,7 @@ const datasetColumns = [
   {
     title: 'Category',
     key: 'category',
-    width: 100,
+    width: 150,
     render(row) {
       const isExpanded = expandedRowIds.value.has('cat-' + row.id);
       return h(
@@ -439,6 +444,56 @@ const datafieldColumns = [
     }
   },
   {
+    title: 'Coverage',
+    key: 'coverage',
+    width: 90,
+    align: 'right',
+    render(row) {
+      // Find data matching current JOINT filters
+      const matchingData = row.data.find(d => isMatchingTag(d));
+      if (matchingData && matchingData.coverage != null) {
+        return h('div', { style: 'font-size: 11px; font-weight: bold; color: #18a058' }, `${(matchingData.coverage * 100).toFixed(2)}%`);
+      }
+      // Fallback: show max coverage if no filter or no match
+      const maxCov = Math.max(...row.data.map(d => d.coverage || 0));
+      return h('div', { style: 'font-size: 11px; color: #999' }, maxCov > 0 ? `${(maxCov * 100).toFixed(2)}%` : '--');
+    }
+  },
+  {
+    title: 'Alphas',
+    key: 'alphaCount',
+    width: 70,
+    align: 'right',
+    sorter: true,
+    render(row) {
+      const matchingData = row.data.find(d => isMatchingTag(d));
+      if (matchingData && matchingData.alphaCount != null) {
+        return h('div', { style: 'font-size: 11px; font-weight: bold; color: #18a058' }, matchingData.alphaCount);
+      }
+      const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
+      return h('div', { style: 'font-size: 11px; color: #999' }, sum > 0 ? sum : '--');
+    }
+  },
+  {
+    title: 'Description',
+    key: 'description',
+    render(row) {
+      const isExpanded = expandedRowIds.value.has(row.id);
+      return h(
+        'div',
+        {
+          class: ['regular-cell', 'no-max-width', isExpanded ? 'expanded' : ''],
+          style: { cursor: 'pointer' },
+          onClick: () => {
+            if (window.getSelection().toString()) return;
+            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
+          },
+        },
+        row.description || '--'
+      );
+    }
+  },
+  {
     title: 'Region Coverage',
     key: 'regions',
     width: 300,
@@ -481,25 +536,6 @@ const datafieldColumns = [
             default: () => content
           });
         })
-      );
-    }
-  },
-  {
-    title: 'Description',
-    key: 'description',
-    render(row) {
-      const isExpanded = expandedRowIds.value.has(row.id);
-      return h(
-        'div',
-        {
-          class: ['regular-cell', 'no-max-width', isExpanded ? 'expanded' : ''],
-          style: { cursor: 'pointer' },
-          onClick: () => {
-            if (window.getSelection().toString()) return;
-            isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
-          },
-        },
-        row.description || '--'
       );
     }
   }
@@ -548,6 +584,8 @@ async function fetchDatafields() {
       region: filters.selectedRegion || null,
       universe: filters.filterUniverse.trim() || null,
       delay: filters.filterDelay !== null ? filters.filterDelay : null,
+      sort_field: currentFieldSorter.value?.columnKey || null,
+      sort_order: currentFieldSorter.value?.order === 'descend' ? -1 : (currentFieldSorter.value?.order === 'ascend' ? 1 : null)
     };
     
     const result = await invoke('get_datafields', { params });
@@ -608,6 +646,11 @@ function handleFieldPageSizeChange(pageSize) {
 
 function handleFieldSearch() {
   fieldPagination.page = 1;
+  fetchDatafields();
+}
+
+function handleFieldSorterChange(sorter) {
+  currentFieldSorter.value = sorter;
   fetchDatafields();
 }
 
