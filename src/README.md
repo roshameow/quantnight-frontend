@@ -1,47 +1,42 @@
-# 前端架构
+# 前端开发文档
 
-本项目前端采用 Vue 3 (Composition API) 构建，并遵循“容器组件”与“展示组件”分离的设计模式，以提高代码的可维护性和复用性。
+本项目前端采用 Vue 3 (Composition API) 构建，基于 Vite 开发环境和 Naive UI 组件库。采用“容器组件”与“展示组件”分离的模式。
 
-## 目录结构
+## 目录结构与模块职责
 
--   **`src/main.js`**: 应用入口文件，负责初始化 Vue 应用、路由和 Pinia 状态管理。
--   **`src/router/index.js`**: 定义应用的页面路由。
--   **`src/stores/`**: 存放 Pinia store 模块。
-    -   `taskStore.js`: 全局管理任务列表、任务进度等状态，实现跨组件共享。
--   **`src/views/`**: 存放页面级组件，作为“容器”，负责业务逻辑、数据获取和状态管理。
-    -   `TaskManager.vue`: 任务管理页面的主容器。
-    -   `DataPage.vue`: Alpha 数据分析页面的主容器。
--   **`src/components/`**: 存放可复用的“展示组件”，它们接收 props 并通过 emits 与父组件通信。
-    -   `modals/`: 存放所有弹窗组件，如 `AddTaskModal`、`StartTaskModal` 等。
-    -   `TaskCards/`: 存放与任务卡片相关的组件，如 `PriorityTaskCard`、`RegularTaskCard`。
-    -   `data/`: 存放与数据展示相关的组件，如 `DataFilters`。
--   **`src/composables/`**: 存放可复用的 Vue Composition API 函数（“组合式函数”）。
-    -   `useAlphaTableColumns.js`: 抽离了 `DataPage` 中复杂的表格列定义逻辑。
+### 1. 核心状态管理 (Pinia Stores)
 
-## 核心页面与组件拆分逻辑
+| Store | 文件名 | 职责 (Responsibilities) |
+| :--- | :--- | :--- |
+| **任务状态** | `taskStore.js` | 维护实时任务列表、进度映射及任务操作逻辑。 |
+| **数据集状态** | `datasetStore.js` | 实现数据集面板的状态持久化（搜索条件、视图模式、分页）。 |
+| **分析状态** | `analysisStore.js` | 管理 Alpha 列表的筛选状态及选中的 Alpha 详情。 |
+| **配置状态** | `configStore.js` | 处理应用级全局配置、数据库切换及显示映射。 |
+| **查询历史** | `queryStore.js` | 自动记录并持久化用户的高频搜索查询语句。 |
 
-### 1. 任务管理 (`TaskManager.vue`)
+### 2. 页面容器 (Views)
 
--   **`TaskManager.vue` (容器)**:
-    -   通过 `invoke` 与 Tauri 后端通信，处理所有任务相关的增删改查操作。
-    -   管理所有任务弹窗的显示/隐藏状态。
-    -   监听子组件（如卡片、工具栏）发出的事件并执行相应逻辑。
--   **`TaskManagerToolbar.vue` (展示)**:
-    -   显示顶部的“添加任务”按钮组。
-    -   点击时，通过 `emits` 通知父组件打开相应的弹窗。
--   **`PriorityTaskCard.vue` / `RegularTaskCard.vue` (展示)**:
-    -   接收 `task` 和 `progress` 对象作为 props 来渲染卡片UI。
-    -   卡片上的所有操作按钮（如启动、暂停）都通过 `emits` 将事件和任务信息传递给父容器处理。
+| 页面 | 文件名 | 描述 |
+| :--- | :--- | :--- |
+| **任务管理** | `TaskManager.vue` | 核心调度界面，处理 WebSocket 事件及任务生命周期管理。 |
+| **数据详情** | `DataPage.vue` | 基础 Alpha 列表页，支持高维度的组合过滤。 |
+| **提交统计** | `SubmissionStatsPanel.vue` | 基于聚合数据的可视化统计，支持下钻到具体 Alpha 列表。 |
+| **数据集管理** | `DatasetPanel.vue` | 两级数据结构管理，支持从 Dataset 下钻到 Datafield。 |
+| **Alpha 分析** | `AnalysisPage.vue` | 包含图表对比、PNL 趋势分析的综合视图。 |
 
-### 2. 数据分析 (`DataPage.vue`)
+## 开发核心逻辑说明
 
--   **`DataPage.vue` (容器)**:
-    -   管理筛选条件、分页和排序的状态。
-    -   调用 Tauri 后端获取 Alpha 数据。
-    -   使用 `useAlphaTableColumns` 组合式函数来获取表格的列定义。
--   **`DataFilters.vue` (展示)**:
-    -   包含所有的筛选输入框和选择器。
-    -   使用 `v-model` 与父组件的 `filters` 对象双向绑定，实现状态同步。
--   **`useAlphaTableColumns.js` (逻辑复用)**:
-    -   一个独立的函数，返回一个响应式的 `columns` 数组。
-    -   封装了所有复杂的列渲染逻辑，包括自定义单元格、Popover 弹窗和内嵌的 ECharts PNL 图表，使 `DataPage.vue` 的代码更加简洁。
+### 1. 实时进度推送机制
+前端通过调用 `get_tasks` 初始化列表后，会监听由 `src-tauri/src/watcher.rs` 推送的实时事件。`taskStore.js` 维护一个 `progressMap`，以 `taskName` 为键实时更新渲染。
+
+### 2. 复杂表格渲染 (`useAlphaTableColumns.js`)
+为了保持 View 组件的整洁，所有的 Alpha 列表列定义均抽离到 Composables 中。
+- **渲染技术**：利用 `h` 函数动态生成 Naive UI 组件。
+- **动态图表**：PNL 曲线采用 `vue-echarts`，在行展开时按需加载数据并渲染。
+
+### 3. 数据集状态保持
+为了优化用户体验，`DatasetPanel.vue` 不再使用本地 `ref` 存储搜索状态。所有输入框、分页和视图模式均绑定到 `datasetStore`。这确保了用户在查看 Datafield 后返回列表，或者切换到其他页面再回来时，搜索上下文完全保持。
+
+## UI 规范与样式
+- **CSS 架构**：全局样式定义在 `src/assets/table-styles.css` 中，专门针对大数据量展示进行了性能优化（如虚拟列表单元格高度微调）。
+- **组件交互**：遵循“数据流向下（Props），事件流向上（Emits）”的原则。
