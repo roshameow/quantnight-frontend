@@ -144,29 +144,26 @@
 import { ref, onMounted, computed, h, reactive, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { NButton, NSelect, NDataTable, NInput, NTag, NTooltip, NText, NSpace } from 'naive-ui';
+import { useDatasetStore } from '../stores/datasetStore';
+import { storeToRefs } from 'pinia';
 import '../assets/table-styles.css';
 
+const datasetStore = useDatasetStore();
+const { 
+  viewMode, 
+  currentDataset, 
+  filters, 
+  fieldSearchText, 
+  currentSorter, 
+  currentFieldSorter, 
+  expandedRowIds,
+  pagination: storePagination,
+  fieldPagination: storeFieldPagination
+} = storeToRefs(datasetStore);
+
 const loading = ref(false);
-const viewMode = ref('datasets'); // 'datasets' or 'datafields'
 const datasets = ref([]);
-const currentDataset = ref(null);
 const datafields = ref([]);
-
-const filters = reactive({
-  searchText: '',
-  filterId: '',
-  filterFieldId: '',
-  filterName: '',
-  filterCategory: null,
-  selectedRegion: null,
-  filterUniverse: '',
-  filterDelay: null,
-});
-
-const fieldSearchText = ref('');
-const currentSorter = ref(null);
-const currentFieldSorter = ref(null);
-const expandedRowIds = ref(new Set());
 
 const delayOptions = [
   { label: 'Delay 0', value: 0 },
@@ -180,12 +177,12 @@ const categoryOptions = [
 ].map(c => ({ label: c, value: c }));
 
 const isMatchingTag = (d) => {
-  if (filters.selectedRegion && d.region !== filters.selectedRegion) return false;
-  if (filters.filterUniverse && !d.universe.toLowerCase().includes(filters.filterUniverse.toLowerCase())) return false;
-  if (filters.filterDelay !== null && d.delay !== filters.filterDelay) return false;
+  if (filters.value.selectedRegion && d.region !== filters.value.selectedRegion) return false;
+  if (filters.value.filterUniverse && !d.universe.toLowerCase().includes(filters.value.filterUniverse.toLowerCase())) return false;
+  if (filters.value.filterDelay !== null && d.delay !== filters.value.filterDelay) return false;
   
   // Return true if any filter is active and matches
-  return !!(filters.selectedRegion || filters.filterUniverse || filters.filterDelay !== null);
+  return !!(filters.value.selectedRegion || filters.value.filterUniverse || filters.value.filterDelay !== null);
 };
 
 // Debounced watcher for filters
@@ -206,28 +203,24 @@ watch(fieldSearchText, () => {
 });
 
 // Pagination for Datasets
-const pagination = reactive({
-  page: 1,
-  pageSize: 20,
+const pagination = computed(() => ({
+  ...storePagination.value,
   showSizePicker: true,
   pageSizes: [20, 50, 100, 200],
-  itemCount: 0,
   prefix ({ itemCount }) {
     return `Total ${itemCount} items`;
   }
-});
+}));
 
 // Pagination for Datafields
-const fieldPagination = reactive({
-  page: 1,
-  pageSize: 20,
+const fieldPagination = computed(() => ({
+  ...storeFieldPagination.value,
   showSizePicker: true,
   pageSizes: [20, 50, 100, 200, 500],
-  itemCount: 0,
   prefix ({ itemCount }) {
     return `Total ${itemCount} fields`;
   }
-});
+}));
 
 const regionOptions = [
   { label: 'USA', value: 'USA' },
@@ -565,23 +558,23 @@ async function fetchDatasets() {
   loading.value = true;
   try {
     const params = {
-      page: pagination.page,
-      page_size: pagination.pageSize,
-      search: filters.searchText.trim() || null,
-      id: filters.filterId.trim() || null,
-      name: filters.filterName.trim() || null,
-      field_id: filters.filterFieldId.trim() || null,
-      category: filters.filterCategory || null,
-      region: filters.selectedRegion || null,
-      universe: filters.filterUniverse.trim() || null,
-      delay: filters.filterDelay !== null ? filters.filterDelay : null,
+      page: storePagination.value.page,
+      page_size: storePagination.value.pageSize,
+      search: filters.value.searchText.trim() || null,
+      id: filters.value.filterId.trim() || null,
+      name: filters.value.filterName.trim() || null,
+      field_id: filters.value.filterFieldId.trim() || null,
+      category: filters.value.filterCategory || null,
+      region: filters.value.selectedRegion || null,
+      universe: filters.value.filterUniverse.trim() || null,
+      delay: filters.value.filterDelay !== null ? filters.value.filterDelay : null,
       sort_field: currentSorter.value?.columnKey || null,
       sort_order: currentSorter.value?.order === 'descend' ? -1 : (currentSorter.value?.order === 'ascend' ? 1 : null)
     };
     
     const result = await invoke('get_datasets', { params });
     datasets.value = result.data;
-    pagination.itemCount = result.total;
+    storePagination.value.itemCount = result.total;
   } catch (e) {
     console.error('Failed to fetch datasets:', e);
   } finally {
@@ -595,19 +588,19 @@ async function fetchDatafields() {
   try {
     const params = {
       dataset_id: currentDataset.value.id,
-      page: fieldPagination.page,
-      page_size: fieldPagination.pageSize,
+      page: storeFieldPagination.value.page,
+      page_size: storeFieldPagination.value.pageSize,
       search: fieldSearchText.value.trim() || null,
-      region: filters.selectedRegion || null,
-      universe: filters.filterUniverse.trim() || null,
-      delay: filters.filterDelay !== null ? filters.filterDelay : null,
+      region: filters.value.selectedRegion || null,
+      universe: filters.value.filterUniverse.trim() || null,
+      delay: filters.value.filterDelay !== null ? filters.value.filterDelay : null,
       sort_field: currentFieldSorter.value?.columnKey || null,
       sort_order: currentFieldSorter.value?.order === 'descend' ? -1 : (currentFieldSorter.value?.order === 'ascend' ? 1 : null)
     };
     
     const result = await invoke('get_datafields', { params });
     datafields.value = result.data;
-    fieldPagination.itemCount = result.total;
+    storeFieldPagination.value.itemCount = result.total;
   } catch (e) {
     console.error('Failed to fetch datafields:', e);
   } finally {
@@ -618,7 +611,7 @@ async function fetchDatafields() {
 function enterDataset(dataset) {
   currentDataset.value = dataset;
   viewMode.value = 'datafields';
-  fieldPagination.page = 1;
+  storeFieldPagination.value.page = 1;
   fieldSearchText.value = '';
   fetchDatafields();
 }
@@ -627,21 +620,22 @@ function backToDatasets() {
   viewMode.value = 'datasets';
   currentDataset.value = null;
   datafields.value = [];
+  fetchDatasets(); // Refresh datasets when coming back
 }
 
 function handlePageChange(page) {
-  pagination.page = page;
+  storePagination.value.page = page;
   fetchDatasets();
 }
 
 function handlePageSizeChange(pageSize) {
-  pagination.pageSize = pageSize;
-  pagination.page = 1;
+  storePagination.value.pageSize = pageSize;
+  storePagination.value.page = 1;
   fetchDatasets();
 }
 
 function handleSearch() {
-  pagination.page = 1;
+  storePagination.value.page = 1;
   fetchDatasets();
 }
 
@@ -651,18 +645,18 @@ function handleSorterChange(sorter) {
 }
 
 function handleFieldPageChange(page) {
-  fieldPagination.page = page;
+  storeFieldPagination.value.page = page;
   fetchDatafields();
 }
 
 function handleFieldPageSizeChange(pageSize) {
-  fieldPagination.pageSize = pageSize;
-  fieldPagination.page = 1;
+  storeFieldPagination.value.pageSize = pageSize;
+  storeFieldPagination.value.page = 1;
   fetchDatafields();
 }
 
 function handleFieldSearch() {
-  fieldPagination.page = 1;
+  storeFieldPagination.value.page = 1;
   fetchDatafields();
 }
 
@@ -672,7 +666,11 @@ function handleFieldSorterChange(sorter) {
 }
 
 onMounted(() => {
-  fetchDatasets();
+  if (viewMode.value === 'datafields' && currentDataset.value) {
+    fetchDatafields();
+  } else {
+    fetchDatasets();
+  }
 });
 </script>
 
