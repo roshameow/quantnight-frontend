@@ -45,6 +45,8 @@ pub struct AlphaResult {
     pub cluster_y: Option<f64>,
     pub cluster_id: Option<serde_json::Value>,
     pub classifications: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "currentProdCorrelation")]
+    pub current_prod_correlation: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +226,8 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         }
     }
 
+    let current_prod_correlation = doc.get("currentProdCorrelation").and_then(|v| serde_json::to_value(v).ok());
+
     Some(AlphaResult {
         id,
         region,
@@ -249,6 +253,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         cluster_y,
         cluster_id,
         classifications,
+        current_prod_correlation,
     })
 }
 

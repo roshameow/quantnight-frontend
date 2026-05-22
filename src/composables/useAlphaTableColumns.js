@@ -231,6 +231,11 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       key: "corr_os",
       render: (row) => row.corr_os ?? "-",
     },
+    {
+      title: "Corr Prod",
+      key: "corr_prod",
+      render: (row) => row.currentProdCorrelation?.value ?? "-",
+    },
   ];
 
   const columns = computed(() => {
@@ -247,6 +252,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       if (col.key === 'message') return visibleColumns.value.includes('message');
       if (col.key === 'pnl') return visibleColumns.value.includes('pnl');
       if (col.key === 'corr_ppac' || col.key === 'corr_os') return visibleColumns.value.includes('corr');
+      if (col.key === 'corr_prod') return visibleColumns.value.includes('corr_prod');
       return true;
     });
   });

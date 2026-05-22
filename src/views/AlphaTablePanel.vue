@@ -78,7 +78,7 @@ const corrLoading = ref(false);
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
-const visibleColumns = ref(['score', 'pnl', 'message', 'corr']);
+const visibleColumns = ref(['score', 'pnl', 'message', 'corr', 'corr_prod']);
 
 // Context Menu State
 const showDropdownRef = ref(false);
@@ -139,6 +139,7 @@ const columnOptions = [
   { label: 'PnL', value: 'pnl' },
   { label: 'Message', value: 'message' },
   { label: 'Correlation', value: 'corr' },
+  { label: 'Corr Prod', value: 'corr_prod' },
 ];
 
 const filters = reactive({
