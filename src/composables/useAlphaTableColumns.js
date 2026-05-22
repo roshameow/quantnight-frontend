@@ -70,7 +70,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             "div",
             {
               class: ["regular-cell", "expanded"],
-              style: { cursor: "pointer", fontFamily: 'Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace' },
+              style: { cursor: "pointer" },
               onClick: () => expandedRowIds.value.delete(row.id),
               innerHTML: highlighted
             }
