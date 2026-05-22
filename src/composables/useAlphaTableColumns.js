@@ -5,6 +5,10 @@ import { use } from "echarts/core";
 import { LineChart } from "echarts/charts";
 import { GridComponent, TooltipComponent, LegendComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
+import Prism from "prismjs";
+import "prismjs/themes/prism.css";
+// Support python-like syntax which usually works well for Alpha expressions
+import "prismjs/components/prism-python";
 
 // Register ECharts components
 use([LineChart, GridComponent, TooltipComponent, CanvasRenderer, LegendComponent]);
@@ -57,17 +61,33 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       key: "code",
       render(row) {
         const isExpanded = expandedRowIds.value.has(row.id);
+        const code = row.code || "--";
+        
+        if (isExpanded) {
+          // Use Prism to highlight when expanded
+          const highlighted = Prism.highlight(code, Prism.languages.python, "python");
+          return h(
+            "div",
+            {
+              class: ["regular-cell", "expanded"],
+              style: { cursor: "pointer", fontFamily: 'Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace' },
+              onClick: () => expandedRowIds.value.delete(row.id),
+              innerHTML: highlighted
+            }
+          );
+        }
+
         return h(
           "div",
           {
-            class: ["regular-cell", isExpanded ? "expanded" : ""],
+            class: ["regular-cell"],
             style: { cursor: "pointer" },
             onClick: () => {
               if (window.getSelection().toString()) return;
-              isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(row.id);
+              expandedRowIds.value.add(row.id);
             },
           },
-          row.code || "--"
+          code
         );
       },
     },

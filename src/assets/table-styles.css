@@ -63,9 +63,16 @@
 }
 
 .regular-cell.expanded {
-  white-space: normal !important;
+  white-space: pre-wrap !important; /* 保留原始换行并支持自动折行 */
   word-break: break-word;
   overflow: visible;
+  line-height: 1.4;
+}
+
+/* 仅当内部包含展开元素时，才允许 TD 高度自适应 */
+.custom-table .n-data-table-td:has(.expanded) {
+  height: auto !important;
+  white-space: normal !important;
 }
 
 .message-cell {
