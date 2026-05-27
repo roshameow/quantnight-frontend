@@ -372,6 +372,7 @@ const datasetColumns = [
             h('div', `Delay: ${d.delay}`),
             h('div', `Universe: ${d.universe}`),
             d.coverage ? h('div', `Coverage: ${(d.coverage * 100).toFixed(2)}%`) : null,
+            d.dateCoverage ? h('div', `Date Coverage: ${(d.dateCoverage * 100).toFixed(2)}%`) : null,
             d.fieldCount ? h('div', `Field Count: ${d.fieldCount}`) : null,
             d.alphaCount ? h('div', `Alpha Count: ${d.alphaCount}`) : null,
             d.userCount !== undefined ? h('div', `User Count: ${d.userCount}`) : null,
@@ -462,10 +463,14 @@ const datafieldColumns = [
     key: 'dateCoverage',
     width: 100,
     align: 'right',
+    sorter: true,
     render(row) {
-      return h('div', { 
-        style: row.dateCoverage != null ? 'font-size: 11px; color: #18a058' : 'font-size: 11px; color: #999' 
-      }, row.dateCoverage != null ? `${(row.dateCoverage * 100).toFixed(2)}%` : '--');
+      const matchingData = row.data.find(d => isMatchingTag(d));
+      if (matchingData && matchingData.dateCoverage != null) {
+        return h('div', { style: 'font-size: 11px; font-weight: bold; color: #18a058' }, `${(matchingData.dateCoverage * 100).toFixed(2)}%`);
+      }
+      const maxDateCov = Math.max(...row.data.map(d => d.dateCoverage || 0));
+      return h('div', { style: 'font-size: 11px; color: #999' }, maxDateCov > 0 ? `${(maxDateCov * 100).toFixed(2)}%` : '--');
     }
   },
   {
@@ -529,6 +534,7 @@ const datafieldColumns = [
             h('div', `Delay: ${d.delay}`),
             h('div', `Universe: ${d.universe}`),
             d.coverage ? h('div', `Coverage: ${(d.coverage * 100).toFixed(2)}%`) : null,
+            d.dateCoverage ? h('div', `Date Coverage: ${(d.dateCoverage * 100).toFixed(2)}%`) : null,
             d.alphaCount ? h('div', `Alpha Count: ${d.alphaCount}`) : null,
             d.userCount !== undefined ? h('div', `User Count: ${d.userCount}`) : null,
           ]);

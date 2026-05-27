@@ -328,6 +328,7 @@ pub struct DatasetRegionData {
     pub delay: i32,
     pub universe: String,
     pub coverage: Option<f64>,
+    pub date_coverage: Option<f64>,
     pub field_count: Option<f64>,
     pub alpha_count: Option<f64>,
     pub user_count: Option<f64>,
@@ -366,6 +367,7 @@ pub struct DatafieldRegionData {
     pub delay: i32,
     pub universe: String,
     pub coverage: Option<f64>,
+    pub date_coverage: Option<f64>,
     pub alpha_count: Option<f64>,
     pub user_count: Option<f64>,
 }
@@ -378,8 +380,6 @@ pub struct Datafield {
     pub category: Option<JsonValue>,
     pub subcategory: Option<JsonValue>,
     pub dataset: Option<JsonValue>,
-    #[serde(rename = "dateCoverage")]
-    pub date_coverage: Option<f64>,
     pub data: Vec<DatafieldRegionData>,
 }
 
@@ -458,7 +458,7 @@ pub async fn get_datafields(
     let mongo_sort_field;
 
     match sort_field {
-        "alphaCount" | "coverage" => {
+        "alphaCount" | "coverage" | "dateCoverage" => {
             let mut filter_conds = vec![];
             if let Some(reg) = &params.region {
                 filter_conds.push(doc! { "$eq": ["$$this.region", reg] });
@@ -473,15 +473,16 @@ pub async fn get_datafields(
             }
 
             if filter_conds.is_empty() {
-                // No filters: sort by total sum for alphas or max for coverage
+                // No filters: sort by total sum for alphas or max for coverage/dateCoverage
                 if sort_field == "alphaCount" {
                     add_fields.insert("sortValue", doc! { "$sum": "$data.alphaCount" });
                 } else {
-                    add_fields.insert("sortValue", doc! { "$max": "$data.coverage" });
+                    let field_name = if sort_field == "coverage" { "coverage" } else { "dateCoverage" };
+                    add_fields.insert("sortValue", doc! { "$max": format!("$data.{}", field_name) });
                 }
             } else {
                 // With filters: sort by the sum of matching entries (usually one entry)
-                let field_name = if sort_field == "alphaCount" { "alphaCount" } else { "coverage" };
+                let field_name = if sort_field == "alphaCount" { "alphaCount" } else if sort_field == "coverage" { "coverage" } else { "dateCoverage" };
                 add_fields.insert("sortValue", doc! {
                     "$reduce": {
                         "input": {
