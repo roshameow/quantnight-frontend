@@ -71,7 +71,10 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             {
               class: ["regular-cell", "expanded"],
               style: { cursor: "pointer" },
-              onClick: () => expandedRowIds.value.delete(row.id),
+              onClick: () => {
+                if (window.getSelection().toString()) return;
+                expandedRowIds.value.delete(row.id);
+              },
               innerHTML: highlighted
             }
           );
