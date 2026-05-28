@@ -125,6 +125,16 @@
             placeholder="Include Classifications"
             style="width: 400px"
           />
+          <n-select
+            :value="modelValue.selfCategories"
+            multiple
+            clearable
+            :virtual-scroll="false"
+            @update:value="updateFilter('selfCategories', $event)"
+            :options="categoryOptions"
+            placeholder="Category"
+            style="width: 250px"
+          />
         </n-space>
       </n-grid-item>
 
@@ -159,6 +169,12 @@ const props = defineProps({
 const excludeMessageOptions = messagesData.exclude.map(msg => ({ label: msg, value: msg }));
 const includeMessageOptions = messagesData.include.map(msg => ({ label: msg, value: msg }));
 const classificationOptions = classificationsData.map(c => ({ label: c.name, value: c.id }));
+
+const categoryOptions = [
+  'Analyst', 'Broker', 'Earnings', 'Fundamental', 'Imbalance', 'Insiders', 
+  'Institutions', 'Macro', 'Model', 'News', 'Option', 'Other', 
+  'Price Volume', 'Risk', 'Sentiment', 'Short Interest', 'Social Media'
+].map(c => ({ label: c, value: c }));
 
 const emit = defineEmits(["update:modelValue", "calculateCorr"]);
 

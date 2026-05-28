@@ -140,6 +140,7 @@ const columnOptions = [
   { label: 'Message', value: 'message' },
   { label: 'Correlation', value: 'corr' },
   { label: 'Corr Prod', value: 'corr_prod' },
+  { label: 'Category', value: 'category' },
 ];
 
 const filters = reactive({
@@ -158,6 +159,7 @@ const filters = reactive({
   minMargin: null,
   minReturn: null,
   type: "REGULAR",
+  selfCategories: [],
 });
 
 const onFiltersUpdate = (newFilters) => {
@@ -210,6 +212,7 @@ async function fetchData() {
     min_margin: filters.minMargin != null ? parseFloat(filters.minMargin) / 10000 : null,
     min_returns: filters.minReturn != null ? parseFloat(filters.minReturn) / 100 : null,
     alpha_type: filters.type || null,
+    self_categories: filters.selfCategories.length > 0 ? filters.selfCategories : null,
     page: pagination.value.page,
     page_size: pagination.value.pageSize,
     sort_field: sortState.value.field,

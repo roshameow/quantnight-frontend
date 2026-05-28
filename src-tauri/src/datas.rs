@@ -47,6 +47,7 @@ pub struct AlphaResult {
     pub classifications: Option<Vec<serde_json::Value>>,
     #[serde(rename = "currentProdCorrelation")]
     pub current_prod_correlation: Option<serde_json::Value>,
+    pub self_category: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +78,7 @@ pub struct AlphaQuery {
     pub delay: Option<u32>,
     pub min_returns: Option<f64>,
     pub alpha_type: Option<String>,
+    pub self_categories: Option<Vec<String>>,
     pub collection: Option<String>,
     pub embedding: Option<String>,
     pub page: Option<u32>,
@@ -167,6 +169,10 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         }).collect()
     });
 
+    let self_category = doc.get_array("self_category").ok().map(|arr| {
+        arr.iter().filter_map(|bson| bson.as_str().map(|s| s.to_string())).collect()
+    });
+
     let (cluster_x, cluster_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
         if let Some(key) = embedding_key {
             analysis_doc.get_document("embeddings").ok()
@@ -254,6 +260,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
         cluster_id,
         classifications,
         current_prod_correlation,
+        self_category,
     })
 }
 
@@ -793,6 +800,11 @@ pub async fn get_alpha_results(
     }
     if let Some(alpha_type) = &params.alpha_type {
         filters.push(doc! { "type": alpha_type });
+    }
+    if let Some(categories) = &params.self_categories {
+        if !categories.is_empty() {
+            filters.push(doc! { "self_category": { "$in": categories } });
+        }
     }
 
     let filter = if filters.is_empty() {
