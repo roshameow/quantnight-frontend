@@ -265,6 +265,17 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
 }
 
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+static RE_TRUE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bTrue\b").unwrap());
+static RE_FALSE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bFalse\b").unwrap());
+static RE_NONE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bNone\b").unwrap());
+static RE_INT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:int|NumberInt)\((\d+)\)").unwrap());
+static RE_FLOAT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:float|NumberDecimal)\(([\d\.]+)\)").unwrap());
+static RE_KEYS: Lazy<Regex> = Lazy::new(|| Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap());
+static RE_COMMA: Lazy<Regex> = Lazy::new(|| Regex::new(r",\s*([\]}])").unwrap());
+
 fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
     let q_trimmed = q.trim();
     if q_trimmed.is_empty() {
@@ -280,17 +291,11 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
         .replace('‘', "'")
         .replace('’', "'");
     
-    let re_true = regex::Regex::new(r"\bTrue\b").unwrap();
-    let re_false = regex::Regex::new(r"\bFalse\b").unwrap();
-    let re_none = regex::Regex::new(r"\bNone\b").unwrap();
-    let re_int = regex::Regex::new(r"\b(?:int|NumberInt)\((\d+)\)").unwrap();
-    let re_float = regex::Regex::new(r"\b(?:float|NumberDecimal)\(([\d\.]+)\)").unwrap();
-    
-    normalized_q = re_true.replace_all(&normalized_q, "true").to_string();
-    normalized_q = re_false.replace_all(&normalized_q, "false").to_string();
-    normalized_q = re_none.replace_all(&normalized_q, "null").to_string();
-    normalized_q = re_int.replace_all(&normalized_q, "$1").to_string();
-    normalized_q = re_float.replace_all(&normalized_q, "$1").to_string();
+    normalized_q = RE_TRUE.replace_all(&normalized_q, "true").to_string();
+    normalized_q = RE_FALSE.replace_all(&normalized_q, "false").to_string();
+    normalized_q = RE_NONE.replace_all(&normalized_q, "null").to_string();
+    normalized_q = RE_INT.replace_all(&normalized_q, "$1").to_string();
+    normalized_q = RE_FLOAT.replace_all(&normalized_q, "$1").to_string();
 
     // 2. Smart wrap: if it looks like an object (contains :) but lacks braces, wrap it
     if !normalized_q.starts_with('{') && normalized_q.contains(':') {
@@ -298,8 +303,7 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
     }
 
     // 3. Automatically quote unquoted keys (e.g. $or -> "$or", os.sharpe -> "os.sharpe")
-    let re_keys = regex::Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap();
-    normalized_q = re_keys.replace_all(&normalized_q, "$1\"$2\":").to_string();
+    normalized_q = RE_KEYS.replace_all(&normalized_q, "$1\"$2\":").to_string();
     normalized_q = normalized_q.replace("\"\"", "\"");
 
     println!("Normalized query: {}", normalized_q);
@@ -314,8 +318,7 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
     }
     
     // 5. Fallback: Clean trailing commas
-    let re_comma = regex::Regex::new(r",\s*([\]}])").unwrap();
-    let cleaned_q = re_comma.replace_all(&normalized_q, "$1").to_string();
+    let cleaned_q = RE_COMMA.replace_all(&normalized_q, "$1").to_string();
     
     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
         if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
