@@ -6,8 +6,8 @@ use futures_util::stream::TryStreamExt;
 use futures::join;
 
 use mongodb::{
-    bson::doc,
-    options::FindOptions,
+    bson::{doc, Document},
+    options::{FindOptions, FindOneOptions},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
@@ -521,7 +521,18 @@ pub async fn get_datafields(
         pipeline.push(doc! { "$addFields": add_fields });
     }
 
-    pipeline.push(doc! { "$project": { "description_embedding": 0, "embedding": 0 } });
+    pipeline.push(doc! { 
+        "$project": { 
+            "id": 1,
+            "description": 1,
+            "type": 1,
+            "category": 1,
+            "subcategory": 1,
+            "dataset": 1,
+            "data": 1,
+            "totalAlphaCount": 1,
+        } 
+    });
     pipeline.push(doc! { "$sort": { mongo_sort_field: sort_order } });
     pipeline.push(doc! { "$skip": skip as i64 });
     pipeline.push(doc! { "$limit": page_size as i64 });
@@ -689,6 +700,39 @@ pub async fn get_datasets(
     })
 }
 
+fn get_alpha_projection() -> mongodb::bson::Document {
+    doc! {
+        "id": 1,
+        "type": 1,
+        "settings": 1,
+        "regular.code": 1,
+        "selection.code": 1,
+        "combo.code": 1,
+        "is": {
+            "sharpe": 1,
+            "fitness": 1,
+            "drawdown": 1,
+            "turnover": 1,
+            "margin": 1,
+            "longCount": 1,
+            "shortCount": 1,
+            "returns": 1,
+            "checks": 1,
+        },
+        "os": {
+            "sharpe": 1,
+            "fitness": 1,
+        },
+        "pnl_score": 1,
+        "dateCreated": 1,
+        "dateSubmitted": 1,
+        "classifications": 1,
+        "self_category": 1,
+        "analysis.embeddings": 1,
+        "currentProdCorrelation": 1,
+    }
+}
+
 #[command]
 pub async fn get_alpha_results(
     params: AlphaQuery,
@@ -837,7 +881,7 @@ pub async fn get_alpha_results(
     };
 
     let find_options = FindOptions::builder()
-        .projection(doc! { "pnl": 0 })
+        .projection(get_alpha_projection())
         .sort(sort_doc)
         .skip(skip)
         .limit(page_size as i64)
@@ -1109,7 +1153,7 @@ pub async fn search_alpha_in_all_collections(
         let collection = db.collection::<mongodb::bson::Document>(&coll_name);
         let filter = doc! { "id": &query.id };
         
-        if let Ok(Some(doc)) = collection.find_one(filter, None).await {
+        if let Ok(Some(doc)) = collection.find_one(filter, FindOneOptions::builder().projection(get_alpha_projection()).build()).await {
             if let Some(result) = parse_alpha_document(doc, None) {
                 return Ok(Some(AlphaInCollectionResult {
                     id: result.id,
