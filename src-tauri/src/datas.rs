@@ -185,10 +185,12 @@ pub struct DbAlphaDocument {
     pub combo: Option<DbCode>,
     pub is: Option<DbIsMetrics>,
     pub os: Option<DbOsMetrics>,
+    #[serde(rename = "pnl_score")]
     pub pnl_score: Option<f64>,
     pub date_created: Option<String>,
     pub date_submitted: Option<String>,
     pub classifications: Option<Vec<DbClassification>>,
+    #[serde(rename = "self_category")]
     pub self_category: Option<Vec<String>>,
     pub current_prod_correlation: Option<serde_json::Value>,
     pub analysis: Option<DbAnalysis>,
