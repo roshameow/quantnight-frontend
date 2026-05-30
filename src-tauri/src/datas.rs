@@ -586,7 +586,7 @@ pub async fn get_datafields(
             "subcategory": 1,
             "dataset": 1,
             "data": 1,
-            "totalAlphaCount": 1,
+            "sortValue": 1,
         } 
     });
     pipeline.push(doc! { "$sort": { mongo_sort_field: sort_order } });
