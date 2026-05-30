@@ -1008,23 +1008,26 @@ pub async fn get_pnl_by_id(
     let client = &clients.local;
     let db = client.database(&config.mongodb.databases.alpha);
 
-    let coll_name = query
-        .collection
-        .as_deref()
-        .and_then(|s| sanitize_collection_name(s))
-        .unwrap_or_else(|| "alpha_results".to_string());
-
-    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
     let filter = doc! { "id": &query.id };
+    
+    // 1. First attempt: Look in the centralized partitioned collection "alpha_pnls"
+    let pnls_coll = db.collection::<mongodb::bson::Document>("alpha_pnls");
+    let mut doc_opt = pnls_coll.find_one(filter.clone(), None).await.ok().flatten();
 
-    let doc = collection
-        .find_one(filter, None)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?
-        .ok_or_else(|| "Document not found".to_string())?;
+    // 2. Second attempt: Fallback to the original source collection if not found in alpha_pnls
+    if doc_opt.is_none() {
+        if let Some(source_coll_name) = query.collection.as_deref().and_then(sanitize_collection_name) {
+            if source_coll_name != "alpha_pnls" {
+                let source_coll = db.collection::<mongodb::bson::Document>(&source_coll_name);
+                doc_opt = source_coll.find_one(filter, None).await.ok().flatten();
+            }
+        }
+    }
 
-    let pnl_obj = doc.get_document("pnl").map_err(|_| "No pnl field")?;
-    let records = pnl_obj.get_array("records").map_err(|_| "No records array")?;
+    let doc = doc_opt.ok_or_else(|| "PNL document not found in alpha_pnls or source collection".to_string())?;
+
+    let pnl_obj = doc.get_document("pnl").map_err(|_| "No pnl field found")?;
+    let records = pnl_obj.get_array("records").map_err(|_| "No records array found")?;
 
     let pnl_series: Vec<PnlPoint> = records
         .iter()
