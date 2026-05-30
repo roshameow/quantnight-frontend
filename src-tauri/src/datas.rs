@@ -103,165 +103,216 @@ pub struct PagedResult<T> {
     pub page_size: u32,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbCheck {
+    pub name: Option<String>,
+    pub result: Option<String>,
+    pub limit: Option<f64>,
+    pub value: Option<f64>,
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbIsMetrics {
+    pub sharpe: Option<f64>,
+    pub fitness: Option<f64>,
+    pub drawdown: Option<f64>,
+    pub returns: Option<f64>,
+    pub turnover: Option<f64>,
+    pub margin: Option<f64>,
+    pub long_count: Option<i32>,
+    pub short_count: Option<i32>,
+    pub checks: Option<Vec<DbCheck>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbOsMetrics {
+    pub sharpe: Option<f64>,
+    pub fitness: Option<f64>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbSettings {
+    #[serde(default = "default_region")]
+    pub region: String,
+    pub universe: Option<String>,
+    pub neutralization: Option<String>,
+}
+
+fn default_region() -> String {
+    "Unknown".to_string()
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbCode {
+    pub code: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbAnalysisEmbedding {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub cluster: Option<serde_json::Value>, // Has an 'id' inside
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbAnalysis {
+    pub embeddings: Option<HashMap<String, DbAnalysisEmbedding>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbClassification {
+    pub id: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DbAlphaDocument {
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub settings: Option<DbSettings>,
+    pub regular: Option<DbCode>,
+    pub selection: Option<DbCode>,
+    pub combo: Option<DbCode>,
+    pub is: Option<DbIsMetrics>,
+    pub os: Option<DbOsMetrics>,
+    pub pnl_score: Option<f64>,
+    pub date_created: Option<String>,
+    pub date_submitted: Option<String>,
+    pub classifications: Option<Vec<DbClassification>>,
+    pub self_category: Option<Vec<String>>,
+    pub current_prod_correlation: Option<serde_json::Value>,
+    pub analysis: Option<DbAnalysis>,
+}
+
+impl DbAlphaDocument {
+    pub fn into_alpha_result(self, embedding_key: Option<&str>) -> Option<AlphaResult> {
+        let id = self.id?;
+        let r#type = self.r#type.unwrap_or_else(|| "UNKNOWN".to_string());
+        
+        let settings = self.settings.unwrap_or_else(|| DbSettings { region: default_region(), universe: None, neutralization: None });
+        
+        let code = match r#type.as_str() {
+            "REGULAR" => self.regular.and_then(|r| r.code),
+            "SUPER" => {
+                let selection_code = self.selection.and_then(|r| r.code).unwrap_or_default();
+                let combo_code = self.combo.and_then(|r| r.code).unwrap_or_default();
+                Some(format!("{}\n{}", selection_code, combo_code))
+            }
+            _ => None,
+        };
+
+        let mut sub_universe_sharpe = None;
+        let mut message = None;
+
+        if let Some(is_metrics) = &self.is {
+            if let Some(checks) = &is_metrics.checks {
+                let mut msg_parts = Vec::new();
+                for check in checks {
+                    let name = check.name.as_deref().unwrap_or("");
+                    let result = check.result.as_deref().unwrap_or("");
+                    
+                    if name == "LOW_SUB_UNIVERSE_SHARPE" {
+                        sub_universe_sharpe = check.value;
+                    }
+
+                    if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
+                        let part = if let (Some(l), Some(v)) = (check.limit, check.value) {
+                            format!("{}({:.2}/{:.2})", name, v, l)
+                        } else if let Some(m) = &check.message {
+                            format!("{}:{}", name, m)
+                        } else {
+                            name.to_string()
+                        };
+                        msg_parts.push(part);
+                    }
+                }
+                if !msg_parts.is_empty() {
+                    message = Some(msg_parts.join(","));
+                }
+            }
+        }
+
+        let classifications = self.classifications.map(|arr| {
+            arr.into_iter().filter_map(|c| {
+                if let (Some(cid), Some(cname)) = (c.id, c.name) {
+                    Some(serde_json::json!({ "id": cid, "name": cname }))
+                } else {
+                    None
+                }
+            }).collect()
+        });
+
+        let mut cluster_x = None;
+        let mut cluster_y = None;
+        let mut cluster_id = None;
+
+        if let Some(analysis) = self.analysis {
+            if let Some(embeddings) = analysis.embeddings {
+                if let Some(key) = embedding_key {
+                    if let Some(umap) = embeddings.get(key) {
+                        cluster_x = umap.x;
+                        cluster_y = umap.y;
+                        if let Some(cluster_val) = &umap.cluster {
+                            if let Some(obj) = cluster_val.as_object() {
+                                if let Some(id_val) = obj.get("id") {
+                                    cluster_id = Some(id_val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(AlphaResult {
+            id,
+            region: settings.region,
+            universe: settings.universe,
+            neutralization: settings.neutralization,
+            code,
+            sharpe: self.is.as_ref().and_then(|is| is.sharpe),
+            fitness: self.is.as_ref().and_then(|is| is.fitness),
+            drawdown: self.is.as_ref().and_then(|is| is.drawdown),
+            returns: self.is.as_ref().and_then(|is| is.returns),
+            turnover: self.is.as_ref().and_then(|is| is.turnover),
+            margin: self.is.as_ref().and_then(|is| is.margin),
+            long_count: self.is.as_ref().and_then(|is| is.long_count),
+            short_count: self.is.as_ref().and_then(|is| is.short_count),
+            sub_universe_sharpe,
+            message,
+            date_created: self.date_created,
+            date_submitted: self.date_submitted,
+            pnl_score: self.pnl_score,
+            os_sharpe: self.os.as_ref().and_then(|os| os.sharpe),
+            os_fitness: self.os.as_ref().and_then(|os| os.fitness),
+            cluster_x,
+            cluster_y,
+            cluster_id,
+            classifications,
+            current_prod_correlation: self.current_prod_correlation,
+            self_category: self.self_category,
+        })
+    }
+}
+
 fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str>) -> Option<AlphaResult> {
-    let id = doc.get_str("id").ok()?.to_string();
-
-    let settings = doc.get_document("settings").ok();
-    let region = settings
-        .and_then(|d| d.get_str("region").ok())
-        .unwrap_or("Unknown")
-        .to_string();
-
-    let universe = settings
-        .and_then(|d| d.get_str("universe").ok())
-        .map(|s| s.to_string());
-
-    let neutralization = settings
-        .and_then(|d| d.get_str("neutralization").ok())
-        .map(|s| s.to_string());
-
-    let alpha_type = doc.get_str("type").unwrap_or("UNKNOWN");
-    let code = match alpha_type {
-        "REGULAR" => doc.get_document("regular").ok()
-            .and_then(|d| d.get_str("code").ok())
-            .map(|s| s.to_string()),
-        "SUPER" => {
-            let selection_code = doc.get_document("selection").ok()
-                .and_then(|d| d.get_str("code").ok())
-                .unwrap_or("")
-                .to_string();
-            let combo_code = doc.get_document("combo").ok()
-                .and_then(|d| d.get_str("code").ok())
-                .unwrap_or("")
-                .to_string();
-            Some(format!("{}\n{}", selection_code, combo_code))
-        }
-        _ => None,
-    };
-
-    let is = doc.get_document("is").ok();
-    let sharpe = is.and_then(|d| d.get_f64("sharpe").ok());
-    let fitness = is.and_then(|d| d.get_f64("fitness").ok());
-    let drawdown = is.and_then(|d| d.get_f64("drawdown").ok());
-    let turnover = is.and_then(|d| d.get_f64("turnover").ok());
-    let margin = is.and_then(|d| d.get_f64("margin").ok());
-    let long_count = is.and_then(|d| d.get_i32("longCount").ok());
-    let short_count = is.and_then(|d| d.get_i32("shortCount").ok());
-    let returns = is.and_then(|d| d.get_f64("returns").ok());
-    let pnl_score = doc.get_f64("pnl_score").ok();
-
-    let os = doc.get_document("os").ok();
-    let os_sharpe = os.and_then(|d| d.get("sharpe")).and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
-    let os_fitness = os.and_then(|d| d.get("fitness")).and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
-
-    let date_created = doc.get_str("dateCreated").ok().map(|s| s.to_string());
-    let date_submitted = doc.get_str("dateSubmitted").ok().map(|s| s.to_string());
-
-    let classifications = doc.get_array("classifications").ok().map(|arr| {
-        arr.iter().filter_map(|bson| {
-            if let Some(doc) = bson.as_document() {
-                let id = doc.get_str("id").unwrap_or("").to_string();
-                let name = doc.get_str("name").unwrap_or("").to_string();
-                Some(serde_json::json!({ "id": id, "name": name }))
-            } else {
-                None
-            }
-        }).collect()
-    });
-
-    let self_category = doc.get_array("self_category").ok().map(|arr| {
-        arr.iter().filter_map(|bson| bson.as_str().map(|s| s.to_string())).collect()
-    });
-
-    let (cluster_x, cluster_y, cluster_id) = if let Some(analysis_doc) = doc.get_document("analysis").ok() {
-        if let Some(key) = embedding_key {
-            analysis_doc.get_document("embeddings").ok()
-                .and_then(|em| em.get_document(key).ok())
-                .map_or((None, None, None), |umap| {
-                    let x = umap.get_f64("x").ok();
-                    let y = umap.get_f64("y").ok();
-                    let cid = umap.get_document("cluster").ok()
-                                .and_then(|c| c.get("id"))
-                                .and_then(|id_val| match id_val {
-                                    mongodb::bson::Bson::Int32(i) => Some(serde_json::json!(i)),
-                                    mongodb::bson::Bson::Int64(i) => Some(serde_json::json!(i)),
-                                    mongodb::bson::Bson::Double(f) => Some(serde_json::json!(f)),
-                                    mongodb::bson::Bson::String(s) => Some(serde_json::json!(s)),
-                                    _ => None,
-                                });
-                    (x, y, cid)
-                })
-        } else {
-            (None, None, None)
-        }
-    } else {
-        (None, None, None)
-    };
-    
-    let mut sub_universe_sharpe = None;
-    let mut message = None;
-
-    if let Some(checks) = is.and_then(|d| d.get_array("checks").ok()) {
-        let mut msg_parts = Vec::new();
-        for item in checks {
-            if let Some(check_doc) = item.as_document() {
-                let name = check_doc.get_str("name").unwrap_or("");
-                let result = check_doc.get_str("result").unwrap_or("");
-                
-                let limit = check_doc.get("limit").and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
-                let value = check_doc.get("value").and_then(|v| v.as_f64().or(v.as_i32().map(|i| i as f64)));
-                
-                if name == "LOW_SUB_UNIVERSE_SHARPE" {
-                    sub_universe_sharpe = value;
-                }
-
-                if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
-                    let part = if let (Some(l), Some(v)) = (limit, value) {
-                        format!("{}({:.2}/{:.2})", name, v, l)
-                    } else if let Ok(m) = check_doc.get_str("message") {
-                        format!("{}:{}", name, m)
-                    } else {
-                        name.to_string()
-                    };
-                    msg_parts.push(part);
-                }
-            }
-        }
-        if !msg_parts.is_empty() {
-            message = Some(msg_parts.join(","));
+    match mongodb::bson::from_document::<DbAlphaDocument>(doc) {
+        Ok(db_alpha) => db_alpha.into_alpha_result(embedding_key),
+        Err(e) => {
+            println!("Error deserializing alpha document: {}", e);
+            None
         }
     }
-
-    let current_prod_correlation = doc.get("currentProdCorrelation").and_then(|v| serde_json::to_value(v).ok());
-
-    Some(AlphaResult {
-        id,
-        region,
-        universe,
-        neutralization,
-        code,
-        sharpe,
-        fitness,
-        drawdown,
-        returns,
-        turnover,
-        margin,
-        long_count,
-        short_count,
-        sub_universe_sharpe,
-        message,
-        date_created,
-        date_submitted,
-        pnl_score,
-        os_sharpe,
-        os_fitness,
-        cluster_x,
-        cluster_y,
-        cluster_id,
-        classifications,
-        current_prod_correlation,
-        self_category,
-    })
 }
 
 
