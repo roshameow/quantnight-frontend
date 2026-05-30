@@ -57,6 +57,11 @@ function getPNLOption(series) {
 export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, loadPNL, visibleColumns }) {
   const allColumns = [
     {
+      title: "Category",
+      key: "category",
+      render: (row) => row.self_category?.join(", ") || "-",
+    },
+    {
       title: "Regular",
       key: "code",
       render(row) {
@@ -258,11 +263,6 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       title: "Corr Prod",
       key: "corr_prod",
       render: (row) => row.currentProdCorrelation?.value ?? "-",
-    },
-    {
-      title: "Category",
-      key: "category",
-      render: (row) => row.self_category?.join(", ") || "-",
     },
   ];
 
