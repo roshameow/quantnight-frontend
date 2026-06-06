@@ -233,7 +233,9 @@ impl DbAlphaDocument {
                         if let Some(pyramids) = &check.pyramids {
                             for p in pyramids {
                                 if let Some(pname) = &p.name {
-                                    pyramid_names.push(pname.clone());
+                                    // Extract the last part after the last '/'
+                                    let short_name = pname.split('/').last().unwrap_or(pname).to_string();
+                                    pyramid_names.push(short_name);
                                 }
                             }
                         }
@@ -925,14 +927,24 @@ pub async fn get_alpha_results(
     }
     if let Some(categories) = &params.self_categories {
         if !categories.is_empty() {
-            filters.push(doc! { 
-                "is.checks": { 
-                    "$elemMatch": { 
-                        "name": "MATCHES_PYRAMID", 
-                        "pyramids.name": { "$in": categories } 
+            let mut and_conds = Vec::new();
+            for cat in categories {
+                // Use regex to match the suffix (e.g. "OPTION" matches "USA/D1/OPTION")
+                let pattern = format!("{}$", regex::escape(cat));
+                and_conds.push(doc! { 
+                    "is.checks": { 
+                        "$elemMatch": { 
+                            "name": "MATCHES_PYRAMID", 
+                            "pyramids": {
+                                "$elemMatch": {
+                                    "name": { "$regex": pattern, "$options": "i" }
+                                }
+                            }
+                        } 
                     } 
-                } 
-            });
+                });
+            }
+            filters.push(doc! { "$and": and_conds });
         }
     }
 
