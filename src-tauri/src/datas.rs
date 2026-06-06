@@ -105,12 +105,19 @@ pub struct PagedResult<T> {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct DbPyramid {
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct DbCheck {
     pub name: Option<String>,
     pub result: Option<String>,
     pub limit: Option<f64>,
     pub value: Option<f64>,
     pub message: Option<String>,
+    pub pyramids: Option<Vec<DbPyramid>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -190,8 +197,6 @@ pub struct DbAlphaDocument {
     pub date_created: Option<String>,
     pub date_submitted: Option<String>,
     pub classifications: Option<Vec<DbClassification>>,
-    #[serde(rename = "self_category")]
-    pub self_category: Option<Vec<String>>,
     pub current_prod_correlation: Option<serde_json::Value>,
     pub analysis: Option<DbAnalysis>,
 }
@@ -215,6 +220,7 @@ impl DbAlphaDocument {
 
         let mut sub_universe_sharpe = None;
         let mut message = None;
+        let mut pyramid_names = Vec::new();
 
         if let Some(is_metrics) = &self.is {
             if let Some(checks) = &is_metrics.checks {
@@ -223,6 +229,16 @@ impl DbAlphaDocument {
                     let name = check.name.as_deref().unwrap_or("");
                     let result = check.result.as_deref().unwrap_or("");
                     
+                    if name == "MATCHES_PYRAMID" {
+                        if let Some(pyramids) = &check.pyramids {
+                            for p in pyramids {
+                                if let Some(pname) = &p.name {
+                                    pyramid_names.push(pname.clone());
+                                }
+                            }
+                        }
+                    }
+
                     if name == "LOW_SUB_UNIVERSE_SHARPE" {
                         sub_universe_sharpe = check.value;
                     }
@@ -302,7 +318,7 @@ impl DbAlphaDocument {
             cluster_id,
             classifications,
             current_prod_correlation: self.current_prod_correlation,
-            self_category: self.self_category,
+            self_category: if !pyramid_names.is_empty() { Some(pyramid_names) } else { None },
         })
     }
 }
@@ -773,7 +789,14 @@ fn get_alpha_projection() -> mongodb::bson::Document {
             "longCount": 1,
             "shortCount": 1,
             "returns": 1,
-            "checks": 1,
+            "checks": {
+                "name": 1,
+                "result": 1,
+                "limit": 1,
+                "value": 1,
+                "message": 1,
+                "pyramids": 1,
+            },
         },
         "os": {
             "sharpe": 1,
@@ -783,7 +806,6 @@ fn get_alpha_projection() -> mongodb::bson::Document {
         "dateCreated": 1,
         "dateSubmitted": 1,
         "classifications": 1,
-        "self_category": 1,
         "analysis.embeddings": 1,
         "currentProdCorrelation": 1,
     }
@@ -903,7 +925,14 @@ pub async fn get_alpha_results(
     }
     if let Some(categories) = &params.self_categories {
         if !categories.is_empty() {
-            filters.push(doc! { "self_category": { "$in": categories } });
+            filters.push(doc! { 
+                "is.checks": { 
+                    "$elemMatch": { 
+                        "name": "MATCHES_PYRAMID", 
+                        "pyramids.name": { "$in": categories } 
+                    } 
+                } 
+            });
         }
     }
 
