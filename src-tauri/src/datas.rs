@@ -66,6 +66,7 @@ pub enum SortField {
 #[derive(Deserialize)]
 pub struct AlphaQuery {
     pub query: Option<String>,
+    pub exclude_query: Option<String>, // New field for excluding certain alpha code patterns
     pub id: Option<String>,
     pub messages_in: Option<Vec<String>>, // Renamed from messages
     pub messages_nin: Option<Vec<String>>, // Added for exclusion
@@ -848,6 +849,19 @@ pub async fn get_alpha_results(
                     { "regular.code": { "$regex": &escaped, "$options": "i" } },
                     { "selection.code": { "$regex": &escaped, "$options": "i" } },
                     { "combo.code": { "$regex": &escaped, "$options": "i" } }
+                ]
+            });
+        }
+    }
+
+    if let Some(ex_q) = &params.exclude_query {
+        if !ex_q.trim().is_empty() {
+            let escaped = regex::escape(ex_q.trim());
+            filters.push(doc! {
+                "$and": [
+                    { "regular.code": { "$not": { "$regex": &escaped, "$options": "i" } } },
+                    { "selection.code": { "$not": { "$regex": &escaped, "$options": "i" } } },
+                    { "combo.code": { "$not": { "$regex": &escaped, "$options": "i" } } }
                 ]
             });
         }

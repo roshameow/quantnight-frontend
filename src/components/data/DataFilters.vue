@@ -32,7 +32,14 @@
             @update:value="updateFilter('searchQuery', $event)"
             placeholder="🔍 Search Regular"
             clearable
-            style="width: 280px"
+            style="width: 250px"
+          />
+          <n-input
+            :value="modelValue.excludeQuery"
+            @update:value="updateFilter('excludeQuery', $event)"
+            placeholder="🚫 Exclude"
+            clearable
+            style="width: 150px"
           />
           <n-input
             :value="modelValue.id"

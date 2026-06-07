@@ -147,6 +147,7 @@ const filters = reactive({
   collection: "alpha_results",
   embedding: "",
   searchQuery: "",
+  excludeQuery: "",
   id: "",
   messages: [], // This is for NIN
   messagesIn: [], // This is for IN
@@ -198,6 +199,7 @@ async function fetchData() {
     collection: filters.collection || "alpha_results",
     embedding: filters.embedding || null,
     query: filters.searchQuery.trim() || null,
+    exclude_query: filters.excludeQuery.trim() || null,
     id: filters.id.trim() || null,
     messages_nin: filters.messages.length > 0 ? filters.messages : null,
     messages_in: filters.messagesIn.length > 0 ? filters.messagesIn : null,
