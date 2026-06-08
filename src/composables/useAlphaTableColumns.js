@@ -59,12 +59,14 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Category",
       key: "category",
+      width: 100,
       render: (row) => row.self_category?.join(", ") || "-",
     },
     {
       title: "Settings",
       key: "settings",
-      width: 60,
+      width: 50,
+      ellipsis: true,
       render(row) {
         const key = "set-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
@@ -78,7 +80,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
           "div",
           {
             class: ["regular-cell", isExpanded ? "expanded" : ""],
-            style: { cursor: "pointer" },
+            style: { cursor: "pointer", maxWidth: isExpanded ? "none" : "50px" },
             onClick: () => {
               if (window.getSelection().toString()) return;
               isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
