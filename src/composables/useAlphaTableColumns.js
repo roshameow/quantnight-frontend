@@ -65,7 +65,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Settings",
       key: "settings",
-      width: 80,
+      width: 200,
       ellipsis: true,
       render(row) {
         const key = "set-" + row.id;
