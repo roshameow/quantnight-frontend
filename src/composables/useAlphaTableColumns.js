@@ -64,6 +64,8 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Settings",
       key: "settings",
+      width: 150,
+      ellipsis: true,
       render(row) {
         const key = "set-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
@@ -222,6 +224,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Message",
       key: "message",
+      width: 300,
       render(row) {
         const key = "msg-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
