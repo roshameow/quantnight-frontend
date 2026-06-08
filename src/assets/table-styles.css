@@ -52,7 +52,6 @@
 
 /* Specific cell classes used in useAlphaTableColumns */
 .regular-cell {
-  max-width: 300px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -77,6 +76,9 @@
 
 .message-cell {
   font-size: 12px !important;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .message-cell.expanded {

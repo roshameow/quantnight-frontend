@@ -60,7 +60,13 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       title: "Category",
       key: "category",
       width: 120,
-      render: (row) => row.self_category?.join(", ") || "-",
+      render: (row) => {
+        const pyramidCheck = row.is?.checks?.find(c => c.name === 'MATCHES_PYRAMID');
+        if (pyramidCheck && pyramidCheck.pyramid) {
+          return pyramidCheck.pyramid.split('/').pop();
+        }
+        return row.self_category?.join(", ") || "-";
+      }
     },
     {
       title: "Settings",
@@ -93,7 +99,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Regular",
       key: "code",
-      width: 400,
+      width: 300,
       render(row) {
         const isExpanded = expandedRowIds.value.has(row.id);
         const code = row.code || "--";
