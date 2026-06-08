@@ -62,6 +62,32 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       render: (row) => row.self_category?.join(", ") || "-",
     },
     {
+      title: "Settings",
+      key: "settings",
+      render(row) {
+        const key = "set-" + row.id;
+        const isExpanded = expandedRowIds.value.has(key);
+        const settings = row.settings || {};
+        
+        const settingsText = Object.entries(settings)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join("\n");
+
+        return h(
+          "div",
+          {
+            class: ["regular-cell", isExpanded ? "expanded" : ""],
+            style: { cursor: "pointer", whiteSpace: "pre-wrap" },
+            onClick: () => {
+              if (window.getSelection().toString()) return;
+              isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
+            },
+          },
+          settingsText || "--"
+        );
+      },
+    },
+    {
       title: "Regular",
       key: "code",
       render(row) {
@@ -282,6 +308,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       if (col.key === 'corr_ppac' || col.key === 'corr_os') return visibleColumns.value.includes('corr');
       if (col.key === 'corr_prod') return visibleColumns.value.includes('corr_prod');
       if (col.key === 'category') return visibleColumns.value.includes('category');
+      if (col.key === 'settings') return visibleColumns.value.includes('settings');
       return true;
     });
   });

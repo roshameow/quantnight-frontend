@@ -141,6 +141,7 @@ const columnOptions = [
   { label: 'Correlation', value: 'corr' },
   { label: 'Corr Prod', value: 'corr_prod' },
   { label: 'Category', value: 'category' },
+  { label: 'Settings', value: 'settings' },
 ];
 
 const filters = reactive({

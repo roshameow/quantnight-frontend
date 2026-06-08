@@ -25,6 +25,7 @@ pub struct AlphaResult {
     pub region: String,
     pub universe: Option<String>,
     pub neutralization: Option<String>,
+    pub settings: Option<serde_json::Value>,
     pub code: Option<String>,
     pub sharpe: Option<f64>,
     pub fitness: Option<f64>,
@@ -144,23 +145,9 @@ pub struct DbOsMetrics {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct DbSettings {
-    #[serde(default = "default_region")]
-    pub region: String,
-    pub universe: Option<String>,
-    pub neutralization: Option<String>,
-}
-
-fn default_region() -> String {
-    "Unknown".to_string()
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
 pub struct DbCode {
     pub code: Option<String>,
 }
-
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DbAnalysisEmbedding {
@@ -187,7 +174,7 @@ pub struct DbClassification {
 pub struct DbAlphaDocument {
     pub id: Option<String>,
     pub r#type: Option<String>,
-    pub settings: Option<DbSettings>,
+    pub settings: Option<serde_json::Value>,
     pub regular: Option<DbCode>,
     pub selection: Option<DbCode>,
     pub combo: Option<DbCode>,
@@ -207,7 +194,10 @@ impl DbAlphaDocument {
         let id = self.id?;
         let r#type = self.r#type.unwrap_or_else(|| "UNKNOWN".to_string());
         
-        let settings = self.settings.unwrap_or_else(|| DbSettings { region: default_region(), universe: None, neutralization: None });
+        let settings_val = self.settings.unwrap_or_else(|| serde_json::json!({}));
+        let region = settings_val.get("region").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+        let universe = settings_val.get("universe").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let neutralization = settings_val.get("neutralization").and_then(|v| v.as_str()).map(|s| s.to_string());
         
         let code = match r#type.as_str() {
             "REGULAR" => self.regular.and_then(|r| r.code),
@@ -297,9 +287,10 @@ impl DbAlphaDocument {
 
         Some(AlphaResult {
             id,
-            region: settings.region,
-            universe: settings.universe,
-            neutralization: settings.neutralization,
+            region,
+            universe,
+            neutralization,
+            settings: Some(settings_val),
             code,
             sharpe: self.is.as_ref().and_then(|is| is.sharpe),
             fitness: self.is.as_ref().and_then(|is| is.fitness),
