@@ -131,6 +131,8 @@ const onClickoutside = () => {
 };
 
 const columnOptions = [
+  { label: 'Category', value: 'category' },
+  { label: 'Settings', value: 'settings' },
   { label: 'Score', value: 'score' },
   { label: 'OS Stats', value: 'os' },
   { label: 'Universe', value: 'universe' },
@@ -140,8 +142,6 @@ const columnOptions = [
   { label: 'Message', value: 'message' },
   { label: 'Correlation', value: 'corr' },
   { label: 'Corr Prod', value: 'corr_prod' },
-  { label: 'Category', value: 'category' },
-  { label: 'Settings', value: 'settings' },
 ];
 
 const filters = reactive({
