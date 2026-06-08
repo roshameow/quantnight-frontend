@@ -77,15 +77,10 @@
 
 .message-cell {
   font-size: 12px !important;
-  max-width: 300px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 
 .message-cell.expanded {
-  white-space: pre-wrap !important;
+  white-space: normal !important;
   word-break: break-word;
   overflow: visible;
-  line-height: 1.4;
 }
