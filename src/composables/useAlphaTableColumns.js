@@ -226,6 +226,10 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       render(row) {
         const key = "msg-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
+        let msg = row.message || "--";
+        if (isExpanded && msg !== "--") {
+          msg = msg.split(",").join("\n");
+        }
         return h(
           "div",
           {
@@ -236,7 +240,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
               isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
             },
           },
-          row.message || "--"
+          msg
         );
       },
     },
