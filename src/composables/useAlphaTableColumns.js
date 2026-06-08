@@ -64,6 +64,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Settings",
       key: "settings",
+      width: 200,
       render(row) {
         const key = "set-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
@@ -77,7 +78,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
           "div",
           {
             class: ["regular-cell", isExpanded ? "expanded" : ""],
-            style: { cursor: "pointer", whiteSpace: "pre-wrap" },
+            style: { cursor: "pointer" },
             onClick: () => {
               if (window.getSelection().toString()) return;
               isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
