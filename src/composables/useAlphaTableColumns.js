@@ -59,6 +59,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Category",
       key: "category",
+      width: 120,
       render: (row) => row.self_category?.join(", ") || "-",
     },
     {
@@ -92,6 +93,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Regular",
       key: "code",
+      width: 400,
       render(row) {
         const isExpanded = expandedRowIds.value.has(row.id);
         const code = row.code || "--";
@@ -132,6 +134,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     {
       title: "Universe",
       key: "universe",
+      width: 120,
       render(row) {
         const key = "univ-" + row.id;
         const isExpanded = expandedRowIds.value.has(key);
@@ -142,7 +145,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
             style: { cursor: "pointer" },
             onClick: () => {
               if (window.getSelection().toString()) return;
-              isExpanded ? expandedRowIds.value.delete(row.id) : expandedRowIds.value.add(key);
+              isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
             },
           },
           row.universe || "--"
