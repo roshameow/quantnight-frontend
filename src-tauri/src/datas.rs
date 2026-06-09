@@ -833,13 +833,12 @@ pub async fn get_alpha_results(
         if let Some(parsed_doc) = parse_query_to_bson(q) {
             filters.push(parsed_doc);
         } else if !q.trim().is_empty() {
-            println!("JSON parsing failed, falling back to regex search");
-            let escaped = regex::escape(q.trim());
+            println!("JSON parsing failed, falling back to regex search: {}", q.trim());
             filters.push(doc! {
                 "$or": [
-                    { "regular.code": { "$regex": &escaped, "$options": "i" } },
-                    { "selection.code": { "$regex": &escaped, "$options": "i" } },
-                    { "combo.code": { "$regex": &escaped, "$options": "i" } }
+                    { "regular.code": { "$regex": q.trim(), "$options": "i" } },
+                    { "selection.code": { "$regex": q.trim(), "$options": "i" } },
+                    { "combo.code": { "$regex": q.trim(), "$options": "i" } }
                 ]
             });
         }
@@ -847,12 +846,12 @@ pub async fn get_alpha_results(
 
     if let Some(ex_q) = &params.exclude_query {
         if !ex_q.trim().is_empty() {
-            let escaped = regex::escape(ex_q.trim());
+            println!("Excluding regex: {}", ex_q.trim());
             filters.push(doc! {
                 "$and": [
-                    { "regular.code": { "$not": { "$regex": &escaped, "$options": "i" } } },
-                    { "selection.code": { "$not": { "$regex": &escaped, "$options": "i" } } },
-                    { "combo.code": { "$not": { "$regex": &escaped, "$options": "i" } } }
+                    { "regular.code": { "$not": { "$regex": ex_q.trim(), "$options": "i" } } },
+                    { "selection.code": { "$not": { "$regex": ex_q.trim(), "$options": "i" } } },
+                    { "combo.code": { "$not": { "$regex": ex_q.trim(), "$options": "i" } } }
                 ]
             });
         }
