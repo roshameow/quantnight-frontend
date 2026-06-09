@@ -309,7 +309,7 @@ const alphaLoading = ref(false);
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
-const visibleColumns = ref(['score', 'universe', 'pnl', 'message']);
+const visibleColumns = ref(['score', 'pnl', 'message']);
 
 const { columns: alphaColumns } = useAlphaTableColumns({
   expandedRowIds,

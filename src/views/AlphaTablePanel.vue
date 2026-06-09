@@ -135,8 +135,6 @@ const columnOptions = [
   { label: 'Settings', value: 'settings' },
   { label: 'Score', value: 'score' },
   { label: 'OS Stats', value: 'os' },
-  { label: 'Universe', value: 'universe' },
-  { label: 'Neutralization', value: 'neutralization' },
   { label: 'Drawdown', value: 'drawdown' },
   { label: 'PnL', value: 'pnl' },
   { label: 'Message', value: 'message' },

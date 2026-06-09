@@ -400,8 +400,6 @@ const columnOptions = [
   { label: 'Score', value: 'score' },
   { label: 'IS Score', value: 'is_score' },
   { label: 'OS Stats', value: 'os' },
-  { label: 'Universe', value: 'universe' },
-  { label: 'Neutralization', value: 'neutralization' },
   { label: 'Drawdown', value: 'drawdown' },
   { label: 'PnL', value: 'pnl' },
   { label: 'Message', value: 'message' },
