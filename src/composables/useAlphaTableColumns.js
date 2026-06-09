@@ -138,32 +138,6 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
     { title: "ID", key: "id" },
     { title: "Region", key: "region" },
     {
-      title: "Universe",
-      key: "universe",
-      width: 120,
-      render(row) {
-        const key = "univ-" + row.id;
-        const isExpanded = expandedRowIds.value.has(key);
-        return h(
-          "div",
-          {
-            class: ["regular-cell", isExpanded ? "expanded" : ""],
-            style: { cursor: "pointer" },
-            onClick: () => {
-              if (window.getSelection().toString()) return;
-              isExpanded ? expandedRowIds.value.delete(key) : expandedRowIds.value.add(key);
-            },
-          },
-          row.universe || "--"
-        );
-      },
-    },
-    {
-      title: "Neutralization",
-      key: "neutralization",
-      render: (row) => row.neutralization || "--",
-    },
-    {
       title: "Score",
       key: "pnl_score",
       sorter: true,
@@ -313,8 +287,6 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
       if (col.key === 'is_score') return visibleColumns.value.includes('is_score');
       if (col.key === 'drawdown') return visibleColumns.value.includes('drawdown');
       if (col.key === 'os_sharpe' || col.key === 'os_fitness') return visibleColumns.value.includes('os');
-      if (col.key === 'universe') return visibleColumns.value.includes('universe');
-      if (col.key === 'neutralization') return visibleColumns.value.includes('neutralization');
       if (col.key === 'message') return visibleColumns.value.includes('message');
       if (col.key === 'pnl') return visibleColumns.value.includes('pnl');
       if (col.key === 'corr_ppac' || col.key === 'corr_os') return visibleColumns.value.includes('corr');

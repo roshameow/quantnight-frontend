@@ -23,8 +23,6 @@ use serde_json::Value as JsonValue;
 pub struct AlphaResult {
     pub id: String,  // 原来是 ObjectId，改为 String
     pub region: String,
-    pub universe: Option<String>,
-    pub neutralization: Option<String>,
     pub settings: Option<serde_json::Value>,
     pub code: Option<String>,
     pub sharpe: Option<f64>,
@@ -196,8 +194,6 @@ impl DbAlphaDocument {
         
         let settings_val = self.settings.unwrap_or_else(|| serde_json::json!({}));
         let region = settings_val.get("region").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-        let universe = settings_val.get("universe").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let neutralization = settings_val.get("neutralization").and_then(|v| v.as_str()).map(|s| s.to_string());
         
         let code = match r#type.as_str() {
             "REGULAR" => self.regular.and_then(|r| r.code),
@@ -288,8 +284,6 @@ impl DbAlphaDocument {
         Some(AlphaResult {
             id,
             region,
-            universe,
-            neutralization,
             settings: Some(settings_val),
             code,
             sharpe: self.is.as_ref().and_then(|is| is.sharpe),
