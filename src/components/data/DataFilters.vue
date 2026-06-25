@@ -158,6 +158,7 @@
 <script setup>
 import messagesData from '../../data/messages.json';
 import classificationsData from '../../data/classifications.json';
+import categoryOptions from '../../data/categories.json';
 import { useConfigStore } from '../../stores/configStore';
 
 const configStore = useConfigStore();
@@ -176,12 +177,6 @@ const props = defineProps({
 const excludeMessageOptions = messagesData.exclude.map(msg => ({ label: msg, value: msg }));
 const includeMessageOptions = messagesData.include.map(msg => ({ label: msg, value: msg }));
 const classificationOptions = classificationsData.map(c => ({ label: c.name, value: c.id }));
-
-const categoryOptions = [
-  'Analyst', 'Broker', 'Earnings', 'Fundamental', 'Imbalance', 'Insiders', 
-  'Institutions', 'Macro', 'Model', 'News', 'Option', 'Other', 
-  'Price Volume', 'Risk', 'Sentiment', 'Short Interest', 'Social Media'
-].map(c => ({ label: c, value: c }));
 
 const emit = defineEmits(["update:modelValue", "calculateCorr"]);
 

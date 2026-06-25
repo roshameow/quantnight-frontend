@@ -1,0 +1,19 @@
+[
+  { "label": "Analyst", "value": "ANALYST" },
+  { "label": "Broker", "value": "BROKER" },
+  { "label": "Earnings", "value": "EARNINGS" },
+  { "label": "Fundamental", "value": "FUNDAMENTAL" },
+  { "label": "Imbalance", "value": "IMBALANCE" },
+  { "label": "Insiders", "value": "INSIDER" },
+  { "label": "Institutions", "value": "INSTITUTION" },
+  { "label": "Macro", "value": "MACRO" },
+  { "label": "Model", "value": "MODEL" },
+  { "label": "News", "value": "NEWS" },
+  { "label": "Option", "value": "OPTION" },
+  { "label": "Other", "value": "OTHER" },
+  { "label": "Price Volume", "value": "PV" },
+  { "label": "Risk", "value": "RISK" },
+  { "label": "Sentiment", "value": "SENTIMENT" },
+  { "label": "Short Interest", "value": "SHORT_INTEREST" },
+  { "label": "Social Media", "value": "SOCIAL_MEDIA" }
+]

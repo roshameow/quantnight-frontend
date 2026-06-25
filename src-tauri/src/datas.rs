@@ -9,13 +9,30 @@ use mongodb::{
     bson::{doc, Document},
     options::{FindOptions, FindOneOptions},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 use tauri::{command, State};
 
 use crate::mongo_manager::MongoClients;
 use crate::config::{AppConfig, run_python_command};
 
 use serde_json::Value as JsonValue;
+
+/// 自定义反序列化器，用于处理可能是字符串（如 "RAM"）或数字的 Option<f64> 字段
+fn deserialize_option_f64_flexible<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // 尝试反序列化为 serde_json::Value 以处理多种可能的类型
+    let v: serde_json::Value = serde::Deserialize::deserialize(deserializer).unwrap_or(serde_json::Value::Null);
+    match v {
+        serde_json::Value::Number(n) => Ok(n.as_f64()),
+        serde_json::Value::String(s) => {
+            // 尝试将字符串解析为 f64，如果失败（如 "RAM"）则返回 None
+            Ok(s.parse::<f64>().ok())
+        }
+        _ => Ok(None),
+    }
+}
 
 
 
@@ -114,7 +131,9 @@ pub struct DbPyramid {
 pub struct DbCheck {
     pub name: Option<String>,
     pub result: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub limit: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub value: Option<f64>,
     pub message: Option<String>,
     pub pyramids: Option<Vec<DbPyramid>>,
@@ -123,11 +142,17 @@ pub struct DbCheck {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DbIsMetrics {
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub sharpe: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub fitness: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub drawdown: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub returns: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub turnover: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub margin: Option<f64>,
     pub long_count: Option<i32>,
     pub short_count: Option<i32>,
@@ -137,7 +162,9 @@ pub struct DbIsMetrics {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DbOsMetrics {
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub sharpe: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub fitness: Option<f64>,
 }
 
@@ -149,7 +176,9 @@ pub struct DbCode {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DbAnalysisEmbedding {
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub x: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_option_f64_flexible")]
     pub y: Option<f64>,
     pub cluster: Option<serde_json::Value>, // Has an 'id' inside
 }
@@ -178,7 +207,7 @@ pub struct DbAlphaDocument {
     pub combo: Option<DbCode>,
     pub is: Option<DbIsMetrics>,
     pub os: Option<DbOsMetrics>,
-    #[serde(rename = "pnl_score")]
+    #[serde(rename = "pnl_score", default, deserialize_with = "deserialize_option_f64_flexible")]
     pub pnl_score: Option<f64>,
     pub date_created: Option<String>,
     pub date_submitted: Option<String>,

@@ -146,6 +146,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { NButton, NSelect, NDataTable, NInput, NTag, NTooltip, NText, NSpace } from 'naive-ui';
 import { useDatasetStore } from '../stores/datasetStore';
 import { storeToRefs } from 'pinia';
+import categoryOptions from '../data/categories.json';
 import '../assets/table-styles.css';
 
 const datasetStore = useDatasetStore();
@@ -169,12 +170,6 @@ const delayOptions = [
   { label: 'Delay 0', value: 0 },
   { label: 'Delay 1', value: 1 },
 ];
-
-const categoryOptions = [
-  'Analyst', 'Broker', 'Earnings', 'Fundamental', 'Imbalance', 'Insiders', 
-  'Institutions', 'Macro', 'Model', 'News', 'Option', 'Other', 
-  'Price Volume', 'Risk', 'Sentiment', 'Short Interest', 'Social Media'
-].map(c => ({ label: c, value: c }));
 
 const isMatchingTag = (d) => {
   if (filters.value.selectedRegion && d.region !== filters.value.selectedRegion) return false;
