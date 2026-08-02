@@ -50,6 +50,19 @@ watch(show, (val) => emits("update:show", val));
 const form = ref({ config: "" });
 
 // ✅ 普通任务 defaultJson
+const adaptiveDefaultConfig = {
+  enabled: false, // 改为 true 启用自适应调度（惰性打分 + LightGBM）
+  train_interval: 500, // 攒够几条新结果触发重训
+  sample_size: 50000, // 训练集抽样上限
+  min_train: 100, // 最少训练样本数
+  cand_batch: 10000, // 每轮拉取候选条数
+  explore_ratio: 0.2, // 保底纯随机比例（探索）
+  sat_power: 0.5, // 饱和惩罚强度（探索模式，0=关）
+  max_same_df: 5, // 同一 datafield 同时在测上限
+  good_th: [1.25, 0.8], // good 标记阈值 (sharpe, fitness)
+  grade_bounds: [0.5, 1.25, 2.0], // grade 分档边界
+};
+
 const normalDefaultJson = {
   max_concurrent: 8,
   max_multi_simulation_children: 10,
@@ -61,6 +74,7 @@ const normalDefaultJson = {
         "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
     },
   },
+  adaptive: adaptiveDefaultConfig,
 };
 
 // ✅ Super 任务 defaultJson
