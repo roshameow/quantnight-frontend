@@ -438,6 +438,8 @@ pub struct Dataset {
     pub category: Option<JsonValue>,
     pub subcategory: Option<JsonValue>,
     pub data: Vec<DatasetRegionData>,
+    #[serde(rename = "dateUpdated", default)]
+    pub date_updated: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -477,6 +479,8 @@ pub struct Datafield {
     pub subcategory: Option<JsonValue>,
     pub dataset: Option<JsonValue>,
     pub data: Vec<DatafieldRegionData>,
+    #[serde(rename = "dateCreated", default)]
+    pub date_created: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -597,6 +601,9 @@ pub async fn get_datafields(
         "id" => {
             mongo_sort_field = "id";
         },
+        "dateCreated" => {
+            mongo_sort_field = "dateCreated";
+        },
         _ => {
             mongo_sort_field = "id";
         }
@@ -620,6 +627,7 @@ pub async fn get_datafields(
             "dataset": 1,
             "data": 1,
             "sortValue": 1,
+            "dateCreated": 1,
         } 
     });
     pipeline.push(doc! { "$sort": { mongo_sort_field: sort_order } });
@@ -754,6 +762,7 @@ pub async fn get_datasets(
         "name" => "name",
         "totalFieldCount" => "totalFieldCount",
         "totalAlphaCount" => "totalAlphaCount",
+        "dateUpdated" => "dateUpdated",
         _ => "id",
     };
 

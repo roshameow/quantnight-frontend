@@ -337,6 +337,15 @@ const datasetColumns = [
     }
   },
   {
+    title: 'Updated',
+    key: 'dateUpdated',
+    width: 110,
+    sorter: true,
+    render(row) {
+      return h('div', { style: { fontSize: '11px', fontFamily: 'monospace' } }, row.dateUpdated || '--');
+    }
+  },
+  {
     title: 'Regions',
     key: 'regions',
     width: 200,
@@ -481,6 +490,15 @@ const datafieldColumns = [
       }
       const sum = row.data.reduce((acc, d) => acc + (d.alphaCount || 0), 0);
       return h('div', { style: 'font-size: 11px; color: #999' }, sum > 0 ? sum : '--');
+    }
+  },
+  {
+    title: 'Created',
+    key: 'dateCreated',
+    width: 110,
+    sorter: true,
+    render(row) {
+      return h('div', { style: { fontSize: '11px', fontFamily: 'monospace' } }, row.dateCreated || '--');
     }
   },
   {
