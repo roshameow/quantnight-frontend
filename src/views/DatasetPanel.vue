@@ -218,6 +218,7 @@ const fieldPagination = computed(() => ({
 }));
 
 const regionOptions = [
+  { label: 'ALL', value: 'ALL' },
   { label: 'USA', value: 'USA' },
   { label: 'JPN', value: 'JPN' },
   { label: 'EUR', value: 'EUR' },
@@ -228,6 +229,9 @@ const regionOptions = [
   { label: 'GLB', value: 'GLB' },
   { label: 'KOR', value: 'KOR' },
   { label: 'IND', value: 'IND' },
+  { label: 'MEA', value: 'MEA' },
+  { label: 'DEU', value: 'DEU' },
+  { label: 'GBR', value: 'GBR' },
 ];
 
 const datasetColumns = [

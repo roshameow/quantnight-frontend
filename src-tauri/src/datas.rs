@@ -34,6 +34,22 @@ where
     }
 }
 
+/// 将前端 category 值展开为数据库中可能出现的多种形式，保证筛选命中。
+/// 已知差异：
+///   - alpha pyramid 后缀用无下划线/复数形式：INSTITUTIONS / INSIDERS / SHORTINTEREST / SOCIALMEDIA / PV
+///   - dataset category.name 用展示名："Price Volume" / "Short Interest" / "Social Media" / "Institutions"
+/// 展开后的每个别名都参与大小写不敏感匹配，任一命中即算该 category 命中。
+fn category_aliases(cat: &str) -> Vec<String> {
+    let base: Vec<&str> = match cat.trim().to_uppercase().as_str() {
+        "INSIDER" | "INSIDERS" => vec!["INSIDER", "INSIDERS"],
+        "INSTITUTION" | "INSTITUTIONS" => vec!["INSTITUTION", "INSTITUTIONS"],
+        "SHORTINTEREST" | "SHORT_INTEREST" => vec!["SHORT_INTEREST", "SHORTINTEREST", "Short Interest"],
+        "SOCIALMEDIA" | "SOCIAL_MEDIA" => vec!["SOCIAL_MEDIA", "SOCIALMEDIA", "Social Media"],
+        "PV" | "PRICEVOLUME" | "PRICE_VOLUME" => vec!["PV", "Price Volume"],
+        _ => vec![cat.trim()],
+    };
+    base.into_iter().map(String::from).collect()
+}
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -724,7 +740,15 @@ pub async fn get_datasets(
 
     if let Some(cat) = &params.category {
         if !cat.is_empty() {
-            filters.push(doc! { "category.name": { "$regex": regex::escape(cat.trim()), "$options": "i" } });
+            // 展开别名后对 category.name 做 $or 匹配（如 "INSTITUTIONS" 命中 "Institutions"，"Price Volume" 命中 PV）
+            let aliases = category_aliases(cat.trim());
+            let or_conds: Vec<Document> = aliases
+                .iter()
+                .map(|a| {
+                    doc! { "category.name": { "$regex": regex::escape(a), "$options": "i" } }
+                })
+                .collect();
+            filters.push(doc! { "$or": or_conds });
         }
     }
 
@@ -966,19 +990,25 @@ pub async fn get_alpha_results(
             let mut and_conds = Vec::new();
             for cat in categories {
                 // Use regex to match the suffix (e.g. "OPTION" matches "USA/D1/OPTION")
-                let pattern = format!("{}$", regex::escape(cat));
-                and_conds.push(doc! { 
-                    "is.checks": { 
-                        "$elemMatch": { 
-                            "name": "MATCHES_PYRAMID", 
-                            "pyramids": {
-                                "$elemMatch": {
-                                    "name": { "$regex": pattern, "$options": "i" }
+                // 展开别名后 $or 匹配，处理复数/下划线差异（INSTITUTION→INSTITUTIONS, SHORT_INTEREST→SHORTINTEREST 等）
+                let aliases = category_aliases(cat.trim());
+                let mut or_conds: Vec<Document> = Vec::new();
+                for a in aliases {
+                    let pattern = format!("{}$", regex::escape(&a));
+                    or_conds.push(doc! { 
+                        "is.checks": { 
+                            "$elemMatch": { 
+                                "name": "MATCHES_PYRAMID", 
+                                "pyramids": {
+                                    "$elemMatch": {
+                                        "name": { "$regex": pattern, "$options": "i" }
+                                    }
                                 }
-                            }
+                            } 
                         } 
-                    } 
-                });
+                    });
+                }
+                and_conds.push(doc! { "$or": or_conds });
             }
             filters.push(doc! { "$and": and_conds });
         }
