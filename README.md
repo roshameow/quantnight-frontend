@@ -31,7 +31,7 @@ QuantNight 是一款专为量化研究与模拟设计的桌面应用，旨在帮
 | 配置项 | 位置 | 含义 |
 |---|---|---|
 | `mongodb.local_uri` | Settings / config.toml | 本地库连接（默认 `mongodb://localhost:27017`）|
-| `mongodb.remote_uri` | Settings / config.toml | 远程库连接（如 `mongodb://192.168.1.100:27017` = 执行机）|
+| `mongodb.remote_uri` | Settings / config.toml | 远程库连接（经 SSH 隧道，如 `mongodb://127.0.0.1:27018/?directConnection=true` = mac-mini 执行机）|
 | `env.working_dir` | Settings / config.toml | 后端 Python 脚本的工作目录 |
 | `scripts.local_workdir` | credentials.yaml | 本地工作目录 |
 | `scripts.remote_host` / `remote_workdir` | credentials.yaml | 远程执行主机与目录 |

@@ -31,7 +31,7 @@ QuantNight is a desktop application designed for quantitative research and simul
 | Config Key | Location | Meaning |
 |---|---|---|
 | `mongodb.local_uri` | Settings / config.toml | Local DB URI (default `mongodb://localhost:27017`) |
-| `mongodb.remote_uri` | Settings / config.toml | Remote DB URI (e.g. `mongodb://192.168.1.100:27017` = execution machine) |
+| `mongodb.remote_uri` | Settings / config.toml | Remote DB URI (via SSH tunnel, e.g. `mongodb://127.0.0.1:27018/?directConnection=true` = mac-mini execution machine) |
 | `env.working_dir` | Settings / config.toml | Working directory for backend Python scripts |
 | `scripts.local_workdir` | credentials.yaml | Local working directory |
 | `scripts.remote_host` / `remote_workdir` | credentials.yaml | Remote execution host and directory |

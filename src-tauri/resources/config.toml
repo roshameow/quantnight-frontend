@@ -2,8 +2,8 @@
 # This file is used during the build process in GitHub Actions
 
 [mongodb]
-local_uri = "mongodb://localhost:27017"
-remote_uri = "mongodb://localhost:27017"
+local_uri = "mongodb://127.0.0.1:27017/?directConnection=true"
+remote_uri = "mongodb://127.0.0.1:27018/?directConnection=true"
 
   [mongodb.databases]
   mission = "simulation_mission"

@@ -211,7 +211,9 @@ pub struct Task {
     #[serde(rename = "_id")]
     pub id: ObjectId, // 用 id 显得更自然一些，但必须 rename "_id"
     pub name: String,
+    #[serde(default)]
     pub template: String,
+    #[serde(default)]
     pub templatefile: String,
     pub auth_profile: Option<String>,
     pub status: String,
@@ -224,6 +226,52 @@ pub struct Task {
 
 }
 
+/// 删除 remote 端注册的任务（agent 在 mac-mini 直接生成的，仅存在于 remote mission.tasks）
+async fn delete_remote_registered_task(
+    clients: &Arc<MongoClients>,
+    obj_id: ObjectId,
+) -> Result<(), String> {
+    let remote_client = &clients.remote;
+    let tasks = remote_client.database("simulation_mission").collection::<Document>("tasks");
+
+    let task_doc = tasks
+        .find_one(doc! { "_id": obj_id }, None)
+        .await
+        .map_err(|e| format!("连接远程任务库失败: {}", e))?
+        .ok_or_else(|| "未找到指定的任务".to_string())?;
+
+    // 标记 deactive（软删）
+    tasks
+        .update_one(
+            doc! { "_id": obj_id },
+            doc! { "$set": { "status": "deactive" } },
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 删除远程 simulation_db 中的同名 collection
+    let task_name = task_doc
+        .get_str("name")
+        .map_err(|_| "任务中缺少 name 字段".to_string())?
+        .to_string();
+    let sim_data_db = remote_client.database("simulation_db");
+    if sim_data_db
+        .list_collection_names(None)
+        .await
+        .map_err(|e| e.to_string())?
+        .contains(&task_name)
+    {
+        sim_data_db
+            .collection::<Document>(&task_name)
+            .drop(None)
+            .await
+            .map_err(|e| format!("删除远程 simulation_db 中 collection 失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
 #[command]
 pub async fn get_all_tasks(clients: State<'_, Arc<MongoClients>>) -> Result<Vec<Task>, String> {
     let client = &clients.local;
@@ -231,17 +279,38 @@ pub async fn get_all_tasks(clients: State<'_, Arc<MongoClients>>) -> Result<Vec<
     let db = client.database("simulation_mission");
     let collection = db.collection::<Document>("tasks");
 
-    // 查找所有任务
+    // 查找所有本地任务
     let mut cursor = collection.find(None, None).await.map_err(|e| e.to_string())?;
 
     // 用一个 Vec 来存储所有任务
     let mut tasks = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
 
     // 遍历 cursor，获取每一个 Document
-    while let Ok(Some(document)) = cursor.try_next().await {
+    while let Some(document) = cursor.try_next().await.map_err(|e| e.to_string())? {
         // 假设你有一个 `Task` 类型，使用 `from_document` 方法将 Document 转换为 Task
         if let Ok(task) = bson::from_document::<Task>(document) {
+            seen_names.insert(task.name.clone());
             tasks.push(task);
+        }
+    }
+
+    // 聚合远程任务列表（remote 端 agent 直接生成的任务只注册在 remote mission.tasks）。
+    // 远程连接失败时静默跳过，不影响本地任务展示。
+    let remote_client = &clients.remote;
+    let remote_db = remote_client.database("simulation_mission");
+    let remote_collection = remote_db.collection::<Document>("tasks");
+    if let Ok(mut remote_cursor) = remote_collection.find(None, None).await {
+        while let Ok(Some(mut document)) = remote_cursor.try_next().await {
+            // 远程来源统一标记 isRemote = true
+            document.insert("isRemote", true);
+            if let Ok(task) = bson::from_document::<Task>(document) {
+                // 同名任务以本地为准（本地创建后 sync 过去的），不重复显示
+                if !seen_names.contains(&task.name) {
+                    seen_names.insert(task.name.clone());
+                    tasks.push(task);
+                }
+            }
         }
     }
 
@@ -256,6 +325,15 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> R
     let tasks = db.collection::<Document>("tasks");
 
     let obj_id = ObjectId::parse_str(&id).map_err(|e| e.to_string())?;
+
+    // 先在本地 mission.tasks 找；找不到则视为 remote 端注册的任务（agent 直接生成的），路由到远程删除
+    let probe = tasks
+        .find_one(doc! { "_id": obj_id }, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if probe.is_none() {
+        return delete_remote_registered_task(&clients, obj_id).await;
+    }
 
     let update_result = tasks
         .update_one(
