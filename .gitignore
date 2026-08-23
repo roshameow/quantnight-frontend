@@ -28,3 +28,4 @@ target
 src/config.js
 src-tauri/config.toml
 
+tmp
