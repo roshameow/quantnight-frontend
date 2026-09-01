@@ -111,12 +111,24 @@ watch(
         const latestTemplate = await invoke("read_latest_py_file", {
           folderPath: form.value.priorityTemplatePath,
         });
-        form.value.templateFilename = latestTemplate.replace(/\.py$/i, "");
-        form.value.taskName = form.value.templateFilename + "__priority";
-        console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
+        const base = latestTemplate.replace(/\.py$/i, "");
+        // refine_templates/ 中非任务模板需排除：_utils（无 refine 函数）、
+        // group_op_add（类式接口 GroupOpAdder，不走统一 refine 调用）
+        if (["_utils", "group_op_add"].includes(base)) {
+          console.warn("最新模板文件非任务模板:", base);
+          form.value.templateFilename = "";
+          form.value.taskName = "";
+          message.warning(
+            `自动检测到模板 ${base} 不是可用任务模板；\n请手动输入任务名（如 sign_flip__priority / change_settings__priority）`
+          );
+        } else {
+          form.value.templateFilename = base;
+          form.value.taskName = base + "__priority";
+          console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
+        }
       } catch (err) {
         console.error("读取模板失败:", err);
-        message.warning("无法自动读取模板文件，请手动上传");
+        message.warning("无法自动读取模板文件，请手动上传或填写模板名");
       }
     }
   }
