@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::stream::TryStreamExt;
 use mongodb::{
@@ -10,6 +10,7 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
+use tokio::time::timeout;
 use toml;
 use dirs::data_dir;
 
@@ -206,7 +207,7 @@ pub async fn sync_remote_task(alpha_mission_list: String, config: State<'_, AppC
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
     #[serde(rename = "_id")]
     pub id: ObjectId, // 用 id 显得更自然一些，但必须 rename "_id"
@@ -226,54 +227,141 @@ pub struct Task {
 
 }
 
+/// 远程任务列表缓存：短 TTL，避免每次本地操作都穿透 SSH 隧道查远程库。
+/// 缓存的是“远程独有任务”（不含本地任务），读取时再与本地合并去重。
+/// 隧道不可用/超时/失败时返回空，不影响本地任务展示。
+struct RemoteTaskCache {
+    fetched_at: Instant,
+    remote_only_tasks: Vec<Task>,
+}
+
+static REMOTE_TASK_CACHE: OnceLock<Mutex<Option<RemoteTaskCache>>> = OnceLock::new();
+
+/// 远程查询 TTL：窗口内重复调用直接读缓存，不穿透隧道
+const REMOTE_TASK_CACHE_TTL: Duration = Duration::from_secs(10);
+/// 远程查询硬超时：隧道慢/挂时快速失败，避免每次操作被拖住（驱动默认 server selection 可达 30s）
+const REMOTE_TASK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn clear_remote_task_cache() {
+    if let Some(cache) = REMOTE_TASK_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// 从远程 mission.tasks 拉取任务列表（带 TTL 缓存 + 超时）。
+/// 远程不可达/超时时静默返回空，不影响本地任务展示。
+async fn fetch_remote_tasks(clients: &Arc<MongoClients>, local_uri: &str, remote_uri: &str) -> Vec<Task> {
+    // 本地/远程指向同一个库时无需重复查询
+    if remote_uri == local_uri {
+        return Vec::new();
+    }
+
+    // 命中缓存直接返回
+    {
+        let cache = REMOTE_TASK_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some(c) = guard.as_ref() {
+                if c.fetched_at.elapsed() < REMOTE_TASK_CACHE_TTL {
+                    return c.remote_only_tasks.clone();
+                }
+            }
+        }
+    }
+
+    // 网络请求限定时间，避免隧道不可用时每次操作都卡住
+    let result = timeout(REMOTE_TASK_TIMEOUT, async {
+        let remote_client = &clients.remote;
+        let remote_db = remote_client.database("simulation_mission");
+        let remote_collection = remote_db.collection::<Document>("tasks");
+
+        let mut remote_cursor = remote_collection.find(None, None).await.map_err(|e| e.to_string())?;
+        let mut remote_tasks = Vec::new();
+        while let Some(mut document) = remote_cursor.try_next().await.map_err(|e| e.to_string())? {
+            // 远程来源统一标记 isRemote = true
+            document.insert("isRemote", true);
+            if let Ok(task) = bson::from_document::<Task>(document) {
+                remote_tasks.push(task);
+            }
+        }
+        Ok::<Vec<Task>, String>(remote_tasks)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(remote_tasks)) => {
+            let cache = REMOTE_TASK_CACHE.get_or_init(|| Mutex::new(None));
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some(RemoteTaskCache {
+                    fetched_at: Instant::now(),
+                    remote_only_tasks: remote_tasks.clone(),
+                });
+            }
+            remote_tasks
+        }
+        _ => {
+            // 超时或连接失败：静默跳过，不影响本地任务展示
+            eprintln!("⚠️ 远程任务查询失败或超时（{}s），本次跳过远程聚合", REMOTE_TASK_TIMEOUT.as_secs());
+            Vec::new()
+        }
+    }
+}
+
 /// 删除 remote 端注册的任务（agent 在 mac-mini 直接生成的，仅存在于 remote mission.tasks）
 async fn delete_remote_registered_task(
     clients: &Arc<MongoClients>,
     obj_id: ObjectId,
 ) -> Result<(), String> {
-    let remote_client = &clients.remote;
-    let tasks = remote_client.database("simulation_mission").collection::<Document>("tasks");
+    let remote_client = Arc::clone(&clients.remote);
+    let result = timeout(REMOTE_TASK_TIMEOUT, async move {
+        let tasks = remote_client.database("simulation_mission").collection::<Document>("tasks");
 
-    let task_doc = tasks
-        .find_one(doc! { "_id": obj_id }, None)
-        .await
-        .map_err(|e| format!("连接远程任务库失败: {}", e))?
-        .ok_or_else(|| "未找到指定的任务".to_string())?;
-
-    // 标记 deactive（软删）
-    tasks
-        .update_one(
-            doc! { "_id": obj_id },
-            doc! { "$set": { "status": "deactive" } },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 删除远程 simulation_db 中的同名 collection
-    let task_name = task_doc
-        .get_str("name")
-        .map_err(|_| "任务中缺少 name 字段".to_string())?
-        .to_string();
-    let sim_data_db = remote_client.database("simulation_db");
-    if sim_data_db
-        .list_collection_names(None)
-        .await
-        .map_err(|e| e.to_string())?
-        .contains(&task_name)
-    {
-        sim_data_db
-            .collection::<Document>(&task_name)
-            .drop(None)
+        let task_doc = tasks
+            .find_one(doc! { "_id": obj_id }, None)
             .await
-            .map_err(|e| format!("删除远程 simulation_db 中 collection 失败: {}", e))?;
-    }
+            .map_err(|e| format!("连接远程任务库失败: {}", e))?
+            .ok_or_else(|| "未找到指定的任务".to_string())?;
 
-    Ok(())
+        // 标记 deactive（软删）
+        tasks
+            .update_one(
+                doc! { "_id": obj_id },
+                doc! { "$set": { "status": "deactive" } },
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 删除远程 simulation_db 中的同名 collection（尽力而为，失败不阻塞删除主流程）
+        let task_name = task_doc
+            .get_str("name")
+            .map_err(|_| "任务中缺少 name 字段".to_string())?
+            .to_string();
+        let sim_data_db = remote_client.database("simulation_db");
+        if let Ok(names) = sim_data_db.list_collection_names(None).await {
+            if names.contains(&task_name) {
+                let _ = sim_data_db.collection::<Document>(&task_name).drop(None).await;
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+
+    match result {
+        Ok(res) => {
+            clear_remote_task_cache();
+            res
+        }
+        Err(_) => Err("连接远程任务库超时，请检查远程 MongoDB / 隧道是否可用".to_string()),
+    }
 }
 
 #[command]
-pub async fn get_all_tasks(clients: State<'_, Arc<MongoClients>>) -> Result<Vec<Task>, String> {
+pub async fn get_all_tasks(
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<Vec<Task>, String> {
     let client = &clients.local;
 
     let db = client.database("simulation_mission");
@@ -296,21 +384,13 @@ pub async fn get_all_tasks(clients: State<'_, Arc<MongoClients>>) -> Result<Vec<
     }
 
     // 聚合远程任务列表（remote 端 agent 直接生成的任务只注册在 remote mission.tasks）。
-    // 远程连接失败时静默跳过，不影响本地任务展示。
-    let remote_client = &clients.remote;
-    let remote_db = remote_client.database("simulation_mission");
-    let remote_collection = remote_db.collection::<Document>("tasks");
-    if let Ok(mut remote_cursor) = remote_collection.find(None, None).await {
-        while let Ok(Some(mut document)) = remote_cursor.try_next().await {
-            // 远程来源统一标记 isRemote = true
-            document.insert("isRemote", true);
-            if let Ok(task) = bson::from_document::<Task>(document) {
-                // 同名任务以本地为准（本地创建后 sync 过去的），不重复显示
-                if !seen_names.contains(&task.name) {
-                    seen_names.insert(task.name.clone());
-                    tasks.push(task);
-                }
-            }
+    // 带 TTL 缓存 + 超时，远程不可用/慢时不再拖慢每次操作。
+    let remote_tasks = fetch_remote_tasks(&clients, &config.mongodb.local_uri, &config.mongodb.remote_uri).await;
+    for task in remote_tasks {
+        // 同名任务以本地为准（本地创建后 sync 过去的），不重复显示
+        if !seen_names.contains(&task.name) {
+            seen_names.insert(task.name.clone());
+            tasks.push(task);
         }
     }
 
@@ -371,26 +451,20 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> R
             .await
             .map_err(|e| format!("删除 simulation_db 中 collection 失败: {}", e))?;
     }
-    // 如果是远程任务，尝试连接远程 Mongo 并删除同名 collection
-    let is_remote = task_doc
-        .get_bool("isRemote")
-        .unwrap_or(false);
+    // 如果是远程任务，尝试连接远程 Mongo 并删除同名 collection（尽力而为：超时/失败只告警，不阻塞删除主流程）
+    let is_remote = task_doc.get_bool("isRemote").unwrap_or(false);
     if is_remote {
-        let remote_client = &clients.remote;
-
-
-        let remote_db = remote_client.database("simulation_db");
-
-        if remote_db.list_collection_names(None).await
-            .map_err(|e| e.to_string())?
-            .contains(&task_name)
-        {
-            remote_db
-                .collection::<Document>(&task_name)
-                .drop(None)
-                .await
-                .map_err(|e| format!("删除远程 simulation_db 中 collection 失败: {}", e))?;
-        }
+        let remote_client = Arc::clone(&clients.remote);
+        let remote_task_name = task_name.clone();
+        let _ = timeout(REMOTE_TASK_TIMEOUT, async move {
+            let remote_db = remote_client.database("simulation_db");
+            if let Ok(names) = remote_db.list_collection_names(None).await {
+                if names.contains(&remote_task_name) {
+                    let _ = remote_db.collection::<Document>(&remote_task_name).drop(None).await;
+                }
+            }
+        })
+        .await;
     }
 
     Ok(())
@@ -495,10 +569,26 @@ pub async fn start_super_task(
     )
     .await?;
 
+    // 保存启动配置，供任务卡片展示并发参数。
+    // Super 任务此前只更新 status，导致重新读取任务后没有 mission_config。
+    let mut set_doc = doc! { "status": "running" };
+
+    if let Ok(json_val) = from_str::<serde_json::Value>(&config) {
+        if let Ok(bson_val) = bson::to_bson(&json_val) {
+            if let bson::Bson::Document(doc_inner) = bson_val {
+                set_doc.insert("mission_config", doc_inner);
+            }
+        } else {
+            eprintln!("config 转 BSON 失败");
+        }
+    } else {
+        eprintln!("config 解析成 JSON 失败");
+    }
+
     tasks
         .update_one(
             doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            doc! { "$set": { "status": "running" } },
+            doc! { "$set": set_doc },
             None,
         )
         .await

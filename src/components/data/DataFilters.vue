@@ -56,6 +56,12 @@
            
           />
           <n-input
+            :value="modelValue.universe"
+            @update:value="updateFilter('universe', $event)"
+            placeholder="Universe"
+            style="width: 100px"
+          />
+          <n-input
             :value="modelValue.delay"
             @update:value="updateFilter('delay', $event)"
             placeholder="Delay"

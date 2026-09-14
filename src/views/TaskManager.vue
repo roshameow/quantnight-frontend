@@ -212,7 +212,7 @@ const syncRemoteTask = async (taskName) => {
     await invoke("sync_remote_task", { alphaMissionList: taskName });
     const targetTask = tasks.value.find((t) => t.name === taskName);
     if (targetTask) {
-      await updateIsRemote(targetTask._id, true);
+      updateIsRemote(targetTask._id, true);
     }
     fetchTasks();
   } catch (err) {
@@ -228,8 +228,8 @@ const updateIsRemote = async (id, isRemote) => {
       updates: { is_remote: isRemote },
     });
     message.success(`运行方式已更新为 ${isRemote ? "远程" : "本地"}`);
-    // 重新获取任务数据以更新界面
-    await fetchTasks();
+    // 重新获取任务数据以更新界面（后台刷新，不阻塞提示）
+    fetchTasks();
   } catch (err) {
     console.error("更新 isRemote 失败", err);
     message.error("运行方式更新失败");
@@ -276,8 +276,8 @@ const checkTaskStatus = async (task) => {
 const handleAddTask = async (task) => {
   try {
     await invoke("create_task", { newTask: { ...task, status: task.status ?? "waiting" } });
-    await fetchTasks();
     message.success("任务创建成功");
+    fetchTasks();
   } catch (err) {
     console.error("添加任务失败：", err);
     message.error("任务创建失败");
@@ -287,8 +287,8 @@ const handleAddTask = async (task) => {
 const handleAddSuperTask = async (task) => {
   try {
     await invoke("create_task", { newTask: { ...task, status: task.status ?? "waiting", task_type: "super" } });
-    await fetchTasks();
     message.success("Super任务创建成功");
+    fetchTasks();
   } catch (err) {
     console.error("添加Super任务失败：", err);
     message.error("Super任务创建失败");
@@ -298,8 +298,8 @@ const handleAddSuperTask = async (task) => {
 const handleAddPriorityTask = async (task) => {
   try {
     await invoke("create_task", { newTask: { ...task, status: task.status ?? "waiting", task_type: "priority" } });
-    await fetchTasks();
     message.success("Priority任务创建成功");
+    fetchTasks();
   } catch (err) {
     console.error("添加Priority任务失败：", err);
     message.error("Priority任务创建失败");

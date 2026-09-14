@@ -104,6 +104,7 @@ pub struct AlphaQuery {
     pub messages_nin: Option<Vec<String>>, // Added for exclusion
     pub classifications_in: Option<Vec<String>>, // Added for classifications
     pub region: Option<String>,
+    pub universe: Option<String>,
     pub days_within: Option<u32>,
     pub min_turnover: Option<f64>,
     pub max_turnover: Option<f64>,
@@ -958,6 +959,13 @@ pub async fn get_alpha_results(
     }
     if let Some(region) = &params.region {
         filters.push(doc! { "settings.region": region });
+    }
+    if let Some(universe) = &params.universe {
+        if !universe.trim().is_empty() {
+            filters.push(doc! {
+                "settings.universe": { "$regex": regex::escape(universe.trim()), "$options": "i" }
+            });
+        }
     }
     if let Some(delay) = params.delay {
         filters.push(doc! { "settings.delay": delay as i32 });

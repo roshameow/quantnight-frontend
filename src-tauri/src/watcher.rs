@@ -2,8 +2,8 @@
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 
 // external crates
-use anyhow::Context;
 use bson::{doc, Document};
+use futures_util::future::join_all;
 use futures_util::stream::StreamExt;
 use mongodb::{
     change_stream::{ChangeStream, event::ChangeStreamEvent},
@@ -13,6 +13,7 @@ use mongodb::{
 use serde::Serialize;
 use tauri::{AppHandle, Result as TauriResult, State, Emitter};
 use tokio::sync::{mpsc::{channel, Sender}, Mutex};
+use tokio::time::timeout;
 
 // local crate
 use crate::mongo_manager::MongoClients;
@@ -33,6 +34,9 @@ struct TaskProgress {
 }
 
 static TASKS_WATCH_STARTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// 远程统计/变更流硬超时：隧道慢/挂时快速失败并发零值，避免启动 emit 和进度更新被拖住
+const REMOTE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 前端 ready 时调用，启动 watcher
 #[tauri::command]
@@ -91,34 +95,39 @@ fn extract_collection_name(change: &ChangeStreamEvent<Document>, source: &str) -
     }
 }
 
-/// 根据 collection 名称 emit 任务进度（包含自动查询 isRemote）
+/// 根据 collection 名称 emit 任务进度。
+/// `is_remote_override`：Some(true/false) 时跳过本地查询直接指定（用于远程独有任务）；None 时自动查询本地任务表。
 pub async fn emit_progress_for_collection(
     app: AppHandle,
     client_local: Arc<Client>,
     client_remote: Arc<Client>,
     collection_name: String,
     config: AppConfig,
+    is_remote_override: Option<bool>,
 ) -> TauriResult<()> {
 
-    // ① 自动查询 isRemote
-    let is_remote = {
-        let db_mission = client_local.database(&config.mongodb.databases.mission);
-        let tasks_coll = db_mission.collection::<Document>("tasks");
+    // ① 确定 isRemote
+    let is_remote = match is_remote_override {
+        Some(v) => v,
+        None => {
+            let db_mission = client_local.database(&config.mongodb.databases.mission);
+            let tasks_coll = db_mission.collection::<Document>("tasks");
 
-        let filter = doc! {
-            "name": &collection_name,
-            "status": { "$ne": "deactive" }
-        };
+            let filter = doc! {
+                "name": &collection_name,
+                "status": { "$ne": "deactive" }
+            };
 
-        match tasks_coll.find_one(filter, None).await {
-            Ok(Some(doc)) => doc.get_bool("isRemote").unwrap_or(false),
-            Ok(None) => {
-                println!("⚠️ 未找到任务 [{}]，默认 is_remote=false", collection_name);
-                false
-            }
-            Err(e) => {
-                eprintln!("❌ 查询 isRemote 失败 [{}]: {}", collection_name, e);
-                false
+            match tasks_coll.find_one(filter, None).await {
+                Ok(Some(doc)) => doc.get_bool("isRemote").unwrap_or(false),
+                Ok(None) => {
+                    println!("⚠️ 未找到任务 [{}]，默认 is_remote=false", collection_name);
+                    false
+                }
+                Err(e) => {
+                    eprintln!("❌ 查询 isRemote 失败 [{}]: {}", collection_name, e);
+                    false
+                }
             }
         }
     };
@@ -131,7 +140,8 @@ pub async fn emit_progress_for_collection(
     };
     let collection = db.collection::<Document>(&collection_name);
 
-    // ③ 查询统计：使用 aggregate 一次性获取所有数量
+    // ③ 查询统计：使用 aggregate 一次性获取所有数量。
+    // 远程统计走 SSH 隧道，可能慢/不可用：加超时保护，失败/超时发零值而不是卡住。
     let pipeline = vec![
         doc! { "$group": {
             "_id": null,
@@ -154,22 +164,35 @@ pub async fn emit_progress_for_collection(
         }}
     ];
 
-    let mut agg_cursor = collection
-        .aggregate(pipeline, None)
+    let timeout_dur = if is_remote { REMOTE_PROGRESS_TIMEOUT } else { Duration::from_secs(5) };
+    let (total, success, error, priority_total, priority_success, priority_error) =
+        match timeout(timeout_dur, async {
+            let mut agg_cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
+            if let Some(Ok(doc)) = agg_cursor.next().await {
+                Ok::<_, String>((
+                    doc.get_i32("total").unwrap_or(0) as usize,
+                    doc.get_i32("success").unwrap_or(0) as usize,
+                    doc.get_i32("error").unwrap_or(0) as usize,
+                    doc.get_i32("priority_total").unwrap_or(0) as usize,
+                    doc.get_i32("priority_success").unwrap_or(0) as usize,
+                    doc.get_i32("priority_error").unwrap_or(0) as usize,
+                ))
+            } else {
+                Ok((0, 0, 0, 0, 0, 0))
+            }
+        })
         .await
-        .context("Mongo aggregate failed")?;
-    let (total, success, error, priority_total, priority_success, priority_error) = if let Some(Ok(doc)) = agg_cursor.next().await {
-        (
-            doc.get_i32("total").unwrap_or(0) as usize,
-            doc.get_i32("success").unwrap_or(0) as usize,
-            doc.get_i32("error").unwrap_or(0) as usize,
-            doc.get_i32("priority_total").unwrap_or(0) as usize,
-            doc.get_i32("priority_success").unwrap_or(0) as usize,
-            doc.get_i32("priority_error").unwrap_or(0) as usize,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0)
-    };
+        {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(e)) => {
+                eprintln!("⚠️ 统计任务进度失败 [{}]: {}", collection_name, e);
+                (0, 0, 0, 0, 0, 0)
+            }
+            Err(_) => {
+                eprintln!("⚠️ 统计任务进度超时 [{}]（{}s），发零值", collection_name, timeout_dur.as_secs());
+                (0, 0, 0, 0, 0, 0)
+            }
+        };
 
     // ④ emit
     let payload = TaskProgress {
@@ -188,7 +211,7 @@ pub async fn emit_progress_for_collection(
     Ok(())
 }
 
-/// 启动时一次性 emit 所有 collection 的任务进度
+/// 启动时一次性 emit 所有 collection 的任务进度（并行，远程任务受超时保护）
 async fn emit_all_collections_once(
     app: AppHandle,
     mongo_clients: Arc<MongoClients>,
@@ -200,23 +223,67 @@ async fn emit_all_collections_once(
     println!("🔥 初始 emit 任务进度 for tasks 集合");
 
     let filter = doc! { "status": { "$ne": "deactive" } };
+    let mut futures = Vec::new();
+    let mut emitted = std::collections::HashSet::new();
 
-    if let Ok(mut cursor) = collection.find(filter, None).await {
+    // ① 本地任务：自动查询 isRemote
+    if let Ok(mut cursor) = collection.find(filter.clone(), None).await {
         while let Some(Ok(doc)) = cursor.next().await {
             let name = doc.get_str("name").unwrap_or("未知").to_string();
             println!("✅ 已 emit 任务进度 for 任务: {}", name);
-
-            _ = emit_progress_for_collection(
+            emitted.insert(name.clone());
+            futures.push(emit_progress_for_collection(
                 app.clone(),
                 mongo_clients.local.clone(),
                 mongo_clients.remote.clone(),
                 name,
                 config.clone(),
-            ).await;
+                None,
+            ));
         }
     } else {
         eprintln!("查询 {} 集合失败", &config.mongodb.databases.mission);
     }
+
+    // ② 远程独有任务（agent 在 remote 直接生成的，只注册在 remote mission.tasks）：
+    // 轻量查询远程任务名（2s 超时），给未在本地的任务也发初始进度。
+    let remote_names = timeout(REMOTE_PROGRESS_TIMEOUT, async {
+        let remote_db = mongo_clients.remote.database(&config.mongodb.databases.mission);
+        let remote_coll = remote_db.collection::<Document>("tasks");
+        let mut cursor = remote_coll.find(filter.clone(), None).await.map_err(|e| e.to_string())?;
+        let mut names = Vec::new();
+        while let Some(Ok(doc)) = cursor.next().await {
+            if let Ok(name) = doc.get_str("name") {
+                names.push(name.to_string());
+            }
+        }
+        Ok::<_, String>(names)
+    })
+    .await;
+
+    match remote_names {
+        Ok(Ok(remote_names)) => {
+            for name in remote_names {
+                if !emitted.contains(&name) {
+                    println!("✅ 已 emit 远程任务进度 for 任务: {}", name);
+                    futures.push(emit_progress_for_collection(
+                        app.clone(),
+                        mongo_clients.local.clone(),
+                        mongo_clients.remote.clone(),
+                        name,
+                        config.clone(),
+                        Some(true),
+                    ));
+                }
+            }
+        }
+        _ => {
+            eprintln!("⚠️ 远程任务初始进度跳过（隧道不可用）");
+        }
+    }
+
+    // 并行 emit，避免某个远程任务卡住时阻塞其他任务
+    join_all(futures).await;
 }
 
 
@@ -263,7 +330,7 @@ pub async fn watch_simulation_db_changes(
             let cl2 = cl_clone.clone();
             let cr2 = cr_clone.clone();
             let cfg2 = config_clone.clone();
-            if let Err(e) = emit_progress_for_collection(app2, cl2, cr2, coll_name.clone(), cfg2).await {
+            if let Err(e) = emit_progress_for_collection(app2, cl2, cr2, coll_name.clone(), cfg2, None).await {
                 eprintln!("emit 失败 [{}]: {}", coll_name, e);
             }
         }
@@ -290,8 +357,11 @@ pub async fn watch_simulation_db_changes(
     if let Ok(db_stream_local) = db_local.watch([], Some(options.clone())).await {
         spawn_watcher("db", db_stream_local, tx.clone());
     }
-    if let Ok(db_stream_remote) = db_remote.watch([], Some(options.clone())).await {
+    // 远程 change stream 也走隧道：加超时，隧道不可用时快速跳过而不是卡住启动
+    if let Ok(Ok(db_stream_remote)) = timeout(REMOTE_PROGRESS_TIMEOUT, db_remote.watch([], Some(options.clone()))).await {
         spawn_watcher("db", db_stream_remote, tx.clone());
+    } else {
+        eprintln!("⚠️ 远程 simulation_db 变更流不可用（隧道不通？），远程任务进度需手动刷新");
     }
 
     println!("{} + {} watcher 已启动", &config.mongodb.databases.mission, &config.mongodb.databases.simulation);
