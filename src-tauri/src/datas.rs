@@ -52,10 +52,12 @@ fn category_aliases(cat: &str) -> Vec<String> {
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AlphaResult {
     pub id: String,  // 原来是 ObjectId，改为 String
     pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_type: Option<String>,
     pub settings: Option<serde_json::Value>,
     pub code: Option<String>,
     pub sharpe: Option<f64>,
@@ -80,6 +82,12 @@ pub struct AlphaResult {
     #[serde(rename = "currentProdCorrelation")]
     pub current_prod_correlation: Option<serde_json::Value>,
     pub self_category: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<AlphaResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children_ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +101,11 @@ pub enum SortField {
     Fitness,
     Margin,
     PnlScore,
+    Drawdown,
+    IsScore,
+    OsSharpe,
+    OsFitness,
+    SubUniverseSharpe,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +244,8 @@ pub struct DbAlphaDocument {
     pub classifications: Option<Vec<DbClassification>>,
     pub current_prod_correlation: Option<serde_json::Value>,
     pub analysis: Option<DbAnalysis>,
+    pub children: Option<Vec<String>>,
+    pub parent: Option<String>,
 }
 
 impl DbAlphaDocument {
@@ -242,13 +257,13 @@ impl DbAlphaDocument {
         let region = settings_val.get("region").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
         
         let code = match r#type.as_str() {
-            "REGULAR" => self.regular.and_then(|r| r.code),
+            "REGULAR" | "RA_PARENT" | "RA_CHILD" => self.regular.and_then(|r| r.code),
             "SUPER" => {
                 let selection_code = self.selection.and_then(|r| r.code).unwrap_or_default();
                 let combo_code = self.combo.and_then(|r| r.code).unwrap_or_default();
                 Some(format!("{}\n{}", selection_code, combo_code))
             }
-            _ => None,
+            _ => self.regular.and_then(|r| r.code),
         };
 
         let mut sub_universe_sharpe = None;
@@ -330,6 +345,7 @@ impl DbAlphaDocument {
         Some(AlphaResult {
             id,
             region,
+            alpha_type: Some(r#type),
             settings: Some(settings_val),
             code,
             sharpe: self.is.as_ref().and_then(|is| is.sharpe),
@@ -353,6 +369,9 @@ impl DbAlphaDocument {
             classifications,
             current_prod_correlation: self.current_prod_correlation,
             self_category: if !pyramid_names.is_empty() { Some(pyramid_names) } else { None },
+            parent: self.parent,
+            children: None,
+            children_ids: self.children,
         })
     }
 }
@@ -831,6 +850,8 @@ fn get_alpha_projection() -> mongodb::bson::Document {
         "regular.code": 1,
         "selection.code": 1,
         "combo.code": 1,
+        "children": 1,
+        "parent": 1,
         "is": {
             "sharpe": 1,
             "fitness": 1,
@@ -954,8 +975,22 @@ pub async fn get_alpha_results(
         }
     }
 
+    let is_ra_query = match &params.alpha_type {
+        Some(t) if t == "RA" || t == "RA_PARENT" => true,
+        _ => false,
+    };
+
     if let Some(id) = &params.id {
-        filters.push(doc! { "id": id });
+        if is_ra_query {
+            filters.push(doc! {
+                "$or": [
+                    { "id": id },
+                    { "children": id }
+                ]
+            });
+        } else {
+            filters.push(doc! { "id": id });
+        }
     }
     if let Some(region) = &params.region {
         filters.push(doc! { "settings.region": region });
@@ -991,7 +1026,11 @@ pub async fn get_alpha_results(
         });
     }
     if let Some(alpha_type) = &params.alpha_type {
-        filters.push(doc! { "type": alpha_type });
+        if alpha_type == "RA" {
+            filters.push(doc! { "type": "RA_PARENT" });
+        } else {
+            filters.push(doc! { "type": alpha_type });
+        }
     }
     if let Some(categories) = &params.self_categories {
         if !categories.is_empty() {
@@ -1045,6 +1084,11 @@ pub async fn get_alpha_results(
             SortField::Fitness => "is.fitness",
             SortField::Margin => "is.margin",
             SortField::PnlScore => "pnl_score",
+            SortField::Drawdown => "is.drawdown",
+            SortField::IsScore => "is_score",
+            SortField::OsSharpe => "os.sharpe",
+            SortField::OsFitness => "os.fitness",
+            SortField::SubUniverseSharpe => "is.sub_universe_sharpe",
         };
         doc! { mongo_field: order }
     } else {
@@ -1085,6 +1129,142 @@ pub async fn get_alpha_results(
 
     drop(cursor);
 
+    // If there are any RA_PARENT alphas in results, batch fetch their children and attach them
+    let mut all_child_ids: Vec<String> = Vec::new();
+    for r in &results {
+        if let Some(cids) = &r.children_ids {
+            for cid in cids {
+                all_child_ids.push(cid.clone());
+            }
+        }
+    }
+
+    if !all_child_ids.is_empty() {
+        let child_filter = doc! { "id": { "$in": &all_child_ids } };
+        let child_find_options = FindOptions::builder()
+            .projection(get_alpha_projection())
+            .build();
+
+        if let Ok(mut child_cursor) = collection.find(child_filter, child_find_options).await {
+            let mut child_map: HashMap<String, AlphaResult> = HashMap::new();
+            let mut child_fails_map: HashMap<String, Vec<String>> = HashMap::new();
+            while let Ok(Some(child_doc)) = child_cursor.try_next().await {
+                // Extract failed checks for this child
+                let mut fails = Vec::new();
+                if let Ok(is_doc) = child_doc.get_document("is") {
+                    if let Ok(checks_arr) = is_doc.get_array("checks") {
+                        for c in checks_arr {
+                            if let Some(cdoc) = c.as_document() {
+                                let name = cdoc.get_str("name").unwrap_or("");
+                                let result = cdoc.get_str("result").unwrap_or("");
+                                if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
+                                    fails.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(child_result) = parse_alpha_document(child_doc, params.embedding.as_deref()) {
+                    let cid = child_result.id.clone();
+                    child_fails_map.insert(cid.clone(), fails);
+                    child_map.insert(cid, child_result);
+                }
+            }
+
+            for parent in &mut results {
+                if let Some(cids) = &parent.children_ids {
+                    let mut children = Vec::new();
+                    let mut check_fail_counts: HashMap<String, usize> = HashMap::new();
+                    for cid in cids {
+                        if let Some(child) = child_map.get(cid) {
+                            children.push(child.clone());
+                        }
+                        if let Some(fails) = child_fails_map.get(cid) {
+                            for f in fails {
+                                *check_fail_counts.entry(f.clone()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    if !children.is_empty() {
+                        // Aggregate statistics into parent
+                        let valid_sharpes: Vec<f64> = children.iter().filter_map(|c| c.sharpe).collect();
+                        if !valid_sharpes.is_empty() {
+                            parent.sharpe = Some(valid_sharpes.iter().sum::<f64>() / valid_sharpes.len() as f64);
+                        }
+
+                        let valid_fitness: Vec<f64> = children.iter().filter_map(|c| c.fitness).collect();
+                        if !valid_fitness.is_empty() {
+                            parent.fitness = Some(valid_fitness.iter().sum::<f64>() / valid_fitness.len() as f64);
+                        }
+
+                        let valid_returns: Vec<f64> = children.iter().filter_map(|c| c.returns).collect();
+                        if !valid_returns.is_empty() {
+                            parent.returns = Some(valid_returns.iter().sum::<f64>() / valid_returns.len() as f64);
+                        }
+
+                        let valid_turnover: Vec<f64> = children.iter().filter_map(|c| c.turnover).collect();
+                        if !valid_turnover.is_empty() {
+                            parent.turnover = Some(valid_turnover.iter().sum::<f64>() / valid_turnover.len() as f64);
+                        }
+
+                        let valid_margin: Vec<f64> = children.iter().filter_map(|c| c.margin).collect();
+                        if !valid_margin.is_empty() {
+                            parent.margin = Some(valid_margin.iter().sum::<f64>() / valid_margin.len() as f64);
+                        }
+
+                        let valid_dd: Vec<f64> = children.iter().filter_map(|c| c.drawdown).collect();
+                        if !valid_dd.is_empty() {
+                            parent.drawdown = valid_dd.iter().cloned().reduce(f64::max);
+                        }
+
+                        let valid_score: Vec<f64> = children.iter().filter_map(|c| c.pnl_score).collect();
+                        if !valid_score.is_empty() {
+                            parent.pnl_score = Some(valid_score.iter().sum::<f64>() / valid_score.len() as f64);
+                        }
+
+                        let valid_sub_u: Vec<f64> = children.iter().filter_map(|c| c.sub_universe_sharpe).collect();
+                        if !valid_sub_u.is_empty() {
+                            parent.sub_universe_sharpe = Some(valid_sub_u.iter().sum::<f64>() / valid_sub_u.len() as f64);
+                        }
+
+                        let valid_os_s: Vec<f64> = children.iter().filter_map(|c| c.os_sharpe).collect();
+                        if !valid_os_s.is_empty() {
+                            parent.os_sharpe = Some(valid_os_s.iter().sum::<f64>() / valid_os_s.len() as f64);
+                        }
+
+                        let valid_os_f: Vec<f64> = children.iter().filter_map(|c| c.os_fitness).collect();
+                        if !valid_os_f.is_empty() {
+                            parent.os_fitness = Some(valid_os_f.iter().sum::<f64>() / valid_os_f.len() as f64);
+                        }
+
+                        let long_cnts: Vec<i32> = children.iter().filter_map(|c| c.long_count).collect();
+                        if !long_cnts.is_empty() {
+                            parent.long_count = Some(long_cnts.iter().sum());
+                        }
+
+                        let short_cnts: Vec<i32> = children.iter().filter_map(|c| c.short_count).collect();
+                        if !short_cnts.is_empty() {
+                            parent.short_count = Some(short_cnts.iter().sum());
+                        }
+
+                        // Aggregate message: count how many children failed each check
+                        if !check_fail_counts.is_empty() {
+                            let mut sorted_checks: Vec<(String, usize)> = check_fail_counts.into_iter().collect();
+                            sorted_checks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                            let msg_items: Vec<String> = sorted_checks
+                                .into_iter()
+                                .map(|(name, count)| format!("{}({})", name, count))
+                                .collect();
+                            parent.message = Some(msg_items.join(", "));
+                        }
+
+                        parent.children = Some(children);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(PagedResult {
         data: results,
         total,
@@ -1095,16 +1275,47 @@ pub async fn get_alpha_results(
 
 
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct PnlPoint {
-    date: String,
-    pnl: f64,
-    risk_neutralized_pnl: Option<f64>,
+    pub date: String,
+    pub pnl: f64,
+    pub risk_neutralized_pnl: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PnlChildSeries {
+    pub id: String,
+    pub name: String,
+    pub pnl_series: Vec<PnlPoint>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PnlResponse {
-    pnl_series: Vec<PnlPoint>,
+    pub pnl_series: Vec<PnlPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children_series: Option<Vec<PnlChildSeries>>,
+}
+
+fn parse_pnl_records(records: &mongodb::bson::Array) -> Vec<PnlPoint> {
+    records
+        .iter()
+        .filter_map(|entry| {
+            entry.as_array().and_then(|arr| {
+                if arr.len() >= 2 {
+                    let date = arr.get(0)?.as_str()?.to_string();
+                    let pnl = arr.get(1)?.as_f64().or(arr.get(1)?.as_i32().map(|v| v as f64))?;
+                    let risk_neutralized_pnl = if arr.len() > 2 {
+                        arr.get(2)?.as_f64().or(arr.get(2)?.as_i32().map(|v| v as f64))
+                    } else {
+                        None
+                    };
+                    Some(PnlPoint { date, pnl, risk_neutralized_pnl })
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -1124,47 +1335,96 @@ pub async fn get_pnl_by_id(
     let db = client.database(&config.mongodb.databases.alpha);
 
     let filter = doc! { "id": &query.id };
-    
-    // 1. First attempt: Look in the centralized partitioned collection "alpha_pnls"
     let pnls_coll = db.collection::<mongodb::bson::Document>("alpha_pnls");
-    let mut doc_opt = pnls_coll.find_one(filter.clone(), None).await.ok().flatten();
+    let source_coll_name = query.collection.as_deref().and_then(sanitize_collection_name).unwrap_or_else(|| "alpha_results".to_string());
+    let source_coll = db.collection::<mongodb::bson::Document>(&source_coll_name);
 
-    // 2. Second attempt: Fallback to the original source collection if not found in alpha_pnls
-    if doc_opt.is_none() {
-        if let Some(source_coll_name) = query.collection.as_deref().and_then(sanitize_collection_name) {
-            if source_coll_name != "alpha_pnls" {
-                let source_coll = db.collection::<mongodb::bson::Document>(&source_coll_name);
-                doc_opt = source_coll.find_one(filter, None).await.ok().flatten();
+    // 1. First check if this is an RA_PARENT with children!
+    if let Ok(Some(parent_doc)) = source_coll.find_one(filter.clone(), None).await {
+        if let Ok(children_arr) = parent_doc.get_array("children") {
+            let child_ids: Vec<String> = children_arr
+                .iter()
+                .filter_map(|b| b.as_str().map(|s| s.to_string()))
+                .collect();
+
+            if !child_ids.is_empty() {
+                // Fetch children region metadata
+                let mut child_region_map: HashMap<String, String> = HashMap::new();
+                if let Ok(mut meta_cursor) = source_coll.find(doc! { "id": { "$in": &child_ids } }, None).await {
+                    while let Ok(Some(cdoc)) = meta_cursor.try_next().await {
+                        if let Ok(cid) = cdoc.get_str("id") {
+                            let region = cdoc.get_document("settings")
+                                .ok()
+                                .and_then(|s| s.get_str("region").ok())
+                                .unwrap_or("Unknown");
+                            child_region_map.insert(cid.to_string(), region.to_string());
+                        }
+                    }
+                }
+
+                // Fetch children PnLs from alpha_pnls
+                let mut children_series = Vec::new();
+                let mut date_map: std::collections::BTreeMap<String, (f64, f64, bool)> = std::collections::BTreeMap::new();
+
+                if let Ok(mut pnl_cursor) = pnls_coll.find(doc! { "id": { "$in": &child_ids } }, None).await {
+                    while let Ok(Some(cpnl_doc)) = pnl_cursor.try_next().await {
+                        if let Ok(cid) = cpnl_doc.get_str("id") {
+                            if let Ok(pnl_obj) = cpnl_doc.get_document("pnl") {
+                                if let Ok(records) = pnl_obj.get_array("records") {
+                                    let pts = parse_pnl_records(records);
+                                    for pt in &pts {
+                                        let entry = date_map.entry(pt.date.clone()).or_insert((0.0, 0.0, false));
+                                        entry.0 += pt.pnl;
+                                        if let Some(rn) = pt.risk_neutralized_pnl {
+                                            entry.1 += rn;
+                                            entry.2 = true;
+                                        }
+                                    }
+                                    let region = child_region_map.get(cid).cloned().unwrap_or_else(|| "Sub".to_string());
+                                    children_series.push(PnlChildSeries {
+                                        id: cid.to_string(),
+                                        name: format!("{} ({})", region, cid),
+                                        pnl_series: pts,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !children_series.is_empty() {
+                    let total_pnl_series: Vec<PnlPoint> = date_map
+                        .into_iter()
+                        .map(|(date, (pnl, rn_pnl, has_rn))| PnlPoint {
+                            date,
+                            pnl,
+                            risk_neutralized_pnl: if has_rn { Some(rn_pnl) } else { None },
+                        })
+                        .collect();
+
+                    return Ok(PnlResponse {
+                        pnl_series: total_pnl_series,
+                        children_series: Some(children_series),
+                    });
+                }
             }
         }
     }
 
-    let doc = doc_opt.ok_or_else(|| "PNL document not found in alpha_pnls or source collection".to_string())?;
+    // 2. Normal single-alpha logic
+    let mut doc_opt = pnls_coll.find_one(filter.clone(), None).await.ok().flatten();
+    if doc_opt.is_none() {
+        if source_coll_name != "alpha_pnls" {
+            doc_opt = source_coll.find_one(filter, None).await.ok().flatten();
+        }
+    }
 
+    let doc = doc_opt.ok_or_else(|| "PNL document not found in alpha_pnls or source collection".to_string())?;
     let pnl_obj = doc.get_document("pnl").map_err(|_| "No pnl field found")?;
     let records = pnl_obj.get_array("records").map_err(|_| "No records array found")?;
+    let pnl_series = parse_pnl_records(records);
 
-    let pnl_series: Vec<PnlPoint> = records
-        .iter()
-        .filter_map(|entry| {
-            entry.as_array().and_then(|arr| {
-                if arr.len() >= 2 {
-                    let date = arr.get(0)?.as_str()?.to_string();
-                    let pnl = arr.get(1)?.as_f64().or(arr.get(1)?.as_i32().map(|v| v as f64))?;
-                    let risk_neutralized_pnl = if arr.len() > 2 {
-                        arr.get(2)?.as_f64().or(arr.get(2)?.as_i32().map(|v| v as f64))
-                    } else {
-                        None
-                    };
-                    Some(PnlPoint { date, pnl, risk_neutralized_pnl })
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-
-    Ok(PnlResponse { pnl_series })
+    Ok(PnlResponse { pnl_series, children_series: None })
 }
 
 

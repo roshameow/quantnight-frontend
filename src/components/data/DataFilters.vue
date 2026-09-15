@@ -22,6 +22,7 @@
           >
             <n-radio-button value="REGULAR">REGULAR</n-radio-button>
             <n-radio-button value="SUPER">SUPER</n-radio-button>
+            <n-radio-button value="RA">RA</n-radio-button>
           </n-radio-group>
         </div>
 
@@ -30,7 +31,7 @@
           <n-input
             :value="modelValue.searchQuery"
             @update:value="updateFilter('searchQuery', $event)"
-            placeholder="🔍 Search Regular"
+            :placeholder="modelValue.type === 'SUPER' ? '🔍 Search Super' : modelValue.type === 'RA' ? '🔍 Search RA' : '🔍 Search Regular'"
             clearable
             style="width: 250px"
           />
