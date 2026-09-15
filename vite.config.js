@@ -7,7 +7,12 @@ import fs from 'fs'
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(async ({ mode }) => ({
+  base: mode === 'demo' ? './' : '/',
+  build: mode === 'demo' ? {
+    outDir: 'dist-demo',
+    rollupOptions: { input: path.resolve(__dirname, 'demo.html') },
+  } : {},
   plugins: [vue(),
   {
     name: 'ensure-config-js',

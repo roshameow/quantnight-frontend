@@ -1,7 +1,7 @@
 {
   "name": "quantnight",
   "private": true,
-  "version": "1.2.1",
+  "version": "1.2.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:macos": "bash ./scripts/build-macos.sh"
+    "build:macos": "bash ./scripts/build-macos.sh",
+    "demo": "vite --open /demo.html",
+    "build:demo": "vite build --mode demo",
+    "check:version": "node scripts/check-version.mjs"
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",

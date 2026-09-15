@@ -1,8 +1,8 @@
 [package]
 name = "quantnight-frontend"
-version = "1.2.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "1.2.4"
+description = "Desktop console for quantitative research tasks"
+authors = ["Wen Liu"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -41,5 +41,3 @@ linfa = "0.7.0"
 linfa-reduction = "0.7.0"
 linfa-clustering = "0.7.0"
 ndarray = "0.15"
-
-
