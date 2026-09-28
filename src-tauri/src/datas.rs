@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::stream::TryStreamExt;
 use futures::join;
 
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, Bson, Document},
     options::{FindOptions, FindOneOptions},
 };
 use serde::{Deserialize, Serialize, Deserializer};
@@ -842,6 +842,209 @@ pub async fn get_datasets(
     })
 }
 
+// Only enrich rows already loaded from the results collection (including RA children).
+// An alpha with just a correlation document must be synced into alpha_results first.
+fn prod_correlation_ids(results: &[AlphaResult]) -> Vec<String> {
+    let mut ids = std::collections::HashSet::new();
+    for result in results {
+        ids.insert(result.id.clone());
+        if let Some(children) = &result.children {
+            ids.extend(children.iter().map(|child| child.id.clone()));
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn correlation_timestamp(value: &JsonValue) -> Option<i64> {
+    let date = value.get("updatedAt")?;
+    if let Some(s) = date.as_str() {
+        return DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp_millis());
+    }
+    // BSON dates may deserialize into extended JSON, depending on the BSON decoder.
+    let date = date.get("$date")?;
+    if let Some(s) = date.as_str() {
+        return DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp_millis());
+    }
+    date.get("$numberLong")?.as_str()?.parse::<i64>().ok()
+}
+
+fn has_correlation_value(snapshot: &JsonValue) -> bool {
+    snapshot.get("value").is_some_and(|v| !v.is_null())
+}
+
+// A missing/invalid timestamp cannot establish that fallback is newer; ties
+// also retain the existing alpha_results snapshot.
+fn prefer_prod_correlation(existing: Option<&JsonValue>, fallback: &JsonValue) -> bool {
+    if !has_correlation_value(fallback) {
+        return false;
+    }
+    match existing.filter(|v| has_correlation_value(v)) {
+        None => true,
+        Some(current) => matches!(
+            (correlation_timestamp(current), correlation_timestamp(fallback)),
+            (Some(old), Some(new)) if new > old
+        ),
+    }
+}
+
+fn prod_correlation_filter(ids: Vec<String>) -> Document {
+    doc! { "id": { "$in": ids }, "mode": "prod" }
+}
+
+fn merge_prod_correlations(results: &mut [AlphaResult], docs: Vec<Document>) {
+    let mut by_id: HashMap<String, JsonValue> = HashMap::new();
+    for mut doc in docs {
+        if doc.get_str("mode") != Ok("prod") {
+            continue;
+        }
+        let Ok(id) = doc.get_str("id").map(str::to_owned) else { continue };
+        doc.remove("_id");
+        doc.remove("id");
+        // Convert a BSON DateTime to an ISO timestamp in the same shape as the
+        // existing snapshot; do not depend on serde's extended-JSON encoding.
+        if let Some(Bson::DateTime(date)) = doc.get("updatedAt") {
+            let iso = DateTime::<Utc>::from(date.to_system_time()).to_rfc3339();
+            doc.insert("updatedAt", iso);
+        }
+        let Ok(snapshot) = mongodb::bson::from_document::<JsonValue>(doc) else { continue };
+        if !has_correlation_value(&snapshot) {
+            continue;
+        }
+        let entry = by_id.entry(id).or_insert(JsonValue::Null);
+        if prefer_prod_correlation(Some(entry), &snapshot) {
+            *entry = snapshot;
+        }
+    }
+    for result in results {
+        if let Some(snapshot) = by_id.get(&result.id) {
+            if prefer_prod_correlation(result.current_prod_correlation.as_ref(), snapshot) {
+                result.current_prod_correlation = Some(snapshot.clone());
+            }
+        }
+        if let Some(children) = &mut result.children {
+            for child in children {
+                if let Some(snapshot) = by_id.get(&child.id) {
+                    if prefer_prod_correlation(child.current_prod_correlation.as_ref(), snapshot) {
+                        child.current_prod_correlation = Some(snapshot.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prod_correlation_tests {
+    use super::*;
+    use mongodb::bson::DateTime as BsonDateTime;
+
+    fn result(id: &str, current: Option<JsonValue>) -> AlphaResult {
+        let mut result = parse_alpha_document(
+            doc! { "id": id, "type": "REGULAR", "settings": { "region": "USA" } },
+            None,
+        ).unwrap();
+        result.current_prod_correlation = current;
+        result
+    }
+
+    fn snapshot(value: f64, updated_at: &str) -> JsonValue {
+        serde_json::json!({ "value": value, "updatedAt": updated_at })
+    }
+
+    #[test]
+    fn batch_filter_includes_page_and_ra_children_but_no_other_ids() {
+        let mut parent = result("parent", None);
+        parent.children = Some(vec![result("child", None)]);
+        let results = vec![parent, result("regular", None)];
+        let ids = prod_correlation_ids(&results);
+        assert_eq!(ids.len(), 3);
+        let filter = prod_correlation_filter(ids);
+        assert_eq!(filter.get_str("mode").unwrap(), "prod");
+        let ids = filter.get_document("id").unwrap().get_array("$in").unwrap();
+        for id in ["parent", "child", "regular"] {
+            assert!(ids.iter().any(|item| item.as_str() == Some(id)));
+        }
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn joins_only_existing_rows_and_prod_mode() {
+        let mut results = vec![result("present", None)];
+        merge_prod_correlations(&mut results, vec![
+            doc! { "id": "present", "mode": "self", "value": 0.9 },
+            doc! { "id": "absent", "mode": "prod", "value": 0.8 },
+            doc! { "id": "present", "mode": "prod", "value": 0.0,
+                "updatedAt": BsonDateTime::from_millis(1_700_000_000_000_i64) },
+        ]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].current_prod_correlation.as_ref().unwrap()["value"], 0.0);
+        assert!(results[0].current_prod_correlation.as_ref().unwrap()["updatedAt"].is_string());
+    }
+
+    #[test]
+    fn newest_valid_snapshot_wins_and_equal_or_unknown_time_keeps_existing() {
+        let old = "2024-01-01T00:00:00Z";
+        let new = "2024-01-02T00:00:00Z";
+        let mut results = vec![
+            result("newer_fallback", Some(snapshot(0.1, old))),
+            result("older_fallback", Some(snapshot(0.2, new))),
+            result("equal", Some(snapshot(0.3, new))),
+            result("unknown", Some(serde_json::json!({"value": 0.4}))),
+            result("missing", None),
+        ];
+        merge_prod_correlations(&mut results, vec![
+            doc! { "id": "newer_fallback", "mode": "prod", "value": 0.5, "updatedAt": new },
+            doc! { "id": "older_fallback", "mode": "prod", "value": 0.6, "updatedAt": old },
+            doc! { "id": "equal", "mode": "prod", "value": 0.7, "updatedAt": new },
+            doc! { "id": "unknown", "mode": "prod", "value": 0.8, "updatedAt": new },
+            doc! { "id": "missing", "mode": "prod", "value": 0.9, "updatedAt": old },
+        ]);
+        let values: Vec<_> = results.iter().map(|r| r.current_prod_correlation.as_ref().unwrap()["value"].as_f64().unwrap()).collect();
+        assert_eq!(values, vec![0.5, 0.2, 0.3, 0.4, 0.9]);
+        assert_eq!(correlation_timestamp(&serde_json::json!({"updatedAt": {"$date": {"$numberLong": "1704067200000"}}})), Some(1_704_067_200_000));
+    }
+
+    #[test]
+    fn existing_bson_timestamp_is_comparable_to_fallback() {
+        let mut results = vec![parse_alpha_document(doc! {
+            "id": "bson", "type": "REGULAR", "settings": { "region": "USA" },
+            "currentProdCorrelation": { "value": 0.2,
+                "updatedAt": BsonDateTime::from_millis(1_704_067_200_000) }
+        }, None).unwrap()];
+        merge_prod_correlations(&mut results, vec![
+            doc! { "id": "bson", "mode": "prod", "value": 0.4,
+                "updatedAt": BsonDateTime::from_millis(1_704_153_600_000) }
+        ]);
+        assert_eq!(results[0].current_prod_correlation.as_ref().unwrap()["value"], 0.4);
+    }
+
+    #[test]
+    fn duplicate_fallback_docs_choose_newest_independent_of_cursor_order() {
+        let earlier = doc! { "id": "dup", "mode": "prod", "value": 0.1,
+            "updatedAt": BsonDateTime::from_millis(1_704_067_200_000) };
+        let later = doc! { "id": "dup", "mode": "prod", "value": 0.9,
+            "updatedAt": BsonDateTime::from_millis(1_704_153_600_000) };
+        for docs in [vec![later.clone(), earlier.clone()], vec![earlier.clone(), later.clone()]] {
+            let mut results = vec![result("dup", None)];
+            merge_prod_correlations(&mut results, docs);
+            assert_eq!(results[0].current_prod_correlation.as_ref().unwrap()["value"], 0.9);
+        }
+    }
+
+    #[test]
+    fn children_are_enriched_and_null_fallback_does_not_erase_existing() {
+        let mut parent = result("parent", None);
+        parent.children = Some(vec![result("child", None)]);
+        let mut results = vec![parent, result("already", Some(snapshot(0.2, "2024-01-01T00:00:00Z")))];
+        merge_prod_correlations(&mut results, vec![
+            doc! { "id": "child", "mode": "prod", "value": 0.7 },
+            doc! { "id": "already", "mode": "prod", "value": Bson::Null },
+        ]);
+        assert_eq!(results[0].children.as_ref().unwrap()[0].current_prod_correlation.as_ref().unwrap()["value"], 0.7);
+        assert_eq!(results[1].current_prod_correlation.as_ref().unwrap()["value"], 0.2);
+    }
+}
+
 fn get_alpha_projection() -> mongodb::bson::Document {
     doc! {
         "id": 1,
@@ -1262,6 +1465,26 @@ pub async fn get_alpha_results(
                     }
                 }
             }
+        }
+    }
+
+    // One read for all IDs on this page (including fetched RA children), not
+    // one query per row. Never upsert/insert a partial alpha_results document.
+    let ids = prod_correlation_ids(&results);
+    if !ids.is_empty() {
+        let corr_collection = db.collection::<Document>("alpha_correlations");
+        let options = FindOptions::builder()
+            .projection(doc! { "_id": 0, "id": 1, "mode": 1, "value": 1,
+                "updatedAt": 1, "requestId": 1, "rawResponseHash": 1, "source": 1 })
+            .build();
+        // Correlation is optional enrichment: a read error must not make an
+        // otherwise healthy alpha_results page disappear.
+        match corr_collection.find(prod_correlation_filter(ids), options).await {
+            Ok(cursor) => match cursor.try_collect::<Vec<Document>>().await {
+                Ok(docs) => merge_prod_correlations(&mut results, docs),
+                Err(err) => eprintln!("Prod correlation cursor error: {err}"),
+            },
+            Err(err) => eprintln!("Prod correlation query error: {err}"),
         }
     }
 
