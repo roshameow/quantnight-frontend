@@ -2,182 +2,57 @@
   <n-modal
     v-model:show="showModal"
     preset="dialog"
-    title="添加插队任务"
+    title="添加 Priority 精炼任务"
     :style="{ width: '700px' }"
   >
     <n-form label-placement="top">
-      <n-form-item label="任务名称">
-        <n-input
-          v-model:value="form.taskName"
-          placeholder="请输入任务名称"
-         
-        />
+      <n-form-item label="任务名称（可自定义）">
+        <n-input v-model:value="form.taskName" placeholder="pipeline__priority" />
       </n-form-item>
-
       <n-form-item label="Auth Profile">
-        <n-input
-          v-model:value="form.authProfile"
-          placeholder="请输入 Auth Profile (默认 user1)"
-        />
+        <n-input v-model:value="form.authProfile" placeholder="user1" />
       </n-form-item>
-
-      <n-form-item label="添加模板路径（可选）">
-        <n-input
-          v-model:value="form.priorityTemplatePath"
-          placeholder="模版路径"
-         
-        />
+      <n-p>
+        使用内置 pipeline 模板，无需上传 .py 文件，任务名称无需对应模板文件名。
+        创建只保存配置；启动需另行确认。
+      </n-p>
+      <n-form-item label="配置 JSON（高级：模板开关、参数与预算）">
+        <n-input type="textarea" v-model:value="form.configText" :autosize="{ minRows: 10, maxRows: 24 }" />
       </n-form-item>
-
-      <n-form-item>
-        <template #label>
-          <n-space align="center" style="justify-content: space-between; width: 100%">
-            <span>模版:</span>
-            <n-tag
-              v-if="form.templateFilename"
-              size="small"
-              type="info"
-              style="margin-left: auto"
-            >
-              <n-text depth="3" style="margin-left: auto">
-                {{ form.templateFilename }}.py
-              </n-text>
-            </n-tag>
-          </n-space>
-        </template>
-
-        <n-upload
-          :show-file-list="true"
-          :max="1"
-          accept=".py"
-          @change="handleTemplateUpload"
-        >
-          <n-button secondary type="primary"> 上传 .py 模板文件 </n-button>
-        </n-upload>
-      </n-form-item>
+      <n-p>{{ PRIORITY_CONFIG_HINT }}</n-p>
     </n-form>
-
     <template #action>
-      <n-button @click="handleCancel">取消</n-button>
+      <n-button @click="showModal = false">取消</n-button>
       <n-button type="primary" @click="handleSubmit">创建任务</n-button>
     </template>
   </n-modal>
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from "vue";
+import { ref, watch } from "vue";
 import { useMessage } from "naive-ui";
-import { invoke } from "@tauri-apps/api/core";
-import { AppConfig } from "@/config";
+import { priorityDefaultConfig, priorityTaskPayload, PRIORITY_CONFIG_HINT } from "@/utils/taskConfig";
 
-
-
-// ✅ 预填表单数据
-const form = ref({
-  taskName: "",
-  authProfile: "user1",
-  configText: "", // 预填入 JSON 字符串
-  priorityTemplatePath: AppConfig.paths.priorityTemplatePath,
-  templateFilename: "",
-  templateCode: "",
-  isRemote: false, // ✅ 本地（false）/远程（true）标记
-});
-
-// props
 const props = defineProps({ show: Boolean });
-// emit
-const emit = defineEmits(["update:show", "add-task"]);
-// 局部状态绑定
+const emit = defineEmits(["update:show", "add-priority-task"]);
 const showModal = ref(props.show);
-
-// watch 同步 props => state
-watch(
-  () => props.show,
-  (v) => (showModal.value = v)
-);
-// watch 同步 state => emit 更新父组件
-watch(showModal, (v) => emit("update:show", v));
-
+const form = ref({
+  taskName: "pipeline__priority",
+  authProfile: "user1",
+  configText: JSON.stringify(priorityDefaultConfig(), null, 2),
+});
 const message = useMessage();
-
-
-
-watch(
-  () => props.show,
-  async (v) => {
-    showModal.value = v;
-    if (v) {
-      try {
-        const latestTemplate = await invoke("read_latest_py_file", {
-          folderPath: form.value.priorityTemplatePath,
-        });
-        const base = latestTemplate.replace(/\.py$/i, "");
-        // refine_templates/ 中非任务模板需排除：_utils（无 refine 函数）、
-        // group_op_add（类式接口 GroupOpAdder，不走统一 refine 调用）
-        if (["_utils", "group_op_add"].includes(base)) {
-          console.warn("最新模板文件非任务模板:", base);
-          form.value.templateFilename = "";
-          form.value.taskName = "";
-          message.warning(
-            `自动检测到模板 ${base} 不是可用任务模板；\n请手动输入任务名（如 sign_flip__priority / change_settings__priority）`
-          );
-        } else {
-          form.value.templateFilename = base;
-          form.value.taskName = base + "__priority";
-          console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
-        }
-      } catch (err) {
-        console.error("读取模板失败:", err);
-        message.warning("无法自动读取模板文件，请手动上传或填写模板名");
-      }
-    }
-  }
-);
-
-
-const handleTemplateUpload = ({ file }) => {
-  const reader = new FileReader();
-  reader.onload = () => {
-    form.value.templateCode = reader.result;
-    form.value.templateFilename = file.name.replace(/\.py$/i, ""); // 存储文件名
-    console.log("templateFilename:：", form.value.templateFilename);
-  };
-  reader.readAsText(file.file);
-};
+watch(() => props.show, (value) => (showModal.value = value));
+watch(showModal, (value) => emit("update:show", value));
 
 const handleSubmit = () => {
-  if (!form.value.taskName || !form.value.templateFilename) {
-    message.error("请完整填写任务信息");
-    return;
-  }
-
   try {
-    let parsedConfig = {};
-    if (form.value.configText && form.value.configText.trim() !== "") {
-      parsedConfig = JSON.parse(form.value.configText);
-    }
-
-    const newTask = {
-      name: form.value.taskName,
-      config: parsedConfig,
-      template: form.value.templateCode || "",
-      templatefile: form.value.templateFilename || "",
-      auth_profile: form.value.authProfile || "user1",
-      status: "pending",
-      createdAt: new Date(),
-    };
-
-    emit("add-priority-task", newTask);
-    message.success("任务创建成功");
+    const task = priorityTaskPayload(form.value.taskName, form.value.authProfile, form.value.configText);
+    emit("add-priority-task", task);
+    // Parent reports persistence success/failure after awaiting the command.
     showModal.value = false;
-  } catch (e) {
-    console.error(e);
-    message.error("配置 JSON 格式错误！");
+  } catch (error) {
+    message.error("配置无效: " + error.message);
   }
-};
-
-
-const handleCancel = () => {
-  showModal.value = false;
 };
 </script>

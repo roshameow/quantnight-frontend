@@ -29,6 +29,8 @@ pub struct NewTask {
     pub status: Option<String>,
     pub is_remote: Option<bool>,
     pub task_type: Option<String>,
+    #[serde(default, alias = "config")]
+    pub mission_config: Option<JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +43,22 @@ pub struct CreatedTask {
     pub status: String,
     pub is_remote: Option<bool>,
     pub task_type: Option<String>,
+    pub mission_config: Option<JsonValue>,
+}
+
+// Pure helpers: validate before launching a script or writing a task record.
+fn mission_config_document(value: &JsonValue) -> Result<Document, String> {
+    if !value.is_object() {
+        return Err("配置必须是 JSON 对象".to_string());
+    }
+    bson::to_document(value).map_err(|e| format!("config 转 BSON 失败: {}", e))
+}
+
+fn priority_config_update(config: &str) -> Result<Document, String> {
+    let value: JsonValue = serde_json::from_str(config)
+        .map_err(|e| format!("config 解析成 JSON 失败: {}", e))?;
+    let document = mission_config_document(&value)?;
+    Ok(doc! { "status": "running", "mission_config": document })
 }
 
 #[command]
@@ -48,6 +66,7 @@ pub async fn create_task(
     new_task: NewTask,
     clients: State<'_, Arc<MongoClients>>
 ) -> Result<CreatedTask, String> {
+    let saved_config = new_task.mission_config.as_ref().map(mission_config_document).transpose()?;
     let client = &clients.local;
     let db = client.database("simulation_mission");
     let coll = db.collection::<Document>("tasks");
@@ -57,7 +76,7 @@ pub async fn create_task(
     let task_type = new_task.task_type.clone().unwrap_or_else(|| "regular".to_string());
     let auth_profile = new_task.auth_profile.clone().unwrap_or_else(|| "user1".to_string());
 
-    let task_doc = doc! {
+    let mut task_doc = doc! {
         "name": &new_task.name,
         "template": &new_task.template,
         "templatefile": &new_task.templatefile,
@@ -66,6 +85,9 @@ pub async fn create_task(
         "isRemote": is_remote,
         "taskType": &task_type,
     };
+    if let Some(config) = saved_config {
+        task_doc.insert("mission_config", config);
+    }
 
     let result = coll
         .insert_one(task_doc, None)
@@ -86,6 +108,7 @@ pub async fn create_task(
         status,
         is_remote: Some(is_remote),
         task_type: Some(task_type),
+        mission_config: new_task.mission_config,
     })
 }
 
@@ -224,6 +247,9 @@ pub struct Task {
     pub task_type: Option<String>, // 或者 task_type: Option<String>
     #[serde(rename = "mission_config")]
     pub mission_config: Option<JsonValue>, // 加上这一行，接收嵌套的 config
+    #[serde(rename = "startConfig")]
+    pub start_config: Option<JsonValue>,
+    pub config: Option<JsonValue>,
 
 }
 
@@ -605,6 +631,7 @@ pub async fn start_priority_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
+    let set_doc = priority_config_update(&config)?;
     let client = &clients.local;
     let db = client.database("simulation_mission");
     let tasks = db.collection::<Document>("tasks");
@@ -632,22 +659,8 @@ pub async fn start_priority_task(
     )
     .await?;
 
-    // 解析 config 并准备写入 mission_config
-    let mut set_doc = doc! { "status": "running" };
-
-    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&config) {
-        match bson::to_bson(&json_val) {
-            Ok(bson_val) => {
-                if let bson::Bson::Document(doc_inner) = bson_val {
-                    set_doc.insert("mission_config", doc_inner);
-                }
-            }
-            Err(e) => eprintln!("config 转 BSON 失败: {}", e),
-        }
-    } else {
-        eprintln!("config 解析成 JSON 失败");
-    }
-
+    // Persist exactly the validated object sent to the runner.
+    // Script success means requested config, not an applied-revision acknowledgement.
     // 组合更新
     let update = doc! { "$set": set_doc };
 
@@ -692,7 +705,7 @@ pub async fn update_priority_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    println!("Received config: {}", config); // 打印 config 内容
+    let set_doc = priority_config_update(&config)?;
 
     let client = &clients.local;
     let db = client.database("simulation_mission");
@@ -723,7 +736,7 @@ pub async fn update_priority_task(
     tasks
         .update_one(
             doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            doc! { "$set": { "status": "running" } },
+            doc! { "$set": set_doc },
             None,
         )
         .await
@@ -990,3 +1003,64 @@ pub fn restart_app() -> Result<(), String> {
 }
 
 
+
+#[cfg(test)]
+mod priority_config_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn create_accepts_pipeline_config_and_legacy_config_alias() {
+        for key in ["mission_config", "config"] {
+            let mut payload = json!({
+                "name": "custom_research__priority", "template": "", "templatefile": "pipeline",
+                "task_type": "priority"
+            });
+            payload[key] = json!({
+                "refine_templates": [{"name":"group_op_add", "enabled":true,
+                    "params":{"num_variants":2}, "max_variants":4}],
+                "max_variants_per_alpha": 40
+            });
+            let task: NewTask = serde_json::from_value(payload).unwrap();
+            assert_eq!(task.templatefile, "pipeline");
+            let saved = mission_config_document(task.mission_config.as_ref().unwrap()).unwrap();
+            assert_eq!(saved.get_array("refine_templates").unwrap().len(), 1);
+        }
+        let legacy: NewTask = serde_json::from_value(json!({
+            "name":"sign_flip__priority", "template":"", "templatefile":"sign_flip"
+        })).unwrap();
+        assert!(legacy.mission_config.is_none());
+    }
+
+    #[test]
+    fn update_persists_exact_nested_object_and_explicit_empty_steps() {
+        let value = json!({"refine_templates":[], "max_variants_per_alpha":40,
+            "extension":{"preserve":true}});
+        let update = priority_config_update(&value.to_string()).unwrap();
+        assert_eq!(update.get_str("status").unwrap(), "running");
+        let saved = update.get_document("mission_config").unwrap();
+        assert!(saved.get_array("refine_templates").unwrap().is_empty());
+        assert_eq!(serde_json::to_value(saved).unwrap(), value);
+        let legacy = priority_config_update("{\"interval\":600}").unwrap();
+        assert!(!legacy.get_document("mission_config").unwrap().contains_key("refine_templates"));
+    }
+
+    #[test]
+    fn invalid_top_level_config_is_rejected_before_script_execution() {
+        for value in ["[]", "null", "false", "3", "broken"] {
+            assert!(priority_config_update(value).is_err());
+        }
+        assert!(mission_config_document(&json!([])).is_err());
+    }
+
+    #[test]
+    fn task_read_model_exposes_all_saved_config_sources() {
+        for key in ["mission_config", "startConfig", "config"] {
+            let mut document = doc! {"_id": ObjectId::new(), "name":"legacy__priority", "status":"pending"};
+            document.insert(key, doc! {"refine_templates": []});
+            let task: Task = bson::from_document(document).unwrap();
+            let exposed = serde_json::to_value(task).unwrap();
+            assert_eq!(exposed[key]["refine_templates"], json!([]));
+        }
+    }
+}

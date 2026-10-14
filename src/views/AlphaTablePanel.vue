@@ -30,7 +30,11 @@
         :on-clickoutside="onClickoutside"
         @select="handleMenuSelect"
       />
+      <div v-if="rowError" role="alert" style="color: #d03050; margin-bottom: 8px">
+        加载列表失败：{{ rowError }}
+      </div>
       <n-data-table
+        :loading="rowsLoading"
         :columns="columns"
         :data="data"
         :bordered="false"
@@ -44,7 +48,8 @@
         @update:sorter="handleSorterUpdate"
       />
 
-      <div style="display: flex; justify-content: flex-end; margin-top: 12px">
+      <div style="display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 12px">
+        <span role="status" style="font-size: 13px; color: #666">{{ totalLabel }}</span>
         <n-pagination
           v-model:page="pagination.page"
           v-model:page-size="pagination.pageSize"
@@ -61,11 +66,12 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, reactive, nextTick } from "vue";
+import { ref, watch, onMounted, onBeforeUnmount, reactive, nextTick, computed } from "vue";
 import { useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import DataFilters from "../components/data/DataFilters.vue";
 import { useAlphaTableColumns } from "../composables/useAlphaTableColumns.js";
+import { createAlphaListLoader, provisionalItemCount } from "../utils/alphaListLoader.js";
 
 import { useConfigStore } from "../stores/configStore.js";
 import { useAnalysisStore } from "../stores/analysisStore.js";
@@ -77,6 +83,14 @@ const analysisStore = useAnalysisStore();
 const message = useMessage();
 const data = ref([]);
 const corrLoading = ref(false);
+const rowsLoading = ref(false);
+const rowError = ref("");
+const exactTotal = ref(null);
+const countStatus = ref("pending");
+const totalLabel = computed(() => countStatus.value === "exact"
+  ? `共 ${exactTotal.value} 条`
+  : countStatus.value === "unavailable" ? "总数暂不可用" : "总数统计中");
+let isPanelMounted = false;
 const pnlDataMap = ref({});
 const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
@@ -174,7 +188,9 @@ const filters = reactive({
 });
 
 const onFiltersUpdate = (newFilters) => {
-  Object.assign(filters, newFilters);
+  // Deep watchers receive the same object for old/new; compare before assignment instead.
+  const collectionChanged = newFilters.collection !== filters.collection;
+  Object.assign(filters, newFilters, collectionChanged ? { messages: [] } : {});
 };
 
 const pagination = ref({
@@ -198,14 +214,36 @@ const { columns } = useAlphaTableColumns({
 });
 
 // --- Data Fetching ---
-let requestCounter = 0;
-const latestRequestId = ref(0);
+let deliveredRows = null;
+let uiGeneration = 0;
+const listLoader = createAlphaListLoader({
+  invoke,
+  onState: (state) => {
+    if (uiGeneration !== state.generation) {
+      uiGeneration = state.generation;
+      pnlDataMap.value = {};
+      loadingSet.value = new Set();
+      corrLoading.value = false;
+    }
+    if (deliveredRows !== state.rows) {
+      deliveredRows = state.rows;
+      data.value = state.rows;
+      corrLoading.value = false;
+    }
+    rowsLoading.value = state.loading;
+    rowError.value = state.error ? String(state.error) : "";
+    exactTotal.value = state.total;
+    countStatus.value = state.countStatus;
+    pagination.value.itemCount = state.countStatus === "exact"
+      ? state.total
+      : provisionalItemCount(state.page, state.pageSize, state.rows, state.hasRows);
+    pagination.value.page = state.page;
+    pagination.value.pageSize = state.pageSize;
+  },
+});
 
-async function fetchData() {
-  const currentRequestId = ++requestCounter;
-  latestRequestId.value = currentRequestId;
-
-  const params = {
+function requestParams() {
+  return {
     collection: filters.collection || "alpha_results",
     embedding: filters.embedding || null,
     query: filters.searchQuery.trim() || null,
@@ -216,7 +254,7 @@ async function fetchData() {
     classifications_in: filters.classificationsIn.length > 0 ? filters.classificationsIn : null,
     region: filters.region || null,
     universe: filters.universe || null,
-    delay: filters.delay ? parseInt(filters.delay) : null,
+    delay: filters.delay != null && filters.delay !== "" ? parseInt(filters.delay) : null,
     days_within: filters.days ? parseInt(filters.days) : null,
     min_turnover:
       filters.minTurnover != null ? parseFloat(filters.minTurnover) / 100 : null,
@@ -231,28 +269,28 @@ async function fetchData() {
     sort_field: sortState.value.field,
     sort_order: sortState.value.order,
   };
+}
 
-  try {
-    const result = await invoke("get_alpha_results", { params });
-    if (currentRequestId === latestRequestId.value) {
-      data.value = result.data;
-      pagination.value.itemCount = result.total;
-      pagination.value.page = result.page;
-      pagination.value.pageSize = result.page_size;
-    }
-  } catch (e) {
-    console.error("Error fetching data:", e);
-  }
+function fetchData() {
+  listLoader.schedule(requestParams(), { immediate: true });
+}
+
+function scheduleData() {
+  listLoader.schedule(requestParams());
 }
 
 // --- PNL & Correlation Logic ---
 async function loadPNL(id) {
   if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
   loadingSet.value.add(id);
+  const generation = listLoader.getGeneration();
+  const collection = filters.collection;
+  const isCurrent = () => isPanelMounted && generation === listLoader.getGeneration();
   try {
     const result = await invoke("get_pnl_by_id", {
-      query: { id, collection: filters.collection },
+      query: { id, collection },
     });
+    if (!isCurrent()) return;
     // If result has children_series (RA Parent), preserve the entire object for multi-line chart rendering
     if (result && result.children_series && result.children_series.length > 0) {
       pnlDataMap.value[id] = result;
@@ -260,14 +298,20 @@ async function loadPNL(id) {
       pnlDataMap.value[id] = result ? result.pnl_series : null;
     }
   } catch (e) {
-    console.error("Error loading PnL:", e);
-    pnlDataMap.value[id] = null;
+    if (isCurrent()) {
+      console.error("Error loading PnL:", e);
+      pnlDataMap.value[id] = null;
+    }
   } finally {
-    loadingSet.value.delete(id);
+    if (isCurrent()) loadingSet.value.delete(id);
   }
 }
 
 async function calculateCorr() {
+  const generation = listLoader.getGeneration();
+  const rows = data.value;
+  const isCurrent = () => isPanelMounted && generation === listLoader.getGeneration()
+    && data.value === rows;
   corrLoading.value = true;
   try {
     const idsOnPage = [];
@@ -283,6 +327,7 @@ async function calculateCorr() {
 
     const result = await invoke("compute_correlation", { alphaIds: idsOnPage });
 
+    if (!isCurrent()) return;
     const updateRowCorr = (row) => {
       const corr = result[row.id];
       let updated = corr
@@ -309,9 +354,9 @@ async function calculateCorr() {
     };
     data.value = data.value.map(updateRowCorr);
   } catch (e) {
-    console.error("计算 corr 失败", e);
+    if (isCurrent()) console.error("计算 corr 失败", e);
   } finally {
-    corrLoading.value = false;
+    if (isPanelMounted && generation === listLoader.getGeneration()) corrLoading.value = false;
   }
 }
 
@@ -336,30 +381,31 @@ function handlePageSizeChange(pageSize) {
 // --- Watchers & Lifecycle ---
 watch(
   filters,
-  (newFilters, oldFilters) => {
-    // Check if the collection has changed
-    if (newFilters.collection !== oldFilters.collection) {
-      filters.messages = []; // Reset messages when collection changes
-    }
-    fetchData(); // Fetch data on any filter change
+  () => {
+    if (!isPanelMounted) return;
+    pagination.value.page = 1; // Preserve RA filter page reset.
+    // Synchronous invalidation prevents old promises from landing during the debounce.
+    scheduleData();
   },
-  { deep: true }
+  { deep: true, flush: "sync" }
 );
 
-onMounted(() => {
-  // Set default embedding if not set
-  if (!filters.embedding && configStore.embeddingOptions.length > 0) {
-    filters.embedding = configStore.embeddingOptions[0].value;
-  }
-  fetchData();
-});
-
+// Embedding only changes the filter. The mount/filter scheduler is the sole request path.
 watch(() => configStore.embeddingOptions, (options) => {
   if (!filters.embedding && options && options.length > 0) {
     filters.embedding = options[0].value;
-    fetchData();
   }
 }, { immediate: true });
+
+onMounted(() => {
+  isPanelMounted = true;
+  scheduleData();
+});
+
+onBeforeUnmount(() => {
+  isPanelMounted = false;
+  listLoader.dispose();
+});
 </script>
 
 <style>

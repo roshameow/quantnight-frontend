@@ -253,7 +253,7 @@ export function useAlphaTableColumns({ expandedRowIds, pnlDataMap, loadingSet, l
               },
               row.id
             ),
-            isParent && childCount > 0
+            isParent
               ? h(
                   "span",
                   {

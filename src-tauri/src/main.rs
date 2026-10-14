@@ -49,8 +49,10 @@ fn main() {
             commands::update_priority_task,
             commands::pause_task,
             commands::check_task_status,
-            watcher::frontend_ready,  // 确保此命令通过前端调用
+            watcher::frontend_ready,
+            watcher::refresh_task_progress,
             datas::get_alpha_results,
+            datas::get_alpha_count,
             datas::get_datasets,
             datas::get_datafields,
             datas::get_pnl_by_id,

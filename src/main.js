@@ -12,11 +12,12 @@ import { useTaskStore } from './stores/taskStore';
 async function initGlobalTaskWatcher() {
   const taskStore = useTaskStore();
 
-  // 全局监听 Rust emit 的任务进度
-  await listen("task-progress-update", (event) => {
-    // 写入 Pinia store
-    taskStore.updateProgress(event.payload);
-  });
+  // Keep both success and stale/error state current even outside the task page.
+  await Promise.all([
+    listen("task-progress-update", (event) => taskStore.updateProgress(event.payload)),
+    listen("task-progress-error", (event) => taskStore.updateProgressError(event.payload)),
+    listen("task-progress-refresh-error", (event) => taskStore.markProgressStale(event.payload)),
+  ]);
 
   console.log("✅ 全局任务进度监听器已启动");
 }
@@ -33,4 +34,4 @@ app.use(createPinia());
 app.mount('#app');
 
 // ⬇️ 在 app 挂载之后启动全局 watcher
-initGlobalTaskWatcher();
+initGlobalTaskWatcher().catch((error) => console.error("启动全局任务进度监听失败", error));

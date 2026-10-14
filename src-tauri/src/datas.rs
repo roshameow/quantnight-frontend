@@ -7,7 +7,7 @@ use futures::join;
 
 use mongodb::{
     bson::{doc, Bson, Document},
-    options::{FindOptions, FindOneOptions},
+    options::{CountOptions, FindOptions, FindOneOptions},
 };
 use serde::{Deserialize, Serialize, Deserializer};
 use tauri::{command, State};
@@ -130,6 +130,8 @@ pub struct AlphaQuery {
     pub embedding: Option<String>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+    /// Missing preserves legacy totals; false omits only non-RA totals.
+    pub include_total: Option<bool>,
     pub sort_field: Option<SortField>,
     pub sort_order: Option<i32>,
 }
@@ -405,14 +407,14 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
     }
 
     println!("Incoming query: {}", q_trimmed);
-    
+
     // 1. Normalize smart quotes (common on macOS) and Python-style values
     let mut normalized_q = q_trimmed
         .replace('“', "\"")
         .replace('”', "\"")
         .replace('‘', "'")
         .replace('’', "'");
-    
+
     normalized_q = RE_TRUE.replace_all(&normalized_q, "true").to_string();
     normalized_q = RE_FALSE.replace_all(&normalized_q, "false").to_string();
     normalized_q = RE_NONE.replace_all(&normalized_q, "null").to_string();
@@ -438,10 +440,10 @@ fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
             }
         }
     }
-    
+
     // 5. Fallback: Clean trailing commas
     let cleaned_q = RE_COMMA.replace_all(&normalized_q, "$1").to_string();
-    
+
     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
         if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
             if let Some(parsed_doc) = bson_val.as_document() {
@@ -541,7 +543,7 @@ pub async fn get_datafields(
     let client = &clients.local;
     let db_name = config.mongodb.databases.datafield.as_deref().unwrap_or("data_db");
     let coll_name = config.mongodb.databases.datafield_collection.as_deref().unwrap_or("datafields_all");
-    
+
     let db = client.database(db_name);
     let collection = db.collection::<mongodb::bson::Document>(coll_name);
 
@@ -552,7 +554,7 @@ pub async fn get_datafields(
     let mut filters = vec![
         doc! { "dataset.id": &params.dataset_id }
     ];
-    
+
     if let Some(search) = &params.search {
         if !search.is_empty() {
             let escaped = regex::escape(search.trim());
@@ -672,7 +674,7 @@ pub async fn get_datafields(
 
     let total = collection.count_documents(filter, None).await.map_err(|e| e.to_string())?;
     let mut cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
-    
+
     let mut results = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
         if let Ok(field) = mongodb::bson::from_document::<Datafield>(doc) {
@@ -697,7 +699,7 @@ pub async fn get_datasets(
     let client = &clients.local;
     let db_name = config.mongodb.databases.dataset.as_deref().unwrap_or("dataset_db");
     let coll_name = config.mongodb.databases.dataset_collection.as_deref().unwrap_or("datasets_all");
-    
+
     let db = client.database(db_name);
     let collection = db.collection::<mongodb::bson::Document>(coll_name);
 
@@ -706,7 +708,7 @@ pub async fn get_datasets(
     let skip = ((page - 1) * page_size) as u64;
 
     let mut filters = vec![];
-    
+
     if let Some(search) = &params.search {
         if !search.is_empty() {
             let escaped = regex::escape(search.trim());
@@ -826,7 +828,7 @@ pub async fn get_datasets(
 
     let total = collection.count_documents(filter, None).await.map_err(|e| e.to_string())?;
     let mut cursor = collection.aggregate(pipeline, None).await.map_err(|e| e.to_string())?;
-    
+
     let mut results = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
         if let Ok(dataset) = mongodb::bson::from_document::<Dataset>(doc) {
@@ -1086,29 +1088,225 @@ fn get_alpha_projection() -> mongodb::bson::Document {
     }
 }
 
-#[command]
-pub async fn get_alpha_results(
-    params: AlphaQuery,
-    clients: State<'_, Arc<MongoClients>>,
-    config: State<'_, AppConfig>,
-) -> Result<PagedResult<AlphaResult>, String> {
+// Exclude only FAIL/WARNING checks, matching the regular-alpha Mongo filter.
+fn parse_ra_child(
+    child_doc: Document,
+    embedding_key: Option<&str>,
+    excluded_messages: Option<&[String]>,
+) -> Option<(AlphaResult, Vec<String>)> {
+    let mut fails = Vec::new();
+    if let Ok(is_doc) = child_doc.get_document("is") {
+        if let Ok(checks) = is_doc.get_array("checks") {
+            for check in checks {
+                if let Some(check) = check.as_document() {
+                    let name = check.get_str("name").unwrap_or("");
+                    let result = check.get_str("result").unwrap_or("");
+                    if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
+                        fails.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(excluded) = excluded_messages {
+        if fails.iter().any(|name| excluded.contains(name)) {
+            return None;
+        }
+    }
+    parse_alpha_document(child_doc, embedding_key).map(|child| (child, fails))
+}
 
-    let client = &clients.local;
-    let db = client.database(&config.mongodb.databases.alpha);
+// Test eligibility before pagination so short RA groups neither leave gaps in
+// pages nor inflate the total. Count actual matching documents, not child IDs.
+fn ra_parent_page_pipeline(
+    filter: Document,
+    coll_name: &str,
+    excluded_messages: Option<&[String]>,
+    sort: Document,
+    skip: u64,
+    page_size: u32,
+) -> Vec<Document> {
+    // Use an equality lookup so Mongo can use the child ID index. Exclude
+    // missing IDs, which would otherwise match a missing/empty children field.
+    let mut child_pipeline = vec![doc! { "$match": { "id": { "$type": "string" } } }];
+    if let Some(messages) = excluded_messages.filter(|messages| !messages.is_empty()) {
+        child_pipeline.push(doc! {
+            "$match": {
+                "is.checks": {
+                    "$not": {
+                        "$elemMatch": {
+                            "name": { "$in": messages },
+                            "result": { "$in": ["FAIL", "WARNING"] }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // Only need to know whether at least two children survive.
+    child_pipeline.push(doc! { "$limit": 2 });
+    child_pipeline.push(doc! { "$project": { "_id": 0, "id": 1 } });
+    vec![
+        doc! { "$match": filter },
+        doc! { "$lookup": {
+            "from": coll_name,
+            "localField": "children",
+            "foreignField": "id",
+            "pipeline": child_pipeline,
+            "as": "_matchingRaChildren"
+        } },
+        doc! { "$match": { "_matchingRaChildren.1": { "$exists": true } } },
+        doc! { "$project": { "_matchingRaChildren": 0 } },
+        doc! { "$facet": {
+            "data": [
+                { "$sort": sort },
+                { "$skip": skip as i64 },
+                { "$limit": page_size as i64 },
+                { "$project": get_alpha_projection() }
+            ],
+            "total": [{ "$count": "count" }]
+        } },
+    ]
+}
 
-    let page = params.page.unwrap_or(1);
-    let page_size = params.page_size.unwrap_or(50);
-    let skip = ((page - 1) * page_size) as u64;
+fn attach_ra_children(
+    results: &mut [AlphaResult],
+    child_map: &HashMap<String, AlphaResult>,
+    child_fails_map: &HashMap<String, Vec<String>>,
+) {
+    for parent in results {
+        if let Some(cids) = &parent.children_ids {
+            let mut children = Vec::new();
+            let mut check_fail_counts: HashMap<String, usize> = HashMap::new();
+            for cid in cids {
+                if let Some(child) = child_map.get(cid) {
+                    children.push(child.clone());
+                }
+                if let Some(fails) = child_fails_map.get(cid) {
+                    for f in fails {
+                        *check_fail_counts.entry(f.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            // Never retain values from excluded children or stale parent checks.
+            parent.sharpe = None;
+            parent.fitness = None;
+            parent.returns = None;
+            parent.turnover = None;
+            parent.margin = None;
+            parent.drawdown = None;
+            parent.pnl_score = None;
+            parent.sub_universe_sharpe = None;
+            parent.os_sharpe = None;
+            parent.os_fitness = None;
+            parent.long_count = None;
+            parent.short_count = None;
+            parent.message = None;
+            if !children.is_empty() {
+                // Aggregate statistics into parent
+                let valid_sharpes: Vec<f64> = children.iter().filter_map(|c| c.sharpe).collect();
+                if !valid_sharpes.is_empty() {
+                    parent.sharpe = Some(valid_sharpes.iter().sum::<f64>() / valid_sharpes.len() as f64);
+                }
 
-    let coll_name = params
-        .collection
-        .as_deref()
-        .and_then(|s| sanitize_collection_name(s))
-        .unwrap_or_else(|| "alpha_results".to_string());
-    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
+                let valid_fitness: Vec<f64> = children.iter().filter_map(|c| c.fitness).collect();
+                if !valid_fitness.is_empty() {
+                    parent.fitness = Some(valid_fitness.iter().sum::<f64>() / valid_fitness.len() as f64);
+                }
 
-    let t_filter = std::time::Instant::now();
+                let valid_returns: Vec<f64> = children.iter().filter_map(|c| c.returns).collect();
+                if !valid_returns.is_empty() {
+                    parent.returns = Some(valid_returns.iter().sum::<f64>() / valid_returns.len() as f64);
+                }
+
+                let valid_turnover: Vec<f64> = children.iter().filter_map(|c| c.turnover).collect();
+                if !valid_turnover.is_empty() {
+                    parent.turnover = Some(valid_turnover.iter().sum::<f64>() / valid_turnover.len() as f64);
+                }
+
+                let valid_margin: Vec<f64> = children.iter().filter_map(|c| c.margin).collect();
+                if !valid_margin.is_empty() {
+                    parent.margin = Some(valid_margin.iter().sum::<f64>() / valid_margin.len() as f64);
+                }
+
+                let valid_dd: Vec<f64> = children.iter().filter_map(|c| c.drawdown).collect();
+                if !valid_dd.is_empty() {
+                    parent.drawdown = valid_dd.iter().cloned().reduce(f64::max);
+                }
+
+                let valid_score: Vec<f64> = children.iter().filter_map(|c| c.pnl_score).collect();
+                if !valid_score.is_empty() {
+                    parent.pnl_score = Some(valid_score.iter().sum::<f64>() / valid_score.len() as f64);
+                }
+
+                let valid_sub_u: Vec<f64> = children.iter().filter_map(|c| c.sub_universe_sharpe).collect();
+                if !valid_sub_u.is_empty() {
+                    parent.sub_universe_sharpe = Some(valid_sub_u.iter().sum::<f64>() / valid_sub_u.len() as f64);
+                }
+
+                let valid_os_s: Vec<f64> = children.iter().filter_map(|c| c.os_sharpe).collect();
+                if !valid_os_s.is_empty() {
+                    parent.os_sharpe = Some(valid_os_s.iter().sum::<f64>() / valid_os_s.len() as f64);
+                }
+
+                let valid_os_f: Vec<f64> = children.iter().filter_map(|c| c.os_fitness).collect();
+                if !valid_os_f.is_empty() {
+                    parent.os_fitness = Some(valid_os_f.iter().sum::<f64>() / valid_os_f.len() as f64);
+                }
+
+                let long_cnts: Vec<i32> = children.iter().filter_map(|c| c.long_count).collect();
+                if !long_cnts.is_empty() {
+                    parent.long_count = Some(long_cnts.iter().sum());
+                }
+
+                let short_cnts: Vec<i32> = children.iter().filter_map(|c| c.short_count).collect();
+                if !short_cnts.is_empty() {
+                    parent.short_count = Some(short_cnts.iter().sum());
+                }
+
+                // Aggregate message: count how many retained children failed each check
+                if !check_fail_counts.is_empty() {
+                    let mut sorted_checks: Vec<(String, usize)> = check_fail_counts.into_iter().collect();
+                    sorted_checks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    let msg_items: Vec<String> = sorted_checks
+                        .into_iter()
+                        .map(|(name, count)| format!("{}({})", name, count))
+                        .collect();
+                    parent.message = Some(msg_items.join(", "));
+                }
+            }
+            // Preserve the filtered child list for table expansion and metrics.
+            parent.children = Some(children);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "ra_message_tests.rs"]
+mod ra_message_tests;
+
+#[cfg(test)]
+#[path = "ra_parent_page_tests.rs"]
+mod ra_parent_page_tests;
+
+// RA pagination and totals share child eligibility and must stay atomic.
+fn is_ra_query(params: &AlphaQuery) -> bool {
+    matches!(params.alpha_type.as_deref(), Some("RA" | "RA_PARENT"))
+}
+
+fn should_include_total(params: &AlphaQuery) -> bool {
+    is_ra_query(params) || params.include_total.unwrap_or(true)
+}
+
+fn alpha_collection_name(params: &AlphaQuery) -> String {
+    params.collection.as_deref()
+        .and_then(sanitize_collection_name)
+        .unwrap_or_else(|| "alpha_results".to_string())
+}
+
+fn build_alpha_filter(params: &AlphaQuery) -> Document {
     let mut filters = vec![];
+    let is_ra_query = is_ra_query(params);
 
     if let Some(q) = &params.query {
         if let Some(parsed_doc) = parse_query_to_bson(q) {
@@ -1151,18 +1349,21 @@ pub async fn get_alpha_results(
         }
     }
 
-    if let Some(messages) = &params.messages_nin {
-        if !messages.is_empty() {
-            filters.push(doc! {
-                "is.checks": {
-                    "$not": {
-                        "$elemMatch": {
-                            "name": { "$in": messages },
-                            "result": { "$in": ["FAIL", "WARNING"] }
+    // RA exclusions belong to the children, not the parent document.
+    if !is_ra_query {
+        if let Some(messages) = &params.messages_nin {
+            if !messages.is_empty() {
+                filters.push(doc! {
+                    "is.checks": {
+                        "$not": {
+                            "$elemMatch": {
+                                "name": { "$in": messages },
+                                "result": { "$in": ["FAIL", "WARNING"] }
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -1177,11 +1378,6 @@ pub async fn get_alpha_results(
             });
         }
     }
-
-    let is_ra_query = match &params.alpha_type {
-        Some(t) if t == "RA" || t == "RA_PARENT" => true,
-        _ => false,
-    };
 
     if let Some(id) = &params.id {
         if is_ra_query {
@@ -1264,11 +1460,56 @@ pub async fn get_alpha_results(
         }
     }
 
-    let filter = if filters.is_empty() {
+    if filters.is_empty() {
         doc! {}
     } else {
         doc! { "$and": filters }
-    };
+    }
+}
+
+#[cfg(test)]
+#[path = "alpha_page_tests.rs"]
+mod alpha_page_tests;
+
+/// Exact non-RA count, deliberately independent from page retrieval.
+#[command]
+pub async fn get_alpha_count(
+    params: AlphaQuery,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<u64, String> {
+    if is_ra_query(&params) {
+        return Err("get_alpha_count does not support RA/RA_PARENT; use get_alpha_results for eligibility totals".to_string());
+    }
+    let db = clients.local.database(&config.mongodb.databases.alpha);
+    let collection = db.collection::<Document>(&alpha_collection_name(&params));
+    let options = CountOptions::builder()
+        .max_time(std::time::Duration::from_secs(30))
+        .build();
+    collection.count_documents(build_alpha_filter(&params), options).await
+        .map_err(|e| format!("DB count error: {e}"))
+}
+
+#[command]
+pub async fn get_alpha_results(
+    params: AlphaQuery,
+    clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>,
+) -> Result<PagedResult<AlphaResult>, String> {
+
+    let client = &clients.local;
+    let db = client.database(&config.mongodb.databases.alpha);
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(50);
+    let skip = ((page - 1) * page_size) as u64;
+
+    let coll_name = alpha_collection_name(&params);
+    let collection = db.collection::<mongodb::bson::Document>(&coll_name);
+
+    let t_filter = std::time::Instant::now();
+    let is_ra_query = is_ra_query(&params);
+    let filter = build_alpha_filter(&params);
     println!("Final Mongo filter: {:?}", filter);
     println!("⏱ filter build took {:?}", t_filter.elapsed());
     println!("Mongo filter: {:?}", filter);
@@ -1298,39 +1539,67 @@ pub async fn get_alpha_results(
         doc! { "dateCreated": -1 }
     };
 
-    let find_options = FindOptions::builder()
-        .projection(get_alpha_projection())
-        .sort(sort_doc)
-        .skip(skip)
-        .limit(page_size as i64)
-        .build();
+    let (total, documents) = if is_ra_query {
+        let pipeline = ra_parent_page_pipeline(
+            filter,
+            &coll_name,
+            params.messages_nin.as_deref(),
+            sort_doc,
+            skip,
+            page_size,
+        );
+        let mut cursor = collection.aggregate(pipeline, None).await
+            .map_err(|e| format!("RA query error: {e}"))?;
+        let facet = cursor.try_next().await.map_err(|e| e.to_string())?
+            .ok_or_else(|| "Missing RA page result".to_string())?;
+        let counts = facet.get_array("total").map_err(|e| e.to_string())?;
+        let total = counts.first().and_then(Bson::as_document).map(|count| {
+            count.get_i64("count")
+                .or_else(|_| count.get_i32("count").map(i64::from))
+                .unwrap_or(0) as u64
+        }).unwrap_or(0);
+        let documents = facet.get_array("data").map_err(|e| e.to_string())?
+            .iter().filter_map(Bson::as_document).cloned().collect::<Vec<_>>();
+        (total, documents)
+    } else {
+        let find_options = FindOptions::builder()
+            .projection(get_alpha_projection())
+            .sort(sort_doc)
+            .skip(skip)
+            .limit(page_size as i64)
+            .build();
 
-    let (count_res, cursor_res) = join!(
-        collection.count_documents(filter.clone(), None),
-        collection.find(filter.clone(), find_options)
-    );
+        let (total, cursor_res) = if should_include_total(&params) {
+            let (count_res, cursor_res) = join!(
+                collection.count_documents(filter.clone(), None),
+                collection.find(filter, find_options)
+            );
+            // Keep legacy page behavior for old clients, including count fallback.
+            println!("⏱ count_documents took {:?}", t_count.elapsed());
+            (count_res.unwrap_or(0), cursor_res)
+        } else {
+            // Explicit omitted-total placeholder. Do not schedule any count.
+            (0, collection.find(filter, find_options).await)
+        };
 
-    let total = count_res.unwrap_or(0);
-    println!("⏱ count_documents took {:?}", t_count.elapsed());
+        let mut cursor = match cursor_res {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                println!("❌ collection.find() error: {}", e);
+                return Err(format!("DB query error: {}", e));
+            }
+        };
+        println!("⏱ collection.find() took {:?}", t_find.elapsed());
 
-    let mut cursor = match cursor_res {
-        Ok(cursor) => cursor,
-        Err(e) => {
-            println!("❌ collection.find() error: {}", e);
-            return Err(format!("DB query error: {}", e));
+        let mut documents = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(|e| e.to_string())? {
+            documents.push(document);
         }
+        (total, documents)
     };
-    println!("⏱ collection.find() took {:?}", t_find.elapsed());
-
-    let mut results = Vec::new();
-
-    while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
-        if let Some(result) = parse_alpha_document(doc, params.embedding.as_deref()) {
-            results.push(result);
-        }
-    }
-
-    drop(cursor);
+    let mut results: Vec<AlphaResult> = documents.into_iter()
+        .filter_map(|document| parse_alpha_document(document, params.embedding.as_deref()))
+        .collect();
 
     // If there are any RA_PARENT alphas in results, batch fetch their children and attach them
     let mut all_child_ids: Vec<String> = Vec::new();
@@ -1348,124 +1617,23 @@ pub async fn get_alpha_results(
             .projection(get_alpha_projection())
             .build();
 
-        if let Ok(mut child_cursor) = collection.find(child_filter, child_find_options).await {
-            let mut child_map: HashMap<String, AlphaResult> = HashMap::new();
-            let mut child_fails_map: HashMap<String, Vec<String>> = HashMap::new();
-            while let Ok(Some(child_doc)) = child_cursor.try_next().await {
-                // Extract failed checks for this child
-                let mut fails = Vec::new();
-                if let Ok(is_doc) = child_doc.get_document("is") {
-                    if let Ok(checks_arr) = is_doc.get_array("checks") {
-                        for c in checks_arr {
-                            if let Some(cdoc) = c.as_document() {
-                                let name = cdoc.get_str("name").unwrap_or("");
-                                let result = cdoc.get_str("result").unwrap_or("");
-                                if (result == "FAIL" || result == "WARNING") && !name.is_empty() {
-                                    fails.push(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(child_result) = parse_alpha_document(child_doc, params.embedding.as_deref()) {
-                    let cid = child_result.id.clone();
-                    child_fails_map.insert(cid.clone(), fails);
-                    child_map.insert(cid, child_result);
-                }
-            }
-
-            for parent in &mut results {
-                if let Some(cids) = &parent.children_ids {
-                    let mut children = Vec::new();
-                    let mut check_fail_counts: HashMap<String, usize> = HashMap::new();
-                    for cid in cids {
-                        if let Some(child) = child_map.get(cid) {
-                            children.push(child.clone());
-                        }
-                        if let Some(fails) = child_fails_map.get(cid) {
-                            for f in fails {
-                                *check_fail_counts.entry(f.clone()).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    if !children.is_empty() {
-                        // Aggregate statistics into parent
-                        let valid_sharpes: Vec<f64> = children.iter().filter_map(|c| c.sharpe).collect();
-                        if !valid_sharpes.is_empty() {
-                            parent.sharpe = Some(valid_sharpes.iter().sum::<f64>() / valid_sharpes.len() as f64);
-                        }
-
-                        let valid_fitness: Vec<f64> = children.iter().filter_map(|c| c.fitness).collect();
-                        if !valid_fitness.is_empty() {
-                            parent.fitness = Some(valid_fitness.iter().sum::<f64>() / valid_fitness.len() as f64);
-                        }
-
-                        let valid_returns: Vec<f64> = children.iter().filter_map(|c| c.returns).collect();
-                        if !valid_returns.is_empty() {
-                            parent.returns = Some(valid_returns.iter().sum::<f64>() / valid_returns.len() as f64);
-                        }
-
-                        let valid_turnover: Vec<f64> = children.iter().filter_map(|c| c.turnover).collect();
-                        if !valid_turnover.is_empty() {
-                            parent.turnover = Some(valid_turnover.iter().sum::<f64>() / valid_turnover.len() as f64);
-                        }
-
-                        let valid_margin: Vec<f64> = children.iter().filter_map(|c| c.margin).collect();
-                        if !valid_margin.is_empty() {
-                            parent.margin = Some(valid_margin.iter().sum::<f64>() / valid_margin.len() as f64);
-                        }
-
-                        let valid_dd: Vec<f64> = children.iter().filter_map(|c| c.drawdown).collect();
-                        if !valid_dd.is_empty() {
-                            parent.drawdown = valid_dd.iter().cloned().reduce(f64::max);
-                        }
-
-                        let valid_score: Vec<f64> = children.iter().filter_map(|c| c.pnl_score).collect();
-                        if !valid_score.is_empty() {
-                            parent.pnl_score = Some(valid_score.iter().sum::<f64>() / valid_score.len() as f64);
-                        }
-
-                        let valid_sub_u: Vec<f64> = children.iter().filter_map(|c| c.sub_universe_sharpe).collect();
-                        if !valid_sub_u.is_empty() {
-                            parent.sub_universe_sharpe = Some(valid_sub_u.iter().sum::<f64>() / valid_sub_u.len() as f64);
-                        }
-
-                        let valid_os_s: Vec<f64> = children.iter().filter_map(|c| c.os_sharpe).collect();
-                        if !valid_os_s.is_empty() {
-                            parent.os_sharpe = Some(valid_os_s.iter().sum::<f64>() / valid_os_s.len() as f64);
-                        }
-
-                        let valid_os_f: Vec<f64> = children.iter().filter_map(|c| c.os_fitness).collect();
-                        if !valid_os_f.is_empty() {
-                            parent.os_fitness = Some(valid_os_f.iter().sum::<f64>() / valid_os_f.len() as f64);
-                        }
-
-                        let long_cnts: Vec<i32> = children.iter().filter_map(|c| c.long_count).collect();
-                        if !long_cnts.is_empty() {
-                            parent.long_count = Some(long_cnts.iter().sum());
-                        }
-
-                        let short_cnts: Vec<i32> = children.iter().filter_map(|c| c.short_count).collect();
-                        if !short_cnts.is_empty() {
-                            parent.short_count = Some(short_cnts.iter().sum());
-                        }
-
-                        // Aggregate message: count how many children failed each check
-                        if !check_fail_counts.is_empty() {
-                            let mut sorted_checks: Vec<(String, usize)> = check_fail_counts.into_iter().collect();
-                            sorted_checks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                            let msg_items: Vec<String> = sorted_checks
-                                .into_iter()
-                                .map(|(name, count)| format!("{}({})", name, count))
-                                .collect();
-                            parent.message = Some(msg_items.join(", "));
-                        }
-
-                        parent.children = Some(children);
-                    }
-                }
+        let mut child_cursor = collection.find(child_filter, child_find_options).await
+            .map_err(|e| format!("RA child query error: {e}"))?;
+        let mut child_map: HashMap<String, AlphaResult> = HashMap::new();
+        let mut child_fails_map: HashMap<String, Vec<String>> = HashMap::new();
+        while let Some(child_doc) = child_cursor.try_next().await.map_err(|e| e.to_string())? {
+            if let Some((child_result, fails)) = parse_ra_child(
+                child_doc,
+                params.embedding.as_deref(),
+                params.messages_nin.as_deref(),
+            ) {
+                let cid = child_result.id.clone();
+                child_fails_map.insert(cid.clone(), fails);
+                child_map.insert(cid, child_result);
             }
         }
+
+        attach_ra_children(&mut results, &child_map, &child_fails_map);
     }
 
     // One read for all IDs on this page (including fetched RA children), not
@@ -1795,11 +1963,11 @@ pub async fn search_alpha_in_all_collections(
 ) -> Result<Option<AlphaInCollectionResult>, String> {
     let client = &clients.local;
     let db = client.database(&config.mongodb.databases.alpha);
-    
+
     // 获取所有collection名称
     let collection_names = db.list_collection_names(None).await
         .map_err(|e| format!("Failed to list collections: {}", e))?;
-    
+
     // 在每个collection中搜索指定的alpha ID
     for coll_name in collection_names {
         // 跳过系统collection
@@ -1836,7 +2004,7 @@ pub async fn search_alpha_in_all_collections(
             }
         }
     }
-    
+
     // 在所有collection中都没有找到
     Ok(None)
 }

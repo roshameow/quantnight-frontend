@@ -7,7 +7,9 @@
                       v-model:value="form.config"
                       autosize
                     />
-                  </n-form-item>    </n-form>
+                  </n-form-item>
+      <n-p v-if="isPriority">{{ PRIORITY_CONFIG_HINT }}</n-p>
+    </n-form>
     <template #action>
       <n-button @click="onCancel">取消</n-button>
       <n-button type="primary" @click="onConfirm">更新</n-button>
@@ -18,6 +20,7 @@
 <script setup>
 import { ref, watch } from "vue";
 import { useMessage } from "naive-ui";
+import { priorityDefaultConfig, resolveTaskConfig, parseTaskConfig, validatePriorityConfig, PRIORITY_CONFIG_HINT } from "@/utils/taskConfig";
 
 const props = defineProps({
   show: Boolean,
@@ -88,22 +91,14 @@ const superDefaultJson = {
   },
 };
 
-const priorityDefaultJson = {
-  interval: 600,
-  priority: 1,
-  filter_params: {
-    sharpe_th: 1.2,
-    fitness_th: 0.8,
-    usage: "check",
-  },
-};
+// Priority defaults are shared; saved legacy configurations are never expanded.
 
 // ---------- 生成默认配置 ----------
 function generateDefaultConfig(task, isSuper, isPriority) {
   const template = isSuper
     ? superDefaultJson
     : isPriority
-    ? priorityDefaultJson
+    ? priorityDefaultConfig(task)
     : normalDefaultJson;
   const cloned = JSON.parse(JSON.stringify(template)); // 深拷贝
 
@@ -113,7 +108,7 @@ function generateDefaultConfig(task, isSuper, isPriority) {
     cloned.tag.tags = [taskName];
   }
 
-  return cloned;
+  return resolveTaskConfig(task, cloned);
 }
 
 // ---------- 初始化表单 ----------
@@ -122,8 +117,14 @@ watch(
   (val) => {
     show.value = val;
     if (val && props.task) {
-      const config = generateDefaultConfig(props.task, props.isSuper, props.isPriority);
-      form.value.config = JSON.stringify(config, null, 2);
+      try {
+        const config = generateDefaultConfig(props.task, props.isSuper, props.isPriority);
+        form.value.config = JSON.stringify(config, null, 2);
+      } catch (error) {
+        // Surface invalid saved data instead of silently replacing it with defaults.
+        form.value.config = "";
+        message.error("已保存配置无效: " + error.message);
+      }
     }
   },
   { immediate: true }
@@ -133,7 +134,9 @@ const onCancel = () => (show.value = false);
 
 const onConfirm = () => {
   try {
-    const parsed = JSON.parse(form.value.config);
+    const parsed = props.isPriority
+      ? validatePriorityConfig(form.value.config)
+      : parseTaskConfig(form.value.config);
     if (!props.task || !props.task.name) {
       message.error("任务信息缺失，无法更新");
       return;
@@ -157,7 +160,7 @@ const onConfirm = () => {
 
     show.value = false;
   } catch (e) {
-    message.error("JSON 格式错误，请检查输入");
+    message.error("配置无效: " + e.message);
   }
 };
 </script>
