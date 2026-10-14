@@ -392,6 +392,17 @@ fn root_ledger_selection(rows: &[Document], name: &str, auth: &str, pool: &str) 
     Ok(RootLedgerSelection { by_source, total })
 }
 
+// CP/ledger host and immutable source execution host are separate selections.
+fn select_host<'a, T>(local: &'a T, remote: &'a T, is_remote: bool) -> &'a T {
+    if is_remote { remote } else { local }
+}
+
+fn missing_root_pool(runtime: &mut PriorityRuntime) -> Result<ProgressCounts> {
+    runtime.mode = Some("per_root".into());
+    runtime.reason = Some("root_pool_not_registered".into());
+    Err(anyhow!("所选运行主机的root池尚未登记：不读取或迁移parked旧global campaign"))
+}
+
 async fn query_root_counts(clients: &MongoClients, client: &Client, name: &str, config: &AppConfig,
     runtime: &mut PriorityRuntime) -> Result<ProgressCounts> {
     let rows: Vec<Document> = client.database(&config.mongodb.databases.mission)
@@ -401,7 +412,7 @@ async fn query_root_counts(clients: &MongoClients, client: &Client, name: &str, 
     let selection = root_ledger_selection(&rows, name, &runtime.auth_profile, runtime.pool_id.as_deref().unwrap())?;
     let mut observed = ProgressCounts::default();
     for ((remote, source), ids) in selection.by_source {
-        let execution = if remote { &clients.remote } else { &clients.local };
+        let execution = select_host(&clients.local, &clients.remote, remote);
         let counts = read_counts(execution.database(&config.mongodb.databases.simulation)
             .collection::<Document>(&source).aggregate(priority_stats_pipeline(Some(&ids)), None).await?).await?;
         observed.total += counts.total;
@@ -605,24 +616,22 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
         };
         is_remote = Some(task.is_remote);
         task_id = Some(task.task_id.clone());
-        let client = if task.is_remote { &clients.remote } else { &clients.local };
+        let client = select_host(&clients.local, &clients.remote, task.is_remote);
         let counts = if task.registration.get_str("taskType").ok().or_else(|| task.registration.get_str("task_type").ok()) == Some("priority") {
             let mut runtime = priority_runtime(&task, &request.collection, updated_at);
             let result = with_deadline(PROGRESS_TIMEOUT, async {
-                // Source registrations, CPU controller and root ledger are
-                // always local, even for a stale isRemote=true priority record.
-                let mission = clients.local.database(&config.mongodb.databases.mission);
+                // Root registry/stages live on the selected Priority run host.
+                // Feedback below still follows each root's immutable source_remote.
+                let mission = client.database(&config.mongodb.databases.mission);
                 let filter = priority_summary_filter(&request.collection, &runtime.auth_profile);
                 let root_pool = mission.collection::<Document>("priority_root_pools")
                     .find_one(filter.clone(), None).await?;
                 if let Some(summary) = root_pool.as_ref() {
                     apply_root_summary(&mut runtime, summary)?;
                     let _ = app.emit("task-priority-runtime-update", &runtime);
-                    query_root_counts(clients, &clients.local, &request.collection, config, &mut runtime).await
+                    query_root_counts(clients, client, &request.collection, config, &mut runtime).await
                 } else if round_enabled(&task.registration) {
-                    runtime.mode = Some("per_root".into());
-                    runtime.reason = Some("local_root_pool_not_registered".into());
-                    Err(anyhow!("本地root池尚未登记：不读取或迁移parked旧global campaign"))
+                    missing_root_pool(&mut runtime)
                 } else {
                     // Read-only legacy diagnosis. No migration, requeue, reset,
                     // standalone consumer or RuntimeJob redispatch from watcher.
@@ -952,6 +961,41 @@ mod tests {
         row.insert("source_task", source);
         row.insert("source_remote", remote);
         row
+    }
+
+    #[test]
+    fn priority_cp_host_selection_does_not_rebind_mixed_source_feedback() {
+        let local = "local";
+        let remote = "remote";
+        for cp_remote in [false, true] {
+            let mut registration = priority_task();
+            registration.insert("isRemote", cp_remote);
+            let route = resolved_task(&registration, cp_remote).unwrap();
+            assert!(std::ptr::eq(select_host(&local, &remote, route.is_remote),
+                if cp_remote { &remote } else { &local }));
+            let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+            let ids = [bson::oid::ObjectId::new(), bson::oid::ObjectId::new()];
+            let rows = vec![
+                root_row("root-local", "source-local", false, 1, &ids[..1]),
+                root_row("root-remote", "source-remote", true, 1, &ids[1..]),
+            ];
+            let selection = root_ledger_selection(&rows, "pipeline__priority", "user1", "pool-a").unwrap();
+            assert_eq!(selection.total, 2);
+            for ((source_remote, source), source_ids) in selection.by_source {
+                assert_eq!(*select_host(&local, &remote, source_remote),
+                    if source == "source-remote" { "remote" } else { "local" });
+                assert_eq!(source_ids.len(), 1);
+            }
+            // Missing selected-host root registry is authoritative absence, not
+            // permission to consult an old local/remote global campaign.
+            assert!(missing_root_pool(&mut runtime).is_err());
+            assert_eq!(runtime.is_remote, cp_remote);
+            assert_eq!(runtime.reason.as_deref(), Some("root_pool_not_registered"));
+            assert_eq!(runtime.mode.as_deref(), Some("per_root"));
+            assert!(runtime.campaign_id.is_none());
+            assert!(runtime.counts.is_none());
+            assert!(!runtime.stats_confirmed);
+        }
     }
 
     #[test]

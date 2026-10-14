@@ -786,3 +786,21 @@ test('root pool counts over 180 remain cached only within the same pool identity
   assert.equal(cached.pool_id, 'pool-b');
   assert.equal(cached.counts, null);
 });
+
+test('selected-host missing registry is not a transport error that can revive legacy global CP', () => {
+  for (const is_remote of [false, true]) {
+    const store = freshStore([task({ isRemote: is_remote })]);
+    store.updateProgress(campaignProgress({ is_remote, priority_campaign: campaign({ is_remote, mode: 'legacy' }) }));
+    const missing = campaign({ is_remote, updated_at: 101, campaign_id: null, pool_id: null, mode: 'per_root',
+      reason: 'root_pool_not_registered', status: null, current_round: null, stats_confirmed: false,
+      counts: null, stale: true, last_error: 'selected host registry missing' });
+    assert.equal(store.updateProgressError(failure({ is_remote, updated_at: 101, priority_campaign: missing })), true);
+    const runtime = store.taskProgressMap.alpha.priority_campaign;
+    assert.equal(runtime.campaign_id, null);
+    assert.equal(runtime.pool_id, null);
+    assert.equal(runtime.mode, 'per_root');
+    assert.equal(runtime.counts, null);
+    assert.equal(runtime.reason, 'root_pool_not_registered');
+    assert.equal(store.taskProgressMap.alpha.stale, true);
+  }
+});

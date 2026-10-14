@@ -72,7 +72,8 @@ export const useTaskStore = defineStore('task', () => {
         payload.is_remote !== (accepted.task.isRemote === true) ||
         payload.updated_at !== accepted.timestamp) throw new Error('invalid campaign metadata')
     const sameIdentity = previous?.task_id === payload.task_id && previous?.is_remote === payload.is_remote
-    const incoming = sameIdentity && payload.last_error && !payload.campaign_id && !payload.pool_id
+    const incoming = sameIdentity && payload.reason !== 'root_pool_not_registered' &&
+      payload.last_error && !payload.campaign_id && !payload.pool_id
       ? { ...payload, campaign_id: previous.campaign_id, pool_id: previous.pool_id,
           mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
           waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,

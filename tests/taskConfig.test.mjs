@@ -412,9 +412,44 @@ test('dynamic sources remain omitted; optional list validates even before templa
 });
 
 
-test('local control discovery is independent from local/remote source execution', () => {
-  assert.match(PRIORITY_CONFIG_HINT, /本地 control 注册表中同 auth/);
-  assert.match(PRIORITY_CONFIG_HINT, /controller\/CPU生成始终本地/);
-  assert.match(PRIORITY_CONFIG_HINT, /按root.source_remote路由/);
-  assert.doesNotMatch(PRIORITY_CONFIG_HINT, /同 auth\/执行目标下/);
+test('selected Priority CP host is independent from immutable source execution', () => {
+  assert.match(PRIORITY_CONFIG_HINT, /所选 Priority 主机 control 注册表中同 auth/);
+  assert.match(PRIORITY_CONFIG_HINT, /前端仅启动和监控/);
+  assert.match(PRIORITY_CONFIG_HINT, /CP目标独立于来源执行/);
+  assert.match(PRIORITY_CONFIG_HINT, /来源按root.source_remote路由/);
+  assert.doesNotMatch(PRIORITY_CONFIG_HINT, /始终本地|固定本地/);
 });
+
+test('create host defaults remote and round-trips both hosts without rewriting root origin', async () => {
+  assert.equal(priorityTaskPayload('remote-default', '', '{}').is_remote, true);
+  for (const isRemote of [true, false]) {
+    const { state, events, template } = await modal('AddPriorityTaskModal');
+    assert.equal(state.form.value.isRemote, true);
+    assert.match(template, /v-model:value="form.isRemote"/);
+    assert.doesNotMatch(template, /固定本地/);
+    state.form.value.isRemote = isRemote;
+    state.form.value.configText = JSON.stringify({ rounds: { enabled: true }, source_remote: !isRemote });
+    state.handleSubmit();
+    const created = events.find(([name]) => name === 'add-priority-task')[1];
+    assert.equal(created.is_remote, isRemote);
+    assert.equal(created.mission_config.source_remote, !isRemote);
+    assert.equal(created.mission_config.rounds.enabled, true);
+  }
+  assert.throws(() => priorityTaskPayload('bad-host', '', '{}', 'true'), /运行主机/);
+});
+
+for (const [name, handler, eventName] of [
+  ['StartTaskModal', 'onConfirm', 'start-priority-task'],
+  ['UpdateTaskModal', 'onConfirm', 'update-priority-task'],
+]) {
+  test(`${name} forwards the requested per-root host independently of source_remote`, async () => {
+    for (const isRemote of [true, false]) {
+      const saved = { rounds: { enabled: true }, source_remote: !isRemote };
+      const { state, events } = await modal(name, { task: { name: 'remote__priority', isRemote, mission_config: saved } });
+      state[handler]();
+      const sent = events.find(([key]) => key === eventName)[1];
+      assert.equal(sent.isRemote, isRemote);
+      assert.deepEqual(sent.config, saved);
+    }
+  });
+}

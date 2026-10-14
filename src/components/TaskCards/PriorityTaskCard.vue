@@ -48,7 +48,7 @@
           R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
           R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
         <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
-        <div><n-text depth="3">具体cap按各root冻结配置，不随活跃来源切换重置；来源执行按source_remote，可local/remote</n-text></div>
+        <div><n-text depth="3">具体cap按各root冻结配置，不随活跃来源切换重置；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</n-text></div>
         <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
           完成roots {{ runtime?.completed ?? '—' }} · 阻塞roots {{ runtime?.blocked ?? '—' }}</div>
       </template>
@@ -71,14 +71,13 @@
 
     <n-space align="center" style="margin-top: 2px">
       <n-switch
-        :value="roundEnabled || runtime?.mode === 'per_root' ? false : task.isRemote"
-        :disabled="roundEnabled || runtime?.mode === 'per_root'"
+        :value="task.isRemote"
         @update:value="(val) => $emit('update:isRemote', val)"
         :checked-value="true"
         :unchecked-value="false"
       >
         <template #checked>远程</template>
-        <template #unchecked>{{ roundEnabled || runtime?.mode === 'per_root' ? '本地controller' : '本地' }}</template>
+        <template #unchecked>本地</template>
       </n-switch>
       <n-tag v-if="task.auth_profile" size="small" :bordered="false" type="info" style="background-color: #e3f2fd; color: #1976d2;">
         {{ task.auth_profile }}
@@ -118,7 +117,8 @@ export function mergePriorityRuntime(event, previous) {
   const sameIdentity = previous?.task_id === event.task_id && previous?.is_remote === event.is_remote;
   // A metadata transport failure doesn't establish a new campaign. Keep the
   // last confirmed campaign/stage/counts visibly stale until a successful read.
-  const incoming = sameIdentity && event.last_error && !event.campaign_id && !event.pool_id
+  const incoming = sameIdentity && event.reason !== 'root_pool_not_registered' &&
+    event.last_error && !event.campaign_id && !event.pool_id
     ? { ...previous, ...event, campaign_id: previous.campaign_id, pool_id: previous.pool_id,
         mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
         waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,
@@ -181,7 +181,7 @@ watch(() => props.progress?.priority_campaign, (payload) => {
 const legacyRuntime = computed(() => runtime.value?.mode === 'legacy' || (!runtime.value?.pool_id && !!runtime.value?.campaign_id));
 const sourceNames = computed(() => {
   const names = runtime.value?.source_tasks?.length ? runtime.value.source_tasks : priorityConfig.value?.source_tasks;
-  return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular（本地control同 auth，来源可远程）';
+  return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular（所选Priority主机control同 auth，来源可local/remote）';
 });
 const roundEnabled = computed(() => priorityConfig.value?.rounds?.enabled === true);
 const displayProgress = computed(() => {

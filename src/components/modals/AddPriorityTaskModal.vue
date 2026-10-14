@@ -12,10 +12,16 @@
       <n-form-item label="Auth Profile">
         <n-input v-model:value="form.authProfile" placeholder="user1" />
       </n-form-item>
+      <n-form-item label="Priority 运行主机（独立于 root 来源执行主机）">
+        <n-switch v-model:value="form.isRemote">
+          <template #checked>远程</template>
+          <template #unchecked>本地</template>
+        </n-switch>
+      </n-form-item>
       <n-p>
         使用内置 pipeline 模板，无需上传 .py 文件，任务名称无需对应模板文件名。
-        创建只保存配置；启动需另行确认。默认持续接收本地control注册表中同账号的活跃 regular 任务真实成功结果（来源可远程执行），
-        controller/CPU生成固定本地，每个 root 独立3阶段（每阶段≤60、累计≤180），不是整个任务 Round 1/3。
+        创建只保存配置；启动需另行确认。默认持续接收所选Priority主机control注册表中同账号的活跃 regular 任务真实成功结果（来源按immutable source_remote独立执行），
+        前端仅启动和监控，生成在所选运行主机执行，每个 root 独立3阶段（每阶段≤60、累计≤180），不是整个任务 Round 1/3。
         可在 JSON 中设置 source_tasks 过滤来源；省略则动态选择，不绑定当前任务名。
       </n-p>
       <n-form-item label="配置 JSON（高级：模板开关、参数与预算）">
@@ -41,6 +47,7 @@ const showModal = ref(props.show);
 const form = ref({
   taskName: "pipeline__priority",
   authProfile: "user1",
+  isRemote: true,
   configText: JSON.stringify(priorityDefaultConfig(), null, 2),
 });
 const message = useMessage();
@@ -49,7 +56,7 @@ watch(showModal, (value) => emit("update:show", value));
 
 const handleSubmit = () => {
   try {
-    const task = priorityTaskPayload(form.value.taskName, form.value.authProfile, form.value.configText);
+    const task = priorityTaskPayload(form.value.taskName, form.value.authProfile, form.value.configText, form.value.isRemote);
     emit("add-priority-task", task);
     // Parent reports persistence success/failure after awaiting the command.
     showModal.value = false;

@@ -243,10 +243,32 @@ test('legacy campaign has read-only warning and no whole-task round UI', async (
 });
 
 
-test('per-root switch describes local controller, never remote source execution', async () => {
-  const saved = poolEvent();
-  const html = await render({ task, progress: { stale: false, updated_at: saved.updated_at, priority_campaign: saved } });
-  assert.match(html, /value="false" disabled/);
-  assert.match(html, /来源执行按source_remote，可local\/remote/);
-  assert.match(html, /regular-a, regular-b/);
+test('per-root switch remains selectable and reflects Priority host, not source execution', async () => {
+  for (const isRemote of [true, false]) {
+    const saved = poolEvent({ is_remote: isRemote });
+    const html = await render({ task: { ...task, isRemote },
+      progress: { stale: false, updated_at: saved.updated_at, priority_campaign: saved } });
+    assert.match(html, new RegExp(`value="${isRemote}"`));
+    assert.doesNotMatch(html, /disabled|本地controller/);
+    assert.match(html, /来源执行独立按source_remote，可local\/remote/);
+    assert.match(html, /regular-a, regular-b/);
+  }
+});
+
+test('selected-host missing root registry cannot revive an old global campaign or counts', () => {
+  for (const is_remote of [true, false]) {
+    const previous = event({ is_remote, mode: 'legacy', status: 'completed', unresolved: 0 });
+    const missing = event({ is_remote, campaign_id: null, pool_id: null, mode: 'per_root',
+      reason: 'root_pool_not_registered', status: null, current_round: null,
+      stats_confirmed: false, counts: null, stale: true, last_error: 'selected host registry missing' });
+    const merged = mergePriorityRuntime(missing, previous);
+    assert.equal(merged.campaign_id, null);
+    assert.equal(merged.mode, 'per_root');
+    assert.equal(merged.reason, 'root_pool_not_registered');
+    assert.equal(merged.counts, null);
+    assert.equal(card.priorityDisplayStatus(merged, true, 'error'), 'waiting');
+    const oldPool = poolEvent({ is_remote });
+    assert.equal(mergePriorityRuntime(missing, oldPool).pool_id, null);
+    assert.equal(mergePriorityRuntime(missing, oldPool).counts, null);
+  }
 });

@@ -54,23 +54,14 @@ fn mission_config_document(value: &JsonValue) -> Result<Document, String> {
     bson::to_document(value).map_err(|e| format!("config 转 BSON 失败: {}", e))
 }
 
-fn priority_controller_remote(config: &Document, requested: bool) -> bool {
-    // Per-root control/CPU discovery is local; immutable source_remote selects
-    // simulation DBs. Legacy continuous mode retains its requested location.
-    requested && config.get_document("rounds").ok()
-        .and_then(|cfg| cfg.get_bool("enabled").ok()) != Some(true)
-}
-
-fn priority_config_update(config: &str) -> Result<Document, String> {
+fn priority_config_update(config: &str, is_remote: bool) -> Result<Document, String> {
     let value: JsonValue = serde_json::from_str(config)
         .map_err(|e| format!("config 解析成 JSON 失败: {}", e))?;
     let document = mission_config_document(&value)?;
-    let mut update = doc! { "status": "running", "mission_config": document.clone() };
-    if !priority_controller_remote(&document, true) {
-        update.insert("isRemote", false);
-        update.insert("targetRemote", false);
-    }
-    Ok(update)
+    // Prepared before launch, persisted only after the requested host's script succeeds.
+    // CP/run host is independent of each root's immutable source_remote.
+    Ok(doc! { "status": "running", "mission_config": document,
+        "isRemote": is_remote, "targetRemote": is_remote })
 }
 
 #[command]
@@ -643,9 +634,7 @@ pub async fn start_priority_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let set_doc = priority_config_update(&config)?;
-    let is_remote = priority_controller_remote(set_doc.get_document("mission_config")
-        .map_err(|e| e.to_string())?, is_remote);
+    let set_doc = priority_config_update(&config, is_remote)?;
     let client = &clients.local;
     let db = client.database("simulation_mission");
     let tasks = db.collection::<Document>("tasks");
@@ -719,9 +708,7 @@ pub async fn update_priority_task(
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let set_doc = priority_config_update(&config)?;
-    let is_remote = priority_controller_remote(set_doc.get_document("mission_config")
-        .map_err(|e| e.to_string())?, is_remote);
+    let set_doc = priority_config_update(&config, is_remote)?;
 
     let client = &clients.local;
     let db = client.database("simulation_mission");
@@ -1052,37 +1039,35 @@ mod priority_config_tests {
     fn update_persists_exact_nested_object_and_explicit_empty_steps() {
         let value = json!({"refine_templates":[], "max_variants_per_alpha":40,
             "extension":{"preserve":true}});
-        let update = priority_config_update(&value.to_string()).unwrap();
+        let update = priority_config_update(&value.to_string(), false).unwrap();
         assert_eq!(update.get_str("status").unwrap(), "running");
         let saved = update.get_document("mission_config").unwrap();
         assert!(saved.get_array("refine_templates").unwrap().is_empty());
         assert_eq!(serde_json::to_value(saved).unwrap(), value);
-        let legacy = priority_config_update("{\"interval\":600}").unwrap();
+        let legacy = priority_config_update("{\"interval\":600}", false).unwrap();
         assert!(!legacy.get_document("mission_config").unwrap().contains_key("refine_templates"));
     }
 
     #[test]
     fn invalid_top_level_config_is_rejected_before_script_execution() {
         for value in ["[]", "null", "false", "3", "broken"] {
-            assert!(priority_config_update(value).is_err());
+            assert!(priority_config_update(value, true).is_err());
         }
         assert!(mission_config_document(&json!([])).is_err());
     }
 
     #[test]
-    fn per_root_controller_is_local_but_preserves_remote_origin_filters() {
-        let value = json!({"rounds":{"enabled":true}, "source_tasks":["remote-source"],
-            "extra":{"source_remote":true}});
-        let update = priority_config_update(&value.to_string()).unwrap();
-        let cfg = update.get_document("mission_config").unwrap();
-        assert!(!priority_controller_remote(cfg, true));
-        assert!(!priority_controller_remote(cfg, false));
-        assert!(!update.get_bool("isRemote").unwrap());
-        assert!(!update.get_bool("targetRemote").unwrap());
-        assert_eq!(serde_json::to_value(cfg).unwrap(), value);
-        let legacy = priority_config_update("{\"rounds\":{\"enabled\":false}}").unwrap();
-        assert!(priority_controller_remote(legacy.get_document("mission_config").unwrap(), true));
-        assert!(!legacy.contains_key("isRemote"));
+    fn requested_cp_host_is_preserved_independently_of_root_origin_and_round_mode() {
+        for enabled in [true, false] {
+            for remote in [true, false] {
+                let value = json!({"rounds":{"enabled":enabled}, "source_tasks":["remote-source"],
+                    "extra":{"source_remote":!remote}});
+                let update = priority_config_update(&value.to_string(), remote).unwrap();
+                assert_eq!(update.get_bool("isRemote").unwrap(), remote);
+                assert_eq!(update.get_bool("targetRemote").unwrap(), remote);
+                assert_eq!(serde_json::to_value(update.get_document("mission_config").unwrap()).unwrap(), value);
+            }
+        }
     }
 
     #[test]
