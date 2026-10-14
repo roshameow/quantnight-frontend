@@ -214,6 +214,14 @@ async fn resolve_source(clients: &MongoClients, name: &str, config: &AppConfig, 
 
 // Priority metadata is streamed independently and cached as priority_campaign
 // alongside numeric events. Never substitute summary.reserved for actual states.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PrioritySourceSummary {
+    source_task: String,
+    source_remote: bool,
+    root_count: usize,
+    stage_distribution: std::collections::BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PriorityRuntime {
     collection: String,
@@ -233,6 +241,7 @@ struct PriorityRuntime {
     completed: Option<usize>,
     blocked: Option<usize>,
     source_tasks: Vec<String>,
+    source_summaries: Option<Vec<PrioritySourceSummary>>,
     stage: Option<String>,
     status: Option<String>,
     reason: Option<String>,
@@ -264,7 +273,7 @@ fn priority_runtime(task: &ResolvedTask, name: &str, updated_at: u64) -> Priorit
         auth_profile: task.registration.get_str("auth_profile").ok().filter(|s| !s.is_empty()).unwrap_or("user1").into(),
         pool_id: None, mode: None, stage_distribution: None, root_count: None,
         waiting_feedback: None, waiting_slots: None, completed: None, blocked: None,
-        source_tasks: Vec::new(),
+        source_tasks: Vec::new(), source_summaries: None,
         campaign_id: None, stage: None, status: None, reason: None, current_round: None,
         max_rounds: priority_config(&task.registration).and_then(|cfg| cfg.get_document("rounds").ok())
             .and_then(|rounds| count_field(rounds, "max_rounds").ok()),
@@ -301,21 +310,72 @@ fn root_stage_filter(name: &str, auth: &str, pool: &str) -> Document {
     doc! { "priority_task": name, "auth_profile": auth, "pool_id": pool }
 }
 
+// All roots, including R0, belong to the logical source target, not the
+// selected Priority host. These groups never define the exact-item denominator.
+fn root_source_summaries(summary: &Document, name: &str, root_count: usize,
+    distribution: &std::collections::BTreeMap<String, usize>) -> Result<Option<Vec<PrioritySourceSummary>>> {
+    let rows = match summary.get("source_summaries") {
+        None | Some(Bson::Null) => return Ok(None),
+        Some(Bson::Array(rows)) => rows,
+        _ => return Err(anyhow!("Root source_summaries must be an array")),
+    };
+    let mut groups = Vec::new();
+    let mut bindings = std::collections::HashSet::new();
+    let mut total = 0_usize;
+    let mut stages = [0_usize; 4];
+    for row in rows {
+        let row = row.as_document().context("Root source summary must be an object")?;
+        let source = row.get_str("source_task").context("Root source summary 缺少 source_task")?;
+        if source.is_empty() || source == name || source.starts_with("system.") || source.contains(['$', '\0']) {
+            return Err(anyhow!("Root source_task invalid"));
+        }
+        let remote = row.get_bool("source_remote").context("Root source summary 缺少 source_remote")?;
+        if !bindings.insert((source.to_owned(), remote)) { return Err(anyhow!("Root source summary duplicate")); }
+        let count = count_field(row, "root_count")?;
+        let stage_counts = row.get_document("stage_distribution")?;
+        if stage_counts.len() != 4 { return Err(anyhow!("Root source stages must be exactly 0..3")); }
+        let mut stage_distribution = std::collections::BTreeMap::new();
+        let mut sum = 0_usize;
+        for (index, stage) in ["0", "1", "2", "3"].iter().enumerate() {
+            let value = count_field(stage_counts, stage)?;
+            sum = sum.checked_add(value).context("Root source stage sum overflow")?;
+            stages[index] = stages[index].checked_add(value).context("Root source stage total overflow")?;
+            stage_distribution.insert((*stage).to_owned(), value);
+        }
+        if sum != count { return Err(anyhow!("Root source stage sum/root_count mismatch")); }
+        total = total.checked_add(count).context("Root source root_count total overflow")?;
+        groups.push(PrioritySourceSummary { source_task: source.into(), source_remote: remote,
+            root_count: count, stage_distribution });
+    }
+    if total != root_count { return Err(anyhow!("Root source/global root_count mismatch")); }
+    for (index, stage) in ["0", "1", "2", "3"].iter().enumerate() {
+        if stages[index] != distribution.get(*stage).copied().unwrap_or(0) {
+            return Err(anyhow!("Root source/global stage distribution mismatch"));
+        }
+    }
+    Ok(Some(groups))
+}
+
 fn apply_root_summary(runtime: &mut PriorityRuntime, summary: &Document) -> Result<()> {
+    // A failed refresh must not expose old or partially validated source groups.
+    runtime.source_summaries = None;
     if summary.get_str("_id").ok() != Some(&format!("{}:{}", runtime.auth_profile, runtime.collection))
         || summary.get_str("mode").ok() != Some("per_root") {
         return Err(anyhow!("Priority root pool identity/mode mismatch"));
     }
     let pool = summary.get_str("pool_id").context("Root registry 缺少 pool_id")?;
     if pool.is_empty() { return Err(anyhow!("Root registry pool_id 为空")); }
-    runtime.pool_id = Some(pool.into());
-    runtime.mode = Some("per_root".into());
-    runtime.stage_distribution = Some(summary.get_document("stage_distribution")?
+    let distribution = summary.get_document("stage_distribution")?
         .iter().map(|(key, _)| {
             if !["0", "1", "2", "3"].contains(&key.as_str()) { return Err(anyhow!("Root stage distribution key invalid")); }
             Ok((key.clone(), count_field(summary.get_document("stage_distribution")?, key)?))
-        }).collect::<Result<_>>()?);
-    runtime.root_count = Some(count_field(summary, "root_count")?);
+        }).collect::<Result<_>>()?;
+    let root_count = count_field(summary, "root_count")?;
+    let source_summaries = root_source_summaries(summary, &runtime.collection, root_count, &distribution)?;
+    runtime.pool_id = Some(pool.into());
+    runtime.mode = Some("per_root".into());
+    runtime.stage_distribution = Some(distribution);
+    runtime.root_count = Some(root_count);
     for (key, target) in [("waiting_feedback", &mut runtime.waiting_feedback),
         ("waiting_slots", &mut runtime.waiting_slots), ("completed", &mut runtime.completed),
         ("blocked", &mut runtime.blocked)] {
@@ -330,6 +390,7 @@ fn apply_root_summary(runtime: &mut PriorityRuntime, summary: &Document) -> Resu
     // No task-level round or denominator maximum; registry counts are metadata.
     runtime.current_round = None;
     runtime.reserved = None;
+    runtime.source_summaries = source_summaries;
     Ok(())
 }
 
@@ -1019,6 +1080,221 @@ mod tests {
         for (key, value) in [("_id", "other:task"), ("mode", "legacy"), ("pool_id", "")] {
             let mut bad = summary.clone(); bad.insert(key, value);
             assert!(apply_root_summary(&mut runtime, &bad).is_err());
+        }
+    }
+
+    fn source_summary(source: &str, remote: bool, stages: [i64; 4]) -> Document {
+        doc! { "source_task": source, "source_remote": remote, "root_count": stages.iter().sum::<i64>(),
+            "stage_distribution": { "0": stages[0], "1": stages[1], "2": stages[2], "3": stages[3] } }
+    }
+
+    fn grouped_root_summary() -> Document {
+        doc! { "_id": "user1:pipeline__priority", "mode": "per_root", "pool_id": "pool-a",
+            "root_count": 7, "stage_distribution": { "0": 3, "1": 2, "2": 1, "3": 1 },
+            "source_tasks": ["source-a", "source-b"], "source_summaries": [
+                source_summary("source-a", false, [1, 2, 0, 1]),
+                source_summary("source-b", true, [2, 0, 1, 0]) ] }
+    }
+
+    #[test]
+    fn source_summaries_include_r0_without_changing_exact_item_counts_and_serialize() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        assert!(runtime.source_summaries.is_none());
+        let counts = ProgressCounts { total: 3, success: 1, error: 1, ..Default::default() };
+        runtime.counts = Some(counts.clone());
+        runtime.stats_confirmed = true;
+        apply_root_summary(&mut runtime, &grouped_root_summary()).unwrap();
+        let groups = runtime.source_summaries.as_ref().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].source_task, "source-a");
+        assert!(!groups[0].source_remote);
+        assert_eq!(groups[0].root_count, 4);
+        assert_eq!(groups[0].stage_distribution["0"], 1);
+        assert_eq!(groups[1].source_task, "source-b");
+        assert!(groups[1].source_remote);
+        assert_eq!(groups[1].root_count, 3);
+        assert_eq!(groups[1].stage_distribution["0"], 2);
+        assert_eq!(runtime.counts.as_ref(), Some(&counts));
+        assert!(runtime.stats_confirmed);
+        assert_eq!(runtime.current_round, None);
+        assert_eq!(runtime.reserved, None);
+        let payload = TaskProgress { collection: runtime.collection.clone(), task_id: runtime.task_id.clone(),
+            counts, is_remote: false, updated_at: 100, priority_campaign: Some(runtime) };
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["priority_campaign"]["root_count"], 7);
+        assert_eq!(json["priority_campaign"]["counts"]["total"], 3);
+        assert_eq!(json["priority_campaign"]["source_summaries"], serde_json::json!([
+            { "source_task": "source-a", "source_remote": false, "root_count": 4,
+                "stage_distribution": { "0": 1, "1": 2, "2": 0, "3": 1 } },
+            { "source_task": "source-b", "source_remote": true, "root_count": 3,
+                "stage_distribution": { "0": 2, "1": 0, "2": 1, "3": 0 } }
+        ]));
+    }
+
+    #[test]
+    fn same_source_name_logical_targets_stay_separate_when_priority_host_switches() {
+        let mut summary = grouped_root_summary();
+        summary.get_array_mut("source_summaries").unwrap()[1].as_document_mut().unwrap()
+            .insert("source_task", "source-a");
+        let mut previous = None;
+        for cp_remote in [false, true] {
+            let route = resolved_task(&priority_task(), cp_remote).unwrap();
+            let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+            apply_root_summary(&mut runtime, &summary).unwrap();
+            let groups = runtime.source_summaries.as_ref().unwrap();
+            assert_eq!(runtime.is_remote, cp_remote);
+            assert_eq!(groups[0].source_task, groups[1].source_task);
+            assert!(!groups[0].source_remote);
+            assert!(groups[1].source_remote);
+            assert_eq!(groups[0].root_count, 4);
+            assert_eq!(groups[1].root_count, 3);
+            if let Some(previous) = previous { assert_eq!(runtime.source_summaries, previous); }
+            previous = Some(runtime.source_summaries);
+        }
+    }
+
+    #[test]
+    fn old_missing_or_null_source_summaries_remain_optional() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        for value in [None, Some(Bson::Null)] {
+            apply_root_summary(&mut runtime, &grouped_root_summary()).unwrap();
+            let mut old = grouped_root_summary();
+            old.remove("source_summaries");
+            if let Some(value) = value { old.insert("source_summaries", value); }
+            apply_root_summary(&mut runtime, &old).unwrap();
+            assert!(runtime.source_summaries.is_none());
+            assert!(serde_json::to_value(&runtime).unwrap()["source_summaries"].is_null());
+            assert!(runtime.counts.is_none());
+        }
+        let mut summary = grouped_root_summary();
+        summary.insert("root_count", 0);
+        summary.insert("stage_distribution", doc! {});
+        summary.insert("source_summaries", Vec::<Bson>::new());
+        apply_root_summary(&mut runtime, &summary).unwrap();
+        assert_eq!(runtime.source_summaries, Some(Vec::new()));
+        // Global zero stages may be omitted by older producers; group stages may not.
+        summary.insert("root_count", 1);
+        summary.insert("stage_distribution", doc! { "0": 1 });
+        summary.insert("source_summaries", vec![source_summary("source-a", false, [1, 0, 0, 0])]);
+        apply_root_summary(&mut runtime, &summary).unwrap();
+        assert_eq!(runtime.source_summaries.as_ref().unwrap()[0].stage_distribution["3"], 0);
+    }
+
+    #[test]
+    fn malformed_source_summaries_are_rejected_before_publishing_any_groups() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        let good = grouped_root_summary();
+        let group = source_summary("source-a", false, [1, 2, 0, 1]);
+        let mut invalid = Vec::new();
+        for value in [Bson::String("bad".into()), Bson::Document(doc! {}), Bson::Boolean(false)] {
+            let mut bad = good.clone(); bad.insert("source_summaries", value); invalid.push(bad);
+        }
+        let mut bad = good.clone(); bad.insert("source_summaries", vec![Bson::Null]); invalid.push(bad);
+        let mut bad = good.clone(); bad.get_array_mut("source_summaries").unwrap().push(Bson::Document(group.clone())); invalid.push(bad);
+        for key in ["source_task", "source_remote", "root_count", "stage_distribution"] {
+            let mut bad_group = group.clone(); bad_group.remove(key);
+            let mut bad = good.clone(); bad.get_array_mut("source_summaries").unwrap()[0] = Bson::Document(bad_group); invalid.push(bad);
+        }
+        for source in ["", "pipeline__priority", "system.roots", "bad$name", "bad\0name"] {
+            let mut bad = good.clone();
+            bad.get_array_mut("source_summaries").unwrap()[0].as_document_mut().unwrap().insert("source_task", source);
+            invalid.push(bad);
+        }
+        for (key, values) in [
+            ("source_task", vec![Bson::Null, Bson::Int32(1)]),
+            ("source_remote", vec![Bson::Null, Bson::Int32(0), Bson::String("false".into())]),
+            ("root_count", vec![Bson::Null, Bson::Int32(-1), Bson::Int64(-1), Bson::Double(4.0), Bson::Boolean(true), Bson::String("4".into())]),
+            ("stage_distribution", vec![Bson::Null, Bson::Array(vec![])])
+        ] {
+            for value in values {
+                let mut bad = good.clone();
+                bad.get_array_mut("source_summaries").unwrap()[0].as_document_mut().unwrap().insert(key, value);
+                invalid.push(bad);
+            }
+        }
+        for key in ["0", "1", "2", "3"] {
+            let mut bad_group = group.clone(); bad_group.get_document_mut("stage_distribution").unwrap().remove(key);
+            let mut bad = good.clone(); bad.get_array_mut("source_summaries").unwrap()[0] = Bson::Document(bad_group); invalid.push(bad);
+            for value in [Bson::Null, Bson::Int32(-1), Bson::Int64(-1), Bson::Double(1.0), Bson::Boolean(true), Bson::String("1".into())] {
+                let mut bad = good.clone();
+                bad.get_array_mut("source_summaries").unwrap()[0].as_document_mut().unwrap()
+                    .get_document_mut("stage_distribution").unwrap().insert(key, value);
+                invalid.push(bad);
+            }
+        }
+        for replace in [false, true] {
+            let mut bad = good.clone();
+            let stages = bad.get_array_mut("source_summaries").unwrap()[0].as_document_mut().unwrap()
+                .get_document_mut("stage_distribution").unwrap();
+            if replace { stages.remove("3"); }
+            stages.insert("4", 1);
+            invalid.push(bad);
+        }
+        // A later metadata failure must also prevent validated groups from leaking.
+        let mut bad = good.clone(); bad.insert("waiting_slots", -1); invalid.push(bad);
+        let mut bad = good.clone(); bad.insert("source_tasks", vec![Bson::Null]); invalid.push(bad);
+        for (index, bad) in invalid.iter().enumerate() {
+            apply_root_summary(&mut runtime, &good).unwrap();
+            assert!(apply_root_summary(&mut runtime, bad).is_err(), "case {index}: {bad:?}");
+            assert!(runtime.source_summaries.is_none(), "case {index}");
+            assert!(runtime.counts.is_none());
+            assert!(!runtime.stats_confirmed);
+        }
+    }
+
+    #[test]
+    fn inconsistent_source_summary_totals_never_survive_a_stale_refresh() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        let good = grouped_root_summary();
+        let mut invalid = Vec::new();
+        let mut bad = good.clone(); bad.get_array_mut("source_summaries").unwrap()[1].as_document_mut().unwrap()
+            .insert("root_count", 4); invalid.push(bad);
+        let mut bad = good.clone(); bad.insert("root_count", 8); invalid.push(bad);
+        let mut bad = good.clone(); bad.get_document_mut("stage_distribution").unwrap().insert("0", 4); invalid.push(bad);
+        let mut bad = good.clone(); bad.get_document_mut("stage_distribution").unwrap().remove("0"); invalid.push(bad);
+        let mut bad = good.clone(); bad.insert("source_summaries", Vec::<Bson>::new()); invalid.push(bad);
+        for bad in invalid {
+            apply_root_summary(&mut runtime, &good).unwrap();
+            let error = apply_root_summary(&mut runtime, &bad).unwrap_err();
+            runtime.stale = true;
+            runtime.last_error = Some(error.to_string());
+            let payload = TaskProgressError { collection: runtime.collection.clone(), task_id: Some(runtime.task_id.clone()),
+                is_remote: Some(runtime.is_remote), error: error.to_string(), updated_at: 101, priority_campaign: Some(runtime.clone()) };
+            let json = serde_json::to_value(payload).unwrap();
+            assert_eq!(json["priority_campaign"]["stale"], true);
+            assert!(json["priority_campaign"]["source_summaries"].is_null());
+            assert!(json["priority_campaign"]["counts"].is_null());
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn source_summary_checked_sums_reject_overflow() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        let mut summary = grouped_root_summary();
+        summary.insert("root_count", i64::MAX);
+        summary.insert("stage_distribution", doc! { "0": i64::MAX });
+        let mut overflowing = source_summary("source-a", false, [0, 0, 0, 0]);
+        overflowing.insert("root_count", i64::MAX);
+        overflowing.insert("stage_distribution", doc! { "0": i64::MAX, "1": i64::MAX, "2": 2_i64, "3": 0 });
+        summary.insert("source_summaries", vec![overflowing]);
+        assert!(apply_root_summary(&mut runtime, &summary).unwrap_err().to_string().contains("stage sum overflow"));
+        assert!(runtime.source_summaries.is_none());
+        for same_stage in [false, true] {
+            let groups: Vec<_> = (0..3).map(|index| {
+                let mut stages = [0; 4]; stages[if same_stage { 0 } else { index }] = i64::MAX;
+                source_summary(&format!("source-{index}"), false, stages)
+            }).collect();
+            summary.insert("source_summaries", groups);
+            let error = apply_root_summary(&mut runtime, &summary).unwrap_err().to_string();
+            assert!(error.contains(if same_stage { "stage total overflow" } else { "root_count total overflow" }), "{error}");
+            assert!(runtime.source_summaries.is_none());
         }
     }
 

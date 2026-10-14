@@ -43,14 +43,22 @@
     <div>任务状态：{{ displayRuntimeStatus }}</div>
     <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
       <template v-if="!legacyRuntime">
-        <div>Roots {{ runtime?.root_count ?? '—' }} ·
+        <div v-for="group in sourceGroups" :key="group.key" class="source-group">
+          {{ group.source_task }}<template v-if="group.distinguishHost">（{{ group.source_remote ? '远程' : '本地' }}）</template> · Roots {{ group.root_count ?? '—' }} ·
+          R0 {{ group.stage_distribution ? (group.stage_distribution['0'] ?? 0) : '—' }} /
+          R1 {{ group.stage_distribution?.['1'] ?? '—' }} /
+          R2 {{ group.stage_distribution?.['2'] ?? '—' }} /
+          R3 {{ group.stage_distribution?.['3'] ?? '—' }}
+        </div>
+        <div v-if="!sourceGroups.length">Roots {{ runtime?.root_count ?? '—' }} ·
           R0 {{ runtime?.stage_distribution ? (runtime.stage_distribution['0'] ?? 0) : '—' }} /
           R1 {{ runtime?.stage_distribution?.['1'] ?? '—' }} /
           R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
           R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
+        <div v-if="sourceGroupsUnconfirmed"><n-text type="warning">来源分组未确认，请更新状态</n-text></div>
       </template>
       <n-text v-else type="warning">旧 campaign（只读）：不自动迁移、重排或重新派发</n-text>
-      <div>来源任务：{{ sourceNames }}</div>
+      <div v-if="legacyRuntime || !sourceGroups.length">来源任务：{{ sourceNames }}</div>
       <div v-if="runtimeWarning"><n-text type="warning">{{ runtimeWarning }}</n-text></div>
       <div v-if="runtime?.data_source === 'own_task_fallback'"><n-text type="warning">仅旧本任务集合（账本未确认）</n-text></div>
       <div v-if="runtime?.reason === 'source_consumer_upgrade_required'"><n-text type="warning">
@@ -59,6 +67,13 @@
       <details class="runtime-details">
         <summary>详情 / Details</summary>
         <template v-if="!legacyRuntime">
+          <div v-if="sourceGroups.length">总 Roots {{ runtime?.root_count ?? '—' }} ·
+            R0 {{ runtime?.stage_distribution ? (runtime.stage_distribution['0'] ?? 0) : '—' }} /
+            R1 {{ runtime?.stage_distribution?.['1'] ?? '—' }} /
+            R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
+            R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
+          <div v-for="group in sourceGroups" :key="'host:' + group.key">来源执行：{{ group.source_task }} ·
+            {{ typeof group.source_remote === 'boolean' ? (group.source_remote ? 'remote' : 'local') : '主机未确认' }}</div>
           <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
           <div>具体cap按各root冻结配置，不随活跃来源切换重置；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</div>
           <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
@@ -131,6 +146,7 @@ export function mergePriorityRuntime(event, previous) {
         mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
         waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,
         completed: previous.completed, blocked: previous.blocked, source_tasks: previous.source_tasks,
+        source_summaries: previous.source_summaries,
         stage: previous.stage, status: previous.status, reason: previous.reason,
         current_round: previous.current_round, max_rounds: previous.max_rounds,
         max_per_round: previous.max_per_round, unresolved: previous.unresolved }
@@ -139,6 +155,30 @@ export function mergePriorityRuntime(event, previous) {
     previous?.campaign_id === incoming.campaign_id && previous?.mode === incoming.mode;
   const counts = incoming.stats_confirmed ? incoming.counts : (same ? previous?.counts : null);
   return { ...incoming, counts: counts ?? null };
+}
+
+// Groups belong to source task + logical source target, not the Priority host.
+// Old single-source metadata can use the aggregate; never copy it to multiple sources.
+export function prioritySourceGroups(runtime, configuredSources) {
+  const names = [...new Set(runtime?.source_tasks?.length ? runtime.source_tasks
+    : (Array.isArray(configuredSources) ? configuredSources : []))];
+  const summaries = runtime?.source_summaries;
+  const groups = Array.isArray(summaries) ? summaries.map(group => ({ ...group })) : [];
+  if (!groups.length) {
+    const singleFallback = names.length === 1 && summaries == null;
+    const emptyPool = Array.isArray(summaries) && runtime?.root_count === 0;
+    return names.map(source_task => ({ key: source_task, source_task, source_remote: null,
+      root_count: emptyPool ? 0 : singleFallback ? runtime?.root_count : null,
+      stage_distribution: emptyPool ? { '0': 0, '1': 0, '2': 0, '3': 0 }
+        : singleFallback ? runtime?.stage_distribution : null }));
+  }
+  for (const source_task of names) {
+    if (!groups.some(group => group.source_task === source_task)) {
+      groups.push({ source_task, source_remote: null, root_count: null, stage_distribution: null });
+    }
+  }
+  return groups.map(group => ({ ...group, key: JSON.stringify([group.source_task, group.source_remote]),
+    distinguishHost: groups.filter(other => other.source_task === group.source_task).length > 1 }));
 }
 
 export function priorityDisplayStatus(runtime, roundEnabled, controlStatus) {
@@ -205,6 +245,9 @@ const sourceNames = computed(() => {
   const names = runtime.value?.source_tasks?.length ? runtime.value.source_tasks : priorityConfig.value?.source_tasks;
   return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular';
 });
+const sourceGroups = computed(() => prioritySourceGroups(runtime.value, priorityConfig.value?.source_tasks));
+const sourceGroupsUnconfirmed = computed(() => sourceGroups.value.length > 0 &&
+  sourceGroups.value.some(group => group.root_count == null));
 const runtimeWarning = computed(() => priorityRuntimeWarning(runtime.value));
 const roundEnabled = computed(() => priorityConfig.value?.rounds?.enabled === true);
 const displayProgress = computed(() => {
@@ -300,6 +343,9 @@ const getStatusType = priorityStatusType;
 </script>
 
 <style scoped>
+.source-group {
+  overflow-wrap: anywhere;
+}
 .runtime-details {
   margin-top: 4px;
   color: #666;

@@ -804,3 +804,48 @@ test('selected-host missing registry is not a transport error that can revive le
     assert.equal(store.taskProgressMap.alpha.stale, true);
   }
 });
+
+const groupedPool = (overrides = {}) => campaign({ campaign_id: null, pool_id: 'pool-a', mode: 'per_root',
+  root_count: 144, stage_distribution: { '0': 36, '1': 92, '2': 8, '3': 8 },
+  source_tasks: ['glb_spread', 'asi_revision'], source_summaries: [
+    { source_task: 'glb_spread', source_remote: false, root_count: 118,
+      stage_distribution: { '0': 29, '1': 89, '2': 0, '3': 0 } },
+    { source_task: 'asi_revision', source_remote: true, root_count: 26,
+      stage_distribution: { '0': 7, '1': 3, '2': 8, '3': 8 } },
+  ], ...overrides });
+
+test('source-group cache survives metadata/discovery errors and remount snapshots without mixing counts', () => {
+  const store = freshStore();
+  const saved = groupedPool();
+  store.updateProgress(campaignProgress({ priority_campaign: saved }));
+  store.updateProgressError(failure({ updated_at: 101, priority_campaign: groupedPool({ updated_at: 101,
+    pool_id: null, source_summaries: null, source_tasks: [], stage_distribution: null, root_count: null,
+    stale: true, last_error: 'registry timeout', stats_confirmed: false }) }));
+  let cached = store.taskProgressMap.alpha.priority_campaign;
+  assert.deepEqual(cached.source_summaries, saved.source_summaries);
+  assert.equal(cached.stale, true);
+  assert.equal(cached.counts.total, 60); // item counts are not root counts
+  store.markProgressStale(discoveryFailure({ scope: 'all', updated_at: 102 }));
+  store.replaceTasks([task()]);
+  cached = store.taskProgressMap.alpha.priority_campaign;
+  assert.deepEqual(cached.source_summaries.map(group => group.root_count), [118, 26]);
+  assert.deepEqual(cached.source_summaries.map(group => group.stage_distribution['0']), [29, 7]);
+});
+
+test('new or missing pool and selected host/task identity changes cannot inherit old source groups', () => {
+  for (const extra of [{ pool_id: 'pool-b' }, { pool_id: null, reason: 'root_pool_not_registered' }]) {
+    const store = freshStore();
+    store.updateProgress(campaignProgress({ priority_campaign: groupedPool() }));
+    store.updateProgressError(failure({ updated_at: 101, priority_campaign: groupedPool({ ...extra, updated_at: 101,
+      source_summaries: null, stale: true, last_error: 'unconfirmed', stats_confirmed: false }) }));
+    assert.equal(store.taskProgressMap.alpha.priority_campaign.source_summaries, null);
+    assert.equal(store.taskProgressMap.alpha.priority_campaign.counts, null);
+  }
+  for (const change of [store => store.setTaskSource('alpha', true),
+    store => store.replaceTasks([task({ _id: 'other-id' })])]) {
+    const store = freshStore();
+    store.updateProgress(campaignProgress({ priority_campaign: groupedPool() }));
+    change(store);
+    assert.equal(store.taskProgressMap.alpha.priority_campaign, undefined);
+  }
+});

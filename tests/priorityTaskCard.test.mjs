@@ -205,7 +205,7 @@ test('all 60 pending reserved entries display 0 success/0 failures/60 planned, w
 
 const poolEvent = (extra = {}) => event({ mode: 'per_root', campaign_id: null, pool_id: 'pool-a',
   root_count: 4, stage_distribution: { '1': 1, '2': 2, '3': 1 }, waiting_feedback: 2,
-  waiting_slots: 1, completed: 1, blocked: 0, source_tasks: ['regular-a', 'regular-b'],
+  waiting_slots: 1, completed: 1, blocked: 0, source_tasks: ['regular-a'],
   counts: { total: 240, success: 50, error: 0 }, unresolved: 190, ...extra });
 
 test('root pool SSR shows independent distribution, origins and more than 180 entries without task round', async () => {
@@ -216,12 +216,12 @@ test('root pool SSR shows independent distribution, origins and more than 180 en
   assert.match(html, /R0 0 \/\s*R1 1/);
   assert.match(html, /R2 2/);
   assert.match(html, /R3 1/);
-  assert.match(html, /regular-a, regular-b/);
+  assert.match(html, /regular-a/);
   assert.match(html, /待slots 1/);
   assert.match(html, /无池全局预算/);
   assert.match(html, /未完成 190（含等待与未确认结果，不计为失败）/);
   const { main, details } = sections(html);
-  assert.match(main, /Σ 240|Roots 4|regular-a, regular-b/);
+  assert.match(main, /Σ 240|Roots 4|regular-a/);
   assert.doesNotMatch(main, /待slots|无池全局预算|未完成|UNKNOWN/);
   assert.match(details, /待slots 1|无池全局预算/);
   assert.doesNotMatch(html, /Round|Σ\s*240\s*\/\s*180/);
@@ -264,7 +264,7 @@ test('per-root switch remains selectable and reflects Priority host, not source 
     assert.match(html, new RegExp(`value="${isRemote}"`));
     assert.doesNotMatch(html, /disabled|本地controller/);
     assert.match(html, /来源执行独立按source_remote，可local\/remote/);
-    assert.match(html, /regular-a, regular-b/);
+    assert.match(html, /regular-a/);
   }
 });
 
@@ -294,7 +294,7 @@ test('pending/processing totals are not UNKNOWN and all-zero secondary counters 
       counts: { total: 60, success: 0, error: 0, priority_total: 60, priority_success: 0, priority_error: 0 } });
     const html = await render({ task, progress: { stale: false, priority_campaign: saved } });
     const { main, details } = sections(html);
-    for (const value of [/✓ 0/, /✗ 0/, /Σ 60/, /Roots 4/, /R0 0 \/\s*R1 4/, /R2 0/, /R3 0/, /regular-a, regular-b/]) {
+    for (const value of [/✓ 0/, /✗ 0/, /Σ 60/, /Roots 4/, /R0 0 \/\s*R1 4/, /R2 0/, /R3 0/, /regular-a/]) {
       assert.match(main, value);
     }
     assert.doesNotMatch(main, /待规划|待反馈|待slots|完成roots|阻塞roots|无池全局预算|冻结配置|source_remote|未完成|UNKNOWN|不是失败|awaiting_consumer/);
@@ -381,7 +381,130 @@ test('R0 comes from stage zero immediately before R1/R2/R3 with no duplicate pla
   assert.match(main, /Roots 118 ·\s*R0 29 \/\s*R1 89 \/\s*R2 0 \/\s*R3 0/);
   assert.match(main, /Σ 240/);
   assert.match(main, /✓ 50/);
-  assert.match(main, /regular-a, regular-b/);
+  assert.match(main, /regular-a/);
   assert.doesNotMatch(main, /待规划|阶段分布|未完成/);
   assert.match(details, /待规划 29/);
+});
+
+const sourceSummaries = [
+  { source_task: 'glb_spread', source_remote: false, root_count: 118,
+    stage_distribution: { '0': 29, '1': 89, '2': 0, '3': 0 } },
+  { source_task: 'asi_revision', source_remote: true, root_count: 26,
+    stage_distribution: { '0': 7, '1': 3, '2': 8, '3': 8 } },
+];
+const groupedEvent = (extra = {}) => poolEvent({ status: 'active', reason: null, root_count: 144,
+  stage_distribution: { '0': 36, '1': 92, '2': 8, '3': 8 },
+  source_tasks: ['glb_spread', 'asi_revision'], source_summaries: sourceSummaries, ...extra });
+const plainText = html => html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+
+test('two real source groups show their own Roots and R0–R3, not duplicated global counts', async () => {
+  const saved = groupedEvent();
+  const { main, details } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+  const text = plainText(main);
+  assert.match(text, /glb_spread · Roots 118 · R0 29 \/ R1 89 \/ R2 0 \/ R3 0/);
+  assert.match(text, /asi_revision · Roots 26 · R0 7 \/ R1 3 \/ R2 8 \/ R3 8/);
+  assert.equal((text.match(/Roots /g) || []).length, 2);
+  assert.doesNotMatch(text, /Roots 144|R0 36|来源任务：|待规划|来源分组未确认/);
+  assert.match(text, /Σ 240/);
+  assert.match(text, /✓ 50/);
+  assert.match(plainText(details), /总 Roots 144 · R0 36/);
+  assert.match(plainText(details), /来源执行：glb_spread · local/);
+  assert.match(plainText(details), /来源执行：asi_revision · remote/);
+  assert.doesNotMatch(text, /来源执行：/);
+  const groups = card.prioritySourceGroups(saved);
+  assert.equal(groups[0].root_count, 118);
+  assert.equal(groups[1].root_count, 26);
+  assert.notEqual(groups[0].key, groups[1].key);
+  assert.deepEqual(groups.map(group => group.source_remote), [false, true]);
+});
+
+test('single-source old metadata uses global distribution once without redundant origin/global lines', async () => {
+  const saved = poolEvent({ source_tasks: ['glb_spread'], root_count: 118,
+    stage_distribution: { '0': 29, '1': 89, '2': 0, '3': 0 } });
+  const { main } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+  const text = plainText(main);
+  assert.match(text, /glb_spread · Roots 118 · R0 29 \/ R1 89 \/ R2 0 \/ R3 0/);
+  assert.equal((text.match(/glb_spread/g) || []).length, 1);
+  assert.equal((text.match(/Roots /g) || []).length, 1);
+  assert.doesNotMatch(text, /来源任务：|待规划/);
+  assert.equal(card.prioritySourceGroups(saved)[0].source_remote, null); // never assume Priority host
+});
+
+test('single actual source summary overrides old global fallback and is never duplicated', async () => {
+  const saved = groupedEvent({ source_tasks: ['glb_spread'], source_summaries: sourceSummaries.slice(0, 1),
+    root_count: 118, stage_distribution: sourceSummaries[0].stage_distribution });
+  const { main } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+  const text = plainText(main);
+  assert.match(text, /glb_spread · Roots 118 · R0 29/);
+  assert.equal((text.match(/glb_spread/g) || []).length, 1);
+  assert.equal((text.match(/Roots /g) || []).length, 1);
+  assert.doesNotMatch(text, /来源任务：|来源分组未确认/);
+});
+
+test('old multi-source metadata shows unknown group counts until updated, never assigns aggregate per source', async () => {
+  for (const source_summaries of [undefined, null]) {
+    const saved = groupedEvent({ source_summaries });
+    const { main, details } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+    const text = plainText(main);
+    for (const name of ['glb_spread', 'asi_revision']) {
+      assert.match(text, new RegExp(`${name} · Roots — · R0 — / R1 — / R2 — / R3 —`));
+    }
+    assert.doesNotMatch(text, /Roots 144|Roots 118|Roots 26|R0 36|来源任务：/);
+    assert.match(text, /来源分组未确认，请更新状态/);
+    assert.match(plainText(details), /总 Roots 144 · R0 36/);
+    assert.match(text, /Σ 240/); // actual item counts are still confirmed
+  }
+});
+
+test('same source name local/remote groups remain distinct and are not rebound by Priority host switch', async () => {
+  const sameName = sourceSummaries.map(group => ({ ...group, source_task: 'same-source' }));
+  for (const isRemote of [false, true]) {
+    const saved = groupedEvent({ is_remote: isRemote, source_tasks: ['same-source'], source_summaries: sameName });
+    const { main } = sections(await render({ task: { ...task, isRemote },
+      progress: { stale: false, priority_campaign: saved } }));
+    const text = plainText(main);
+    assert.match(text, /same-source（本地） · Roots 118 · R0 29/);
+    assert.match(text, /same-source（远程） · Roots 26 · R0 7/);
+    assert.deepEqual(card.prioritySourceGroups(saved).map(group => group.root_count), [118, 26]);
+  }
+});
+
+test('active source without a group is visibly unconfirmed, not assigned another group or the aggregate', async () => {
+  const saved = groupedEvent({ source_tasks: ['glb_spread', 'asi_revision', 'new-source'] });
+  const { main } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+  const text = plainText(main);
+  assert.match(text, /new-source · Roots — · R0 —/);
+  assert.doesNotMatch(text, /new-source · Roots (144|118|26)/);
+});
+
+test('metadata transport failure preserves source groups visibly stale; missing/new pool does not inherit them', async () => {
+  const { hooks, state } = await setupCard({ task, progress: { stale: false, priority_campaign: groupedEvent() } });
+  await hooks.mount();
+  hooks.handler({ payload: groupedEvent({ updated_at: 101, pool_id: null, source_summaries: null,
+    source_tasks: [], root_count: null, stage_distribution: null, stale: true, last_error: 'registry timeout',
+    stats_confirmed: false, counts: null }) });
+  assert.deepEqual(state.runtime.value.source_summaries, sourceSummaries);
+  assert.deepEqual(state.sourceGroups.value.map(group => group.root_count), [118, 26]);
+  assert.equal(state.progressStale.value, true);
+  assert.equal(state.progressError.value, 'registry timeout');
+  for (const extra of [{ pool_id: 'pool-b' }, { pool_id: null, reason: 'root_pool_not_registered' }]) {
+    const merged = mergePriorityRuntime(groupedEvent({ ...extra, source_summaries: null, stale: true,
+      last_error: 'not confirmed', counts: null, stats_confirmed: false }), groupedEvent());
+    assert.equal(merged.source_summaries, null);
+    assert.equal(merged.counts, null);
+    assert.ok(card.prioritySourceGroups(merged).every(group => group.root_count == null));
+  }
+  hooks.unmount();
+});
+
+test('confirmed empty source summaries mean no roots, not fabricated uncertainty on normal waiting', async () => {
+  const saved = groupedEvent({ root_count: 0, source_summaries: [], status: 'waiting',
+    stage_distribution: { '0': 0, '1': 0, '2': 0, '3': 0 }, reason: 'no_eligible_source_results',
+    counts: { total: 0, success: 0, error: 0 }, unresolved: 0 });
+  const { main } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
+  const text = plainText(main);
+  for (const name of ['glb_spread', 'asi_revision']) {
+    assert.match(text, new RegExp(`${name} · Roots 0 · R0 0 / R1 0 / R2 0 / R3 0`));
+  }
+  assert.doesNotMatch(text, /来源分组未确认|UNKNOWN|待规划/);
 });

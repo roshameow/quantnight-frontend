@@ -78,6 +78,7 @@ export const useTaskStore = defineStore('task', () => {
           mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
           waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,
           completed: previous.completed, blocked: previous.blocked, source_tasks: previous.source_tasks,
+          source_summaries: previous.source_summaries,
           stage: previous.stage, status: previous.status,
           reason: previous.reason, current_round: previous.current_round, max_rounds: previous.max_rounds,
           max_per_round: previous.max_per_round, unresolved: previous.unresolved }
