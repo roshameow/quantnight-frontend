@@ -78,6 +78,15 @@ const sameTask = (task, pending) => task && taskId(task) === pending.id &&
   (task.isRemote === true) === pending.isRemote
 
 export function isTaskComplete(task, progress) {
+  const kind = task?.taskType ?? task?.task_type
+  if (kind === 'priority') {
+    let config = task?.mission_config ?? task?.startConfig ?? task?.config
+    try { if (typeof config === 'string') config = JSON.parse(config) } catch { return false }
+    // A full intermediate round is not a completed research campaign. Its
+    // bounded producer owns completion; generic five-minute auto-pause must
+    // never interrupt feedback/planning or a later round.
+    if (config?.rounds?.enabled === true || progress?.priority_campaign) return false
+  }
   return task?.status === 'running' && progress?.stale === false &&
     progress.is_remote === (task.isRemote === true) &&
     progress.total > 0 && progress.success >= progress.total

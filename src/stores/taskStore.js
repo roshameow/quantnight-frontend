@@ -59,6 +59,35 @@ export const useTaskStore = defineStore('task', () => {
     return { task, previous, timestamp }
   }
 
+  // Optional campaign metadata shares the existing task/source/version guards.
+  // Only flat, validated item counters may populate its actual-count snapshot;
+  // registry reserved/status fields are never substituted for real counts.
+  const campaignMetadata = (event, accepted, counts) => {
+    const payload = event.priority_campaign
+    const previous = accepted.previous?.priority_campaign
+    if (payload === undefined) return counts ? undefined : previous
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        payload.task_id !== taskId(accepted.task) ||
+        payload.collection !== accepted.task.name ||
+        payload.is_remote !== (accepted.task.isRemote === true) ||
+        payload.updated_at !== accepted.timestamp) throw new Error('invalid campaign metadata')
+    const sameIdentity = previous?.task_id === payload.task_id && previous?.is_remote === payload.is_remote
+    const incoming = sameIdentity && payload.last_error && !payload.campaign_id && !payload.pool_id
+      ? { ...payload, campaign_id: previous.campaign_id, pool_id: previous.pool_id,
+          mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
+          waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,
+          completed: previous.completed, blocked: previous.blocked, source_tasks: previous.source_tasks,
+          stage: previous.stage, status: previous.status,
+          reason: previous.reason, current_round: previous.current_round, max_rounds: previous.max_rounds,
+          max_per_round: previous.max_per_round, unresolved: previous.unresolved }
+      : { ...payload }
+    const sameCampaign = sameIdentity && previous?.pool_id === incoming.pool_id &&
+      previous?.campaign_id === incoming.campaign_id && previous?.mode === incoming.mode
+    incoming.counts = counts && incoming.stats_confirmed === true
+      ? { ...counts } : (sameCampaign ? previous?.counts ?? null : null)
+    return incoming
+  }
+
   const updateProgress = (event) => {
     const accepted = acceptEvent(event, false)
     if (!accepted || !validCount(event.success) || !validCount(event.total)) return false
@@ -69,7 +98,10 @@ export const useTaskStore = defineStore('task', () => {
       priority_total: event.priority_total ?? 0,
     }
     if (!Object.values(counts).every(validCount)) return false
+    let priorityCampaign
+    try { priorityCampaign = campaignMetadata(event, accepted, counts) } catch { return false }
     taskProgressMap.value[event.collection] = {
+      ...(priorityCampaign ? { priority_campaign: priorityCampaign } : {}),
       ...counts,
       is_remote: accepted.task.isRemote === true,
       updated_at: accepted.timestamp,
@@ -82,8 +114,11 @@ export const useTaskStore = defineStore('task', () => {
   const updateProgressError = (event) => {
     const accepted = acceptEvent(event, true)
     if (!accepted || typeof event.error !== 'string') return false
+    let priorityCampaign
+    try { priorityCampaign = campaignMetadata(event, accepted) } catch { return false }
     taskProgressMap.value[event.collection] = {
       ...(accepted.previous ?? emptyProgress(accepted.task)),
+      ...(priorityCampaign ? { priority_campaign: priorityCampaign } : {}),
       updated_at: accepted.timestamp,
       stale: true,
       lastError: event.error,

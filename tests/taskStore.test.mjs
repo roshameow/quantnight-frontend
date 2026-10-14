@@ -671,3 +671,118 @@ test('failed source mutation propagates, skips commit and invalidates reads star
   assert.equal(h.replacements.length, 0)
   assert.equal(h.refreshCount, 0)
 })
+
+const campaign = (overrides = {}) => ({ collection: 'alpha', task_id: 'id-a', is_remote: false,
+  updated_at: 100, auth_profile: 'user1', campaign_id: 'campaign-a', status: 'blocked',
+  reason: 'feedback_incomplete_or_wait_timeout', current_round: 1, max_rounds: 3,
+  max_per_round: 60, reserved: 60, unresolved: 60, data_source: 'ledger',
+  stats_confirmed: true, stale: false, last_error: null,
+  counts: { success: 999, error: 999, total: 999 }, ...overrides });
+const campaignProgress = (overrides = {}) => progress({ task_id: 'id-a', updated_at: 100,
+  success: 0, error: 0, total: 60, priority_total: 60, priority_success: 0, priority_error: 0,
+  priority_campaign: campaign(), ...overrides });
+
+test('priority campaign cache retains real blocked round metadata and only actual flat counters', () => {
+  const store = freshStore();
+  assert.equal(store.updateProgress(campaignProgress()), true);
+  const cached = store.taskProgressMap.alpha;
+  assert.equal(cached.total, 60);
+  assert.equal(cached.success, 0);
+  assert.equal(cached.error, 0);
+  assert.equal(cached.priority_campaign.status, 'blocked');
+  assert.equal(cached.priority_campaign.reason, 'feedback_incomplete_or_wait_timeout');
+  assert.equal(cached.priority_campaign.current_round, 1);
+  assert.equal(cached.priority_campaign.max_rounds, 3);
+  assert.equal(cached.priority_campaign.max_per_round, 60);
+  assert.equal(cached.priority_campaign.counts.total, 60); // not nested fake 999 or summary budget
+  assert.equal(cached.priority_campaign.counts.error, 0);
+  store.replaceTasks([task()]);
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.status, 'blocked');
+});
+
+test('priority metadata must match active task identity/source/version independently of outer event', () => {
+  const store = freshStore();
+  store.updateProgress(campaignProgress());
+  for (const override of [{ task_id: 'id-old' }, { collection: 'other' }, { is_remote: true },
+    { updated_at: 99 }, { updated_at: undefined }]) {
+    assert.equal(store.updateProgress(campaignProgress({ priority_campaign: campaign(override) })), false);
+  }
+  for (const invalid of [null, [], 'bad']) {
+    assert.equal(store.updateProgress(campaignProgress({ priority_campaign: invalid })), false);
+  }
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.counts.total, 60);
+});
+
+test('priority failures preserve same-campaign actual counts and do not turn reserved/UNKNOWN into failures', () => {
+  const store = freshStore();
+  store.updateProgress(campaignProgress());
+  assert.equal(store.updateProgressError(failure({ task_id: 'id-a', updated_at: 101,
+    priority_campaign: campaign({ updated_at: 101, stats_confirmed: false, counts: null,
+      stale: true, last_error: 'ledger read failed', reserved: 180 }) })), true);
+  const cached = store.taskProgressMap.alpha;
+  assert.equal(cached.stale, true);
+  assert.equal(cached.total, 60);
+  assert.equal(cached.error, 0);
+  assert.equal(cached.priority_campaign.counts.total, 60);
+  assert.equal(cached.priority_campaign.counts.error, 0);
+  assert.equal(cached.priority_campaign.reserved, 180);
+  assert.equal(cached.priority_campaign.unresolved, 60);
+  assert.equal(store.updateProgressError(failure({ updated_at: 102 })), true);
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.counts.total, 60);
+});
+
+test('metadata read errors keep the last campaign; new campaigns never reuse old actual counts', () => {
+  const store = freshStore();
+  store.updateProgress(campaignProgress());
+  store.updateProgressError(failure({ updated_at: 101, priority_campaign: campaign({ updated_at: 101,
+    campaign_id: null, status: null, current_round: null, stats_confirmed: false, counts: null,
+    last_error: 'registry timeout' }) }));
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.campaign_id, 'campaign-a');
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.status, 'blocked');
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.current_round, 1);
+  store.updateProgressError(failure({ updated_at: 102, priority_campaign: campaign({ updated_at: 102,
+    campaign_id: 'campaign-b', stats_confirmed: false, counts: null, last_error: 'ledger unready' }) }));
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.counts, null);
+});
+
+test('source changes and same-name replacements cannot reuse campaign metadata', () => {
+  const store = freshStore();
+  store.updateProgress(campaignProgress());
+  store.setTaskSource('alpha', true);
+  assert.equal(store.taskProgressMap.alpha.priority_campaign, undefined);
+  assert.equal(store.updateProgress(campaignProgress()), false);
+  store.replaceTasks([task({ _id: 'id-new' })]);
+  assert.equal(store.taskProgressMap.alpha.priority_campaign, undefined);
+});
+
+
+test('complete intermediate priority round does not trigger generic auto-pause', () => {
+  const priority = task({ taskType: 'priority', mission_config: { rounds: { enabled: true } } })
+  const completeRound = progress({ stale: false, success: 60, total: 60,
+    priority_campaign: { status: 'waiting', current_round: 1, max_rounds: 3 } })
+  assert.equal(isTaskComplete(priority, completeRound), false)
+  assert.equal(isTaskComplete(task(), progress({ stale: false, success: 10, total: 10 })), true)
+  assert.equal(isTaskComplete(task({ taskType: 'priority', mission_config: { rounds: { enabled: false } } }),
+    progress({ stale: false, success: 10, total: 10 })), true)
+})
+
+test('root pool counts over 180 remain cached only within the same pool identity', () => {
+  const store = freshStore();
+  const pool = campaign({ campaign_id: null, pool_id: 'pool-a', mode: 'per_root',
+    root_count: 4, stage_distribution: { '1': 2, '2': 1, '3': 1 }, waiting_feedback: 2,
+    waiting_slots: 1, completed: 1, blocked: 0, source_tasks: ['source-a', 'source-b'], current_round: null });
+  store.updateProgress(campaignProgress({ total: 240, priority_total: 240, priority_campaign: pool }));
+  assert.equal(store.taskProgressMap.alpha.priority_campaign.counts.total, 240);
+  store.updateProgressError(failure({ updated_at: 101, priority_campaign: { ...pool, updated_at: 101,
+    pool_id: null, mode: null, root_count: null, stage_distribution: null, source_tasks: [],
+    stats_confirmed: false, counts: null, stale: true, last_error: 'registry timeout' } }));
+  let cached = store.taskProgressMap.alpha.priority_campaign;
+  assert.equal(cached.pool_id, 'pool-a');
+  assert.deepEqual(cached.stage_distribution, pool.stage_distribution);
+  assert.equal(cached.counts.total, 240);
+  store.updateProgressError(failure({ updated_at: 102, priority_campaign: { ...pool, updated_at: 102,
+    pool_id: 'pool-b', stats_confirmed: false, counts: null, stale: true, last_error: 'ledger timeout' } }));
+  cached = store.taskProgressMap.alpha.priority_campaign;
+  assert.equal(cached.pool_id, 'pool-b');
+  assert.equal(cached.counts, null);
+});

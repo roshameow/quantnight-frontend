@@ -71,6 +71,8 @@ struct TaskProgress {
     task_id: String,
     #[serde(flatten)]
     counts: ProgressCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority_campaign: Option<PriorityRuntime>,
     is_remote: bool,
     // Query start time, not completion time: an older slow query cannot overwrite a newer query.
     updated_at: u64,
@@ -83,6 +85,8 @@ struct TaskProgressError {
     is_remote: Option<bool>,
     error: String,
     updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority_campaign: Option<PriorityRuntime>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +100,7 @@ struct TaskProgressRefreshError {
 struct ResolvedTask {
     task_id: String,
     is_remote: bool,
+    registration: Document,
 }
 
 fn emit_discovery_error(app: &AppHandle, scope: &'static str, error: &anyhow::Error, updated_at: u64) {
@@ -182,6 +187,7 @@ fn resolved_task(task: &Document, is_remote: bool) -> Result<ResolvedTask> {
     Ok(ResolvedTask {
         task_id: task.get_object_id("_id").context("任务缺少 ObjectId")?.to_hex(),
         is_remote,
+        registration: task.clone(),
     })
 }
 
@@ -204,6 +210,335 @@ async fn resolve_source(clients: &MongoClients, name: &str, config: &AppConfig, 
         }
     }).await.context("查询任务运行方式失败")
     // Errors propagate; never silently reroute or attach statistics to an unknown task identity.
+}
+
+// Priority metadata is streamed independently and cached as priority_campaign
+// alongside numeric events. Never substitute summary.reserved for actual states.
+#[derive(Debug, Clone, Serialize)]
+struct PriorityRuntime {
+    collection: String,
+    task_id: String,
+    is_remote: bool,
+    updated_at: u64,
+    auth_profile: String,
+    // Compatibility campaign fields stay on the wire; per_root UI never uses
+    // current_round as a task-global progress indicator.
+    campaign_id: Option<String>,
+    pool_id: Option<String>,
+    mode: Option<String>,
+    stage_distribution: Option<std::collections::BTreeMap<String, usize>>,
+    root_count: Option<usize>,
+    waiting_feedback: Option<usize>,
+    waiting_slots: Option<usize>,
+    completed: Option<usize>,
+    blocked: Option<usize>,
+    source_tasks: Vec<String>,
+    stage: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+    current_round: Option<usize>,
+    max_rounds: Option<usize>,
+    max_per_round: Option<usize>,
+    reserved: Option<usize>,
+    unresolved: Option<usize>,
+    data_source: String,
+    stats_confirmed: bool,
+    counts: Option<ProgressCounts>,
+    stale: bool,
+    last_error: Option<String>,
+}
+
+fn priority_config(task: &Document) -> Option<&Document> {
+    task.get_document("mission_config").ok().or_else(|| task.get_document("startConfig").ok()).or_else(|| task.get_document("config").ok())
+}
+
+fn round_enabled(task: &Document) -> bool {
+    (task.get_str("taskType").ok().or_else(|| task.get_str("task_type").ok()) == Some("priority"))
+        && priority_config(task).and_then(|cfg| cfg.get_document("rounds").ok())
+            .and_then(|rounds| rounds.get_bool("enabled").ok()) == Some(true)
+}
+
+fn priority_runtime(task: &ResolvedTask, name: &str, updated_at: u64) -> PriorityRuntime {
+    PriorityRuntime {
+        collection: name.into(), task_id: task.task_id.clone(), is_remote: task.is_remote, updated_at,
+        auth_profile: task.registration.get_str("auth_profile").ok().filter(|s| !s.is_empty()).unwrap_or("user1").into(),
+        pool_id: None, mode: None, stage_distribution: None, root_count: None,
+        waiting_feedback: None, waiting_slots: None, completed: None, blocked: None,
+        source_tasks: Vec::new(),
+        campaign_id: None, stage: None, status: None, reason: None, current_round: None,
+        max_rounds: priority_config(&task.registration).and_then(|cfg| cfg.get_document("rounds").ok())
+            .and_then(|rounds| count_field(rounds, "max_rounds").ok()),
+        max_per_round: priority_config(&task.registration).and_then(|cfg| cfg.get_document("rounds").ok())
+            .and_then(|rounds| count_field(rounds, "max_simulations_per_round").ok()),
+        reserved: None, unresolved: None, data_source: "unconfirmed".into(),
+        stats_confirmed: false, counts: None, stale: true, last_error: None,
+    }
+}
+
+fn priority_summary_filter(name: &str, auth: &str) -> Document {
+    doc! { "_id": format!("{auth}:{name}") }
+}
+
+fn priority_ledger_filter(name: &str, auth: &str, campaign: &str) -> Document {
+    doc! { "task": name, "auth_profile": auth, "campaign_id": campaign }
+}
+
+fn apply_summary(runtime: &mut PriorityRuntime, summary: Option<&Document>) -> Result<()> {
+    let Some(summary) = summary else { return Ok(()); };
+    runtime.campaign_id = Some(summary.get_str("campaign_id").context("Priority registry 缺少 campaign_id")?
+        .to_owned());
+    if runtime.campaign_id.as_deref() == Some("") { return Err(anyhow!("Priority registry campaign_id 为空")); }
+    for (name, target) in [("stage", &mut runtime.stage), ("status", &mut runtime.status), ("reason", &mut runtime.reason)] {
+        *target = summary.get_str(name).ok().map(str::to_owned);
+    }
+    for (name, target) in [("current_round", &mut runtime.current_round), ("max_rounds", &mut runtime.max_rounds), ("max_per_round", &mut runtime.max_per_round), ("reserved", &mut runtime.reserved)] {
+        if summary.contains_key(name) { *target = Some(count_field(summary, name)?); }
+    }
+    Ok(())
+}
+
+fn root_stage_filter(name: &str, auth: &str, pool: &str) -> Document {
+    doc! { "priority_task": name, "auth_profile": auth, "pool_id": pool }
+}
+
+fn apply_root_summary(runtime: &mut PriorityRuntime, summary: &Document) -> Result<()> {
+    if summary.get_str("_id").ok() != Some(&format!("{}:{}", runtime.auth_profile, runtime.collection))
+        || summary.get_str("mode").ok() != Some("per_root") {
+        return Err(anyhow!("Priority root pool identity/mode mismatch"));
+    }
+    let pool = summary.get_str("pool_id").context("Root registry 缺少 pool_id")?;
+    if pool.is_empty() { return Err(anyhow!("Root registry pool_id 为空")); }
+    runtime.pool_id = Some(pool.into());
+    runtime.mode = Some("per_root".into());
+    runtime.stage_distribution = Some(summary.get_document("stage_distribution")?
+        .iter().map(|(key, _)| {
+            if !["0", "1", "2", "3"].contains(&key.as_str()) { return Err(anyhow!("Root stage distribution key invalid")); }
+            Ok((key.clone(), count_field(summary.get_document("stage_distribution")?, key)?))
+        }).collect::<Result<_>>()?);
+    runtime.root_count = Some(count_field(summary, "root_count")?);
+    for (key, target) in [("waiting_feedback", &mut runtime.waiting_feedback),
+        ("waiting_slots", &mut runtime.waiting_slots), ("completed", &mut runtime.completed),
+        ("blocked", &mut runtime.blocked)] {
+        if summary.contains_key(key) { *target = Some(count_field(summary, key)?); }
+    }
+    runtime.status = summary.get_str("status").ok().map(str::to_owned);
+    runtime.reason = summary.get_str("reason").ok().map(str::to_owned);
+    if let Ok(names) = summary.get_array("source_tasks") {
+        runtime.source_tasks = names.iter().map(|name| name.as_str().filter(|s| !s.is_empty())
+            .map(str::to_owned).ok_or_else(|| anyhow!("Root source_tasks invalid"))).collect::<Result<_>>()?;
+    }
+    // No task-level round or denominator maximum; registry counts are metadata.
+    runtime.current_round = None;
+    runtime.reserved = None;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RootLedgerSelection {
+    by_source: std::collections::BTreeMap<(bool, String), Vec<bson::oid::ObjectId>>,
+    total: usize,
+}
+
+// Root origin is immutable across stages. A same ID on a different execution
+// DB is a distinct entry; hashes never substitute for exact entry IDs.
+fn root_ledger_selection(rows: &[Document], name: &str, auth: &str, pool: &str) -> Result<RootLedgerSelection> {
+    let mut unique = std::collections::BTreeMap::new();
+    let mut roots = std::collections::BTreeMap::new();
+    let mut stages = std::collections::BTreeMap::new();
+    for row in rows {
+        for (key, value) in [("priority_task", name), ("auth_profile", auth), ("pool_id", pool)] {
+            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("Root ledger scope mismatch: {key}")); }
+        }
+        let root = row.get_str("root_alpha_id").context("Root ledger 缺少 root_alpha_id")?;
+        if root.is_empty() { return Err(anyhow!("Root alpha ID 为空")); }
+        let source = row.get_str("source_task").context("Root ledger 缺少 source_task")?;
+        if source.is_empty() || source == name || source.starts_with("system.") || source.contains(['$', '\0']) {
+            return Err(anyhow!("Root source_task invalid"));
+        }
+        let remote = row.get_bool("source_remote").context("Root ledger 缺少 source_remote")?;
+        let binding = (remote, source.to_owned());
+        if let Some(previous) = roots.insert(root.to_owned(), binding.clone()) {
+            if previous != binding { return Err(anyhow!("Root immutable source binding changed")); }
+        }
+        let number = count_field(row, "number")?;
+        if !(1..=3).contains(&number) { return Err(anyhow!("Root stage number 必须为1..3")); }
+        let entries = row.get_array("entries").context("Root ledger 缺少 exact entries")?;
+        if entries.len() > 60 { return Err(anyhow!("Root stage entries 超过60")); }
+        // Duplicate stage records must be byte-for-byte identical, not extend a
+        // reserved stage. There is deliberately no pool-wide 60/180 check.
+        if let Some(previous) = stages.insert((root.to_owned(), number), entries.clone()) {
+            if previous != *entries { return Err(anyhow!("Root stage reservation changed")); }
+        }
+        for entry in entries {
+            let entry = entry.as_document().context("Root entry 不是对象")?;
+            if entry.get_str("collection").ok() != Some(source) {
+                return Err(anyhow!("Root entry must route to immutable source_task"));
+            }
+            let id = match entry.get("item_id") {
+                Some(Bson::ObjectId(id)) => *id,
+                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("Root item_id invalid")?,
+                _ => return Err(anyhow!("Root item_id must be ObjectId/hex")),
+            };
+            let hash = entry.get_str("payload_hash").context("Root entry 缺少 payload_hash")?;
+            if hash.is_empty() { return Err(anyhow!("Root payload_hash 为空")); }
+            if let Some(previous) = unique.insert((remote, source.to_owned(), id), hash.to_owned()) {
+                if previous != hash { return Err(anyhow!("Root exact ID payload hash conflict")); }
+            }
+        }
+    }
+    let total = unique.len();
+    let mut by_source = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for ((remote, source, id), _) in unique { by_source.entry((remote, source)).or_default().push(id); }
+    Ok(RootLedgerSelection { by_source, total })
+}
+
+async fn query_root_counts(clients: &MongoClients, client: &Client, name: &str, config: &AppConfig,
+    runtime: &mut PriorityRuntime) -> Result<ProgressCounts> {
+    let rows: Vec<Document> = client.database(&config.mongodb.databases.mission)
+        .collection::<Document>("priority_root_stages")
+        .find(root_stage_filter(name, &runtime.auth_profile, runtime.pool_id.as_deref().unwrap()), None)
+        .await?.try_collect().await?;
+    let selection = root_ledger_selection(&rows, name, &runtime.auth_profile, runtime.pool_id.as_deref().unwrap())?;
+    let mut observed = ProgressCounts::default();
+    for ((remote, source), ids) in selection.by_source {
+        let execution = if remote { &clients.remote } else { &clients.local };
+        let counts = read_counts(execution.database(&config.mongodb.databases.simulation)
+            .collection::<Document>(&source).aggregate(priority_stats_pipeline(Some(&ids)), None).await?).await?;
+        observed.total += counts.total;
+        observed.success += counts.success;
+        observed.error += counts.error;
+        if !runtime.source_tasks.contains(&source) { runtime.source_tasks.push(source); }
+    }
+    runtime.source_tasks.sort();
+    runtime.source_tasks.dedup();
+    let (counts, unresolved) = reserved_counts(selection.total, observed)?;
+    runtime.unresolved = Some(unresolved);
+    runtime.data_source = "root_ledger".into();
+    Ok(counts)
+}
+
+#[derive(Debug)]
+struct LedgerSelection {
+    by_collection: std::collections::BTreeMap<String, Vec<bson::oid::ObjectId>>,
+    total: usize,
+    current_round: usize,
+}
+
+// Pure BSON parser. Exact IDs, not payload hashes or priority flags, define the
+// denominator. Same ID in different collections is distinct; reused IDs aren't.
+fn ledger_selection(rows: &[Document], name: &str, auth: &str, campaign: &str) -> Result<LedgerSelection> {
+    let mut unique = std::collections::BTreeMap::new();
+    let mut current_round = 0;
+    for row in rows {
+        for (key, value) in [("task", name), ("auth_profile", auth), ("campaign_id", campaign)] {
+            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("Priority ledger scope mismatch: {key}")); }
+        }
+        let number = count_field(row, "number")?;
+        if number == 0 { return Err(anyhow!("Priority ledger round number 必须为正数")); }
+        current_round = current_round.max(number);
+        for entry in row.get_array("entries").context("Priority ledger 缺少 entries，旧账本需要补齐")? {
+            let entry = entry.as_document().context("Priority ledger entry 不是对象")?;
+            let collection = entry.get_str("collection").context("Priority ledger entry 缺少 collection")?;
+            if collection.is_empty() || collection.starts_with("system.") || collection.contains(['$', '\0']) {
+                return Err(anyhow!("Priority ledger collection 无效"));
+            }
+            let id = match entry.get("item_id") {
+                Some(Bson::ObjectId(id)) => *id,
+                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("Priority ledger item_id 无效")?,
+                _ => return Err(anyhow!("Priority ledger item_id 必须是 ObjectId/hex")),
+            };
+            let hash = entry.get_str("payload_hash").context("Priority ledger 缺少 payload_hash")?;
+            if hash.is_empty() { return Err(anyhow!("Priority ledger payload_hash 为空")); }
+            let key = (collection.to_owned(), id);
+            if let Some(previous) = unique.insert(key, hash.to_owned()) {
+                if previous != hash { return Err(anyhow!("Priority ledger 同一 collection/item_id 有冲突 payload_hash")); }
+            }
+        }
+    }
+    let total = unique.len();
+    let mut by_collection = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for ((collection, id), _) in unique { by_collection.entry(collection).or_default().push(id); }
+    Ok(LedgerSelection { by_collection, total, current_round })
+}
+
+const PRIORITY_FAILURES: [&str; 8] = ["fail", "failed", "error", "permanent_error", "timeout_error", "cancelled", "canceled", "rejected"];
+
+fn priority_stats_pipeline(ids: Option<&[bson::oid::ObjectId]>) -> Vec<Document> {
+    let mut pipeline = Vec::new();
+    if let Some(ids) = ids { pipeline.push(doc! { "$match": { "_id": { "$in": ids.to_vec() } } }); }
+    // Monitoring loss is UNKNOWN even if legacy code stored a terminal-looking status.
+    let unknown = doc! { "$or": [
+        { "$eq": ["$terminalStatus", "UNKNOWN"] },
+        { "$eq": ["$acceptance", "UNKNOWN"] },
+        { "$eq": ["$errorClass", "campaign_outcome_unknown"] },
+        { "$eq": ["$errorClass", "campaign_rate_limited"] },
+    ] };
+    pipeline.push(doc! { "$set": { "_priority_state": { "$cond": [unknown, "unknown",
+        { "$toLower": { "$convert": { "input": "$status", "to": "string", "onError": "", "onNull": "" } } }
+    ] } } });
+    let mut group = stats_pipeline().remove(0);
+    let fields = group.get_document_mut("$group").unwrap();
+    let success = doc! { "$sum": { "$cond": [{ "$eq": ["$_priority_state", "success"] }, 1, 0] } };
+    let error = doc! { "$sum": { "$cond": [{ "$in": ["$_priority_state", PRIORITY_FAILURES.to_vec()] }, 1, 0] } };
+    fields.insert("success", success.clone());
+    fields.insert("error", error.clone());
+    fields.insert("priority_success", success);
+    fields.insert("priority_error", error);
+    fields.insert("priority_total", doc! { "$sum": 1 });
+    pipeline.push(group);
+    pipeline
+}
+
+fn reserved_counts(total: usize, observed: ProgressCounts) -> Result<(ProgressCounts, usize)> {
+    if observed.total > total || observed.success + observed.error > observed.total {
+        return Err(anyhow!("Priority actual states 超出 ledger 保留数量"));
+    }
+    let unresolved = total - observed.success - observed.error;
+    Ok((ProgressCounts { total, priority_total: total, priority_success: observed.success,
+        priority_error: observed.error, ..observed }, unresolved))
+}
+
+fn confirmed_priority_fallback(counts: ProgressCounts) -> Result<(ProgressCounts, usize)> {
+    if counts.total == 0 {
+        return Err(anyhow!("Priority ledger 缺失且本任务集合为空：进度未确认（旧条目可能仍在 priority_collection）"));
+    }
+    reserved_counts(counts.total, counts)
+}
+
+async fn query_priority_counts(client: &Client, name: &str, config: &AppConfig, runtime: &mut PriorityRuntime) -> Result<ProgressCounts> {
+    let simulation = client.database(&config.mongodb.databases.simulation);
+    let rows: Vec<Document> = if let Some(campaign) = runtime.campaign_id.as_deref() {
+        client.database(&config.mongodb.databases.mission).collection::<Document>("priority_campaign_rounds")
+            .find(priority_ledger_filter(name, &runtime.auth_profile, campaign), None).await?.try_collect().await?
+    } else { Vec::new() };
+    if rows.is_empty() {
+        // Transitional fallback only to the task's own collection. Never adopt all
+        // priority_collection items, nor pretend a missing old ledger is empty work.
+        if runtime.reserved.unwrap_or(0) > 0 {
+            return Err(anyhow!("Priority 已保留条目但缺少 exact-ID ledger，等待账本补齐"));
+        }
+        let counts = read_counts(simulation.collection::<Document>(name)
+            .aggregate(priority_stats_pipeline(None), None).await?).await?;
+        let (counts, unresolved) = confirmed_priority_fallback(counts)?;
+        runtime.unresolved = Some(unresolved);
+        runtime.data_source = "own_task_fallback".into();
+        return Ok(counts);
+    }
+    let selection = ledger_selection(&rows, name, &runtime.auth_profile, runtime.campaign_id.as_deref().unwrap())?;
+    if selection.total == 0 { return Err(anyhow!("Priority ledger 尚无保留 IDs：进度未确认")); }
+    runtime.current_round = Some(runtime.current_round.unwrap_or(0).max(selection.current_round));
+    let mut observed = ProgressCounts::default();
+    for (collection, ids) in selection.by_collection {
+        let counts = read_counts(simulation.collection::<Document>(&collection)
+            .aggregate(priority_stats_pipeline(Some(&ids)), None).await?).await?;
+        observed.total += counts.total;
+        observed.success += counts.success;
+        observed.error += counts.error;
+    }
+    let (counts, unresolved) = reserved_counts(selection.total, observed)?;
+    runtime.unresolved = Some(unresolved);
+    runtime.data_source = "ledger".into();
+    Ok(counts)
 }
 
 fn count_field(document: &Document, name: &str) -> Result<usize> {
@@ -263,6 +598,7 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
     let updated_at = timestamp_ms();
     let mut is_remote = None;
     let mut task_id = None;
+    let mut priority_campaign = None;
     let result: Result<()> = async {
         let Some(task) = resolve_source(clients, &request.collection, config, request.source).await? else {
             return Ok(()); // Deleted tasks and unregistered data collections are not cards.
@@ -270,10 +606,58 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
         is_remote = Some(task.is_remote);
         task_id = Some(task.task_id.clone());
         let client = if task.is_remote { &clients.remote } else { &clients.local };
-        let counts = query_counts(client, &request.collection, config).await?;
+        let counts = if task.registration.get_str("taskType").ok().or_else(|| task.registration.get_str("task_type").ok()) == Some("priority") {
+            let mut runtime = priority_runtime(&task, &request.collection, updated_at);
+            let result = with_deadline(PROGRESS_TIMEOUT, async {
+                // Source registrations, CPU controller and root ledger are
+                // always local, even for a stale isRemote=true priority record.
+                let mission = clients.local.database(&config.mongodb.databases.mission);
+                let filter = priority_summary_filter(&request.collection, &runtime.auth_profile);
+                let root_pool = mission.collection::<Document>("priority_root_pools")
+                    .find_one(filter.clone(), None).await?;
+                if let Some(summary) = root_pool.as_ref() {
+                    apply_root_summary(&mut runtime, summary)?;
+                    let _ = app.emit("task-priority-runtime-update", &runtime);
+                    query_root_counts(clients, &clients.local, &request.collection, config, &mut runtime).await
+                } else if round_enabled(&task.registration) {
+                    runtime.mode = Some("per_root".into());
+                    runtime.reason = Some("local_root_pool_not_registered".into());
+                    Err(anyhow!("本地root池尚未登记：不读取或迁移parked旧global campaign"))
+                } else {
+                    // Read-only legacy diagnosis. No migration, requeue, reset,
+                    // standalone consumer or RuntimeJob redispatch from watcher.
+                    let legacy = client.database(&config.mongodb.databases.mission).collection::<Document>("priority_campaign_tasks")
+                        .find_one(filter, None).await?;
+                    apply_summary(&mut runtime, legacy.as_ref())?;
+                    runtime.mode = Some("legacy".into());
+                    let _ = app.emit("task-priority-runtime-update", &runtime);
+                    query_priority_counts(client, &request.collection, config, &mut runtime).await
+                }
+            }).await;
+            match result {
+                Ok(counts) => {
+                    runtime.stats_confirmed = true;
+                    runtime.counts = Some(counts.clone());
+                    runtime.stale = !["ledger", "root_ledger"].contains(&runtime.data_source.as_str());
+                    if runtime.stale { runtime.last_error = Some("轮次账本缺失：仅显示本任务集合，无法确认完整保留数量".into()); }
+                    let _ = app.emit("task-priority-runtime-update", &runtime);
+                    priority_campaign = Some(runtime);
+                    counts
+                }
+                Err(error) => {
+                    runtime.stale = true;
+                    runtime.last_error = Some(format!("{error:#}"));
+                    let _ = app.emit("task-priority-runtime-update", &runtime);
+                    priority_campaign = Some(runtime);
+                    return Err(error);
+                }
+            }
+        } else {
+            query_counts(client, &request.collection, config).await?
+        };
         app.emit("task-progress-update", TaskProgress {
             collection: request.collection.clone(), task_id: task.task_id, counts,
-            is_remote: task.is_remote, updated_at,
+            is_remote: task.is_remote, updated_at, priority_campaign: priority_campaign.clone(),
         })?;
         Ok(())
     }.await;
@@ -281,7 +665,7 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
         let message = format!("{error:#}");
         eprintln!("⚠️ 任务进度刷新失败 [{}]: {}（保留上次统计）", request.collection, message);
         let _ = app.emit("task-progress-error", TaskProgressError {
-            collection: request.collection, task_id, is_remote, error: message, updated_at,
+            collection: request.collection, task_id, is_remote, error: message, updated_at, priority_campaign,
         });
     }
 }
@@ -349,11 +733,19 @@ async fn emit_all_collections_once(app: AppHandle, clients: Arc<MongoClients>, c
 }
 
 fn extract_request(change: &ChangeStreamEvent<Document>, source: ProgressSource) -> Option<ProgressRequest> {
+    if source.is_mission() && change.ns.as_ref().and_then(|ns| ns.coll.as_deref()) != Some("tasks") {
+        if matches!(change.ns.as_ref().and_then(|ns| ns.coll.as_deref()),
+            Some("priority_root_pools" | "priority_root_stages" | "priority_campaign_tasks" | "priority_campaign_rounds")) {
+            PROGRESS_REFRESH.notify_one();
+        }
+        return None;
+    }
     let collection = if source.is_mission() {
         change.full_document.as_ref()?.get_str("name").ok()?.to_owned()
     } else {
         change.ns.as_ref()?.coll.clone()?
     };
+    if !source.is_mission() { PROGRESS_REFRESH.notify_one(); }
     if collection.starts_with("system.") { return None; }
     Some(ProgressRequest { collection, source })
 }
@@ -374,8 +766,7 @@ async fn watch_source(client: Arc<Client>, config: AppConfig, source: ProgressSo
             .full_document(Some(FullDocumentType::UpdateLookup))
             .max_await_time(Some(Duration::from_secs(1))).build();
         let open = async {
-            if source.is_mission() { db.collection::<Document>("tasks").watch([], options).await }
-            else { db.watch([], options).await }
+            db.watch([], options).await
         };
         match timeout(METADATA_TIMEOUT, open).await {
             Ok(Ok(mut changes)) => {
@@ -460,6 +851,295 @@ async fn watch_simulation_db_changes(app: AppHandle, clients: Arc<MongoClients>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn priority_task() -> Document {
+        doc! { "_id": bson::oid::ObjectId::new(), "taskType": "priority", "auth_profile": "user1",
+            "mission_config": { "rounds": { "enabled": true, "max_rounds": 3 } } }
+    }
+
+    fn ledger_row(collection: &str, ids: &[bson::oid::ObjectId], number: i32) -> Document {
+        let entries: Vec<_> = ids.iter().map(|id| Bson::Document(doc! {
+            "collection": collection, "item_id": id.to_hex(), "payload_hash": format!("hash-{id}")
+        })).collect();
+        doc! { "task": "pipeline__priority", "auth_profile": "user1", "campaign_id": "campaign", "number": number, "entries": entries }
+    }
+
+    #[test]
+    fn priority_round_detection_and_summary_are_pure_metadata() {
+        let mut task = priority_task();
+        assert!(round_enabled(&task));
+        task.get_document_mut("mission_config").unwrap().get_document_mut("rounds").unwrap().insert("enabled", false);
+        assert!(!round_enabled(&task));
+        task.remove("mission_config");
+        task.insert("config", doc! { "rounds": { "enabled": true } });
+        assert!(round_enabled(&task));
+        task.insert("taskType", "regular");
+        assert!(!round_enabled(&task));
+        let route = resolved_task(&priority_task(), true).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        apply_summary(&mut runtime, Some(&doc! { "campaign_id": "campaign", "stage": "feedback",
+            "status": "blocked", "reason": "feedback_incomplete_or_wait_timeout", "current_round": 1,
+            "max_rounds": 3, "max_per_round": 60, "reserved": 60 })).unwrap();
+        assert_eq!(runtime.status.as_deref(), Some("blocked"));
+        assert_eq!(runtime.reserved, Some(60));
+        assert_eq!(runtime.max_rounds, Some(3));
+        assert_eq!(runtime.max_per_round, Some(60));
+        assert!(!runtime.stats_confirmed);
+        assert!(runtime.counts.is_none()); // summary cannot manufacture real statistics
+        let (pending_counts, unresolved) = reserved_counts(60, ProgressCounts::default()).unwrap();
+        runtime.counts = Some(pending_counts.clone());
+        runtime.unresolved = Some(unresolved);
+        runtime.stats_confirmed = true;
+        let payload = TaskProgress { collection: runtime.collection.clone(), task_id: runtime.task_id.clone(),
+            counts: pending_counts, is_remote: true, updated_at: 100, priority_campaign: Some(runtime.clone()) };
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["total"], 60);
+        assert_eq!(json["error"], 0);
+        assert_eq!(json["priority_campaign"]["auth_profile"], "user1");
+        assert_eq!(json["priority_campaign"]["max_rounds"], 3);
+        assert_eq!(json["priority_campaign"]["max_per_round"], 60);
+        assert_eq!(json["priority_campaign"]["status"], "blocked");
+        assert_eq!(json["priority_campaign"]["counts"]["total"], 60);
+        assert_eq!(json["priority_campaign"]["counts"]["error"], 0);
+        assert_eq!(priority_summary_filter("pipeline__priority", "user1"), doc! { "_id": "user1:pipeline__priority" });
+        assert_eq!(priority_ledger_filter("pipeline__priority", "user1", "campaign"),
+            doc! { "task": "pipeline__priority", "auth_profile": "user1", "campaign_id": "campaign" });
+        assert!(apply_summary(&mut runtime, Some(&doc! { "reserved": 60 })).is_err());
+    }
+
+    #[test]
+    fn ledger_preserves_old_sixty_ids_and_deduplicates_across_rounds() {
+        let ids: Vec<_> = (0..60).map(|_| bson::oid::ObjectId::new()).collect();
+        let old = ledger_row("priority_collection", &ids, 1);
+        let repeat = ledger_row("priority_collection", &ids[0..10], 2);
+        let new_id = bson::oid::ObjectId::new();
+        let new = ledger_row("pipeline__priority", &[new_id], 2);
+        let selection = ledger_selection(&[old, repeat, new], "pipeline__priority", "user1", "campaign").unwrap();
+        assert_eq!(selection.total, 61);
+        assert_eq!(selection.current_round, 2);
+        assert_eq!(selection.by_collection["priority_collection"].len(), 60);
+        assert_eq!(selection.by_collection["pipeline__priority"], vec![new_id]);
+        let same_id_elsewhere = ledger_row("pipeline__priority", &[ids[0]], 2);
+        let selection = ledger_selection(&[ledger_row("priority_collection", &ids, 1), same_id_elsewhere],
+            "pipeline__priority", "user1", "campaign").unwrap();
+        assert_eq!(selection.total, 61);
+    }
+
+    #[test]
+    fn ledger_rejects_unscoped_old_malformed_and_conflicting_entries() {
+        let id = bson::oid::ObjectId::new();
+        let good = ledger_row("priority_collection", &[id], 1);
+        for key in ["task", "auth_profile", "campaign_id", "entries", "number"] {
+            let mut invalid = good.clone(); invalid.remove(key);
+            assert!(ledger_selection(&[invalid], "pipeline__priority", "user1", "campaign").is_err(), "{key}");
+        }
+        let mut invalid = good.clone();
+        invalid.get_array_mut("entries").unwrap()[0].as_document_mut().unwrap().insert("item_id", "bad");
+        assert!(ledger_selection(&[invalid], "pipeline__priority", "user1", "campaign").is_err());
+        let mut conflict = good.clone();
+        conflict.get_array_mut("entries").unwrap()[0].as_document_mut().unwrap().insert("payload_hash", "different");
+        assert!(ledger_selection(&[good.clone(), conflict], "pipeline__priority", "user1", "campaign").is_err());
+        let mut native = good.clone();
+        native.get_array_mut("entries").unwrap()[0].as_document_mut().unwrap().insert("item_id", id);
+        assert_eq!(ledger_selection(&[good, native], "pipeline__priority", "user1", "campaign").unwrap().total, 1);
+    }
+
+    fn root_row(root: &str, source: &str, remote: bool, number: i32, ids: &[bson::oid::ObjectId]) -> Document {
+        let mut row = ledger_row(source, ids, number);
+        row.remove("task"); row.remove("campaign_id");
+        row.insert("priority_task", "pipeline__priority");
+        row.insert("pool_id", "pool-a");
+        row.insert("root_alpha_id", root);
+        row.insert("source_task", source);
+        row.insert("source_remote", remote);
+        row
+    }
+
+    #[test]
+    fn root_pool_summary_is_distribution_metadata_not_global_round_or_denominator() {
+        let route = resolved_task(&priority_task(), false).unwrap();
+        let mut runtime = priority_runtime(&route, "pipeline__priority", 100);
+        let summary = doc! { "_id": "user1:pipeline__priority", "mode": "per_root", "pool_id": "pool-a",
+            "stage_distribution": { "0": 1, "1": 5, "2": 3, "3": 2 }, "root_count": 11,
+            "waiting_feedback": 5, "waiting_slots": 3, "completed": 2, "blocked": 0,
+            "source_tasks": ["source-a", "source-b"], "status": "active", "reserved": 600, "current_round": 1 };
+        apply_root_summary(&mut runtime, &summary).unwrap();
+        assert_eq!(runtime.root_count, Some(11));
+        assert_eq!(runtime.stage_distribution.as_ref().unwrap()["0"], 1);
+        assert_eq!(runtime.stage_distribution.as_ref().unwrap()["2"], 3);
+        assert_eq!(runtime.waiting_slots, Some(3));
+        assert_eq!(runtime.current_round, None);
+        assert_eq!(runtime.reserved, None);
+        assert!(runtime.counts.is_none());
+        assert_eq!(root_stage_filter("pipeline__priority", "user1", "pool-a"),
+            doc! { "priority_task": "pipeline__priority", "auth_profile": "user1", "pool_id": "pool-a" });
+        for (key, value) in [("_id", "other:task"), ("mode", "legacy"), ("pool_id", "")] {
+            let mut bad = summary.clone(); bad.insert(key, value);
+            assert!(apply_root_summary(&mut runtime, &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn roots_independent_more_than_180_and_route_by_origin_execution_db() {
+        let ids: Vec<_> = (0..60).map(|_| bson::oid::ObjectId::new()).collect();
+        let rows = vec![root_row("r1", "source-a", false, 1, &ids),
+            root_row("r2", "source-a", true, 2, &ids), root_row("r3", "source-b", false, 3, &ids),
+            root_row("r4", "source-b", true, 1, &ids)];
+        let selection = root_ledger_selection(&rows, "pipeline__priority", "user1", "pool-a").unwrap();
+        assert_eq!(selection.total, 240);
+        assert_eq!(selection.by_source.len(), 4);
+        let (counts, unresolved) = reserved_counts(selection.total, ProgressCounts::default()).unwrap();
+        assert_eq!(counts.total, 240); assert_eq!(unresolved, 240);
+        let mut repeat = rows.clone(); repeat.push(rows[0].clone());
+        assert_eq!(root_ledger_selection(&repeat, "pipeline__priority", "user1", "pool-a").unwrap().total, 240);
+    }
+
+    #[test]
+    fn root_stage_immutable_source_ids_hash_scope_and_local_limits() {
+        let id = bson::oid::ObjectId::new();
+        let good = root_row("r1", "source-a", false, 1, &[id]);
+        for key in ["priority_task", "auth_profile", "pool_id", "root_alpha_id", "source_task", "source_remote", "number", "entries"] {
+            let mut bad = good.clone(); bad.remove(key);
+            assert!(root_ledger_selection(&[bad], "pipeline__priority", "user1", "pool-a").is_err(), "{key}");
+        }
+        for number in [0, 4] {
+            let mut bad = good.clone(); bad.insert("number", number);
+            assert!(root_ledger_selection(&[bad], "pipeline__priority", "user1", "pool-a").is_err());
+        }
+        let too_many = (0..61).map(|_| bson::oid::ObjectId::new()).collect::<Vec<_>>();
+        assert!(root_ledger_selection(&[root_row("r1", "source-a", false, 1, &too_many)], "pipeline__priority", "user1", "pool-a").is_err());
+        let changed = root_row("r1", "source-b", true, 2, &[id]);
+        assert!(root_ledger_selection(&[good.clone(), changed], "pipeline__priority", "user1", "pool-a").is_err());
+        let mut wrongroute = good.clone();
+        wrongroute.get_array_mut("entries").unwrap()[0].as_document_mut().unwrap().insert("collection", "priority_collection");
+        assert!(root_ledger_selection(&[wrongroute], "pipeline__priority", "user1", "pool-a").is_err());
+        let mut changed = good.clone();
+        changed.get_array_mut("entries").unwrap()[0].as_document_mut().unwrap().insert("payload_hash", "changed");
+        assert!(root_ledger_selection(&[good, changed], "pipeline__priority", "user1", "pool-a").is_err());
+    }
+
+    // Tiny offline BSON expression evaluator exercises the actual pipeline shape,
+    // not a second implementation of terminal-status classification.
+    fn eval(expr: &Bson, row: &Document) -> Bson {
+        match expr {
+            Bson::String(path) if path.starts_with('$') => row.get(&path[1..]).cloned().unwrap_or(Bson::Null),
+            Bson::Document(op) => {
+                let (name, arg) = op.iter().next().unwrap();
+                let args = || arg.as_array().unwrap().iter().map(|e| eval(e, row)).collect::<Vec<_>>();
+                match name.as_str() {
+                    "$eq" => { let a = args(); Bson::Boolean(a[0] == a[1]) },
+                    "$or" => Bson::Boolean(args().iter().any(|v| v.as_bool() == Some(true))),
+                    "$in" => { let a = arg.as_array().unwrap(); Bson::Boolean(a[1].as_array().unwrap().contains(&eval(&a[0], row))) },
+                    "$cond" => { let a = arg.as_array().unwrap(); eval(&a[if eval(&a[0], row).as_bool() == Some(true) { 1 } else { 2 }], row) },
+                    "$toLower" => Bson::String(eval(arg, row).as_str().unwrap_or("").to_lowercase()),
+                    "$convert" => { let d = arg.as_document().unwrap(); let v = eval(d.get("input").unwrap(), row);
+                        if matches!(v, Bson::String(_)) { v } else { Bson::String("".into()) } },
+                    _ => panic!("unsupported expression {name}"),
+                }
+            }
+            _ => expr.clone(),
+        }
+    }
+
+    fn fake_counts(ids: &[bson::oid::ObjectId], rows: Vec<Document>) -> ProgressCounts {
+        let pipeline = priority_stats_pipeline(Some(ids));
+        let exact = pipeline[0].get_document("$match").unwrap().get_document("_id").unwrap().get_array("$in").unwrap();
+        let expression = pipeline[1].get_document("$set").unwrap().get("_priority_state").unwrap();
+        let group = pipeline[2].get_document("$group").unwrap();
+        let mut totals = doc! { "total": 0, "success": 0, "error": 0, "priority_total": 0, "priority_success": 0, "priority_error": 0 };
+        for mut row in rows.into_iter().filter(|row| exact.contains(row.get("_id").unwrap())) {
+            row.insert("_priority_state", eval(expression, &row));
+            for key in ["total", "success", "error", "priority_total", "priority_success", "priority_error"] {
+                let arg = group.get_document(key).unwrap().get("$sum").unwrap();
+                let count = eval(arg, &row).as_i32().unwrap();
+                let old = totals.get_i32(key).unwrap(); totals.insert(key, old + count);
+            }
+        }
+        parse_counts(Some(totals)).unwrap()
+    }
+
+    #[test]
+    fn missing_ledger_empty_fallback_is_not_confirmed_zero_progress() {
+        assert!(confirmed_priority_fallback(ProgressCounts::default()).is_err());
+        let (counts, unresolved) = confirmed_priority_fallback(ProgressCounts {
+            total: 3, success: 1, error: 1, ..Default::default()
+        }).unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn actual_bson_pipeline_counts_rejected_400_but_not_unknown_or_cooling_429() {
+        let ids: Vec<_> = (0..8).map(|_| bson::oid::ObjectId::new()).collect();
+        let rejected = doc! { "_id": ids[0], "status": "rejected",
+            "terminalStatus": "NOT_ACCEPTED", "acceptance": "NOT_ACCEPTED", "httpStatus": 400,
+            "errorClass": "campaign_validation_rejected", "rejection_evidence_received": true };
+        let mut rows = vec![rejected.clone()];
+        for (i, key, value) in [(1, "terminalStatus", "UNKNOWN"), (2, "acceptance", "UNKNOWN"),
+            (3, "errorClass", "campaign_outcome_unknown")] {
+            let mut unknown = rejected.clone();
+            unknown.insert("_id", ids[i]);
+            unknown.insert(key, value);
+            rows.push(unknown);
+        }
+        for (i, status) in [(4, "quota_deferred"), (5, "failed"), (6, "rejected")] {
+            let mut cooling = rejected.clone();
+            cooling.insert("_id", ids[i]);
+            cooling.insert("status", status);
+            cooling.insert("httpStatus", 429);
+            cooling.insert("errorClass", "campaign_rate_limited");
+            rows.push(cooling);
+        }
+        // Each uncertainty marker wins even over a terminal-looking rejected/failed status.
+        for (i, row) in rows.iter().enumerate() {
+            let counts = fake_counts(&ids, vec![row.clone()]);
+            assert_eq!(counts.total, 1);
+            assert_eq!(counts.success, 0);
+            assert_eq!(counts.error, usize::from(i == 0), "row {i}: {row:?}");
+            assert_eq!(counts.priority_error, counts.error);
+        }
+        let mut unowned = rejected;
+        unowned.insert("_id", bson::oid::ObjectId::new());
+        rows.push(unowned); // exact-ID selection must not adopt unrelated rejections
+        let observed = fake_counts(&ids, rows);
+        assert_eq!(observed.total, 7);
+        assert_eq!(observed.success, 0);
+        assert_eq!(observed.error, 1);
+        let (counts, unresolved) = reserved_counts(ids.len(), observed).unwrap();
+        assert_eq!(counts.total, 8); // one missing exact-ID row remains unresolved
+        assert_eq!(counts.priority_total, 8);
+        assert_eq!(counts.priority_error, 1);
+        assert_eq!(unresolved, 7); // six UNKNOWN/cooling rows plus the missing row
+    }
+
+    #[test]
+    fn actual_bson_pipeline_keeps_unknown_missing_and_retryable_out_of_terminal_counts() {
+        let ids: Vec<_> = (0..60).map(|_| bson::oid::ObjectId::new()).collect();
+        let statuses = ["success", "permanent_error", "cancelled", "timeout_error", "error", "fail", "failed",
+            "transient_error", "quota_deferred", "pending", "processing", "UNKNOWN", "success", "error", "SUCCESS", "timeout_error", "failed", "failed"];
+        let mut rows: Vec<_> = statuses.iter().enumerate().map(|(i, status)| doc! { "_id": ids[i], "status": *status }).collect();
+        rows[12].insert("terminalStatus", "UNKNOWN");
+        rows[13].insert("errorClass", "campaign_outcome_unknown");
+        rows[15].insert("terminalStatus", "UNKNOWN");
+        rows[16].insert("acceptance", "UNKNOWN");
+        rows[17].insert("errorClass", "campaign_rate_limited");
+        rows.push(doc! { "_id": bson::oid::ObjectId::new(), "status": "success" }); // not ours
+        let observed = fake_counts(&ids, rows);
+        assert_eq!(observed.total, 18);
+        assert_eq!(observed.success, 2);
+        assert_eq!(observed.error, 6);
+        let (counts, unresolved) = reserved_counts(60, observed).unwrap();
+        assert_eq!(counts.total, 60); // includes all 44 missing rows, never 0 from empty task-name collection
+        assert_eq!(counts.priority_total, 60);
+        assert_eq!(unresolved, 52);
+        assert_eq!(fake_counts(&ids, vec![]), ProgressCounts::default());
+        let (missing, unknown) = reserved_counts(60, ProgressCounts::default()).unwrap();
+        assert_eq!(missing.total, 60);
+        assert_eq!(unknown, 60);
+        assert!(reserved_counts(1, ProgressCounts { total: 2, ..Default::default() }).is_err());
+        assert!(reserved_counts(1, ProgressCounts { total: 1, success: 1, error: 1, ..Default::default() }).is_err());
+    }
+
+
 
     #[test]
     fn query_versions_are_strictly_increasing() {
@@ -571,7 +1251,7 @@ mod tests {
     fn serialized_progress_matches_the_frontend_contract() {
         let payload = TaskProgress {
             collection: "task".into(), task_id: "identity".into(),
-            counts: ProgressCounts::default(), is_remote: true, updated_at: 123,
+            counts: ProgressCounts::default(), is_remote: true, updated_at: 123, priority_campaign: None,
         };
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json["task_id"], "identity");

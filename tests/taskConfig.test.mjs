@@ -29,7 +29,7 @@ async function modal(name, initialProps) {
   return { props, events, state, template: descriptor.template.content };
 }
 
-test('new priority defaults to pipeline auto with task budget 3x60 and per-seed generation cap 40', () => {
+test('new priority defaults to pipeline auto with per-root stage budget 3x60 and per-seed generation cap 40', () => {
   const config = priorityDefaultConfig();
   assert.equal(config.mission_tag, 'pipeline');
   assert.equal(config.refine_templates, 'auto');
@@ -43,8 +43,11 @@ test('new priority defaults to pipeline auto with task budget 3x60 and per-seed 
   assert.equal(DEFAULT_PRIORITY_TEMPLATES.length, 5);
   assert.match(PRIORITY_CONFIG_HINT, /9种模板中默认启用前5种 ablation、turnover_adjust、operator_transfer、group_op_add、event_op_add/);
   assert.match(PRIORITY_CONFIG_HINT, /每模板默认10条/);
-  assert.match(PRIORITY_CONFIG_HINT, /整个任务总预算最多180次，不是每个 alpha/);
-  assert.match(PRIORITY_CONFIG_HINT, /每轮等实际反馈/);
+  assert.match(PRIORITY_CONFIG_HINT, /每个 root 累计最多180次，池无全局60\/180预算/);
+  assert.equal(config.source_scope, 'active');
+  assert.equal(Object.hasOwn(config, 'source_task'), false);
+  assert.equal(Object.hasOwn(config, 'source_tasks'), false);
+  assert.match(PRIORITY_CONFIG_HINT, /同一 root 每阶段等实际反馈/);
   assert.match(PRIORITY_CONFIG_HINT, /sign 方向规范化为免费前置/);
   assert.match(PRIORITY_CONFIG_HINT, /独立 ablation 只消融结构、绝不改变 settings/);
   assert.match(PRIORITY_CONFIG_HINT, /turnover_adjust 仅产生0\/1条 decay-only 变体、无消融/);
@@ -386,3 +389,32 @@ for (const [name, handler, event] of [
     assert.deepEqual(saved.rounds, old.rounds);
   });
 }
+
+
+test('dynamic sources remain omitted; optional list validates even before template fallback', () => {
+  for (const config of [{}, { source_scope: 'active' }, { source_tasks: ['task-a', 'task-b'] }]) {
+    assert.deepEqual(validatePriorityConfig(config), config);
+  }
+  for (const source_tasks of [null, [], '', [''], ['  '], [1], ['a', null], {}]) {
+    for (const refine_templates of [undefined, []]) {
+      assert.throws(() => validatePriorityConfig({ source_tasks, refine_templates }), /source_tasks/);
+    }
+  }
+  for (const source_scope of [null, false, 'all', 'fixed']) {
+    assert.throws(() => validatePriorityConfig({ source_scope }), /source_scope/);
+  }
+  const saved = { source_task: 'legacy-origin', source_remote: true, source_tasks: ['a'],
+    extension: { scope: { dataset: 'keep' } }, rounds: { enabled: true } };
+  assert.deepEqual(resolveTaskConfig({ mission_config: saved }, priorityDefaultConfig()), saved);
+  assert.deepEqual(validatePriorityConfig(saved), saved); // no silent source migration
+  assert.match(PRIORITY_CONFIG_HINT, /protocol3/);
+  assert.match(PRIORITY_CONFIG_HINT, /禁止启动 standalone Consumer/);
+});
+
+
+test('local control discovery is independent from local/remote source execution', () => {
+  assert.match(PRIORITY_CONFIG_HINT, /本地 control 注册表中同 auth/);
+  assert.match(PRIORITY_CONFIG_HINT, /controller\/CPU生成始终本地/);
+  assert.match(PRIORITY_CONFIG_HINT, /按root.source_remote路由/);
+  assert.doesNotMatch(PRIORITY_CONFIG_HINT, /同 auth\/执行目标下/);
+});

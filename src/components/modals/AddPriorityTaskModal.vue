@@ -14,7 +14,9 @@
       </n-form-item>
       <n-p>
         使用内置 pipeline 模板，无需上传 .py 文件，任务名称无需对应模板文件名。
-        创建只保存配置；启动需另行确认。
+        创建只保存配置；启动需另行确认。默认持续接收本地control注册表中同账号的活跃 regular 任务真实成功结果（来源可远程执行），
+        controller/CPU生成固定本地，每个 root 独立3阶段（每阶段≤60、累计≤180），不是整个任务 Round 1/3。
+        可在 JSON 中设置 source_tasks 过滤来源；省略则动态选择，不绑定当前任务名。
       </n-p>
       <n-form-item label="配置 JSON（高级：模板开关、参数与预算）">
         <n-input type="textarea" v-model:value="form.configText" :autosize="{ minRows: 10, maxRows: 24 }" />

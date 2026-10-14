@@ -11,36 +11,55 @@
         <div class="progress-background" :style="progressBarStyle" />
         <div class="header-content">
           <span class="task-name">{{ task.name }}</span>
-          <n-tag :type="getStatusType(task.status)" size="small" round>
-            {{ task.status }}
+          <n-tag :type="getStatusType(displayStatus)" size="small" round>
+            {{ displayStatus }}
           </n-tag>
         </div>
       </div>
     </template>
 
-    <div v-if="progress" style="margin-bottom: 4px">
+    <div v-if="displayProgress" style="margin-bottom: 4px">
       <div style="font-size: 12px; margin-bottom: 2px">
         <n-text type="success" title="成功">
-          ✓ {{ progress?.success ?? 0 }}
+          ✓ {{ displayProgress.success }}
         </n-text>
         &nbsp;|&nbsp;
         <n-text type="error" title="失败">
-          ✗ {{ progress?.error ?? 0 }}
+          ✗ {{ displayProgress.error }}
         </n-text>
         &nbsp;|&nbsp;
-        <n-text depth="3" title="总计">
-          Σ {{ progress?.total ?? 0 }}
+        <n-text depth="3" :title="roundEnabled || runtime ? '已保留计划总数' : '总计'">
+          Σ {{ displayProgress.total }}
         </n-text>
       </div>
     </div>
-    <div v-if="progress?.stale" style="font-size: 12px; margin-bottom: 4px">
-      <n-text type="warning" :title="progress.lastError || '等待进度统计'">
-        {{ progress.lastError ? '进度刷新失败，保留上次统计并重试' : '进度加载中…' }}
-      </n-text>
+    <div v-else style="font-size: 12px; margin-bottom: 4px">
+      <n-text depth="3">✓ — | ✗ — | Σ —（进度未确认）</n-text>
     </div>
-    <div>
-      任务状态：
-      {{ taskRuntimeStatus ?? "未知" }}
+    <div v-if="progressStale" style="font-size: 12px; margin-bottom: 4px">
+      <n-text type="warning">{{ progressError || '进度加载中，尚未确认统计…' }}</n-text>
+      <n-text v-if="displayProgress" depth="3">（保留上次实际统计）</n-text>
+    </div>
+    <div>任务状态：{{ displayRuntimeStatus }}</div>
+    <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
+      <template v-if="!legacyRuntime">
+        <div>Roots {{ runtime?.root_count ?? '—' }} · 阶段分布
+          R1 {{ runtime?.stage_distribution?.['1'] ?? '—' }} /
+          R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
+          R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
+        <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
+        <div><n-text depth="3">具体cap按各root冻结配置，不随活跃来源切换重置；来源执行按source_remote，可local/remote</n-text></div>
+        <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
+          完成roots {{ runtime?.completed ?? '—' }} · 阻塞roots {{ runtime?.blocked ?? '—' }}</div>
+      </template>
+      <n-text v-else type="warning">旧 campaign（只读）：不自动迁移、重排或重新派发</n-text>
+      <div>来源任务：{{ sourceNames }}</div>
+      <div v-if="runtime?.reason"><n-text type="warning">{{ runtime.reason }}</n-text></div>
+      <div v-if="runtime?.unresolved > 0"><n-text depth="3">未完成/UNKNOWN：{{ runtime.unresolved }}（不是失败）</n-text></div>
+      <div v-if="runtime?.data_source === 'own_task_fallback'"><n-text type="warning">仅旧本任务集合（账本未确认）</n-text></div>
+      <div v-if="!runtime || runtime?.reason?.includes('consumer')"><n-text type="warning">
+        原来源任务 normal consumer 须支持 protocol3；未升级则等待，勿启 standalone Consumer 抢槽
+      </n-text></div>
     </div>
     <div
       v-if="task.status === 'running' && priorityConfig"
@@ -52,13 +71,14 @@
 
     <n-space align="center" style="margin-top: 2px">
       <n-switch
-        :value="task.isRemote"
+        :value="roundEnabled || runtime?.mode === 'per_root' ? false : task.isRemote"
+        :disabled="roundEnabled || runtime?.mode === 'per_root'"
         @update:value="(val) => $emit('update:isRemote', val)"
         :checked-value="true"
         :unchecked-value="false"
       >
         <template #checked>远程</template>
-        <template #unchecked>本地</template>
+        <template #unchecked>{{ roundEnabled || runtime?.mode === 'per_root' ? '本地controller' : '本地' }}</template>
       </n-switch>
       <n-tag v-if="task.auth_profile" size="small" :bordered="false" type="info" style="background-color: #e3f2fd; color: #1976d2;">
         {{ task.auth_profile }}
@@ -84,8 +104,54 @@
   </n-card>
 </template>
 
+<script>
+// Pure event boundary; a different task/source/campaign cannot reuse statistics.
+export function acceptPriorityRuntime(event, task, previous) {
+  const id = typeof task?._id === 'object' ? task._id?.$oid : task?._id;
+  return event?.collection === task?.name && event.task_id === id &&
+    event.is_remote === (task.isRemote === true) &&
+    Number.isSafeInteger(event.updated_at) && event.updated_at >= 0 &&
+    (!Number.isSafeInteger(previous?.updated_at) || event.updated_at >= previous.updated_at);
+}
+
+export function mergePriorityRuntime(event, previous) {
+  const sameIdentity = previous?.task_id === event.task_id && previous?.is_remote === event.is_remote;
+  // A metadata transport failure doesn't establish a new campaign. Keep the
+  // last confirmed campaign/stage/counts visibly stale until a successful read.
+  const incoming = sameIdentity && event.last_error && !event.campaign_id && !event.pool_id
+    ? { ...previous, ...event, campaign_id: previous.campaign_id, pool_id: previous.pool_id,
+        mode: previous.mode, stage_distribution: previous.stage_distribution, root_count: previous.root_count,
+        waiting_feedback: previous.waiting_feedback, waiting_slots: previous.waiting_slots,
+        completed: previous.completed, blocked: previous.blocked, source_tasks: previous.source_tasks,
+        stage: previous.stage, status: previous.status, reason: previous.reason,
+        current_round: previous.current_round, max_rounds: previous.max_rounds,
+        max_per_round: previous.max_per_round, unresolved: previous.unresolved }
+    : event;
+  const same = sameIdentity && previous?.pool_id === incoming.pool_id &&
+    previous?.campaign_id === incoming.campaign_id && previous?.mode === incoming.mode;
+  const counts = incoming.stats_confirmed ? incoming.counts : (same ? previous?.counts : null);
+  return { ...incoming, counts: counts ?? null };
+}
+
+export function priorityDisplayStatus(runtime, roundEnabled, controlStatus) {
+  const status = runtime?.status || runtime?.stage || (roundEnabled ? 'waiting' : controlStatus);
+  if (runtime && ['completed', 'done', 'success'].includes(status) &&
+      (!runtime.counts || runtime.unresolved !== 0)) return 'waiting';
+  return status;
+}
+
+export function priorityStatusType(status) {
+  if (['completed', 'done', 'success'].includes(status)) return 'success';
+  if (['blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
+  if (['error', 'failed'].includes(status)) return 'error';
+  return 'default';
+}
+</script>
+
 <script setup>
-import { computed } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 
 const props = defineProps({
   task: {
@@ -104,8 +170,55 @@ const props = defineProps({
 
 defineEmits(['update:isRemote', 'start', 'update', 'pause', 'delete']);
 
+const runtime = ref(null);
+watch(() => [props.task._id, props.task.name, props.task.isRemote], () => { runtime.value = null; });
+// Cached metadata makes remounts truthful before the next background snapshot.
+watch(() => props.progress?.priority_campaign, (payload) => {
+  if (payload && acceptPriorityRuntime(payload, props.task, runtime.value)) {
+    runtime.value = mergePriorityRuntime(payload, runtime.value);
+  }
+}, { immediate: true });
+const legacyRuntime = computed(() => runtime.value?.mode === 'legacy' || (!runtime.value?.pool_id && !!runtime.value?.campaign_id));
+const sourceNames = computed(() => {
+  const names = runtime.value?.source_tasks?.length ? runtime.value.source_tasks : priorityConfig.value?.source_tasks;
+  return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular（本地control同 auth，来源可远程）';
+});
+const roundEnabled = computed(() => priorityConfig.value?.rounds?.enabled === true);
+const displayProgress = computed(() => {
+  if (roundEnabled.value || runtime.value) return runtime.value?.counts ?? null;
+  const p = props.progress;
+  return p && (!p.stale || p.total > 0) ? p : null;
+});
+const progressStale = computed(() => props.progress?.stale || runtime.value?.stale || !displayProgress.value);
+const progressError = computed(() => runtime.value?.last_error || props.progress?.lastError);
+const displayStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status));
+const displayRuntimeStatus = computed(() => roundEnabled.value || runtime.value
+  ? (runtime.value?.status || runtime.value?.stage ? displayStatus.value : '等待root池状态确认')
+  : props.taskRuntimeStatus);
+
+let disposed = false;
+let unlisten;
+onMounted(async () => {
+  try {
+    const cleanup = await listen('task-priority-runtime-update', ({ payload }) => {
+      if (!disposed && acceptPriorityRuntime(payload, props.task, {
+        updated_at: Math.max(runtime.value?.updated_at ?? 0, props.progress?.updated_at ?? 0),
+      })) {
+        runtime.value = mergePriorityRuntime(payload, runtime.value);
+      }
+    });
+    if (disposed) { cleanup(); return; }
+    unlisten = cleanup;
+    // A card mounted after the global snapshot needs its own metadata refresh.
+    await invoke('refresh_task_progress');
+  } catch (error) {
+    if (!disposed) runtime.value = { ...runtime.value, stale: true, last_error: `Root池状态加载失败：${String(error)}` };
+  }
+});
+onUnmounted(() => { disposed = true; unlisten?.(); });
+
 const progressBarStyle = computed(() => {
-  const p = props.progress || {};
+  const p = displayProgress.value || {};
   const success = typeof p.success === "number" ? p.success : 0;
   const error = typeof p.error === "number" ? p.error : 0;
   const total = typeof p.total === "number" && p.total > 0 ? p.total : 1;
@@ -156,12 +269,11 @@ function getNested(obj, pathArray) {
 }
 
 const priorityConfig = computed(() => {
-  const cfg = getNested(props.task, ["mission_config"]) ?? getNested(props.task, ["config"]);
-  return cfg;
+  const cfg = getNested(props.task, ["mission_config"]) ?? getNested(props.task, ["startConfig"]) ?? getNested(props.task, ["config"]);
+  try { return typeof cfg === 'string' ? JSON.parse(cfg) : cfg; } catch { return null; }
 });
 
-const getStatusType = (status) =>
-  status === "done" ? "success" : status === "running" ? "warning" : "default";
+const getStatusType = priorityStatusType;
 </script>
 
 <style scoped>
