@@ -78,7 +78,7 @@ test('real card initially renders unconfirmed values, not 0/0/0 or tmux error', 
     progress: { success: 0, error: 0, total: 0, stale: true } });
   assert.match(html, /进度未确认/);
   assert.match(html, /等待root池状态确认/);
-  assert.match(html, /阶段分布/);
+  assert.match(html, /Roots — ·\s*R0 — \/\s*R1 — \/\s*R2 — \/\s*R3 —/);
   assert.doesNotMatch(html, /Round.*\/.*3/);
   assert.doesNotMatch(html, /Σ 0|✗ 0|✓ 0|任务状态：error/);
 });
@@ -213,13 +213,17 @@ test('root pool SSR shows independent distribution, origins and more than 180 en
   const html = await render({ task, progress: { stale: false, updated_at: saved.updated_at, priority_campaign: saved } });
   assert.match(html, /Σ 240/);
   assert.match(html, /Roots 4/);
-  assert.match(html, /R1 1/);
+  assert.match(html, /R0 0 \/\s*R1 1/);
   assert.match(html, /R2 2/);
   assert.match(html, /R3 1/);
   assert.match(html, /regular-a, regular-b/);
   assert.match(html, /待slots 1/);
   assert.match(html, /无池全局预算/);
-  assert.match(html, /190（不是失败）/);
+  assert.match(html, /未完成 190（含等待与未确认结果，不计为失败）/);
+  const { main, details } = sections(html);
+  assert.match(main, /Σ 240|Roots 4|regular-a, regular-b/);
+  assert.doesNotMatch(main, /待slots|无池全局预算|未完成|UNKNOWN/);
+  assert.match(details, /待slots 1|无池全局预算/);
   assert.doesNotMatch(html, /Round|Σ\s*240\s*\/\s*180/);
 });
 
@@ -242,6 +246,15 @@ test('legacy campaign has read-only warning and no whole-task round UI', async (
   assert.doesNotMatch(html, /Round|R1 1|Roots/);
 });
 
+
+// Native details retain their DOM content in SSR, while only summary is visible.
+function sections(html) {
+  const match = html.match(/<details\b([^>]*)>([\s\S]*?)<\/details>/);
+  assert.ok(match, 'real card exposes an accessible details disclosure');
+  assert.doesNotMatch(match[1], /\bopen(?:\s|=|$)/, 'details are closed by default');
+  assert.match(match[2], /<summary>详情 \/ Details<\/summary>/);
+  return { main: html.replace(match[0], ''), details: match[2] };
+}
 
 test('per-root switch remains selectable and reflects Priority host, not source execution', async () => {
   for (const isRemote of [true, false]) {
@@ -271,4 +284,104 @@ test('selected-host missing root registry cannot revive an old global campaign o
     assert.equal(mergePriorityRuntime(missing, oldPool).pool_id, null);
     assert.equal(mergePriorityRuntime(missing, oldPool).counts, null);
   }
+});
+
+test('pending/processing totals are not UNKNOWN and all-zero secondary counters stay in details', async () => {
+  for (const status of ['waiting', 'running']) {
+    const saved = poolEvent({ status, reason: status === 'waiting' ? 'awaiting_consumer' : null,
+      stage_distribution: { '0': 0, '1': 4, '2': 0, '3': 0 }, waiting_feedback: 0,
+      waiting_slots: 0, completed: 0, blocked: 0, unresolved: 60,
+      counts: { total: 60, success: 0, error: 0, priority_total: 60, priority_success: 0, priority_error: 0 } });
+    const html = await render({ task, progress: { stale: false, priority_campaign: saved } });
+    const { main, details } = sections(html);
+    for (const value of [/✓ 0/, /✗ 0/, /Σ 60/, /Roots 4/, /R0 0 \/\s*R1 4/, /R2 0/, /R3 0/, /regular-a, regular-b/]) {
+      assert.match(main, value);
+    }
+    assert.doesNotMatch(main, /待规划|待反馈|待slots|完成roots|阻塞roots|无池全局预算|冻结配置|source_remote|未完成|UNKNOWN|不是失败|awaiting_consumer/);
+    for (const value of [/待规划 0/, /待反馈 0/, /待slots 0/, /完成roots 0/, /阻塞roots 0/,
+      /每 root ≤3阶段/, /≤60\/阶段/, /≤180累计/, /无池全局预算/, /冻结配置/,
+      /source_remote/, /未完成 60/]) assert.match(details, value);
+    assert.doesNotMatch(html, /未完成\/UNKNOWN|不是失败/);
+    const { state } = await setupCard({ task, progress: { stale: false, priority_campaign: saved } });
+    assert.deepEqual(state.displayProgress.value, saved.counts); // all six raw counters survive
+    assert.equal(state.runtime.value.unresolved, 60);
+    assert.equal(state.runtimeWarning.value, null);
+  }
+});
+
+test('explicit uncertainty/blockers and actual failures remain prominent, not fabricated from unresolved', async () => {
+  for (const extra of [
+    { status: 'UNKNOWN', reason: null },
+    { status: 'waiting', reason: 'campaign_outcome_unknown' },
+    { status: 'waiting', reason: null, blocked: 2 },
+    { status: 'blocked', reason: 'feedback_incomplete_or_wait_timeout' },
+    { status: 'waiting', reason: 'source_consumer_upgrade_required' },
+    { status: 'error', reason: 'consumer_failed' },
+  ]) {
+    const saved = poolEvent({ blocked: 0, counts: { total: 60, success: 5, error: 2 }, unresolved: 53, ...extra });
+    const html = await render({ task, progress: { stale: false, priority_campaign: saved } });
+    const { main } = sections(html);
+    assert.match(main, /✓ 5/);
+    assert.match(main, /✗ 2/);
+    assert.match(main, /Σ 60/);
+    assert.match(main, extra.reason ? new RegExp(extra.reason) : extra.status === 'UNKNOWN'
+      ? /状态 UNKNOWN：请更新确认实际结果/ : /阻塞roots 2：请检查来源反馈并更新状态/);
+    if (extra.reason === 'source_consumer_upgrade_required') assert.match(main, /勿启 standalone Consumer 抢槽/);
+    assert.doesNotMatch(main, /未完成\/UNKNOWN|53（不是失败）/);
+  }
+});
+
+test('stale/missing/fallback metadata and legacy read-only warning stay outside details', async () => {
+  const saved = poolEvent();
+  const cases = [
+    [null, /进度未确认/],
+    [{ ...saved, stale: true, last_error: 'registry timeout' }, /registry timeout/],
+    [{ ...saved, counts: null, stats_confirmed: false, stale: true, reason: 'root_pool_not_registered',
+      last_error: 'selected host registry missing' }, /selected host registry missing/],
+    [{ ...saved, data_source: 'own_task_fallback' }, /仅旧本任务集合（账本未确认）/],
+    [event({ mode: 'legacy' }), /旧 campaign（只读）/],
+  ];
+  for (const [payload, warning] of cases) {
+    const html = await render({ task, progress: { stale: false, priority_campaign: payload } });
+    const { main } = sections(html);
+    assert.match(main, warning);
+    if (payload?.last_error === 'registry timeout') {
+      assert.match(main, /Σ 240/);
+      assert.match(main, /保留上次实际统计/);
+    }
+  }
+});
+
+test('dynamic source fallback is compact; operation event bindings remain unchanged', async () => {
+  const saved = poolEvent({ source_tasks: [] });
+  const { main, details } = sections(await render({ task,
+    progress: { stale: false, priority_campaign: saved } }));
+  assert.match(main, /来源任务：动态 active regular/);
+  assert.doesNotMatch(main, /所选Priority主机control|source_remote/);
+  assert.match(details, /所选Priority主机control同 auth/);
+  for (const operation of ['start', 'update', 'pause', 'delete']) {
+    assert.ok(source.includes(`@click="$emit('${operation}')"`));
+  }
+  assert.ok(source.includes(`@update:value="(val) => $emit('update:isRemote', val)"`));
+});
+
+test('routine explanations never suppress an actual blocker, UNKNOWN state or unfamiliar reason', () => {
+  assert.equal(card.priorityRuntimeWarning(poolEvent({ status: 'waiting', reason: 'no_eligible_source_results', blocked: 0 })), null);
+  for (const status of ['blocked', 'error', 'failed', 'unknown']) {
+    assert.equal(card.priorityRuntimeWarning(poolEvent({ status, reason: 'awaiting_consumer' })), 'awaiting_consumer');
+  }
+  assert.equal(card.priorityRuntimeWarning(poolEvent({ status: 'waiting', reason: 'new_unrecognized_problem' })), 'new_unrecognized_problem');
+});
+
+test('R0 comes from stage zero immediately before R1/R2/R3 with no duplicate planning main text', async () => {
+  const saved = poolEvent({ root_count: 118, status: 'waiting', reason: null,
+    stage_distribution: { '0': 29, '1': 89, '2': 0, '3': 0 } });
+  const { main, details } = sections(await render({ task,
+    progress: { stale: false, priority_campaign: saved } }));
+  assert.match(main, /Roots 118 ·\s*R0 29 \/\s*R1 89 \/\s*R2 0 \/\s*R3 0/);
+  assert.match(main, /Σ 240/);
+  assert.match(main, /✓ 50/);
+  assert.match(main, /regular-a, regular-b/);
+  assert.doesNotMatch(main, /待规划|阶段分布|未完成/);
+  assert.match(details, /待规划 29/);
 });

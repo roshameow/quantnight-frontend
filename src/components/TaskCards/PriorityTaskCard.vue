@@ -43,23 +43,31 @@
     <div>任务状态：{{ displayRuntimeStatus }}</div>
     <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
       <template v-if="!legacyRuntime">
-        <div>Roots {{ runtime?.root_count ?? '—' }} · 阶段分布
+        <div>Roots {{ runtime?.root_count ?? '—' }} ·
+          R0 {{ runtime?.stage_distribution ? (runtime.stage_distribution['0'] ?? 0) : '—' }} /
           R1 {{ runtime?.stage_distribution?.['1'] ?? '—' }} /
           R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
           R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
-        <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
-        <div><n-text depth="3">具体cap按各root冻结配置，不随活跃来源切换重置；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</n-text></div>
-        <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
-          完成roots {{ runtime?.completed ?? '—' }} · 阻塞roots {{ runtime?.blocked ?? '—' }}</div>
       </template>
       <n-text v-else type="warning">旧 campaign（只读）：不自动迁移、重排或重新派发</n-text>
       <div>来源任务：{{ sourceNames }}</div>
-      <div v-if="runtime?.reason"><n-text type="warning">{{ runtime.reason }}</n-text></div>
-      <div v-if="runtime?.unresolved > 0"><n-text depth="3">未完成/UNKNOWN：{{ runtime.unresolved }}（不是失败）</n-text></div>
+      <div v-if="runtimeWarning"><n-text type="warning">{{ runtimeWarning }}</n-text></div>
       <div v-if="runtime?.data_source === 'own_task_fallback'"><n-text type="warning">仅旧本任务集合（账本未确认）</n-text></div>
-      <div v-if="!runtime || runtime?.reason?.includes('consumer')"><n-text type="warning">
+      <div v-if="runtime?.reason === 'source_consumer_upgrade_required'"><n-text type="warning">
         原来源任务 normal consumer 须支持 protocol3；未升级则等待，勿启 standalone Consumer 抢槽
       </n-text></div>
+      <details class="runtime-details">
+        <summary>详情 / Details</summary>
+        <template v-if="!legacyRuntime">
+          <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
+          <div>具体cap按各root冻结配置，不随活跃来源切换重置；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</div>
+          <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
+            完成roots {{ runtime?.completed ?? '—' }} · 阻塞roots {{ runtime?.blocked ?? '—' }}</div>
+        </template>
+        <div>来源选择：动态 active regular（所选Priority主机control同 auth，来源可local/remote）；指定来源以来源任务列表为准</div>
+        <div v-if="runtime?.reason">状态说明：{{ runtime.reason }}</div>
+        <div>未完成 {{ runtime?.unresolved ?? '—' }}（含等待与未确认结果，不计为失败）</div>
+      </details>
     </div>
     <div
       v-if="task.status === 'running' && priorityConfig"
@@ -140,6 +148,20 @@ export function priorityDisplayStatus(runtime, roundEnabled, controlStatus) {
   return status;
 }
 
+// unresolved includes ordinary pending/processing and cannot identify UNKNOWN.
+// Only explicit abnormal metadata is promoted out of the collapsed details.
+export function priorityRuntimeWarning(runtime) {
+  const status = String(runtime?.status || runtime?.stage || '').toLowerCase();
+  const abnormal = ['blocked', 'error', 'failed', 'unknown'].includes(status) || runtime?.blocked > 0;
+  const routineReasons = ['awaiting_consumer', 'no_eligible_source_results', 'no_eligible_real_source_results',
+    'round_limit_reached', 'root_stage_limit_reached', 'no_eligible_successful_feedback',
+    'no_improvement', 'no_new_legal_variants'];
+  if (runtime?.reason && (abnormal || !routineReasons.includes(runtime.reason))) return runtime.reason;
+  if (status === 'unknown') return '状态 UNKNOWN：请更新确认实际结果';
+  if (runtime?.blocked > 0) return `阻塞roots ${runtime.blocked}：请检查来源反馈并更新状态`;
+  return null;
+}
+
 export function priorityStatusType(status) {
   if (['completed', 'done', 'success'].includes(status)) return 'success';
   if (['blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
@@ -181,8 +203,9 @@ watch(() => props.progress?.priority_campaign, (payload) => {
 const legacyRuntime = computed(() => runtime.value?.mode === 'legacy' || (!runtime.value?.pool_id && !!runtime.value?.campaign_id));
 const sourceNames = computed(() => {
   const names = runtime.value?.source_tasks?.length ? runtime.value.source_tasks : priorityConfig.value?.source_tasks;
-  return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular（所选Priority主机control同 auth，来源可local/remote）';
+  return Array.isArray(names) && names.length ? names.join(', ') : '动态 active regular';
 });
+const runtimeWarning = computed(() => priorityRuntimeWarning(runtime.value));
 const roundEnabled = computed(() => priorityConfig.value?.rounds?.enabled === true);
 const displayProgress = computed(() => {
   if (roundEnabled.value || runtime.value) return runtime.value?.counts ?? null;
@@ -277,6 +300,13 @@ const getStatusType = priorityStatusType;
 </script>
 
 <style scoped>
+.runtime-details {
+  margin-top: 4px;
+  color: #666;
+}
+.runtime-details > summary {
+  cursor: pointer;
+}
 .task-card {
   max-width: 300px;
   min-height: 180px;
