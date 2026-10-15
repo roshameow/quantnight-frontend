@@ -82,14 +82,11 @@
         <div>来源选择：动态 active regular（所选Priority主机control同 auth，来源可local/remote）；指定来源以来源任务列表为准</div>
         <div v-if="runtime?.reason">状态说明：{{ runtime.reason }}</div>
         <div>未完成 {{ runtime?.unresolved ?? '—' }}（含等待与未确认结果，不计为失败）</div>
+        <div v-if="priorityConfig?.filter_params">Filter Params: {{ priorityConfig.filter_params }}</div>
       </details>
     </div>
-    <div
-      v-if="task.status === 'running' && priorityConfig"
-      style="margin-top: 4px; font-size: 12px; color: #555"
-    >
-      优先级: {{ priorityConfig.priority ?? "-" }} &nbsp;|&nbsp; Filter
-      Params: {{ priorityConfig.filter_params ?? "-" }}
+    <div style="margin-top: 4px; font-size: 12px; color: #555">
+      <span :title="PRIORITY_SCHEDULING_HINT">调度优先级 {{ priorityConfig?.priority ?? 1 }}</span>
     </div>
 
     <n-space align="center" style="margin-top: 2px">
@@ -214,6 +211,7 @@ export function priorityStatusType(status) {
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
 
 const props = defineProps({
   task: {

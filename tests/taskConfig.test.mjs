@@ -453,3 +453,63 @@ for (const [name, handler, eventName] of [
     }
   });
 }
+
+// Scheduling weight is the existing priority field, not a stage/generation cap.
+test('priority is a finite positive scheduling weight, default 1, independent of budgets', () => {
+  assert.equal(priorityDefaultConfig().priority, 1);
+  assert.match(PRIORITY_CONFIG_HINT, /priority（默认1）为有限正数调度权重，不是回测预算/);
+  assert.match(PRIORITY_CONFIG_HINT, /数值越大越优先；先任务优先级，再R3→R2→R1，同阶段已开始root优先；不抢占正在运行模拟/);
+  for (const priority of [0.5, 1, 2, 200, 1e100]) {
+    const config = { priority, rounds: { enabled: true, max_rounds: 2, max_simulations_per_round: 17 },
+      max_variants_per_alpha: 9, refine_templates: [] };
+    assert.deepEqual(validatePriorityConfig(config), config);
+    assert.deepEqual(validatePriorityConfig(JSON.stringify(config)), config);
+    assert.deepEqual(priorityTaskPayload('weight-test', '', JSON.stringify(config)).mission_config,
+      { ...config, mission_tag: 'pipeline' });
+  }
+  assert.deepEqual(validatePriorityConfig({}), {}); // legacy omission is not expanded
+  for (const priority of [null, false, true, 0, -1, '2', {}, [], NaN, Infinity, -Infinity]) {
+    for (const extra of [{}, { refine_templates: [] }, { rounds: { enabled: false } }]) {
+      assert.throws(() => validatePriorityConfig({ priority, ...extra }), /priority（调度优先级）必须为有限正数/);
+    }
+  }
+  assert.throws(() => validatePriorityConfig('{"priority":1e999}'), /必须为有限正数/);
+});
+
+for (const [name, handler, event] of [
+  ['StartTaskModal', 'onConfirm', 'start-priority-task'],
+  ['UpdateTaskModal', 'onConfirm', 'update-priority-task'],
+]) {
+  test(`${name} preserves saved priority and edits only weight without changing business budgets`, async () => {
+    const saved = { priority: 7.5, rounds: { enabled: true, max_rounds: 2, max_simulations_per_round: 17 },
+      max_variants_per_alpha: 9, refine_templates: [], filter_params: { sharpe_th: 1.8 } };
+    for (const key of ['mission_config', 'startConfig', 'config']) {
+      const { state, events } = await modal(name, { task: { name: 'weight-test', isRemote: false,
+        templatefile: 'pipeline', [key]: JSON.stringify(saved) } });
+      assert.deepEqual(JSON.parse(state.form.value.config), saved);
+      const edited = { ...JSON.parse(state.form.value.config), priority: 250 };
+      state.form.value.config = JSON.stringify(edited);
+      state[handler]();
+      const payload = events.find(([key]) => key === event)[1];
+      assert.deepEqual(payload.config, { ...saved, priority: 250 });
+      assert.equal(payload.isRemote, false);
+      assert.equal(saved.priority, 7.5);
+    }
+  });
+}
+
+for (const [name, handler, event] of [
+  ['AddPriorityTaskModal', 'handleSubmit', 'add-priority-task'],
+  ['StartTaskModal', 'onConfirm', 'start-priority-task'],
+  ['UpdateTaskModal', 'onConfirm', 'update-priority-task'],
+]) {
+  test(`${name} rejects invalid priority without emitting a command`, async () => {
+    const { state, events } = await modal(name, { task: { name: 'weight-test', templatefile: 'pipeline' } });
+    const field = name === 'AddPriorityTaskModal' ? 'configText' : 'config';
+    for (const priority of ['0', '-1', 'null', 'true', '"2"', '1e999', '[]', '{}']) {
+      state.form.value[field] = `{"priority":${priority}}`;
+      state[handler]();
+      assert.equal(events.some(([key]) => key === event), false);
+    }
+  });
+}

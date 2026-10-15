@@ -306,6 +306,34 @@ fn apply_summary(runtime: &mut PriorityRuntime, summary: Option<&Document>) -> R
     Ok(())
 }
 
+// Only a successful absent legacy summary establishes control-only pause.
+// Existing campaigns (including stale summaries) must still resolve exact IDs;
+// a lookup failure must never be mistaken for absence.
+fn apply_legacy_monitor_summary(task: &Document, summary: Result<Option<Document>>,
+    runtime: &mut PriorityRuntime) -> Result<bool> {
+    let summary = summary?;
+    if round_enabled(task) || runtime.pool_id.is_some() || runtime.mode.as_deref() == Some("per_root") {
+        return Err(anyhow!("Root mode cannot use legacy control-only monitoring"));
+    }
+    let control_only = summary.is_none()
+        && task.get_str("taskType").ok().or_else(|| task.get_str("task_type").ok()) == Some("priority")
+        && task.get_str("status").ok() == Some("paused");
+    apply_summary(runtime, summary.as_ref())?;
+    runtime.mode = Some("legacy".into());
+    if control_only {
+        runtime.stage = Some("paused".into());
+        runtime.status = Some("paused".into());
+        runtime.reason = Some("paused_legacy_without_ledger".into());
+        runtime.data_source = "control_only".into();
+        runtime.stats_confirmed = false;
+        runtime.counts = None;
+        runtime.unresolved = None;
+        runtime.stale = true;
+        runtime.last_error = None;
+    }
+    Ok(control_only)
+}
+
 fn root_stage_filter(name: &str, auth: &str, pool: &str) -> Document {
     doc! { "priority_task": name, "auth_profile": auth, "pool_id": pool, "retired": { "$ne": true } }
 }
@@ -690,22 +718,27 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
                 if let Some(summary) = root_pool.as_ref() {
                     apply_root_summary(&mut runtime, summary)?;
                     let _ = app.emit("task-priority-runtime-update", &runtime);
-                    query_root_counts(clients, client, &request.collection, config, &mut runtime).await
+                    query_root_counts(clients, client, &request.collection, config, &mut runtime).await.map(Some)
                 } else if round_enabled(&task.registration) {
-                    missing_root_pool(&mut runtime)
+                    missing_root_pool(&mut runtime).map(Some)
                 } else {
                     // Read-only legacy diagnosis. No migration, requeue, reset,
                     // standalone consumer or RuntimeJob redispatch from watcher.
                     let legacy = client.database(&config.mongodb.databases.mission).collection::<Document>("priority_campaign_tasks")
-                        .find_one(filter, None).await?;
-                    apply_summary(&mut runtime, legacy.as_ref())?;
-                    runtime.mode = Some("legacy".into());
+                        .find_one(filter, None).await.context("查询 legacy Priority registry 失败");
+                    if apply_legacy_monitor_summary(&task.registration, legacy, &mut runtime)? {
+                        return Ok(None); // No numeric/zero-count event or refresh-error log.
+                    }
                     let _ = app.emit("task-priority-runtime-update", &runtime);
-                    query_priority_counts(client, &request.collection, config, &mut runtime).await
+                    query_priority_counts(client, &request.collection, config, &mut runtime).await.map(Some)
                 }
             }).await;
             match result {
-                Ok(counts) => {
+                Ok(None) => {
+                    let _ = app.emit("task-priority-runtime-update", &runtime);
+                    return Ok(());
+                }
+                Ok(Some(counts)) => {
                     runtime.stats_confirmed = true;
                     runtime.counts = Some(counts.clone());
                     runtime.stale = !["ledger", "root_ledger"].contains(&runtime.data_source.as_str());
@@ -1375,6 +1408,99 @@ mod tests {
             }
         }
         parse_counts(Some(totals)).unwrap()
+    }
+
+    fn legacy_paused_task() -> Document {
+        let mut task = priority_task();
+        task.remove("mission_config");
+        task.insert("status", "paused");
+        task
+    }
+
+    #[test]
+    fn paused_legacy_absent_summary_is_control_only_not_confirmed_zero() {
+        for remote in [false, true] {
+            let task = legacy_paused_task();
+            let route = resolved_task(&task, remote).unwrap();
+            let mut runtime = priority_runtime(&route, "sign_flip__priority", 100);
+            assert!(apply_legacy_monitor_summary(&task, Ok(None), &mut runtime).unwrap());
+            let json = serde_json::to_value(&runtime).unwrap();
+            assert_eq!(json["status"], "paused");
+            assert_eq!(json["stage"], "paused");
+            assert_eq!(json["mode"], "legacy");
+            assert_eq!(json["reason"], "paused_legacy_without_ledger");
+            assert_eq!(json["data_source"], "control_only");
+            assert_eq!(json["stats_confirmed"], false);
+            assert_eq!(json["stale"], true);
+            for key in ["counts", "last_error", "unresolved", "campaign_id", "pool_id"] {
+                assert!(json[key].is_null(), "{key}");
+            }
+            assert_eq!(json["is_remote"], remote);
+            // Repeated refreshes remain metadata-only, never a refresh failure.
+            assert!(apply_legacy_monitor_summary(&task, Ok(None), &mut runtime).unwrap());
+            assert!(runtime.last_error.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_running_missing_and_paused_existing_campaign_still_observe_counts() {
+        let mut task = legacy_paused_task();
+        task.insert("status", "running");
+        let mut runtime = priority_runtime(&resolved_task(&task, true).unwrap(), "sign_flip__priority", 100);
+        assert!(!apply_legacy_monitor_summary(&task, Ok(None), &mut runtime).unwrap());
+        assert!(confirmed_priority_fallback(ProgressCounts::default()).is_err());
+
+        task.insert("status", "paused");
+        // A stale/blocked campaign is NOT proof that accepted jobs stopped.
+        let summary = doc! { "campaign_id": "campaign", "status": "blocked",
+            "reason": "feedback_incomplete_or_wait_timeout", "reserved": 1 };
+        assert!(!apply_legacy_monitor_summary(&task, Ok(Some(summary)), &mut runtime).unwrap());
+        assert_eq!(runtime.campaign_id.as_deref(), Some("campaign"));
+        assert_eq!(runtime.status.as_deref(), Some("blocked"));
+        let id = bson::oid::ObjectId::new();
+        let selection = ledger_selection(&[ledger_row("priority_collection", &[id], 1)],
+            "pipeline__priority", "user1", runtime.campaign_id.as_deref().unwrap()).unwrap();
+        assert_eq!(selection.by_collection["priority_collection"], vec![id]);
+        let (counts, unresolved) = reserved_counts(selection.total, ProgressCounts {
+            total: 1, success: 1, ..Default::default()
+        }).unwrap();
+        assert_eq!(counts.success, 1);
+        assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn paused_legacy_lookup_errors_and_malformed_summary_are_not_control_only() {
+        for status in ["paused", "running"] {
+            let mut task = legacy_paused_task();
+            task.insert("status", status);
+            for message in ["network disconnected", "查询超时（15s）"] {
+                let mut runtime = priority_runtime(&resolved_task(&task, true).unwrap(), "sign_flip__priority", 100);
+                let error = apply_legacy_monitor_summary(&task, Err(anyhow!("{message}")), &mut runtime).unwrap_err();
+                assert_eq!(error.to_string(), message);
+                assert_ne!(runtime.data_source, "control_only");
+            }
+            let mut runtime = priority_runtime(&resolved_task(&task, true).unwrap(), "sign_flip__priority", 100);
+            assert!(apply_legacy_monitor_summary(&task, Ok(Some(doc! { "reserved": 60 })), &mut runtime).is_err());
+            assert_ne!(runtime.data_source, "control_only");
+        }
+    }
+
+    #[test]
+    fn paused_root_mode_never_falls_back_to_legacy_control_only() {
+        let mut task = priority_task();
+        task.insert("status", "paused");
+        let mut runtime = priority_runtime(&resolved_task(&task, false).unwrap(), "pipeline__priority", 100);
+        assert!(apply_legacy_monitor_summary(&task, Ok(None), &mut runtime).is_err());
+        assert!(missing_root_pool(&mut runtime).is_err());
+        assert_eq!(runtime.reason.as_deref(), Some("root_pool_not_registered"));
+        assert_ne!(runtime.data_source, "control_only");
+        let legacy_task = legacy_paused_task();
+        for pool in [None, Some("pool-a".to_owned())] {
+            runtime.mode = Some("per_root".into());
+            runtime.pool_id = pool;
+            assert!(apply_legacy_monitor_summary(&legacy_task, Ok(None), &mut runtime).is_err());
+            assert_eq!(runtime.mode.as_deref(), Some("per_root"));
+        }
     }
 
     #[test]

@@ -40,6 +40,14 @@ npm run tauri:dev
 
 Building the desktop app also requires Rust and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 
+## Priority scheduling and paused monitoring
+
+With a compatible per-root backend, **Scheduling priority** is a positive weight (default 1): larger values run first, not a stage number or simulation budget. Within one original source consumer, ordering is **task weight → R3/R2/R1 → started roots within the stage → stable order**. Running simulations are not preempted; separate consumers/hosts do not provide strict account-wide ordering. Each root retains its original source and independent limit of three stages with up to 60 candidates each.
+
+For a paused legacy task whose old campaign summary is confirmed absent, monitoring preserves previous counts and marks progress unconfirmed instead of repeatedly reporting missing-ledger errors. Existing campaigns still use exact-ID receipt monitoring; real network/ledger errors remain visible. No task is resumed automatically.
+
+These changes require updated backend consumers and a rebuilt native frontend. Editing source or refreshing a web page does not upgrade running processes or publish new installers.
+
 ## Documentation
 
 - [User guide](docs/user-guide.en.md): setup, tasks and results.

@@ -9,7 +9,8 @@ export const DEFAULT_PRIORITY_ROUNDS = Object.freeze({
   enabled: true, max_rounds: 3, max_simulations_per_round: 60, promote_top_k: 5,
   exploration_fraction: 0.2, wait_timeout: 7200, poll_interval: 30,
 });
-export const PRIORITY_CONFIG_HINT = 'refine_templates: "auto" 9种模板中默认启用前5种 ablation、turnover_adjust、operator_transfer、group_op_add、event_op_add；新建 pipeline/auto 默认 rounds.enabled:true，每个 root 独立最多3阶段×每阶段60次实际回测，每个 root 累计最多180次，池无全局60/180预算或阶段屏障；兼容字段 rounds.max_rounds 表示每root最大阶段数，max_simulations_per_round 表示每root阶段cap；同一 root 每阶段等实际反馈后晋级前5名，再按已测表现与20%探索自适应选择方向，不按配置列表顺序分配预算。sign 方向规范化为免费前置，不单独回测纯翻转；独立 ablation 只消融结构、绝不改变 settings，实际回测占预算；turnover_adjust 仅产生0/1条 decay-only 变体、无消融。sign_flip 登记在最后，仅供legacy纯翻转；rounds.enabled:true 或 direction_normalization:true 时显式启用 sign_flip 会报错：sign flip是免费前置，请用ablation/auto，不会静默迁移；旧配置需明确改模板名，不重置预算。每模板默认10条，作用于每源×方向的候选池；max_variants_per_alpha 默认40只约束legacy扇出，不是root阶段回测预算。source_scope 默认 active，持续吸收所选 Priority 主机 control 注册表中同 auth 的当前 active regular 任务的成功真实 results；可选 source_tasks 非空任务名列表仅作筛选，不指定固定 source_task，不依赖 tags。root 的 source_task/source_remote 一经建立不可变，切换活跃任务只影响新 roots；变体写回该 root 原来源任务。前端仅启动和监控；per-root controller/CPU生成在所选 Priority 运行主机执行（可remote/local），CP目标独立于来源执行，来源按root.source_remote路由；原任务 normal consumer 须支持 protocol3；未升级则等待，禁止启动 standalone Consumer 抢槽。旧 campaign/UNKNOWN/wrong-route 行不自动迁移或重新派发。省略 rounds 或 enabled:false 保持 legacy continuous 与列表顺序；旧保存配置不注入 rounds。可改为模板名数组或 [{"name":"event_op_add","enabled":true,"params":{"num_variants":6,"max_attempts":60},"max_variants":10}]，enabled:false 禁用该模板，[] 全部关闭。event_op_add 的 open_events / exit_events 可设为非空字符串列表，num_variants 默认6、max_attempts 默认60（均须正整数），include_regional 须为布尔值。datafield_replacement / change_settings / fastexpr_to_python 仅显式加入时启用。';
+export const PRIORITY_SCHEDULING_HINT = '数值越大越优先；先任务优先级，再R3→R2→R1，同阶段已开始root优先；不抢占正在运行模拟';
+export const PRIORITY_CONFIG_HINT = 'priority（默认1）为有限正数调度权重，不是回测预算。' + PRIORITY_SCHEDULING_HINT + '。refine_templates: "auto" 9种模板中默认启用前5种 ablation、turnover_adjust、operator_transfer、group_op_add、event_op_add；新建 pipeline/auto 默认 rounds.enabled:true，每个 root 独立最多3阶段×每阶段60次实际回测，每个 root 累计最多180次，池无全局60/180预算或阶段屏障；兼容字段 rounds.max_rounds 表示每root最大阶段数，max_simulations_per_round 表示每root阶段cap；同一 root 每阶段等实际反馈后晋级前5名，再按已测表现与20%探索自适应选择方向，不按配置列表顺序分配预算。sign 方向规范化为免费前置，不单独回测纯翻转；独立 ablation 只消融结构、绝不改变 settings，实际回测占预算；turnover_adjust 仅产生0/1条 decay-only 变体、无消融。sign_flip 登记在最后，仅供legacy纯翻转；rounds.enabled:true 或 direction_normalization:true 时显式启用 sign_flip 会报错：sign flip是免费前置，请用ablation/auto，不会静默迁移；旧配置需明确改模板名，不重置预算。每模板默认10条，作用于每源×方向的候选池；max_variants_per_alpha 默认40只约束legacy扇出，不是root阶段回测预算。source_scope 默认 active，持续吸收所选 Priority 主机 control 注册表中同 auth 的当前 active regular 任务的成功真实 results；可选 source_tasks 非空任务名列表仅作筛选，不指定固定 source_task，不依赖 tags。root 的 source_task/source_remote 一经建立不可变，切换活跃任务只影响新 roots；变体写回该 root 原来源任务。前端仅启动和监控；per-root controller/CPU生成在所选 Priority 运行主机执行（可remote/local），CP目标独立于来源执行，来源按root.source_remote路由；原任务 normal consumer 须支持 protocol3；未升级则等待，禁止启动 standalone Consumer 抢槽。旧 campaign/UNKNOWN/wrong-route 行不自动迁移或重新派发。省略 rounds 或 enabled:false 保持 legacy continuous 与列表顺序；旧保存配置不注入 rounds。可改为模板名数组或 [{"name":"event_op_add","enabled":true,"params":{"num_variants":6,"max_attempts":60},"max_variants":10}]，enabled:false 禁用该模板，[] 全部关闭。event_op_add 的 open_events / exit_events 可设为非空字符串列表，num_variants 默认6、max_attempts 默认60（均须正整数），include_regional 须为布尔值。datafield_replacement / change_settings / fastexpr_to_python 仅显式加入时启用。';
 const RESERVED_PARAMS = new Set(["response", "async_client", "client", "auth_profile", "task_name", "force", "ablation_only"]);
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -27,6 +28,12 @@ function positiveInt(value, name) {
 
 export function validatePriorityConfig(value) {
   const config = parseTaskConfig(value);
+  // Scheduling weight is independent of generation/stage simulation budgets.
+  // Missing legacy values retain the scheduler's default of 1; don't inject it.
+  if (Object.hasOwn(config, "priority") &&
+      (typeof config.priority !== "number" || !Number.isFinite(config.priority) || config.priority <= 0)) {
+    throw new Error("priority（调度优先级）必须为有限正数，不是回测预算");
+  }
   if (Object.hasOwn(config, "source_scope") && config.source_scope !== "active") {
     throw new Error('source_scope 仅支持 active（所选 Priority 主机 control 同 auth 的活跃 regular 来源）');
   }

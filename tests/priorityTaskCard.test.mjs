@@ -13,8 +13,10 @@ const require = createRequire(import.meta.url);
 const vueModule = pathToFileURL(require.resolve('vue/dist/vue.runtime.esm-bundler.js')).href;
 // Compile the real SFC, not a copied helper or substitute card. Stub only native
 // APIs; no Tauri service/database access and no browser are needed for SSR.
+const configModule = new URL('../src/utils/taskConfig.js', import.meta.url).href;
 const compiled = compileScript(descriptor, { id: 'priority-test', inlineTemplate: true });
 const moduleCode = compiled.content
+  .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
   .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`)
   .replace(/import \{ listen \} from '@tauri-apps\/api\/event';/, 'const listen = async () => () => {};')
@@ -105,6 +107,7 @@ async function setupCard(initial) {
     const invoke = async (name) => { hooks.refresh++; hooks.command = name; };
   `;
   const code = compileScript(descriptor, { id: `priority-instance-${instanceNumber++}` }).content
+    .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
     .replace('computed, onMounted, onUnmounted, ref, watch', 'computed, ref, watch')
     .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`)
     .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
@@ -507,4 +510,43 @@ test('confirmed empty source summaries mean no roots, not fabricated uncertainty
     assert.match(text, new RegExp(`${name} · Roots 0 · R0 0 / R1 0 / R2 0 / R3 0`));
   }
   assert.doesNotMatch(text, /来源分组未确认|UNKNOWN|待规划/);
+});
+
+test('card labels configured/default scheduling weight compactly with tooltip, not verbose main copy', async () => {
+  const { PRIORITY_SCHEDULING_HINT } = await import('../src/utils/taskConfig.js');
+  for (const status of ['pending', 'running', 'paused']) {
+    for (const priority of [undefined, 1, 2, 7.5, 250]) {
+      const config = { rounds: { enabled: true }, filter_params: { sharpe_th: 1.8 },
+        ...(priority === undefined ? {} : { priority }) };
+      const savedTask = { ...task, status, mission_config: config };
+      const { main, details } = sections(await render({ task: savedTask,
+        progress: { stale: false, priority_campaign: groupedEvent() } }));
+      const text = plainText(main);
+      assert.match(text, new RegExp(`调度优先级 ${priority ?? 1}(?![\\d.])`));
+      assert.equal((text.match(/调度优先级/g) || []).length, 1);
+      assert.ok(main.includes(`title="${PRIORITY_SCHEDULING_HINT}"`));
+      assert.doesNotMatch(text, /Filter|Params|数值越大|先任务优先级|不抢占|严格全局|跨机器保证/);
+      assert.match(plainText(details), /Filter Params:/);
+      assert.match(text, /glb_spread · Roots 118 · R0 29 \/ R1 89 \/ R2 0 \/ R3 0/);
+    }
+  }
+});
+
+test('scheduling weight follows saved config precedence, never runtime/item priority markers', async () => {
+  for (const key of ['mission_config', 'startConfig', 'config']) {
+    const savedTask = { _id: 'id-a', name: task.name, status: 'running', isRemote: true,
+      priority: 2, [key]: JSON.stringify({ priority: 9, rounds: { enabled: true } }) };
+    const { main } = sections(await render({ task: savedTask,
+      progress: { stale: false, priority_campaign: groupedEvent({ priority: 2 }) } }));
+    assert.match(plainText(main), /调度优先级 9/);
+    assert.doesNotMatch(plainText(main), /调度优先级 2/);
+  }
+  const html = await render({ task: { ...task, mission_config: undefined }, progress: {} });
+  assert.match(plainText(html), /调度优先级 1/);
+  const { state, props, nextTick } = await setupCard({ task: { ...task,
+    mission_config: { priority: 4 }, startConfig: { priority: 99 } }, progress: {} });
+  assert.equal(state.priorityConfig.value.priority, 4);
+  props.task.mission_config = { priority: 12 };
+  await nextTick();
+  assert.equal(state.priorityConfig.value.priority, 12);
 });
