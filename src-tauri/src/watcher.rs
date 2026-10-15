@@ -307,7 +307,7 @@ fn apply_summary(runtime: &mut PriorityRuntime, summary: Option<&Document>) -> R
 }
 
 fn root_stage_filter(name: &str, auth: &str, pool: &str) -> Document {
-    doc! { "priority_task": name, "auth_profile": auth, "pool_id": pool }
+    doc! { "priority_task": name, "auth_profile": auth, "pool_id": pool, "retired": { "$ne": true } }
 }
 
 // All roots, including R0, belong to the logical source target, not the
@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(runtime.reserved, None);
         assert!(runtime.counts.is_none());
         assert_eq!(root_stage_filter("pipeline__priority", "user1", "pool-a"),
-            doc! { "priority_task": "pipeline__priority", "auth_profile": "user1", "pool_id": "pool-a" });
+            doc! { "priority_task": "pipeline__priority", "auth_profile": "user1", "pool_id": "pool-a", "retired": { "$ne": true } });
         for (key, value) in [("_id", "other:task"), ("mode", "legacy"), ("pool_id", "")] {
             let mut bad = summary.clone(); bad.insert(key, value);
             assert!(apply_root_summary(&mut runtime, &bad).is_err());
