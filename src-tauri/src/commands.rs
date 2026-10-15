@@ -253,6 +253,12 @@ pub struct Task {
     #[serde(rename = "startConfig")]
     pub start_config: Option<JsonValue>,
     pub config: Option<JsonValue>,
+    #[serde(default, rename = "stopConfirmedAt")]
+    pub stop_confirmed_at: Option<bson::DateTime>,
+    #[serde(default, rename = "stopConfirmedRemote")]
+    pub stop_confirmed_remote: Option<bool>,
+    #[serde(default, rename = "stopConfirmedTaskId")]
+    pub stop_confirmed_task_id: Option<String>,
 
 }
 
@@ -973,30 +979,79 @@ fn get_script_description(script_key: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionStopProof {
+    schema_version: u32,
+    task_name: String,
+    target_remote: bool,
+    session_absent: bool,
+    runners_exited: bool,
+}
+
+// Exit zero or a printed success message is insufficient. The stop script
+// must verify both the exact session and its recorded execution processes.
+fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<(), String> {
+    let receipts: Vec<_> = stdout.lines().filter_map(|line|
+        line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")).collect();
+    if receipts.len() != 1 || stdout.lines().last().and_then(|line|
+        line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")) != receipts.first().copied() {
+        return Err("停止状态未确认：缺少唯一的最终执行退出核验回执，请更新停止脚本后核对；不会自动重试停止".into());
+    }
+    let proof: ExecutionStopProof = serde_json::from_str(receipts[0])
+        .map_err(|e| format!("停止状态未确认：回执无效：{e}"))?;
+    if proof.schema_version != 1 || proof.task_name != name || proof.target_remote != remote
+        || !proof.session_absent || !proof.runners_exited {
+        return Err("停止状态未确认：任务/执行目标不匹配，或会话/执行进程尚未确认退出".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedTaskStop {
+    confirmed: bool,
+    task_id: String,
+    task_name: String,
+    is_remote: bool,
+    stop_confirmed_at: i64,
+}
+
+fn confirmed_pause_update(id: ObjectId, remote: bool, at: bson::DateTime) -> Document {
+    doc! { "status": "paused", "pausedAt": at, "stopConfirmedAt": at,
+        "stopConfirmedRemote": remote, "stopConfirmedTaskId": id.to_hex() }
+}
+
 #[command]
-pub async fn pause_task(task_name: String, is_remote: bool, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<(), String> {
-    let (_, _) = run_bash_script(
-        "pause_task",
-        &[("task_name", &task_name)],
-        is_remote,
-        &app_config,
-    )
-    .await?;
-
-    let client = &clients.local;
-
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    tasks
-        .update_one(
-            doc! { "name": &task_name , "status": { "$ne": "deactive" }},
-            doc! { "$set": { "status": "paused" } },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-Ok(())
+pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<String>,
+    clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<ConfirmedTaskStop, String> {
+    let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
+    let mut filter = doc! { "name": &task_name, "status": { "$ne": "deactive" } };
+    if let Some(id) = task_id {
+        filter.insert("_id", ObjectId::parse_str(id).map_err(|e| format!("任务ID无效：{e}"))?);
+    }
+    let task = timeout(Duration::from_secs(5), tasks.find_one(filter, None)).await
+        .map_err(|_| "停止请求未发出：任务身份查询超时".to_string())?
+        .map_err(|e| e.to_string())?.ok_or("停止请求未发出：原任务不存在")?;
+    let id = task.get_object_id("_id").map_err(|e| e.to_string())?;
+    if task.get_bool("isRemote").unwrap_or(false) != is_remote {
+        return Err("停止请求未发出：执行目标已经变更".into());
+    }
+    let (stdout, _) = run_bash_script("pause_task", &[("task_name", &task_name)],
+        is_remote, &app_config).await?;
+    verified_stop_proof(&stdout, &task_name, is_remote)?;
+    let at = bson::DateTime::now();
+    let result = timeout(Duration::from_secs(5), tasks.update_one(
+        doc! { "_id": id, "name": &task_name, "status": { "$ne": "deactive" },
+            "isRemote": task.get("isRemote").cloned().unwrap_or(bson::Bson::Null) },
+        doc! { "$set": confirmed_pause_update(id, is_remote, at) }, None)).await
+        .map_err(|_| "执行退出已核验，但控制记录回写超时；停止状态未完成确认，请核对，不要盲目重试".to_string())?
+        .map_err(|e| format!("执行退出已核验，但控制记录回写失败：{e}"))?;
+    if result.matched_count != 1 {
+        return Err("执行退出已核验，但原任务身份/执行目标已变化；未回写暂停".into());
+    }
+    Ok(ConfirmedTaskStop { confirmed: true, task_id: id.to_hex(), task_name,
+        is_remote, stop_confirmed_at: at.timestamp_millis() })
 }
 
 #[command]
@@ -1006,6 +1061,71 @@ pub fn restart_app() -> Result<(), String> {
 }
 
 
+
+#[cfg(test)]
+mod verified_pause_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn proof(extra: JsonValue) -> String {
+        let mut value = json!({ "schema_version": 1, "task_name": "pipeline__priority",
+            "target_remote": true, "session_absent": true, "runners_exited": true });
+        if let Some(overrides) = extra.as_object() {
+            for (key, replacement) in overrides { value[key] = replacement.clone(); }
+        }
+        format!("stop log\nQUANTNIGHT_PAUSE_CONFIRMED {value}\n")
+    }
+
+    #[test]
+    fn only_exact_verified_execution_receipt_confirms_stop() {
+        let valid = proof(json!({}));
+        assert!(verified_stop_proof(&valid, "pipeline__priority", true).is_ok());
+        assert!(verified_stop_proof("✅ 已关停", "pipeline__priority", true).is_err());
+        assert!(verified_stop_proof("", "pipeline__priority", true).is_err());
+        assert!(verified_stop_proof(&(valid.clone() + &valid), "pipeline__priority", true).is_err());
+        assert!(verified_stop_proof(&(valid.clone() + "more output\n"), "pipeline__priority", true).is_err());
+        assert!(verified_stop_proof(&proof(json!({"unexpected": true})), "pipeline__priority", true).is_err());
+        for changes in [json!({"session_absent": false}), json!({"runners_exited": false}),
+            json!({"schema_version": 2}), json!({"task_name": "other"}),
+            json!({"target_remote": false}), json!({"runners_exited": "true"})] {
+            assert!(verified_stop_proof(&proof(changes), "pipeline__priority", true).is_err());
+        }
+        assert!(verified_stop_proof("QUANTNIGHT_PAUSE_CONFIRMED {broken}", "pipeline__priority", true).is_err());
+    }
+
+    #[test]
+    fn task_list_preserves_persisted_stop_evidence_for_remounts() {
+        let id = ObjectId::new();
+        let at = bson::DateTime::now();
+        let mut record = confirmed_pause_update(id, true, at);
+        record.insert("_id", id);
+        record.insert("name", "pipeline__priority");
+        record.insert("isRemote", true);
+        let task: Task = bson::from_document(record).unwrap();
+        let wire = serde_json::to_value(task).unwrap();
+        assert_eq!(wire["stopConfirmedTaskId"], id.to_hex());
+        assert_eq!(wire["stopConfirmedRemote"], true);
+        assert!(!wire["stopConfirmedAt"].is_null());
+    }
+
+    #[test]
+    fn persisted_and_returned_stop_identity_are_fenced_and_explicit() {
+        let id = ObjectId::new();
+        let at = bson::DateTime::now();
+        let update = confirmed_pause_update(id, true, at);
+        assert_eq!(update.get_str("status").unwrap(), "paused");
+        assert_eq!(update.get_str("stopConfirmedTaskId").unwrap(), id.to_hex());
+        assert!(update.get_bool("stopConfirmedRemote").unwrap());
+        assert_eq!(*update.get_datetime("stopConfirmedAt").unwrap(), at);
+        let response = serde_json::to_value(ConfirmedTaskStop { confirmed: true,
+            task_id: id.to_hex(), task_name: "pipeline__priority".into(), is_remote: true,
+            stop_confirmed_at: at.timestamp_millis() }).unwrap();
+        assert_eq!(response["taskId"], id.to_hex());
+        assert_eq!(response["isRemote"], true);
+        assert_eq!(response["confirmed"], true);
+        assert_eq!(response["stopConfirmedAt"], at.timestamp_millis());
+    }
+}
 
 #[cfg(test)]
 mod priority_config_tests {

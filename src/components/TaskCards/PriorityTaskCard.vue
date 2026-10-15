@@ -40,7 +40,10 @@
       <n-text type="warning">{{ progressError || '进度加载中，尚未确认统计…' }}</n-text>
       <n-text v-if="displayProgress" depth="3">（保留上次实际统计）</n-text>
     </div>
-    <div>任务状态：{{ displayRuntimeStatus }}</div>
+    <div>{{ stopStatus || !(roundEnabled || runtime) ? '任务状态' : '研究状态（非进程存活状态）' }}：{{ displayRuntimeStatus }}</div>
+    <div v-if="stopStatus && (roundEnabled || runtime)">
+      研究状态（非进程存活状态）：{{ runtime?.status || runtime?.stage || '未确认' }}
+    </div>
     <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
       <template v-if="!legacyRuntime">
         <div v-for="group in sourceGroups" :key="group.key" class="source-group">
@@ -178,8 +181,12 @@ export function prioritySourceGroups(runtime, configuredSources) {
     distinguishHost: groups.filter(other => other.source_task === group.source_task).length > 1 }));
 }
 
-export function priorityDisplayStatus(runtime, roundEnabled, controlStatus) {
+export function priorityDisplayStatus(runtime, roundEnabled, controlStatus, stopStatus) {
+  // Research events cannot confirm process exit or replace an operation result.
+  if (stopStatus) return stopStatus;
+  if (controlStatus === 'paused') return '暂停（运行状态未确认）';
   const status = runtime?.status || runtime?.stage || (roundEnabled ? 'waiting' : controlStatus);
+  if (status === 'paused') return '暂停（运行状态未确认）';
   if (runtime && ['completed', 'done', 'success'].includes(status) &&
       (!runtime.counts || runtime.unresolved !== 0)) return 'waiting';
   return status;
@@ -201,7 +208,7 @@ export function priorityRuntimeWarning(runtime) {
 
 export function priorityStatusType(status) {
   if (['completed', 'done', 'success'].includes(status)) return 'success';
-  if (['blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
+  if (['stopping', '停止状态未确认', '暂停（运行状态未确认）', 'blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
   if (['error', 'failed'].includes(status)) return 'error';
   return 'default';
 }
@@ -212,6 +219,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
+import { taskStopDisplayStatus } from '../../stores/taskStore.js';
 
 const props = defineProps({
   task: {
@@ -226,12 +234,17 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  stopOperation: {
+    type: Object,
+    default: null,
+  },
 });
 
 defineEmits(['update:isRemote', 'start', 'update', 'pause', 'delete']);
 
 const runtime = ref(null);
-watch(() => [props.task._id, props.task.name, props.task.isRemote], () => { runtime.value = null; });
+watch(() => JSON.stringify([typeof props.task._id === 'object' ? props.task._id?.$oid : props.task._id,
+  props.task.name, props.task.isRemote === true]), () => { runtime.value = null; });
 // Cached metadata makes remounts truthful before the next background snapshot.
 watch(() => props.progress?.priority_campaign, (payload) => {
   if (payload && acceptPriorityRuntime(payload, props.task, runtime.value)) {
@@ -255,10 +268,12 @@ const displayProgress = computed(() => {
 });
 const progressStale = computed(() => props.progress?.stale || runtime.value?.stale || !displayProgress.value);
 const progressError = computed(() => runtime.value?.last_error || props.progress?.lastError);
-const displayStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status));
-const displayRuntimeStatus = computed(() => roundEnabled.value || runtime.value
-  ? (runtime.value?.status || runtime.value?.stage ? displayStatus.value : '等待root池状态确认')
-  : props.taskRuntimeStatus);
+const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
+const displayStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status, stopStatus.value));
+const displayRuntimeStatus = computed(() => stopStatus.value ? stopStatus.value
+  : roundEnabled.value || runtime.value
+    ? (runtime.value?.status || runtime.value?.stage ? displayStatus.value : '等待root池状态确认')
+    : props.taskRuntimeStatus === 'paused' ? '暂停（运行状态未确认）' : props.taskRuntimeStatus);
 
 let disposed = false;
 let unlisten;

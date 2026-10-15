@@ -30,6 +30,7 @@
               :task="task"
               :progress="taskProgressMap[task.name]"
               :task-runtime-status="taskRuntimeStatus[task.name]"
+              :stop-operation="taskStopOperationMap[task.name]"
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @start="openStartModal(task)"
               @update="openUpdateModal(task)"
@@ -108,7 +109,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
-import { useTaskStore } from "../stores/taskStore";
+import { useTaskStore, validStopReceipt } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, syncTaskToRemote, mutateTaskSource } from "../utils/taskProgress.js";
 import { storeToRefs } from "pinia";
 import { useMessage, useDialog } from "naive-ui";
@@ -127,7 +128,7 @@ import UpdateTaskModal from "../components/modals/UpdateTaskModal.vue";
 
 // Store and Router
 const taskStore = useTaskStore();
-const { tasks, taskProgressMap } = storeToRefs(taskStore);
+const { tasks, taskProgressMap, taskStopOperationMap } = storeToRefs(taskStore);
 const router = useRouter();
 const route = useRoute();
 
@@ -150,6 +151,7 @@ const isPriorityForUpdate = ref(false);
 
 // Other reactive state
 const taskRuntimeStatus = ref({});
+const pendingStops = new Map();
 let disposed = false;
 
 // Computed properties for task lists
@@ -242,8 +244,41 @@ const updateIsRemote = async (id, isRemote) => {
 };
 
 const pauseTask = async (task) => {
-  await invoke("pause_task", { taskName: task.name, isRemote: task.isRemote });
-  await fetchTasks();
+  // Capture before awaiting: the current task/host may be replaced meanwhile.
+  const target = { _id: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true };
+  if (disposed) return false;
+  const operation = taskStore.beginTaskStop(target);
+  if (!operation) return false; // missing/replaced task or an already pending stop
+  pendingStops.set(operation.generation, { target, operation });
+  let receipt;
+  let timer;
+  try {
+    // Reuse both invalidation barriers. A resolved void command or stdout text
+    // is not proof: native must verify process exit AND commit control state.
+    await mutateTaskSource({
+      fetch: fetchTasks,
+      update: async () => {
+        try {
+          receipt = await Promise.race([
+            invoke("pause_task", { taskName: target.name, taskId: target._id, isRemote: target.isRemote }),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("停止确认超时；请核对运行状态，不要盲目重试")), 120000);
+            }),
+          ]);
+        } finally { clearTimeout(timer); }
+        if (!validStopReceipt(target, receipt)) throw new Error("停止回执未确认或身份/执行目标不匹配");
+      },
+      commit: () => { if (!disposed) taskStore.confirmTaskPaused(target, receipt, operation); },
+    });
+  } catch (error) {
+    if (!disposed) {
+      taskStore.markTaskStopUnconfirmed(target, operation, error);
+      message.error("停止状态未确认：" + String(error));
+    }
+    throw error;
+  } finally { pendingStops.delete(operation.generation); }
+  if (!disposed) await fetchTasks();
+  return true;
 };
 
 const deleteTask = (id) => {
@@ -322,8 +357,11 @@ const handleAddPriorityTask = async (task) => {
 };
 
 const handleStartTask = async ({ taskName, config, isRemote }) => {
+  const original = tasks.value.find((task) => task.name === taskName);
+  const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
     await invoke("start_task", { taskName, config: JSON.stringify(config), isRemote });
+    if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
     fetchTasks();
   } catch (err) {
@@ -333,8 +371,11 @@ const handleStartTask = async ({ taskName, config, isRemote }) => {
 };
 
 const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
+  const original = tasks.value.find((task) => task.name === taskName);
+  const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
     await invoke("start_super_task", { taskName, config: JSON.stringify(config), isRemote });
+    if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("Super 任务启动成功");
     fetchTasks();
   } catch (err) {
@@ -344,8 +385,11 @@ const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
 };
 
 const handlePriorityStartTask = async ({ taskName, config, isRemote }) => {
+  const original = tasks.value.find((task) => task.name === taskName);
+  const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
     await invoke("start_priority_task", { taskName, config: JSON.stringify(config), isRemote });
+    if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
     fetchTasks();
   } catch (err) {
@@ -409,7 +453,11 @@ const pollTaskStatus = () => {
 const autoPause = createAutoPauseScheduler({
   getTasks: () => tasks.value,
   getProgress: () => taskProgressMap.value,
-  pause: pauseTask,
+  pause: (task) => {
+    // Progress recovery must not blindly retry a failed/unconfirmed stop.
+    if (taskStopOperationMap.value[task.name]) return;
+    return pauseTask(task);
+  },
   onError: (error) => {
     console.error("自动暂停失败", error);
     message.error("自动暂停失败: " + error);
@@ -442,6 +490,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true;
+  for (const { target, operation } of pendingStops.values()) {
+    taskStore.markTaskStopUnconfirmed(target, operation, '页面已离开，停止回执未完成确认');
+  }
+  pendingStops.clear();
   progressLifecycle.stop();
   stopAutoPauseWatch();
   autoPause.stop();

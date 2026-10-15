@@ -43,3 +43,17 @@ cargo test --bin quantnight-frontend watcher::tests::configured_remote_task_stat
 The backend tests cover query errors versus genuinely empty collections, Int32/Int64 counters, source precedence, active-versus-soft-deleted registration filters, task identity, monotonic versions, merged refresh requests, polling without stream events, and receiving/trailing events while another query is blocked. The optional integration check reads `asi_d1_selected4_ideas` using the application's actual routing and statistics helpers, and checks the remote replica set. It creates no data and writes no database records.
 
 Global success, per-task failure, and discovery-failure listeners in `src/main.js` update the same guarded store, including while the task page is unmounted. Discovery-failure versions are taken before starting the snapshot, so they cannot invalidate newer successful statistics. Native Tauri event delivery/UI interactions still require an application smoke test; Vite builds and unit tests alone are not proof of that path.
+
+## Confirmed pause versus research state
+
+`node --test tests/*.test.mjs` exercises the real Priority SFC (SSR/event setup),
+TaskManager pause handler, Pinia store and existing list-request coordinator.
+A pending stop shows `stopping`; only a matching structured native receipt or
+valid persisted exit evidence establishes confirmed `paused`. Void command returns,
+success logs and bare paused records do not. Failed/invalid/timed-out verification
+shows stop-unconfirmed, not paused. These operation states outrank cached or late
+active/blocked research metadata, which is explicitly not process liveness. Verified
+success commits captured ID/host-fenced evidence before fetching, without resetting
+measured counters/groups. Pre/during-command reads are invalidated; subsequent
+list-load failure cannot undo verified evidence. `$oid` IDs, same-name replacements, changed hosts and
+unmount are covered. These are offline regressions, not native-app smoke tests.

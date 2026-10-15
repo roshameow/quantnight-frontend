@@ -14,8 +14,10 @@ const vueModule = pathToFileURL(require.resolve('vue/dist/vue.runtime.esm-bundle
 // Compile the real SFC, not a copied helper or substitute card. Stub only native
 // APIs; no Tauri service/database access and no browser are needed for SSR.
 const configModule = new URL('../src/utils/taskConfig.js', import.meta.url).href;
+const stopModule = new URL('../src/stores/taskStore.js', import.meta.url).href;
 const compiled = compileScript(descriptor, { id: 'priority-test', inlineTemplate: true });
 const moduleCode = compiled.content
+  .replaceAll("'../../stores/taskStore.js'", JSON.stringify(stopModule))
   .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
   .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`)
@@ -107,6 +109,7 @@ async function setupCard(initial) {
     const invoke = async (name) => { hooks.refresh++; hooks.command = name; };
   `;
   const code = compileScript(descriptor, { id: `priority-instance-${instanceNumber++}` }).content
+    .replaceAll("'../../stores/taskStore.js'", JSON.stringify(stopModule))
     .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
     .replace('computed, onMounted, onUnmounted, ref, watch', 'computed, ref, watch')
     .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`)
@@ -549,4 +552,163 @@ test('scheduling weight follows saved config precedence, never runtime/item prio
   props.task.mission_config = { priority: 12 };
   await nextTick();
   assert.equal(state.priorityConfig.value.priority, 12);
+});
+
+test('actual SFC SSR keeps paused in header and control line for active/blocked/stale/missing research metadata', async () => {
+  for (const rounds of [true, false]) {
+    for (const payload of [groupedEvent(), groupedEvent({ status: 'blocked', reason: 'feedback_incomplete_or_wait_timeout' }),
+      groupedEvent({ stale: true, last_error: 'registry timeout' }),
+      groupedEvent({ status: null, stage: null, stats_confirmed: false, counts: null }), null,
+      event({ mode: 'legacy', status: 'active' })]) {
+      const paused = { ...task, status: 'paused', stopConfirmedAt: Date.now(),
+        stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true, mission_config: { rounds: { enabled: rounds } } };
+      const html = await render({ task: paused, taskRuntimeStatus: 'running',
+        progress: { stale: false, success: 7, error: 2, total: 60, priority_campaign: payload } });
+      const { main, details } = payload || rounds ? sections(html) : { main: html, details: '' };
+      const text = plainText(main);
+      assert.match(text, /pipeline__priority\s*paused/); // actual header slot, not just helper
+      assert.match(text, /任务状态：paused/);
+      assert.doesNotMatch(text, /任务状态：(active|blocked|running|等待root池状态确认)/);
+      if (payload || rounds) assert.match(text, /研究状态（非进程存活状态）：/);
+      if (payload?.pool_id && payload.counts) {
+        assert.match(text, /glb_spread · Roots 118 · R0 29 \/ R1 89 \/ R2 0 \/ R3 0/);
+        assert.match(text, /asi_revision · Roots 26 · R0 7 \/ R1 3 \/ R2 8 \/ R3 8/);
+        assert.match(text, /✓ 50/);
+        assert.match(text, /✗ 0/);
+        assert.match(text, /Σ 240/);
+        assert.match(plainText(details), /≤60\/阶段 · ≤180累计 · 无池全局预算/);
+        if (payload.stale) assert.match(text, /registry timeout.*保留上次实际统计/);
+      }
+      if (payload?.mode === 'legacy') assert.match(text, /旧 campaign（只读）/);
+    }
+  }
+});
+
+test('late successful active/blocked/stale events cannot replace paused badge or control line; counts still update', async () => {
+  const { hooks, state, props, nextTick } = await setupCard({ task: { ...task, status: 'running' },
+    taskRuntimeStatus: 'running', progress: { stale: false, priority_campaign: groupedEvent() } });
+  try {
+    await hooks.mount();
+    props.task.status = 'paused';
+    props.stopOperation = { _id: 'id-a', name: task.name, isRemote: true, status: 'paused',
+      receipt: { confirmed: true, taskId: 'id-a', taskName: task.name, isRemote: true, stopConfirmedAt: Date.now() } };
+    await nextTick();
+    for (const [index, extra] of [{ status: 'active' }, { status: 'blocked' },
+      { status: 'active', stale: true, last_error: 'registry timeout' },
+      { status: null, stage: null }, { status: 'completed', unresolved: 0 }].entries()) {
+      hooks.handler({ payload: groupedEvent({ ...extra, updated_at: 101 + index,
+        counts: { total: 240, success: 51 + index, error: 2 } }) });
+      assert.equal(state.displayStatus.value, 'paused');
+      assert.equal(state.displayRuntimeStatus.value, 'paused');
+      assert.equal(state.displayProgress.value.success, 51 + index);
+      assert.equal(state.displayProgress.value.error, 2);
+      assert.equal(state.sourceGroups.value[0].root_count, 118);
+    }
+    props.progress = { stale: true, priority_campaign: null };
+    await nextTick();
+    assert.equal(state.displayStatus.value, 'paused');
+    assert.equal(state.displayRuntimeStatus.value, 'paused');
+    assert.equal(state.displayProgress.value.total, 240);
+  } finally { hooks.unmount(); }
+});
+
+test('research status is explicitly not liveness; paused-only precedence preserves historical error/blocked behavior', async () => {
+  const saved = groupedEvent();
+  const html = await render({ task: { ...task, status: 'running' }, taskRuntimeStatus: 'error',
+    progress: { stale: false, priority_campaign: saved } });
+  assert.match(plainText(html), /研究状态（非进程存活状态）：active/);
+  assert.equal(card.priorityDisplayStatus(event(), true, 'error'), 'blocked');
+  assert.equal(card.priorityDisplayStatus(saved, true, 'error'), 'active');
+  assert.equal(card.priorityDisplayStatus(null, true, 'paused'), '暂停（运行状态未确认）');
+  assert.equal(card.priorityDisplayStatus(null, false, 'paused'), '暂停（运行状态未确认）');
+  assert.equal(card.priorityDisplayStatus(saved, true, 'paused'), '暂停（运行状态未确认）');
+  assert.equal(card.priorityDisplayStatus(saved, true, 'paused', 'paused'), 'paused');
+});
+
+
+test('actual SFC SSR requires stop proof, never mistakes legacy paused control or active research for stopped process', async () => {
+  for (const payload of [groupedEvent(), groupedEvent({ status: 'blocked' }),
+    groupedEvent({ stale: true, last_error: 'metadata timeout' }), null]) {
+    for (const extra of [{}, { stopConfirmedAt: 'invalid', stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true },
+      { stopConfirmedAt: Date.now(), stopConfirmedTaskId: 'old-id', stopConfirmedRemote: true },
+      { stopConfirmedAt: Date.now(), stopConfirmedTaskId: 'id-a', stopConfirmedRemote: false }]) {
+      const html = await render({ task: { ...task, ...extra, status: 'paused' }, taskRuntimeStatus: 'running',
+        progress: { stale: false, priority_campaign: payload } });
+      const { main } = sections(html);
+      const text = plainText(main);
+      assert.match(text, /pipeline__priority\s*暂停（运行状态未确认）/);
+      assert.match(text, /任务状态：暂停（运行状态未确认）/);
+      assert.doesNotMatch(text, /任务状态：paused|任务状态：active/);
+      if (payload?.counts) { assert.match(text, /✓ 50/); assert.match(text, /Σ 240/); }
+    }
+  }
+});
+
+test('real SFC SSR and late events keep stopping/unconfirmed above all research states, preserving real counts and groups', async () => {
+  for (const [status, label] of [['stopping', 'stopping'], ['stop_unconfirmed', '停止状态未确认']]) {
+    const stopOperation = { _id: 'id-a', name: task.name, isRemote: true, status };
+    for (const payload of [groupedEvent(), groupedEvent({ stale: true, last_error: 'registry timeout' }), null]) {
+      const html = await render({ task: { ...task, status: 'running' }, stopOperation,
+        taskRuntimeStatus: 'running', progress: { stale: false, priority_campaign: payload } });
+      const { main } = sections(html);
+      assert.match(plainText(main), new RegExp(`pipeline__priority\\s*${label}`));
+      assert.match(plainText(main), new RegExp(`任务状态：${label}`));
+      assert.doesNotMatch(plainText(main), /任务状态：paused|任务状态：active/);
+      if (payload?.counts) {
+        assert.match(plainText(main), /✓ 50.*✗ 0.*Σ 240/);
+        assert.match(plainText(main), /glb_spread · Roots 118 · R0 29/);
+      }
+    }
+    const { hooks, state } = await setupCard({ task: { ...task, status: 'paused' }, stopOperation,
+      progress: { stale: false, priority_campaign: groupedEvent() } });
+    try {
+      await hooks.mount();
+      for (const [index, extra] of [{ status: 'active' }, { status: 'blocked' },
+        { status: 'active', stale: true, last_error: 'timeout' }].entries()) {
+        hooks.handler({ payload: groupedEvent({ ...extra, updated_at: 110 + index }) });
+        assert.equal(state.displayStatus.value, label);
+        assert.equal(state.displayRuntimeStatus.value, label);
+        assert.equal(state.displayProgress.value.total, 240);
+      }
+    } finally { hooks.unmount(); }
+  }
+});
+
+test('actual card operation prop is identity/host-fenced; persisted proof confirms remount only on current target', async () => {
+  for (const extra of [{ _id: 'other' }, { name: 'other' }, { isRemote: false }]) {
+    const html = await render({ task: { ...task, status: 'paused' }, stopOperation: {
+      _id: 'id-a', name: task.name, isRemote: true, status: 'stopping', ...extra },
+      progress: { stale: false, priority_campaign: groupedEvent() } });
+    assert.match(plainText(html), /任务状态：暂停（运行状态未确认）/);
+    assert.doesNotMatch(plainText(html), /任务状态：stopping/);
+  }
+  const persisted = { ...task, status: 'paused', stopConfirmedAt: { $date: { $numberLong: String(Date.now()) } },
+    stopConfirmedRemote: true, stopConfirmedTaskId: 'id-a' };
+  const { state } = await setupCard({ task: persisted, progress: {} });
+  assert.equal(state.displayStatus.value, 'paused');
+  assert.equal(state.displayRuntimeStatus.value, 'paused');
+  assert.equal(state.runtime.value, null);
+});
+
+test('research-only paused metadata cannot produce a confirmed paused badge without proof', async () => {
+  const html = await render({ task: { ...task, status: 'running' }, taskRuntimeStatus: 'paused',
+    progress: { stale: false, priority_campaign: groupedEvent({ status: 'paused' }) } });
+  assert.match(plainText(html), /pipeline__priority\s*暂停（运行状态未确认）/);
+  assert.doesNotMatch(plainText(html), /pipeline__priority\s*paused/);
+});
+
+test('same-ID BSON object list reload retains real cached runtime counts while proof/operation display stays fenced', async () => {
+  const saved = { ...task, _id: { $oid: 'id-a' }, status: 'paused', stopConfirmedAt: Date.now(),
+    stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true };
+  const { state, props, nextTick } = await setupCard({ task: saved,
+    progress: { stale: false, priority_campaign: groupedEvent() } });
+  assert.equal(state.displayProgress.value.total, 240);
+  props.task = { ...saved, _id: { $oid: 'id-a' } }; // new JSON object, same logical task
+  await nextTick();
+  assert.equal(state.displayProgress.value.total, 240);
+  assert.equal(state.displayStatus.value, 'paused');
+  props.task = { ...saved, _id: { $oid: 'id-b' } };
+  await nextTick();
+  assert.equal(state.runtime.value, null);
+  assert.equal(state.displayStatus.value, '暂停（运行状态未确认）');
 });

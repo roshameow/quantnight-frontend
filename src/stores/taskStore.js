@@ -16,11 +16,53 @@ const validCount = (value) => typeof value === 'number' && Number.isFinite(value
 const validVersion = (value) => Number.isSafeInteger(value) && value >= 0
 const taskId = (task) => typeof task?._id === 'object' ? task._id?.$oid : task?._id
 
+// Native stop receipts and persisted BSON/JSON dates are proof only when their
+// identity and logical execution target match. A control flag alone is not proof.
+const sameStopTarget = (task, target) => !!task && !!target &&
+  task.name === target.name && typeof taskId(task) === 'string' && !!taskId(task) &&
+  taskId(task) === taskId(target) && typeof target.isRemote === 'boolean' &&
+  (task.isRemote === true) === target.isRemote
+
+export function stopProofMillis(value) {
+  if (value instanceof Date) value = value.getTime()
+  else if (value && typeof value === 'object' && '$date' in value) {
+    value = value.$date
+    if (value && typeof value === 'object' && typeof value.$numberLong === 'string' &&
+        /^\d+$/.test(value.$numberLong)) value = Number(value.$numberLong)
+  }
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) value = Date.parse(value)
+  return Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null
+}
+
+export function validStopReceipt(target, receipt) {
+  return !!receipt && receipt.confirmed === true &&
+    typeof receipt.taskId === 'string' && typeof receipt.taskName === 'string' &&
+    sameStopTarget(target, { _id: receipt.taskId, name: receipt.taskName, isRemote: receipt.isRemote }) &&
+    typeof receipt.stopConfirmedAt === 'number' && stopProofMillis(receipt.stopConfirmedAt) !== null
+}
+
+export function taskStopDisplayStatus(task, operation) {
+  if (sameStopTarget(task, operation)) {
+    if (operation.status === 'stopping') return 'stopping'
+    if (operation.status === 'stop_unconfirmed') return '停止状态未确认'
+    if (operation.status === 'paused' && validStopReceipt(task, operation.receipt)) return 'paused'
+  }
+  if (task?.status !== 'paused') return null
+  const proofMatches = typeof taskId(task) === 'string' && !!taskId(task) &&
+    task.stopConfirmedTaskId === taskId(task) &&
+    typeof task.stopConfirmedRemote === 'boolean' &&
+    task.stopConfirmedRemote === (task.isRemote === true) &&
+    stopProofMillis(task.stopConfirmedAt) !== null
+  return proofMatches ? 'paused' : '暂停（运行状态未确认）'
+}
+
 export const useTaskStore = defineStore('task', () => {
   // One assignment publishes both the task list and its reconciled progress cache.
-  const state = ref({ tasks: [], progress: {} })
+  const state = ref({ tasks: [], progress: {}, stopOperations: {} })
   const tasks = computed(() => state.value.tasks)
   const taskProgressMap = computed(() => state.value.progress)
+  const taskStopOperationMap = computed(() => state.value.stopOperations)
+  let stopGeneration = 0
 
   const replaceTasks = (tasksList) => {
     const previousTasks = new Map(tasks.value.map((task) => [task.name, task]))
@@ -30,7 +72,16 @@ export const useTaskStore = defineStore('task', () => {
       return [task.name, old && sameIdentity && old.is_remote === (task.isRemote === true)
         ? old : emptyProgress(task, old)]
     }))
-    state.value = { tasks: [...tasksList], progress }
+    const stopOperations = Object.fromEntries(tasksList.flatMap((task) => {
+      const operation = taskStopOperationMap.value[task.name]
+      if (!sameStopTarget(task, operation)) return []
+      // A later identity/host-matched persisted proof may resolve an uncertain
+      // action. Old proof from before this attempt must not hide a pending stop.
+      if (operation.status === 'stop_unconfirmed' && taskStopDisplayStatus(task) === 'paused' &&
+          stopProofMillis(task.stopConfirmedAt) >= operation.startedAt) return []
+      return [[task.name, operation]]
+    }))
+    state.value = { tasks: [...tasksList], progress, stopOperations }
   }
 
   const addTask = (task) => replaceTasks([...tasks.value, task])
@@ -38,6 +89,51 @@ export const useTaskStore = defineStore('task', () => {
   const removeTask = (name) => replaceTasks(tasks.value.filter((task) => task.name !== name))
   const setTaskSource = (name, isRemote) => replaceTasks(tasks.value.map((task) =>
     task.name === name ? { ...task, isRemote } : task))
+
+  const currentStopTask = (target) => tasks.value.find((task) => sameStopTarget(task, target))
+  const beginTaskStop = (target) => {
+    if (!currentStopTask(target) || taskStopOperationMap.value[target.name]?.status === 'stopping') return null
+    const operation = { _id: taskId(target), name: target.name, isRemote: target.isRemote,
+      status: 'stopping', generation: ++stopGeneration, startedAt: Date.now() }
+    state.value = { ...state.value,
+      stopOperations: { ...taskStopOperationMap.value, [target.name]: operation } }
+    return operation
+  }
+  const ownsStop = (target, operation) => currentStopTask(target) && operation &&
+    sameStopTarget(target, operation) &&
+    taskStopOperationMap.value[target.name]?.generation === operation.generation
+  const markTaskStopUnconfirmed = (target, operation, error) => {
+    if (!ownsStop(target, operation) || taskStopOperationMap.value[target.name]?.status !== 'stopping') return false
+    state.value = { ...state.value, stopOperations: { ...taskStopOperationMap.value,
+      [target.name]: { ...operation, status: 'stop_unconfirmed', error: String(error) } } }
+    return true
+  }
+  // No void result, stdout claim or bare status flag can enter this commit.
+  const confirmTaskPaused = (target, receipt, operation) => {
+    if (!ownsStop(target, operation) || taskStopOperationMap.value[target.name]?.status !== 'stopping' ||
+        !validStopReceipt(target, receipt)) return false
+    const current = currentStopTask(target)
+    state.value = { ...state.value,
+      tasks: tasks.value.map((task) => task === current ? { ...task, status: 'paused',
+        stopConfirmedAt: receipt.stopConfirmedAt, stopConfirmedRemote: receipt.isRemote,
+        stopConfirmedTaskId: receipt.taskId } : task),
+      stopOperations: { ...taskStopOperationMap.value,
+        [target.name]: { ...operation, status: 'paused', receipt: { ...receipt } } } }
+    return true
+  }
+  // Explicit successful start invalidates old local stop proof, not real counts.
+  const clearTaskStop = (target) => {
+    if (!currentStopTask(target)) return false
+    const stopOperations = { ...taskStopOperationMap.value }
+    delete stopOperations[target.name]
+    const nextTasks = tasks.value.map((task) => {
+      if (!sameStopTarget(task, target)) return task
+      const { stopConfirmedAt, stopConfirmedRemote, stopConfirmedTaskId, ...rest } = task
+      return rest
+    })
+    state.value = { ...state.value, tasks: nextTasks, stopOperations }
+    return true
+  }
 
   const acceptEvent = (event, isError) => {
     if (!event || typeof event !== 'object' || typeof event.collection !== 'string') return null
@@ -146,7 +242,7 @@ export const useTaskStore = defineStore('task', () => {
       }
       changed = true
     }
-    if (changed) state.value = { tasks: tasks.value, progress }
+    if (changed) state.value = { ...state.value, progress }
     return changed
   }
 
@@ -156,7 +252,8 @@ export const useTaskStore = defineStore('task', () => {
   return {
     // Register the backing state with Pinia (subscriptions, devtools, hydration).
     state,
-    tasks, taskProgressMap, replaceTasks, addTask, clearTasks, removeTask,
-    setTaskSource, updateProgress, updateProgressError, markProgressStale, initializeProgressForTasks,
+    tasks, taskProgressMap, taskStopOperationMap, replaceTasks, addTask, clearTasks, removeTask,
+    setTaskSource, beginTaskStop, markTaskStopUnconfirmed, confirmTaskPaused, clearTaskStop,
+    updateProgress, updateProgressError, markProgressStale, initializeProgressForTasks,
   }
 })
