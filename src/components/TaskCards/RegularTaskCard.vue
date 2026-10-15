@@ -17,8 +17,8 @@
         <div class="progress-background" :style="progressBarStyle" />
         <div class="header-content">
           <span class="task-name">{{ task.name }}</span>
-          <n-tag :type="getStatusType(task.status)" size="small" round>
-            {{ task.status }}
+          <n-tag :type="getStatusType(displayStatus)" size="small" round>
+            {{ displayStatus }}
           </n-tag>
         </div>
       </div>
@@ -99,13 +99,40 @@
     </n-card>
   </template>
 
+<script>
+export const REGULAR_RUNTIME_MAX_AGE = 600000; // existing manager poll cadence
+
+export function regularDisplayStatus(task, observation, stopStatus, now = Date.now()) {
+  if (stopStatus) return stopStatus;
+  if (task.status !== 'running') return task.status;
+  if (!observation) return '运行状态待确认';
+  const id = typeof task._id === 'object' ? task._id?.$oid : task._id;
+  if (typeof id !== 'string' || !id || observation.taskId !== id || observation.name !== task.name ||
+      observation.isRemote !== (task.isRemote === true) ||
+      !Number.isSafeInteger(observation.observedAt) || observation.observedAt > now ||
+      now - observation.observedAt >= REGULAR_RUNTIME_MAX_AGE) return '运行状态未确认';
+  if (observation.state === 'running') return 'running';
+  if (observation.state === 'not_running') return '未检测到运行消费者';
+  return '运行状态未确认';
+}
+</script>
+
 <script setup>
-import { computed } from 'vue';
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
+import { taskStopDisplayStatus } from '../../stores/taskStore.js';
 
 const props = defineProps({
   task: {
     type: Object,
     required: true,
+  },
+  taskRuntimeStatus: {
+    type: Object,
+    default: null,
+  },
+  stopOperation: {
+    type: Object,
+    default: null,
   },
   progress: {
     type: Object,
@@ -115,8 +142,30 @@ const props = defineProps({
 
 defineEmits(['update:isRemote', 'view', 'generateList', 'syncRemote', 'start', 'pause', 'delete']);
 
+// A one-shot local expiry (not another native poll) invalidates Vue's cached
+// computed badge even when no props change after a positive observation.
+const runtimeNow = ref(Date.now());
+let mounted = false;
+let expiryTimer;
+const refreshRuntimeExpiry = () => {
+  clearTimeout(expiryTimer);
+  runtimeNow.value = Date.now();
+  const observation = props.taskRuntimeStatus;
+  if (mounted && observation?.state === 'running' && Number.isSafeInteger(observation.observedAt)) {
+    const remaining = observation.observedAt + REGULAR_RUNTIME_MAX_AGE - runtimeNow.value;
+    if (remaining > 0 && remaining <= REGULAR_RUNTIME_MAX_AGE) {
+      expiryTimer = setTimeout(() => { runtimeNow.value = Date.now(); }, remaining);
+    }
+  }
+};
+const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
+onMounted(() => { mounted = true; refreshRuntimeExpiry(); });
+onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(); });
+const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus,
+  taskStopDisplayStatus(props.task, props.stopOperation), runtimeNow.value));
 const getStatusType = (status) =>
-  status === "done" ? "success" : status === "running" ? "warning" : "default";
+  status === "done" ? "success" : ["running", "stopping", "停止状态未确认", "暂停（运行状态未确认）",
+    "运行状态待确认", "运行状态未确认", "未检测到运行消费者"].includes(status) ? "warning" : "default";
 
 const progressBarStyle = computed(() => {
   const p = props.progress || {};

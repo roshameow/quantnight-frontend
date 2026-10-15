@@ -52,17 +52,18 @@ async function harness(initial = task()) {
     const onUnmounted = (fn) => { hooks.unmount = fn; };
   `;
   const module = await import(`data:text/javascript;base64,${Buffer.from(hooksCode + code + `\n// ${instance}`).toString('base64')}`);
-  const calls = [], lists = [], command = deferred();
+  const calls = [], lists = [], probes = [], command = deferred();
   let backgroundError = null;
   module.hooks.invoke = (name, args) => {
     calls.push({ name, args, status: store.tasks[0]?.status });
     if (name === 'pause_task') return command.promise;
+    if (name === 'check_task_status') { const probe = deferred(); probes.push(probe); return probe.promise; }
     if (name === 'get_all_tasks') { const request = deferred(); lists.push(request); return request.promise; }
     if (name === 'refresh_task_progress') return backgroundError ? Promise.reject(backgroundError) : Promise.resolve();
     assert.fail(`unexpected native command: ${name}`);
   };
   const state = module.default.setup({}, { expose() {} });
-  return { store, state, hooks: module.hooks, command, lists, calls, stop: () => module.hooks.unmount(),
+  return { store, state, hooks: module.hooks, command, lists, probes, calls, stop: () => module.hooks.unmount(),
     failBackground: () => { backgroundError = new Error('background progress timeout'); } };
 }
 
@@ -342,4 +343,145 @@ test('actual successful start handler clears previous verified pause so stale ac
     await tick();
     assert.equal(stopStatus(h), null);
   } finally { h.stop(); }
+});
+
+
+const regularTask = (extra = {}) => task({ taskType: 'regular', mission_config: { max_concurrent: 3 }, ...extra });
+const positivePane = '✅ Pane 0 (pid=21733) is running: python3.12';
+const bashPane = '❌ Pane 0 (pid=21733) is running: bash';
+
+test('existing manager poll includes regular, super and priority running tasks, never ready/paused; no DB mutation', async () => {
+  const h = await harness(regularTask());
+  try {
+    h.store.replaceTasks([regularTask(), task({ _id: 'id-p', name: 'priority-p' }),
+      regularTask({ _id: 'id-s', name: 'super-s', taskType: 'super' }),
+      regularTask({ _id: 'id-r', name: 'ready-r', status: 'ready' }),
+      regularTask({ _id: 'id-z', name: 'paused-z', status: 'paused' })]);
+    const before = JSON.stringify(h.store.tasks);
+    h.state.pollTaskStatus();
+    h.state.pollTaskStatus(); // one in-flight request per target
+    assert.deepEqual(h.calls.map(call => call.args.taskName), ['priority-a', 'priority-p', 'super-s']);
+    assert.ok(h.calls.every(call => call.name === 'check_task_status'));
+    assert.equal(h.hooks.timers.size, 3);
+    h.probes.forEach(probe => probe.resolve(bashPane));
+    await tick();
+    assert.equal(h.hooks.timers.size, 0);
+    const observation = h.state.taskRuntimeStatus.value['priority-a'];
+    assert.equal(observation.taskId, 'id-a');
+    assert.equal(observation.isRemote, true);
+    assert.equal(observation.state, 'not_running');
+    assert.ok(Number.isSafeInteger(observation.observedAt));
+    assert.equal(JSON.stringify(h.store.tasks), before);
+  } finally { h.stop(); }
+});
+
+test('native stdout contract only confirms recognized Python/uv, shell-only is missing consumer, errors remain unknown', async () => {
+  const h = await harness(regularTask());
+  try {
+    for (const [output, expected] of [[positivePane, 'running'],
+      ['✅ Pane 0 (pid=21733) is running: uv', 'running'],
+      [bashPane, 'not_running'], [bashPane + '\n' + positivePane, 'running'],
+      ['', 'unknown'], ['running', 'unknown'], ['paused', 'unknown'],
+      ['❌ Session task 不存在 (local)', 'unknown'],
+      ['Permission denied', 'unknown'], ['bash: source: No such file or directory', 'unknown'],
+      [positivePane + '\nPermission denied', 'unknown'],
+      ['✅ Pane 0 (pid=21733) is running: uvicorn', 'unknown'],
+      [positivePane + ' Permission denied', 'unknown'], [bashPane + ' permission denied', 'unknown'], [null, 'unknown']]) {
+      const check = h.state.checkTaskStatus(h.store.tasks[0]);
+      assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'checking');
+      h.probes.at(-1).resolve(output);
+      await check;
+      assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, expected, String(output));
+    }
+    for (const error of ['Native status command permission denied', 'script_config startup failed', 'SSH timeout']) {
+      const check = h.state.checkTaskStatus(h.store.tasks[0]);
+      h.probes.at(-1).reject(new Error(error));
+      await check;
+      assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'unknown');
+      assert.match(h.state.taskRuntimeStatus.value['priority-a'].error, new RegExp(error));
+    }
+  } finally { h.stop(); }
+});
+
+test('regular runtime captures primitive ID/target, rejects replacement ID/host/deletion/control changes and away-back results', async () => {
+  for (const replacement of [regularTask({ _id: 'new-id' }), regularTask({ isRemote: false }),
+    regularTask({ status: 'paused' }), regularTask({ status: 'ready' }), null]) {
+    for (const outcome of ['resolve', 'reject']) {
+      const h = await harness(regularTask());
+      try {
+        const mutable = regularTask();
+        const check = h.state.checkTaskStatus(mutable);
+        mutable._id.$oid = 'mutated'; mutable.isRemote = false; mutable.name = 'other';
+        assert.deepEqual(h.calls[0].args, { taskName: 'priority-a', isRemote: true });
+        h.store.replaceTasks(replacement ? [replacement] : []);
+        assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+        h.store.replaceTasks([regularTask()]); // same name/ID/target again is still a new lifecycle
+        if (outcome === 'resolve') h.probes[0].resolve(positivePane);
+        else h.probes[0].reject(new Error('late permission error'));
+        await check;
+        assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+        assert.equal(h.store.tasks[0].status, 'running');
+      } finally { h.stop(); }
+    }
+  }
+});
+
+test('bounded runtime timeout clears prior positive, late native success cannot overwrite newer bash-only evidence', async () => {
+  const h = await harness(regularTask());
+  try {
+    let check = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[0].resolve(positivePane); await check;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'running');
+    check = h.state.checkTaskStatus(h.store.tasks[0]);
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'checking');
+    const [timer] = h.hooks.timers.values();
+    assert.equal(timer.delay, 15000); timer.callback(); await check;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'unknown');
+    assert.equal(h.hooks.timers.size, 0);
+    const newer = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[2].resolve(bashPane); await newer;
+    h.probes[1].resolve(positivePane); await tick();
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'not_running');
+  } finally { h.stop(); }
+});
+
+test('same logical BSON ID reload keeps evidence; target switch prunes old cache and fences concurrent newer probe', async () => {
+  const h = await harness(regularTask());
+  try {
+    const old = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.store.replaceTasks([regularTask()]);
+    h.probes[0].resolve(positivePane); await old;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'running');
+    const remote = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.store.setTaskSource('priority-a', false);
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+    const local = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[2].resolve(bashPane); await local;
+    h.probes[1].resolve(positivePane); await remote;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'not_running');
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].isRemote, false);
+  } finally { h.stop(); }
+});
+
+test('regular probe completion after manager unmount cannot publish or mutate control/progress', async () => {
+  const h = await harness(regularTask());
+  const before = JSON.stringify(h.store.tasks);
+  const check = h.state.checkTaskStatus(h.store.tasks[0]);
+  h.stop();
+  h.probes[0].resolve(positivePane); await check;
+  assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'checking');
+  assert.equal(h.hooks.timers.size, 0);
+  assert.equal(JSON.stringify(h.store.tasks), before);
+});
+
+
+test('invalid/missing task IDs never launch a runtime probe or publish evidence', async () => {
+  for (const id of [undefined, null, '', {}, { $oid: '' }]) {
+    const h = await harness(regularTask({ _id: id }));
+    try {
+      await h.state.checkTaskStatus(h.store.tasks[0]);
+      assert.equal(h.calls.length, 0);
+      assert.deepEqual(h.state.taskRuntimeStatus.value, {});
+    } finally { h.stop(); }
+  }
 });

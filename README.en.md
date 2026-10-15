@@ -48,6 +48,8 @@ A stop request first shows `stopping`. The card shows confirmed `paused` only af
 
 For a paused legacy task whose old campaign summary is confirmed absent, monitoring preserves previous counts and marks progress unconfirmed instead of repeatedly reporting missing-ledger errors. Existing campaigns still use exact-ID receipt monitoring; real network/ledger errors remain visible. No task is resumed automatically.
 
+Regular/SUPER cards also distinguish control records from current worker observations: `running` requires fresh Python/uv evidence matching the task ID and target. A retained bash/sleep shell reports no observed consumer; failed checks remain unconfirmed, not paused or platform-simulation completion.
+
 These changes require updated backend consumers and a rebuilt native frontend. Editing source or refreshing a web page does not upgrade running processes or publish new installers.
 
 ## Documentation

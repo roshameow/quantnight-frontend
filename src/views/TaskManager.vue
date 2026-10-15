@@ -29,7 +29,7 @@
             <PriorityTaskCard
               :task="task"
               :progress="taskProgressMap[task.name]"
-              :task-runtime-status="taskRuntimeStatus[task.name]"
+              :task-runtime-status="taskRuntimeStatus[task.name]?.raw"
               :stop-operation="taskStopOperationMap[task.name]"
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @start="openStartModal(task)"
@@ -61,6 +61,8 @@
             <RegularTaskCard
               :task="task"
               :progress="taskProgressMap[task.name]"
+              :task-runtime-status="taskRuntimeStatus[task.name]"
+              :stop-operation="taskStopOperationMap[task.name]"
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @view="viewTask(task._id)"
               @generate-list="generateList(task._id)"
@@ -103,6 +105,21 @@
     />
   </div>
 </template>
+
+<script>
+// Native stdout is a process observation, not control state or platform progress.
+export function normalizeTaskRuntime(target, output, observedAt, error = null) {
+  const raw = typeof output === 'string' ? output.trim() : '';
+  const lines = raw.split(/\r?\n/).filter(Boolean);
+  const positive = /^✅ Pane \d+ \(pid=\d+\) is running: (?:python(?:\d+(?:\.\d+)*)?|uv)$/;
+  const negative = /^❌ Pane \d+ \(pid=\d+\) is running: (?:bash|sh|zsh|sleep)$/;
+  // Every line must be understood: permission/startup/transport errors remain
+  // UNKNOWN even if accompanied by a previously printed positive pane line.
+  const recognized = !error && lines.length > 0 && lines.every(line => positive.test(line) || negative.test(line));
+  const state = recognized ? (lines.some(line => positive.test(line)) ? 'running' : 'not_running') : 'unknown';
+  return { ...target, observedAt, state, raw, error: error ? String(error) : null };
+}
+</script>
 
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from "vue";
@@ -151,6 +168,15 @@ const isPriorityForUpdate = ref(false);
 
 // Other reactive state
 const taskRuntimeStatus = ref({});
+const runtimeRequests = new Map();
+const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true });
+const matchesRuntimeTarget = (task, target) => task?.status === 'running' &&
+  typeof target.taskId === 'string' && !!target.taskId && getObjectId(task._id) === target.taskId &&
+  task.name === target.name && (task.isRemote === true) === target.isRemote;
+const invalidateRuntime = (name) => {
+  delete taskRuntimeStatus.value[name];
+  runtimeRequests.delete(name);
+};
 const pendingStops = new Map();
 let disposed = false;
 
@@ -184,7 +210,7 @@ const handleTaskProgressRefreshError = (error) => {
 };
 
 // --- Task Actions (invoking Rust backend) ---
-const getObjectId = (id) => (typeof id === "object" && "$oid" in id ? id.$oid : id);
+const getObjectId = (id) => (id && typeof id === "object" && "$oid" in id ? id.$oid : id);
 
 const generateList = async (id) => {
   try {
@@ -304,23 +330,42 @@ const deleteTask = (id) => {
 };
 
 const checkTaskStatus = async (task) => {
+  const target = runtimeTarget(task); // primitives captured before any await
+  if (disposed || !matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target) ||
+      runtimeRequests.has(target.name)) return;
+  const request = { target };
+  runtimeRequests.set(target.name, request);
+  // Never leave an old positive badge visible while the next probe hangs.
+  taskRuntimeStatus.value[target.name] = { ...target, observedAt: Date.now(), state: 'checking' };
+  let timer;
+  const ownsRequest = () => !disposed && runtimeRequests.get(target.name) === request &&
+    matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target);
   try {
-    const status = await invoke("check_task_status", {
-      taskName: task.name,
-      isRemote: task.isRemote,
-    });
-    const current = tasks.value.find((item) => item.name === task.name);
-    if (!disposed && current?.status === "running" && current.isRemote === task.isRemote) {
-      taskRuntimeStatus.value[task.name] = status.trim();
-    }
+    const status = await Promise.race([
+      invoke("check_task_status", { taskName: target.name, isRemote: target.isRemote }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('消费者状态检查超时')), 15000);
+      }),
+    ]);
+    if (ownsRequest()) taskRuntimeStatus.value[target.name] = normalizeTaskRuntime(target, status, Date.now());
   } catch (err) {
-    console.error(`检查任务 ${task.name} 状态失败`, err);
-    const current = tasks.value.find((item) => item.name === task.name);
-    if (!disposed && current?.status === "running" && current.isRemote === task.isRemote) {
-      taskRuntimeStatus.value[task.name] = "error";
-    }
+    if (ownsRequest()) taskRuntimeStatus.value[target.name] = normalizeTaskRuntime(target, null, Date.now(), err);
+  } finally {
+    clearTimeout(timer);
+    if (runtimeRequests.get(target.name) === request) runtimeRequests.delete(target.name);
   }
 };
+
+// Invalidate on removal, replacement, target switch or leaving running. This
+// also prevents an away-and-back transition from reviving an old async result.
+const stopRuntimeWatch = watch(tasks, () => {
+  for (const [name, observation] of Object.entries(taskRuntimeStatus.value)) {
+    if (!matchesRuntimeTarget(tasks.value.find(item => item.name === name), observation)) invalidateRuntime(name);
+  }
+  for (const [name, request] of runtimeRequests) {
+    if (!matchesRuntimeTarget(tasks.value.find(item => item.name === name), request.target)) invalidateRuntime(name);
+  }
+}, { deep: true, flush: 'sync' });
 
 // --- Modal Handlers ---
 const handleAddTask = async (task) => {
@@ -360,6 +405,7 @@ const handleStartTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    invalidateRuntime(taskName);
     await invoke("start_task", { taskName, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
@@ -374,6 +420,7 @@ const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    invalidateRuntime(taskName);
     await invoke("start_super_task", { taskName, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("Super 任务启动成功");
@@ -388,6 +435,7 @@ const handlePriorityStartTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    invalidateRuntime(taskName);
     await invoke("start_priority_task", { taskName, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
@@ -445,7 +493,7 @@ const openUpdateModal = (task) => {
 // --- Lifecycle Hooks ---
 const pollTaskStatus = () => {
   if (disposed) return;
-  priorityTasks.value.forEach((task) => {
+  tasks.value.forEach((task) => {
     if (task.status === "running") checkTaskStatus(task);
   });
 };
@@ -494,6 +542,8 @@ onUnmounted(() => {
     taskStore.markTaskStopUnconfirmed(target, operation, '页面已离开，停止回执未完成确认');
   }
   pendingStops.clear();
+  runtimeRequests.clear();
+  stopRuntimeWatch();
   progressLifecycle.stop();
   stopAutoPauseWatch();
   autoPause.stop();
