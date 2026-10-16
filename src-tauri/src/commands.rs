@@ -688,6 +688,7 @@ pub async fn start_priority_task(
 
 const DISPATCH_MARKER: &str = "QUANTNIGHT_DISPATCH_STATE ";
 const DISPATCH_MAX_AGE_MS: i64 = 120_000;
+const LEGACY_RECONCILIATION_REASON_PREFIX: &str = "请求结果待核验；暂停新请求，已接受任务继续采集。";
 
 // Native-owned, allowlisted wire data. Never forward arbitrary capability BSON
 // or a marker printed by Bash as authority. Process stdout stays independent.
@@ -777,10 +778,20 @@ fn validated_dispatch_state(cap: &Document, task: &Document, id: ObjectId,
     if run.len() != 32 || !run.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
     let state = cap.get_str("submissionState").ok()?;
     if !["ready", "waiting_reconciliation", "waiting_quota_reset"].contains(&state) { return None; }
-    let reason = dispatch_reason(cap, "submissionReason")?;
-    if state != "ready" && reason.is_none() { return None; }
+    let supplied_reason = dispatch_reason(cap, "submissionReason")?;
+    if state != "ready" && supplied_reason.is_none() { return None; }
     let quota = cap.get_document("quota").ok()?;
-    if quota.get_str("dispatch_state").ok()? != state || dispatch_reason(quota, "reason")? != reason { return None; }
+    let reason = dispatch_reason(quota, "reason")?;
+    if quota.get_str("dispatch_state").ok()? != state { return None; }
+    // One exact historical writer format, not arbitrary display text. Keep the
+    // quota's raw reason authoritative and normalize the DTO to that same raw
+    // value. No trimming, partial matches, or compatibility for other states.
+    let exact_legacy_reason = state == "waiting_reconciliation" &&
+        match (supplied_reason.as_deref(), reason.as_deref()) {
+            (Some(supplied), Some(raw)) => supplied == format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{raw}"),
+            _ => false,
+        };
+    if supplied_reason != reason && !exact_legacy_reason { return None; }
     let stopped = quota.get_bool("stopped").ok()?;
     if stopped != (state == "waiting_quota_reset") { return None; }
     let limit = dispatch_counter(quota, "limit")?;
@@ -1380,6 +1391,109 @@ mod dispatch_state_tests {
             "submissionState": state, "submissionReason": reason, "quota": quota,
             "reset_at": "2026-10-16T02:13:20+00:00" };
         (id, task, cap)
+    }
+
+    // Minimal sanitized shape of the captured live capability: fresh UTC v3,
+    // NOT_ACCEPTED without any trustworthy daily counter/reset. All identity,
+    // account, PID and run fields below are synthetic, never a production dump.
+    const CAPTURED_RAW_REASON: &str = "simulation_quota_unconfirmed: not_accepted response without trustworthy daily quota headers; reconcile budget without a POST probe";
+
+    fn captured_reconciliation_fixture(remote: bool, legacy: bool) -> (ObjectId, Document, Document) {
+        let (id, mut task, mut cap) = fixture(remote, "waiting_reconciliation");
+        task.insert("auth_profile", "fixture-profile");
+        cap.insert("_id", "fixture-profile:source");
+        cap.insert("auth_profile", "fixture-profile");
+        cap.insert("pid", 42);
+        cap.insert("consumer_run_id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        cap.insert("heartbeatAt", bson::DateTime::from_millis(NOW - 7_821));
+        cap.insert("submissionReason", if legacy {
+            format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{CAPTURED_RAW_REASON}")
+        } else { CAPTURED_RAW_REASON.to_string() });
+        cap.insert("reset_at", bson::Bson::Null);
+        let quota = cap.get_document_mut("quota").unwrap();
+        quota.insert("reason", CAPTURED_RAW_REASON);
+        quota.insert("blocked_reason", CAPTURED_RAW_REASON);
+        quota.insert("headers_seen", false);
+        for field in ["limit", "remaining", "stop_floor", "reset", "reset_at"] {
+            quota.insert(field, bson::Bson::Null);
+        }
+        (id, task, cap)
+    }
+
+    #[test]
+    fn captured_canonical_and_exact_legacy_reasons_emit_the_same_raw_contract() {
+        for remote in [false, true] {
+            for legacy in [false, true] {
+                let (id, task, mut cap) = captured_reconciliation_fixture(remote, legacy);
+                // A display-only field is not a machine-state or reason authority.
+                cap.insert("submissionDisplayReason", "untrusted display-only text: ready");
+                let d = validated_dispatch_state(&cap, &task, id, "source", remote, NOW).unwrap();
+                let wire = serde_json::to_value(&d).unwrap();
+                assert_eq!(wire["submissionReason"], CAPTURED_RAW_REASON);
+                assert_eq!(wire["submissionState"], "waiting_reconciliation");
+                assert_eq!(wire["heartbeatAt"], NOW - 7_821);
+                assert_eq!(wire["quota"]["budgetConfirmed"], false);
+                for field in ["limit", "remaining", "stopFloor"] {
+                    assert!(wire["quota"][field].is_null());
+                }
+                assert!(wire["resetAt"].is_null());
+                let output = dispatch_status_output(PANE, Some(d));
+                assert!(output.contains(CAPTURED_RAW_REASON));
+                assert!(!output.contains(LEGACY_RECONCILIATION_REASON_PREFIX));
+                assert!(!output.contains("waiting_quota_reset"));
+                assert!(!output.contains("display-only"));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_reason_compatibility_rejects_tampering_repetition_and_missing_raw_reason() {
+        let (id, task, cap) = captured_reconciliation_fixture(true, true);
+        for reason in ["tampered".to_string(), LEGACY_RECONCILIATION_REASON_PREFIX.to_string(),
+            format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{CAPTURED_RAW_REASON}tampered"),
+            format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{LEGACY_RECONCILIATION_REASON_PREFIX}{CAPTURED_RAW_REASON}"),
+            format!(" {LEGACY_RECONCILIATION_REASON_PREFIX}{CAPTURED_RAW_REASON}"),
+            format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{CAPTURED_RAW_REASON} "),
+            format!("请求结果待核验;暂停新请求，已接受任务继续采集。{CAPTURED_RAW_REASON}")] {
+            let mut invalid = cap.clone(); invalid.insert("submissionReason", reason.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "{reason}");
+        }
+        for raw in [bson::Bson::Null, "".into(), " ".into(), "tampered".into()] {
+            let mut invalid = cap.clone(); invalid.get_document_mut("quota").unwrap().insert("reason", raw.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "{raw:?}");
+        }
+        let mut missing = cap.clone(); missing.get_document_mut("quota").unwrap().remove("reason");
+        assert!(validated_dispatch_state(&missing, &task, id, "source", true, NOW).is_none());
+        for state in ["ready", "waiting_quota_reset"] {
+            let (id, task, mut other) = fixture(true, state);
+            let raw = other.get_document("quota").unwrap().get("reason").unwrap().clone();
+            other.insert("submissionReason", format!("{LEGACY_RECONCILIATION_REASON_PREFIX}{}", raw.as_str().unwrap_or("")));
+            assert!(validated_dispatch_state(&other, &task, id, "source", true, NOW).is_none(), "{state}");
+        }
+    }
+
+    #[test]
+    fn legacy_reason_compatibility_keeps_identity_clock_and_quota_fences() {
+        let (id, task, cap) = captured_reconciliation_fixture(true, true);
+        for changes in [doc! { "source_task_id": ObjectId::new().to_hex() }, doc! { "source_remote": false },
+            doc! { "task": "other" }, doc! { "source_collection": "other" }, doc! { "auth_profile": "other" },
+            doc! { "_id": "other:source" }, doc! { "dist": "local" }, doc! { "taskType": "super" },
+            doc! { "protocol_version": 2 }, doc! { "heartbeat_clock": "local" },
+            doc! { "heartbeatAt": bson::DateTime::from_millis(NOW - DISPATCH_MAX_AGE_MS) },
+            doc! { "heartbeatAt": bson::DateTime::from_millis(NOW + 5001) },
+            doc! { "pid": 0 }, doc! { "consumer_run_id": "bad" }, doc! { "submissionState": "ready" }] {
+            let mut invalid = cap.clone(); invalid.extend(changes.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "{changes:?}");
+        }
+        for changes in [doc! { "dispatch_state": "ready" }, doc! { "stopped": true },
+            doc! { "remaining": -1 }, doc! { "budget_confirmed": "false" }, doc! { "reset_at": "bad" }] {
+            let mut invalid = cap.clone(); invalid.get_document_mut("quota").unwrap().extend(changes.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "{changes:?}");
+        }
+        assert!(validated_dispatch_state(&cap, &task, ObjectId::new(), "source", true, NOW).is_none());
+        assert!(validated_dispatch_state(&cap, &task, id, "source", false, NOW).is_none());
+        let mut paused = task.clone(); paused.insert("status", "paused");
+        assert!(validated_dispatch_state(&cap, &paused, id, "source", true, NOW).is_none());
     }
 
     #[test]

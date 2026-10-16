@@ -57,3 +57,35 @@ success commits captured ID/host-fenced evidence before fetching, without resett
 measured counters/groups. Pre/during-command reads are invalidated; subsequent
 list-load failure cannot undo verified evidence. `$oid` IDs, same-name replacements, changed hosts and
 unmount are covered. These are offline regressions, not native-app smoke tests.
+
+## Exact legacy reconciliation reason compatibility
+
+`commands.rs::dispatch_state_tests` includes a minimal sanitized fixture derived
+from a live capability's **shape**, not its account/task/PID/run identity. It has
+fresh UTC v3 evidence, unconfirmed budget, and null daily counters/reset. Native
+accepts the raw `quota.reason` verbatim or, only for `waiting_reconciliation`, the
+exact historical prefix `请求结果待核验；暂停新请求，已接受任务继续采集。` followed by that same
+raw reason. The emitted DTO always carries the raw reason. Tampering, repeated
+prefixes, prefix-only text, missing raw reason, wrong state/identity/target,
+stale/future clocks, invalid PID/run/protocol and inconsistent quota still fail.
+`submissionDisplayReason` is display-only and is not trusted as machine evidence.
+
+Verified offline: 8 tests passed by extracting the actual pure Native helpers and
+this Rust test module (excluding its Mongo deadline test), then compiling with
+already-cached BSON/Serde/Chrono dependencies; the old validator failed exactly
+the new legacy-acceptance regression. Also, 13 existing SFC/runtime tests passed:
+
+```sh
+node --test tests/test_dispatch_wait_state.test.mjs tests/test_regular_runtime_status.test.mjs
+# Optional full-crate equivalent; not run in this verification. Uses local cache
+# only, skips the Mongo endpoint test, and never invokes the application:
+cd src-tauri
+cargo test --offline --locked --bin quantnight-frontend dispatch_state_tests:: -- --skip unavailable_db_does_not_block_process_status_beyond_two_second_deadline
+```
+
+Cached Rust artifacts must match the compiler and dependency graph: selecting
+rlibs merely by newest mtime can mix Homebrew and rustup builds and produce
+E0514. Use an explicitly matched installed toolchain/cache; do not clean or
+install dependencies as a diagnostic shortcut. These tests do not prove the
+running Native app has loaded the patch; that requires a separately authorized
+frontend build/reload, not a Python consumer restart.
