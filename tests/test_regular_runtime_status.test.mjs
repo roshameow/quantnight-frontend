@@ -49,7 +49,7 @@ function assertPreserved(html) {
 }
 
 test('real regular SFC SSR: initial running control is pending; fresh positive, bash-only and unknown are distinct', async () => {
-  for (const [runtime, label] of [[null, '运行状态待确认'], [observation(), 'running'],
+  for (const [runtime, label] of [[null, '运行状态待确认'], [observation(), '消费者存活（派发状态未确认）'],
     [observation({ state: 'not_running', raw: '❌ Pane 0 (pid=21733) is running: bash' }), '未检测到运行消费者'],
     [observation({ state: 'unknown' }), '运行状态未确认'], [observation({ state: 'checking' }), '运行状态未确认'],
     [observation({ state: 'paused' }), '运行状态未确认']]) {
@@ -59,7 +59,8 @@ test('real regular SFC SSR: initial running control is pending; fresh positive, 
     assert.match(plain(html), new RegExp(`glb_spread ${label}`));
     assertPreserved(html);
     assert.equal(JSON.stringify(input), before);
-    if (label !== 'running') assert.doesNotMatch(plain(html), /glb_spread running/);
+    if (label !== '消费者存活（派发状态未确认）') assert.doesNotMatch(plain(html), /glb_spread 消费者存活（派发状态未确认）/);
+    assert.doesNotMatch(plain(html), /glb_spread running/);
     assert.doesNotMatch(plain(html), /paused|任务完成|启动成功/);
   }
 });
@@ -75,7 +76,7 @@ test('freshness and identity boundary rejects stale, future, invalid and wrong t
     assert.match(plain(html), /glb_spread 运行状态未确认/);
     assertPreserved(html);
   }
-  assert.equal(card.regularDisplayStatus(task(), observation({ observedAt: now - card.REGULAR_RUNTIME_MAX_AGE + 1 }), null, now), 'running');
+  assert.equal(card.regularDisplayStatus(task(), observation({ observedAt: now - card.REGULAR_RUNTIME_MAX_AGE + 1 }), null, now), '消费者存活（派发状态未确认）');
 });
 
 test('actual regular SFC SSR honors stop lifecycle and persisted pause proof above positive or missing consumer evidence', async () => {
@@ -136,9 +137,9 @@ test('mounted real card updates evidence/status without losing counters/config a
   const mounted = memoryMount(props);
   try {
     assert.match(mounted.text(), /glb_spread 运行状态待确认/);
-    for (const [runtime, label] of [[observation(), 'running'],
+    for (const [runtime, label] of [[observation(), '消费者存活（派发状态未确认）'],
       [observation({ state: 'not_running' }), '未检测到运行消费者'],
-      [observation({ state: 'unknown' }), '运行状态未确认'], [observation(), 'running']]) {
+      [observation({ state: 'unknown' }), '运行状态未确认'], [observation(), '消费者存活（派发状态未确认）']]) {
       props.taskRuntimeStatus = runtime;
       await nextTick();
       assert.match(mounted.text(), new RegExp(`glb_spread ${label}`));
@@ -190,13 +191,13 @@ test('mounted positive badge expires without any new props or native polling and
   const props = reactive({ task: task(), taskRuntimeStatus: observation(), progress });
   const mounted = memoryMount(props);
   try {
-    assert.match(mounted.text(), /glb_spread running/);
+    assert.match(mounted.text(), /glb_spread 消费者存活（派发状态未确认）/);
     t.mock.timers.tick(card.REGULAR_RUNTIME_MAX_AGE - 1); await nextTick();
-    assert.match(mounted.text(), /glb_spread running/);
+    assert.match(mounted.text(), /glb_spread 消费者存活（派发状态未确认）/);
     t.mock.timers.tick(1); await nextTick();
     assert.match(mounted.text(), /glb_spread 运行状态未确认/);
     assertPreserved(mounted.text());
     props.taskRuntimeStatus = observation(); await nextTick();
-    assert.match(mounted.text(), /glb_spread running/);
+    assert.match(mounted.text(), /glb_spread 消费者存活（派发状态未确认）/);
   } finally { mounted.stop(); t.mock.timers.reset(); }
 });

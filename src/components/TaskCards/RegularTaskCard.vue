@@ -17,12 +17,15 @@
         <div class="progress-background" :style="progressBarStyle" />
         <div class="header-content">
           <span class="task-name">{{ task.name }}</span>
-          <n-tag :type="getStatusType(displayStatus)" size="small" round>
+          <n-tag class="runtime-badge" :type="getStatusType(displayStatus)" :title="dispatchDetails || undefined" size="small" round>
             {{ displayStatus }}
           </n-tag>
         </div>
       </div>
     </template>
+    <div v-if="dispatchDetails" style="font-size: 12px; margin-bottom: 4px">
+      <n-text depth="3">{{ dispatchDetails }}</n-text>
+    </div>
     <div v-if="progress">
       <div style="font-size: 12px; margin-bottom: 4px">
         <n-text type="success" title="成功 (普通+插队)">
@@ -101,6 +104,16 @@
 
 <script>
 export const REGULAR_RUNTIME_MAX_AGE = 600000; // existing manager poll cadence
+export const REGULAR_DISPATCH_MAX_AGE = 120000;
+
+export function regularDispatchState(task, observation, now = Date.now()) {
+  const d = observation?.dispatch;
+  const id = typeof task._id === 'object' ? task._id?.$oid : task._id;
+  if (task.taskType === 'super' || !d || d.schemaVersion !== 1 || d.taskId !== id || d.name !== task.name ||
+      d.isRemote !== (task.isRemote === true) || d.authProfile !== (task.auth_profile ?? 'user1') ||
+      !Number.isSafeInteger(d.heartbeatAt) || d.heartbeatAt > now + 5000 || now - d.heartbeatAt >= REGULAR_DISPATCH_MAX_AGE) return null;
+  return d;
+}
 
 export function regularDisplayStatus(task, observation, stopStatus, now = Date.now()) {
   if (stopStatus) return stopStatus;
@@ -109,9 +122,16 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
   const id = typeof task._id === 'object' ? task._id?.$oid : task._id;
   if (typeof id !== 'string' || !id || observation.taskId !== id || observation.name !== task.name ||
       observation.isRemote !== (task.isRemote === true) ||
+      (observation.authProfile !== undefined && observation.authProfile !== (task.auth_profile ?? 'user1')) ||
       !Number.isSafeInteger(observation.observedAt) || observation.observedAt > now ||
       now - observation.observedAt >= REGULAR_RUNTIME_MAX_AGE) return '运行状态未确认';
-  if (observation.state === 'running') return 'running';
+  if (observation.state === 'running') {
+    const dispatch = regularDispatchState(task, observation, now);
+    if (dispatch?.submissionState === 'waiting_reconciliation') return '请求结果待核验（派发暂停，消费者存活）';
+    if (dispatch?.submissionState === 'waiting_quota_reset') return '等待配额恢复（派发暂停，消费者存活）';
+    if (dispatch?.submissionState === 'ready') return '消费者存活（可派发）';
+    return task.taskType === 'super' ? 'running' : '消费者存活（派发状态未确认）';
+  }
   if (observation.state === 'not_running') return '未检测到运行消费者';
   return '运行状态未确认';
 }
@@ -152,9 +172,12 @@ const refreshRuntimeExpiry = () => {
   runtimeNow.value = Date.now();
   const observation = props.taskRuntimeStatus;
   if (mounted && observation?.state === 'running' && Number.isSafeInteger(observation.observedAt)) {
-    const remaining = observation.observedAt + REGULAR_RUNTIME_MAX_AGE - runtimeNow.value;
+    const dispatch = regularDispatchState(props.task, observation, runtimeNow.value);
+    const expiresAt = Math.min(observation.observedAt + REGULAR_RUNTIME_MAX_AGE,
+      dispatch ? dispatch.heartbeatAt + REGULAR_DISPATCH_MAX_AGE : Infinity);
+    const remaining = expiresAt - runtimeNow.value;
     if (remaining > 0 && remaining <= REGULAR_RUNTIME_MAX_AGE) {
-      expiryTimer = setTimeout(() => { runtimeNow.value = Date.now(); }, remaining);
+      expiryTimer = setTimeout(refreshRuntimeExpiry, remaining);
     }
   }
 };
@@ -163,9 +186,20 @@ onMounted(() => { mounted = true; refreshRuntimeExpiry(); });
 onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(); });
 const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus,
   taskStopDisplayStatus(props.task, props.stopOperation), runtimeNow.value));
+const dispatchDetails = computed(() => {
+  if (!['请求结果待核验（派发暂停，消费者存活）', '等待配额恢复（派发暂停，消费者存活）', '消费者存活（可派发）'].includes(displayStatus.value)) return '';
+  const d = regularDispatchState(props.task, props.taskRuntimeStatus, runtimeNow.value);
+  if (!d) return '';
+  const q = d.quota;
+  const quota = q?.remaining != null && q?.limit != null
+    ? `${q.budgetConfirmed ? '配额快照' : '上次配额（未核验）'}: ${q.remaining}/${q.limit}` : '配额未核验';
+  const reset = Number.isSafeInteger(d.resetAt) ? `重置时间（UTC）: ${new Date(d.resetAt).toISOString()}` : '重置时间未知';
+  return [d.submissionReason, quota, reset].filter(Boolean).join(' · ');
+});
 const getStatusType = (status) =>
   status === "done" ? "success" : ["running", "stopping", "停止状态未确认", "暂停（运行状态未确认）",
-    "运行状态待确认", "运行状态未确认", "未检测到运行消费者"].includes(status) ? "warning" : "default";
+    "运行状态待确认", "运行状态未确认", "未检测到运行消费者", "请求结果待核验（派发暂停，消费者存活）",
+    "等待配额恢复（派发暂停，消费者存活）", "消费者存活（可派发）", "消费者存活（派发状态未确认）"].includes(status) ? "warning" : "default";
 
 const progressBarStyle = computed(() => {
   const p = props.progress || {};
@@ -281,7 +315,7 @@ const hasConcurrencyConfig = computed(() => {
 .card-header {
   position: relative;
   width: 100%;
-  height: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -309,6 +343,21 @@ const hasConcurrencyConfig = computed(() => {
   padding: 0 12px;
   font-weight: bold;
   font-size: 14px;
+  gap: 6px;
+  align-items: center;
+}
+.runtime-badge {
+  max-width: 72%;
+  height: auto;
+  min-height: 20px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  flex-shrink: 0;
+}
+.runtime-badge :deep(.n-tag__content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 .task-name {
   white-space: nowrap;

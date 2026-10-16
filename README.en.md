@@ -50,6 +50,8 @@ For a paused legacy task whose old campaign summary is confirmed absent, monitor
 
 Regular/SUPER cards also distinguish control records from current worker observations: `running` requires fresh Python/uv evidence matching the task ID and target. A retained bash/sleep shell reports no observed consumer; failed checks remain unconfirmed, not paused or platform-simulation completion.
 
+An alive consumer need not be dispatching: fresh, task/target-matched metadata distinguishes request-outcome reconciliation from waiting for quota recovery. Both retain the process, heartbeat and accepted-result collection; neither proves task exit or a confirmed pause. Missing, stale or conflicting metadata and a missing worker cannot be presented as a healthy waiting consumer.
+
 These changes require updated backend consumers and a rebuilt native frontend. Editing source or refreshing a web page does not upgrade running processes or publish new installers.
 
 ## Documentation

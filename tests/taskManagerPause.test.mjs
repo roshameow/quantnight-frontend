@@ -412,7 +412,7 @@ test('regular runtime captures primitive ID/target, rejects replacement ID/host/
         const mutable = regularTask();
         const check = h.state.checkTaskStatus(mutable);
         mutable._id.$oid = 'mutated'; mutable.isRemote = false; mutable.name = 'other';
-        assert.deepEqual(h.calls[0].args, { taskName: 'priority-a', isRemote: true });
+        assert.deepEqual(h.calls[0].args, { taskName: 'priority-a', taskId: 'id-a', isRemote: true });
         h.store.replaceTasks(replacement ? [replacement] : []);
         assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
         h.store.replaceTasks([regularTask()]); // same name/ID/target again is still a new lifecycle
@@ -484,4 +484,19 @@ test('invalid/missing task IDs never launch a runtime probe or publish evidence'
       assert.deepEqual(h.state.taskRuntimeStatus.value, {});
     } finally { h.stop(); }
   }
+});
+
+test('profile changes fence in-flight native dispatch metadata and invalidate previous process cache', async () => {
+  const h = await harness(regularTask({ auth_profile: 'user1' }));
+  try {
+    const pending = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.store.replaceTasks([regularTask({ auth_profile: 'user2' })]);
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+    h.probes[0].resolve(positivePane); await pending;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+    const next = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[1].resolve(positivePane); await next;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].authProfile, 'user2');
+    assert.equal(h.calls[1].args.taskId, 'id-a');
+  } finally { h.stop(); }
 });

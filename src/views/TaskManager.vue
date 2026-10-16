@@ -107,17 +107,48 @@
 </template>
 
 <script>
+// Wire metadata is constructed by Native, never by the process script. Reject
+// malformed/duplicated/non-terminal markers without weakening process parsing.
+export const DISPATCH_MAX_AGE = 120000;
+const DISPATCH_MARKER = 'QUANTNIGHT_DISPATCH_STATE ';
+export function validDispatchState(value, target, now) {
+  const text = (v, max) => typeof v === 'string' && v.length > 0 && v.length <= max && !/[\x00-\x1f\x7f]/.test(v);
+  const counter = v => v === null || (Number.isSafeInteger(v) && v >= 0);
+  const q = value?.quota;
+  return value?.schemaVersion === 1 && value.taskId === target.taskId && value.name === target.name &&
+    typeof value.isRemote === 'boolean' && value.isRemote === target.isRemote &&
+    value.authProfile === target.authProfile && /^[A-Za-z0-9_-]{1,100}$/.test(value.authProfile) &&
+    ['ready', 'waiting_reconciliation', 'waiting_quota_reset'].includes(value.submissionState) &&
+    (value.submissionReason === null ? value.submissionState === 'ready' : text(value.submissionReason, 1024)) &&
+    Number.isSafeInteger(value.heartbeatAt) && value.heartbeatAt > 0 && value.heartbeatAt <= now + 5000 &&
+    now - value.heartbeatAt < DISPATCH_MAX_AGE && /^[a-fA-F0-9]{32}$/.test(value.consumerRunId) &&
+    Number.isSafeInteger(value.pid) && value.pid > 1 && value.pid <= 4294967295 &&
+    !!q && counter(q.limit) && q.limit !== 0 && counter(q.remaining) && counter(q.stopFloor) &&
+    (q.remaining === null || q.limit === null || q.remaining <= q.limit) &&
+    (q.stopFloor === null || q.limit === null || q.stopFloor <= q.limit) && typeof q.budgetConfirmed === 'boolean' &&
+    (value.submissionState !== 'waiting_quota_reset' || [q.limit, q.remaining, q.stopFloor].every(v => v !== null)) &&
+    (value.resetAt === null || (Number.isSafeInteger(value.resetAt) && value.resetAt > 0 && value.resetAt <= 8640000000000000));
+}
+
 // Native stdout is a process observation, not control state or platform progress.
 export function normalizeTaskRuntime(target, output, observedAt, error = null) {
-  const raw = typeof output === 'string' ? output.trim() : '';
-  const lines = raw.split(/\r?\n/).filter(Boolean);
-  const positive = /^✅ Pane \d+ \(pid=\d+\) is running: (?:python(?:\d+(?:\.\d+)*)?|uv)$/;
-  const negative = /^❌ Pane \d+ \(pid=\d+\) is running: (?:bash|sh|zsh|sleep)$/;
-  // Every line must be understood: permission/startup/transport errors remain
-  // UNKNOWN even if accompanied by a previously printed positive pane line.
+  const input = typeof output === 'string' ? output.trim() : '';
+  const allLines = input.split(/\r?\n/).filter(Boolean);
+  const markers = allLines.filter(line => line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  const lines = allLines.filter(line => !line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  let dispatch = null;
+  if (!error && markers.length === 1 && allLines.at(-1) === markers[0] && markers[0].startsWith(DISPATCH_MARKER)) {
+    try {
+      const value = JSON.parse(markers[0].slice(DISPATCH_MARKER.length));
+      if (validDispatchState(value, target, observedAt)) dispatch = value;
+    } catch { /* Missing/invalid capability is NOT a quota wait. */ }
+  }
+  const raw = lines.join('\n'); // Priority cards retain their legacy process-only string.
+  const positive = /^✅ Pane \d+ \(pid=[1-9]\d*\) is running: (?:python(?:\d+(?:\.\d+)*)?|uv)$/;
+  const negative = /^❌ Pane \d+ \(pid=[1-9]\d*\) is running: (?:bash|sh|zsh|sleep)$/;
   const recognized = !error && lines.length > 0 && lines.every(line => positive.test(line) || negative.test(line));
   const state = recognized ? (lines.some(line => positive.test(line)) ? 'running' : 'not_running') : 'unknown';
-  return { ...target, observedAt, state, raw, error: error ? String(error) : null };
+  return { ...target, observedAt, state, raw, dispatch, error: error ? String(error) : null };
 }
 </script>
 
@@ -169,10 +200,11 @@ const isPriorityForUpdate = ref(false);
 // Other reactive state
 const taskRuntimeStatus = ref({});
 const runtimeRequests = new Map();
-const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true });
+const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true, authProfile: task.auth_profile ?? "user1" });
 const matchesRuntimeTarget = (task, target) => task?.status === 'running' &&
   typeof target.taskId === 'string' && !!target.taskId && getObjectId(task._id) === target.taskId &&
-  task.name === target.name && (task.isRemote === true) === target.isRemote;
+  task.name === target.name && (task.isRemote === true) === target.isRemote &&
+  (task.auth_profile ?? "user1") === target.authProfile;
 const invalidateRuntime = (name) => {
   delete taskRuntimeStatus.value[name];
   runtimeRequests.delete(name);
@@ -342,7 +374,7 @@ const checkTaskStatus = async (task) => {
     matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target);
   try {
     const status = await Promise.race([
-      invoke("check_task_status", { taskName: target.name, isRemote: target.isRemote }),
+      invoke("check_task_status", { taskName: target.name, taskId: target.taskId, isRemote: target.isRemote }),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('消费者状态检查超时')), 15000);
       }),

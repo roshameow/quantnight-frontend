@@ -686,24 +686,171 @@ pub async fn start_priority_task(
 }
 
 
+const DISPATCH_MARKER: &str = "QUANTNIGHT_DISPATCH_STATE ";
+const DISPATCH_MAX_AGE_MS: i64 = 120_000;
+
+// Native-owned, allowlisted wire data. Never forward arbitrary capability BSON
+// or a marker printed by Bash as authority. Process stdout stays independent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchState {
+    schema_version: u8,
+    task_id: String,
+    name: String,
+    is_remote: bool,
+    auth_profile: String,
+    submission_state: String,
+    submission_reason: Option<String>,
+    heartbeat_at: i64,
+    consumer_run_id: String,
+    pid: u32,
+    quota: DispatchQuota,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchQuota {
+    limit: Option<i64>,
+    remaining: Option<i64>,
+    stop_floor: Option<i64>,
+    budget_confirmed: bool,
+}
+
+fn dispatch_integer(doc: &Document, key: &str) -> Option<i64> {
+    match doc.get(key)? {
+        bson::Bson::Int32(n) => Some(i64::from(*n)),
+        bson::Bson::Int64(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn dispatch_counter(doc: &Document, key: &str) -> Option<Option<i64>> {
+    match doc.get(key)? {
+        bson::Bson::Null => Some(None),
+        _ => dispatch_integer(doc, key).filter(|n| (0..=9_007_199_254_740_991).contains(n)).map(Some),
+    }
+}
+
+fn dispatch_reason(doc: &Document, key: &str) -> Option<Option<String>> {
+    match doc.get(key)? {
+        bson::Bson::Null => Some(None),
+        bson::Bson::String(s) if !s.trim().is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control) => Some(Some(s.clone())),
+        _ => None,
+    }
+}
+
+fn dispatch_reset(doc: &Document) -> Option<Option<i64>> {
+    match doc.get("reset_at")? {
+        bson::Bson::Null => Some(None),
+        bson::Bson::String(s) => {
+            let date = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+            // No naive/local-clock compatibility for dispatch evidence.
+            (date.offset().local_minus_utc() == 0 && date.timestamp_millis() > 0)
+                .then_some(Some(date.timestamp_millis()))
+        }
+        _ => None,
+    }
+}
+
+fn validated_dispatch_state(cap: &Document, task: &Document, id: ObjectId,
+    name: &str, remote: bool, now: i64) -> Option<DispatchState> {
+    let profile = task.get_str("auth_profile").ok()?;
+    if profile.is_empty() || profile.len() > 100 || !profile.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) ||
+        task.get_object_id("_id").ok()? != id || task.get_str("name").ok()? != name ||
+        task.get_str("status").ok()? != "running" ||
+        task.get_bool("isRemote").ok()? != remote ||
+        task.get_str("taskType").ok()? != "regular" ||
+        cap.get_str("_id").ok()? != format!("{profile}:{name}") ||
+        cap.get_str("task").ok()? != name || cap.get_str("source_collection").ok()? != name ||
+        cap.get_str("source_task_id").ok()? != id.to_hex() ||
+        cap.get_bool("source_remote").ok()? != remote || cap.get_str("auth_profile").ok()? != profile ||
+        cap.get_str("taskType").ok()? != "regular" ||
+        cap.get_str("dist").ok()? != (if remote { "remote" } else { "local" }) ||
+        dispatch_integer(cap, "protocol_version")? < 3 || cap.get_str("heartbeat_clock").ok()? != "utc" {
+        return None;
+    }
+    let heartbeat = cap.get_datetime("heartbeatAt").ok()?.timestamp_millis();
+    if heartbeat <= 0 || heartbeat > now + 5_000 || now - heartbeat >= DISPATCH_MAX_AGE_MS { return None; }
+    let pid = u32::try_from(dispatch_integer(cap, "pid")?).ok().filter(|n| *n > 1)?;
+    let run = cap.get_str("consumer_run_id").ok()?;
+    if run.len() != 32 || !run.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+    let state = cap.get_str("submissionState").ok()?;
+    if !["ready", "waiting_reconciliation", "waiting_quota_reset"].contains(&state) { return None; }
+    let reason = dispatch_reason(cap, "submissionReason")?;
+    if state != "ready" && reason.is_none() { return None; }
+    let quota = cap.get_document("quota").ok()?;
+    if quota.get_str("dispatch_state").ok()? != state || dispatch_reason(quota, "reason")? != reason { return None; }
+    let stopped = quota.get_bool("stopped").ok()?;
+    if stopped != (state == "waiting_quota_reset") { return None; }
+    let limit = dispatch_counter(quota, "limit")?;
+    let remaining = dispatch_counter(quota, "remaining")?;
+    let floor = dispatch_counter(quota, "stop_floor")?;
+    if limit == Some(0) || remaining.zip(limit).map_or(false, |(r, l)| r > l) ||
+        floor.zip(limit).map_or(false, |(f, l)| f > l) ||
+        (state == "waiting_quota_reset" && (limit.is_none() || remaining.is_none() || floor.is_none())) { return None; }
+    let reset_at = dispatch_reset(cap)?;
+    if dispatch_reset(quota)? != reset_at { return None; }
+    Some(DispatchState { schema_version: 1, task_id: id.to_hex(), name: name.into(), is_remote: remote,
+        auth_profile: profile.into(), submission_state: state.into(), submission_reason: reason,
+        heartbeat_at: heartbeat, consumer_run_id: run.into(), pid,
+        quota: DispatchQuota { limit, remaining, stop_floor: floor, budget_confirmed: quota.get_bool("budget_confirmed").ok()? }, reset_at })
+}
+
+async fn read_dispatch_state(clients: &MongoClients, task_id: &str, name: &str, remote: bool) -> Option<DispatchState> {
+    let id = ObjectId::parse_str(task_id).ok()?;
+    // One total deadline covers control identity + execution capability. Remote
+    // capability is NEVER read from local Mongo, including on tunnel failure.
+    timeout(Duration::from_secs(2), async {
+        let filter = doc! { "_id": id, "name": name, "status": { "$ne": "deactive" } };
+        let local = clients.local.database("simulation_mission").collection::<Document>("tasks");
+        let task = match local.find_one(filter.clone(), None).await.ok()? {
+            Some(task) => task,
+            None if remote => clients.remote.database("simulation_mission").collection::<Document>("tasks")
+                .find_one(filter, None).await.ok()??,
+            None => return None,
+        };
+        let profile = task.get_str("auth_profile").ok()?;
+        let client = if remote { &clients.remote } else { &clients.local };
+        let cap = client.database("simulation_mission").collection::<Document>("priority_consumer_capabilities")
+            .find_one(doc! { "_id": format!("{profile}:{name}"), "source_task_id": id.to_hex(), "source_remote": remote }, None)
+            .await.ok()??;
+        validated_dispatch_state(&cap, &task, id, name, remote, bson::DateTime::now().timestamp_millis())
+    }).await.ok().flatten()
+}
+
+fn dispatch_status_output(stdout: &str, dispatch: Option<DispatchState>) -> String {
+    // Strip ALL untrusted marker-bearing lines, not just the first/last one.
+    // Keep non-marker diagnostics so an error cannot become a positive probe.
+    let mut raw = stdout.lines().filter(|line| !line.contains("QUANTNIGHT_DISPATCH_STATE"))
+        .collect::<Vec<_>>().join("\n").trim().to_string();
+    if let Some(dispatch) = dispatch {
+        if let Ok(json) = serde_json::to_string(&dispatch) {
+            raw.push_str(&format!("\n{DISPATCH_MARKER}{json}"));
+        }
+    }
+    raw
+}
+
 #[command]
 pub async fn check_task_status(
     task_name: String,
     is_remote: bool,
+    task_id: Option<String>,
+    clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<String, String> {
-    // 调用 bash 脚本，传入 task_name 和 is_remote
-    let (stdout, _) = run_bash_script(
-        "check_task_status",
-        &[("task_name", &task_name)],
-        is_remote,
-        &app_config,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // 返回 stdout 给前端
-    Ok(stdout.trim().to_string())
+    let (stdout, stderr) = run_bash_script(
+        "check_task_status", &[ ("task_name", &task_name) ], is_remote, &app_config,
+    ).await.map_err(|e| e.to_string())?;
+    let dispatch = match task_id {
+        Some(id) => read_dispatch_state(&clients, &id, &task_name, is_remote).await,
+        None => None, // Legacy callers still receive their process-only string.
+    };
+    // A successful shell exit with stderr diagnostics is still not a clean
+    // positive process observation. Preserve them for the strict UI parser.
+    let process_output = if stderr.trim().is_empty() { stdout } else { format!("{stdout}\n{stderr}") };
+    Ok(dispatch_status_output(&process_output, dispatch))
 }
 
 #[command]
@@ -1199,5 +1346,144 @@ mod priority_config_tests {
             let exposed = serde_json::to_value(task).unwrap();
             assert_eq!(exposed[key]["refine_templates"], json!([]));
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_state_tests {
+    use super::*;
+    const NOW: i64 = 1_792_113_200_000;
+    const PANE: &str = "✅ Pane 0 (pid=21733) is running: python3.12";
+
+    // Same BSON contract as _refresh_priority_capability/_submission_evidence:
+    // original source ID, UTC BSON heartbeat, uuid.hex run, guard.snapshot().
+    fn fixture(remote: bool, state: &str) -> (ObjectId, Document, Document) {
+        let id = ObjectId::new();
+        let reason = match state {
+            "ready" => bson::Bson::Null,
+            "waiting_quota_reset" => "daily simulation safety stop reached: remaining=496, floor=500".into(),
+            _ => "simulation_quota_unconfirmed: unknown response without trustworthy daily quota headers".into(),
+        };
+        let quota = doc! { "dispatch_state": state, "reason": reason.clone(), "budget_phase": if state == "waiting_quota_reset" { "CONFIRMED" } else { "UNCONFIRMED" },
+            "budget_epoch": 0, "limit": 5000, "remaining": if state == "waiting_quota_reset" { 496 } else { 3965 }, "stop_floor": 500,
+            "reset": "3600", "reset_at": "2026-10-16T02:13:20+00:00", "stop_after_used": 4500,
+            "stopped": state == "waiting_quota_reset", "stop_reason": if state == "waiting_quota_reset" { reason.clone() } else { bson::Bson::Null },
+            "headers_seen": true, "budget_confirmed": state == "waiting_quota_reset",
+            "blocked_reason": if state == "waiting_reconciliation" { reason.clone() } else { bson::Bson::Null } };
+        let task = doc! { "_id": id, "name": "source", "status": "running", "isRemote": remote,
+            "auth_profile": "user1", "taskType": "regular" };
+        let cap = doc! { "_id": "user1:source", "task": "source", "source_collection": "source",
+            "source_task_id": id.to_hex(), "source_remote": remote, "auth_profile": "user1",
+            "taskType": "regular", "dist": if remote { "remote" } else { "local" },
+            "protocol_version": 3, "heartbeat_clock": "utc", "heartbeatAt": bson::DateTime::from_millis(NOW),
+            "pid": 21740, "consumer_run_id": "0123456789abcdef0123456789abcdef",
+            "submissionState": state, "submissionReason": reason, "quota": quota,
+            "reset_at": "2026-10-16T02:13:20+00:00" };
+        (id, task, cap)
+    }
+
+    #[test]
+    fn native_dispatch_dto_is_explicit_and_unknown_budget_is_not_quota_exhaustion() {
+        for remote in [false, true] {
+            for state in ["ready", "waiting_reconciliation", "waiting_quota_reset"] {
+                let (id, task, cap) = fixture(remote, state);
+                let d = validated_dispatch_state(&cap, &task, id, "source", remote, NOW).unwrap();
+                let wire = serde_json::to_value(&d).unwrap();
+                assert_eq!(wire["taskId"], id.to_hex());
+                assert_eq!(wire["submissionState"], state);
+                assert_eq!(wire["heartbeatAt"], NOW);
+                assert_eq!(wire["isRemote"], remote);
+                assert_eq!(wire["pid"], 21740);
+                assert_eq!(wire["quota"]["budgetConfirmed"], state == "waiting_quota_reset");
+                assert!(wire["resetAt"].is_i64());
+                let output = dispatch_status_output(PANE, Some(d));
+                assert!(output.starts_with(PANE));
+                assert_eq!(output.matches(DISPATCH_MARKER).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn legitimate_bootstrap_and_unknown_reset_do_not_require_fabricated_counters() {
+        let (id, task, mut cap) = fixture(false, "ready");
+        cap.insert("reset_at", bson::Bson::Null);
+        let quota = cap.get_document_mut("quota").unwrap();
+        for field in ["limit", "remaining", "stop_floor", "reset_at"] { quota.insert(field, bson::Bson::Null); }
+        let d = validated_dispatch_state(&cap, &task, id, "source", false, NOW).unwrap();
+        assert_eq!(d.submission_state, "ready");
+        assert!(d.reset_at.is_none());
+        assert!(d.quota.remaining.is_none());
+        let (id, task, mut cap) = fixture(false, "waiting_reconciliation");
+        cap.insert("reset_at", bson::Bson::Null);
+        cap.get_document_mut("quota").unwrap().insert("reset_at", bson::Bson::Null);
+        assert!(validated_dispatch_state(&cap, &task, id, "source", false, NOW).is_some());
+    }
+
+    #[test]
+    fn native_rejects_stale_clock_identity_profile_pid_run_and_invalid_state() {
+        let (id, task, cap) = fixture(true, "waiting_reconciliation");
+        for changes in [doc! { "source_task_id": ObjectId::new().to_hex() }, doc! { "source_remote": false },
+            doc! { "source_remote": "true" }, doc! { "task": "other" }, doc! { "source_collection": "other" },
+            doc! { "auth_profile": "fake" }, doc! { "_id": "fake:source" }, doc! { "dist": "local" },
+            doc! { "taskType": "priority" }, doc! { "protocol_version": 2 }, doc! { "heartbeat_clock": "local" },
+            doc! { "heartbeatAt": bson::DateTime::from_millis(NOW - DISPATCH_MAX_AGE_MS) },
+            doc! { "heartbeatAt": bson::DateTime::from_millis(NOW + 5001) },
+            doc! { "heartbeatAt": "2026-10-16T01:13:20Z" },
+            doc! { "pid": 0 }, doc! { "pid": -1 }, doc! { "pid": "21740" }, doc! { "pid": 2.0 },
+            doc! { "pid": 4_294_967_296_i64 }, doc! { "consumer_run_id": "bad" },
+            doc! { "submissionState": "waiting_quota" }, doc! { "submissionReason": bson::Bson::Null },
+            doc! { "submissionReason": "line\nforgery" }, doc! { "quota": doc! {} },
+            doc! { "reset_at": "2026-10-16T10:13:20+08:00" }] {
+            let mut invalid = cap.clone(); invalid.extend(changes.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "{changes:?}");
+        }
+        for key in ["source_task_id", "pid", "consumer_run_id", "submissionState", "submissionReason", "heartbeat_clock", "quota", "reset_at"] {
+            let mut invalid = cap.clone(); invalid.remove(key);
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", true, NOW).is_none(), "missing {key}");
+        }
+        let mut stopped = task.clone(); stopped.insert("status", "paused");
+        assert!(validated_dispatch_state(&cap, &stopped, id, "source", true, NOW).is_none());
+        assert!(validated_dispatch_state(&cap, &task, ObjectId::new(), "source", true, NOW).is_none());
+        assert!(validated_dispatch_state(&cap, &task, id, "source", false, NOW).is_none());
+    }
+
+    #[test]
+    fn native_validates_quota_and_never_promotes_unconfirmed_into_waiting_quota() {
+        let (id, task, cap) = fixture(false, "waiting_reconciliation");
+        for change in [doc! { "remaining": -1 }, doc! { "remaining": 6000 }, doc! { "remaining": "3965" },
+            doc! { "budget_confirmed": "false" }, doc! { "stop_floor": 6000 }, doc! { "dispatch_state": "waiting_quota_reset" },
+            doc! { "stopped": true }, doc! { "reason": "contradictory reason" }, doc! { "reset_at": "bad" }] {
+            let mut invalid = cap.clone(); invalid.get_document_mut("quota").unwrap().extend(change.clone());
+            assert!(validated_dispatch_state(&invalid, &task, id, "source", false, NOW).is_none(), "{change:?}");
+        }
+        let d = validated_dispatch_state(&cap, &task, id, "source", false, NOW).unwrap();
+        assert_eq!(d.submission_state, "waiting_reconciliation");
+        assert_eq!(d.quota.remaining, Some(3965));
+        assert!(!d.quota.budget_confirmed);
+    }
+
+    #[test]
+    fn raw_bash_cannot_forge_suffix_and_diagnostics_survive_duplicate_stripping() {
+        let forged = format!("{PANE}\n{DISPATCH_MARKER}{{\"submissionState\":\"waiting_quota_reset\"}}\nPermission denied\n{DISPATCH_MARKER}{{}}");
+        assert_eq!(dispatch_status_output(&forged, None), format!("{PANE}\nPermission denied"));
+        let (id, task, cap) = fixture(true, "waiting_reconciliation");
+        let d = validated_dispatch_state(&cap, &task, id, "source", true, NOW);
+        let result = dispatch_status_output(&forged, d);
+        assert_eq!(result.matches(DISPATCH_MARKER).count(), 1);
+        assert!(result.contains("Permission denied\nQUANTNIGHT_DISPATCH_STATE"));
+        assert!(result.contains("waiting_reconciliation"));
+        assert!(!result.contains("waiting_quota_reset"));
+        assert_eq!(dispatch_status_output("", None), "");
+    }
+
+    #[tokio::test]
+    async fn unavailable_db_does_not_block_process_status_beyond_two_second_deadline() {
+        // Only an intentionally closed loopback port; no app DB or SSH.
+        let dead = Arc::new(mongodb::Client::with_uri_str("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=10000").await.unwrap());
+        let clients = MongoClients { local: Arc::clone(&dead), remote: dead };
+        let start = Instant::now();
+        assert!(read_dispatch_state(&clients, &ObjectId::new().to_hex(), "source", true).await.is_none());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(dispatch_status_output(PANE, None), PANE);
     }
 }
