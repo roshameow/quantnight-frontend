@@ -17,6 +17,7 @@ const storeModule = new URL('../src/stores/taskStore.js', import.meta.url).href;
 const cardSource = await readFile(new URL('../src/components/TaskCards/RegularTaskCard.vue', import.meta.url), 'utf8');
 const compiled = compileScript(parse(cardSource).descriptor, { id: 'dispatch-card', inlineTemplate: true }).content
   .replaceAll("'../../stores/taskStore.js'", JSON.stringify(storeModule))
+  .replaceAll("'../../utils/taskGeneration.js'", JSON.stringify(new URL('../src/utils/taskGeneration.js', import.meta.url).href))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
   .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`);
 const card = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);

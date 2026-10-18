@@ -60,6 +60,7 @@
           >
             <RegularTaskCard
               :task="task"
+              :generation-busy="Boolean(generationRequests[getObjectId(task._id)])"
               :progress="taskProgressMap[task.name]"
               :task-runtime-status="taskRuntimeStatus[task.name]"
               :stop-operation="taskStopOperationMap[task.name]"
@@ -159,6 +160,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, syncTaskToRemote, mutateTaskSource } from "../utils/taskProgress.js";
+import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
 import { useMessage, useDialog } from "naive-ui";
 
@@ -244,14 +246,23 @@ const handleTaskProgressRefreshError = (error) => {
 // --- Task Actions (invoking Rust backend) ---
 const getObjectId = (id) => (id && typeof id === "object" && "$oid" in id ? id.$oid : id);
 
+const generationRequests = ref({});
 const generateList = async (id) => {
+  const key = getObjectId(id);
+  const task = tasks.value.find(item => getObjectId(item._id) === key);
+  if (!canGenerate(task, Boolean(generationRequests.value[key]))) return;
+  generationRequests.value[key] = true; // disable immediately, before awaiting native
   try {
-    await invoke("generate_list", { id: getObjectId(id) });
-    message.success("生成列表任务已提交");
-    fetchTasks();
+    await invoke("generate_list", { id: key });
+    if (!disposed) message.success("列表生成完成");
   } catch (err) {
     console.error("生成列表失败", err);
-    message.error("生成列表失败: " + err);
+    if (!disposed) message.error("生成列表失败: " + err);
+  } finally {
+    if (!disposed) {
+      await fetchTasks();
+      delete generationRequests.value[key];
+    }
   }
 };
 
@@ -558,11 +569,19 @@ const progressLifecycle = createTaskProgressLifecycle({
   onRefreshError: handleTaskProgressRefreshError,
 });
 
+let registryUnlisten;
 onMounted(async () => {
   try {
+    const unlisten = await listen('task-registry-changed', () => {
+      if (!disposed) fetchTasks();
+    });
+    if (disposed) { unlisten(); return; }
+    registryUnlisten = unlisten;
     await progressLifecycle.start();
     if (!disposed) autoPause.reconcile();
   } catch (error) {
+    registryUnlisten?.();
+    registryUnlisten = undefined;
     console.error("启动任务进度监听失败", error);
     if (!disposed) message.error("启动任务进度监听失败");
   }
@@ -570,6 +589,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true;
+  registryUnlisten?.();
+  registryUnlisten = undefined;
   for (const { target, operation } of pendingStops.values()) {
     taskStore.markTaskStopUnconfirmed(target, operation, '页面已离开，停止回执未完成确认');
   }

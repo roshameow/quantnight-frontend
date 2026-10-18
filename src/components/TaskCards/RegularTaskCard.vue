@@ -78,24 +78,25 @@
         <n-button
           size="small"
           @click="$emit('generateList')"
-          :disabled="task.status === 'running'"
+          :disabled="!canGenerate(task, generationBusy)"
+          :loading="isGenerating(task, generationBusy)"
         >
-          <template #icon>=</template>生成list
+          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : task.status === 'generation_unknown' ? '生成状态待核验' : '生成list' }}
         </n-button>
         <n-button
           size="small"
           @click="$emit('syncRemote')"
-          :disabled="task.status === 'running'"
+          :disabled="task.status === 'running' || generationBusyOrUnknown(task, generationBusy)"
         >
           <template #icon>-></template>发送到远程
         </n-button>
-        <n-button size="small" @click="$emit('start')">
+        <n-button size="small" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('start')">
           <template #icon>>></template>启动
         </n-button>
-        <n-button size="small" @click="$emit('pause')">
+        <n-button size="small" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('pause')">
           <template #icon>| |</template>暂停
         </n-button>
-        <n-button size="small" type="error" @click="$emit('delete')">
+        <n-button size="small" type="error" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('delete')">
           <template #icon>x</template>删除
         </n-button>
       </n-space>
@@ -140,8 +141,10 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
 import { taskStopDisplayStatus } from '../../stores/taskStore.js';
+import { isGenerating, canGenerate, generationBusyOrUnknown } from '../../utils/taskGeneration.js';
 
 const props = defineProps({
+  generationBusy: { type: Boolean, default: false },
   task: {
     type: Object,
     required: true,

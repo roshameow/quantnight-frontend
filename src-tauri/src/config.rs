@@ -386,9 +386,11 @@ pub async fn run_python_command(
         }
     });
 
-    // 可选：加个超时，比如 5 分钟
+    // Ordinary list generation may take several minutes; match taskctl's
+    // existing 15-minute default rather than treating it as a short request.
+    let deadline_seconds = if script_key == "generate_list" { 900 } else { 300 };
     let wait_future = child.wait();
-    let status = match timeout(Duration::from_secs(300), wait_future).await {
+    let status = match timeout(Duration::from_secs(deadline_seconds), wait_future).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             return Err(format!("等待子进程失败: {}", e));

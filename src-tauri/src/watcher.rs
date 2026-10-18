@@ -860,7 +860,7 @@ fn mark_dirty(pending: &mut HashMap<String, ProgressSource>, request: ProgressRe
     }).or_insert(request.source);
 }
 
-async fn watch_source(client: Arc<Client>, config: AppConfig, source: ProgressSource, tx: mpsc::Sender<ProgressRequest>) {
+async fn watch_source(app: AppHandle, client: Arc<Client>, config: AppConfig, source: ProgressSource, tx: mpsc::Sender<ProgressRequest>) {
     let mut retry_delay = Duration::from_secs(5);
     loop {
         let db_name = if source.is_mission() { &config.mongodb.databases.mission } else { &config.mongodb.databases.simulation };
@@ -877,8 +877,15 @@ async fn watch_source(client: Arc<Client>, config: AppConfig, source: ProgressSo
                 println!("进度 watcher 已连接: {source:?}");
                 while let Some(change) = changes.next().await {
                     match change {
-                        Ok(change) => if let Some(request) = extract_request(&change, source) {
-                            if tx.send(request).await.is_err() { return; }
+                        Ok(change) => {
+                            if source.is_mission() && change.ns.as_ref().and_then(|ns| ns.coll.as_deref()) == Some("tasks") {
+                                // CLI/background generation updates control status too.
+                                // Notify the UI to re-read its authoritative task list.
+                                let _ = app.emit("task-registry-changed", serde_json::json!({"remote": source.is_remote()}));
+                            }
+                            if let Some(request) = extract_request(&change, source) {
+                                if tx.send(request).await.is_err() { return; }
+                            }
                         },
                         Err(error) => {
                             eprintln!("⚠️ 进度 watcher 中断 [{source:?}]: {error}（将重连，定时刷新仍有效）");
@@ -940,7 +947,7 @@ async fn watch_simulation_db_changes(app: AppHandle, clients: Arc<MongoClients>,
     for source in [ProgressSource::LocalMission, ProgressSource::LocalData, ProgressSource::RemoteMission, ProgressSource::RemoteData] {
         if source.is_remote() && config.mongodb.local_uri == config.mongodb.remote_uri { continue; }
         let client = if source.is_remote() { clients.remote.clone() } else { clients.local.clone() };
-        tokio::spawn(watch_source(client, config.clone(), source, tx.clone()));
+        tokio::spawn(watch_source(app.clone(), client, config.clone(), source, tx.clone()));
     }
     drop(tx);
     dispatch_requests(rx, MAX_CONCURRENT_STATS, COALESCE_INTERVAL, |request| {

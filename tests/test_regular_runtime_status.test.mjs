@@ -16,6 +16,7 @@ const source = await readFile(new URL('../src/components/TaskCards/RegularTaskCa
 const { descriptor } = parse(source);
 const compiled = compileScript(descriptor, { id: 'regular-runtime-test', inlineTemplate: true }).content
   .replaceAll("'../../stores/taskStore.js'", JSON.stringify(storeModule))
+  .replaceAll("'../../utils/taskGeneration.js'", JSON.stringify(new URL('../src/utils/taskGeneration.js', import.meta.url).href))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
   .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`);
 const cardURL = `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`;
@@ -168,6 +169,7 @@ test('actual TaskManager SFC SSR wires regular stop operation and pending runtim
     .replaceAll('from "pinia"', `from ${JSON.stringify(import.meta.resolve('pinia'))}`)
     .replace('"../stores/taskStore"', JSON.stringify(storeModule))
     .replace('"../utils/taskProgress.js"', JSON.stringify(new URL('../src/utils/taskProgress.js', import.meta.url).href))
+    .replaceAll("'../utils/taskGeneration.js'", JSON.stringify(new URL('../src/utils/taskGeneration.js', import.meta.url).href))
     .replace(/import \{ invoke \} from "@tauri-apps\/api\/core";/, 'const invoke = () => { throw new Error("SSR must not invoke native"); };')
     .replace(/import \{ listen \} from "@tauri-apps\/api\/event";/, 'const listen = async () => () => {};')
     .replace(/import \{ useRoute, useRouter \} from "vue-router";/, 'const useRoute = () => ({ fullPath: "/tasks" }); const useRouter = () => ({});')

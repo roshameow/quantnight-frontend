@@ -144,19 +144,38 @@ pub async fn generate_list(id: String, clients: State<'_, Arc<MongoClients>>,
     replacements.insert("{auth_profile}", auth_profile);
     replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
 
-    run_python_command(&config, "generate_list", &replacements).await?;
-    // 可选：更新状态
-    tasks
-        .update_one(
-            doc! { "_id": obj_id, "status": { "$ne": "deactive" } },
-            doc! { "$set": { "status": "ready" } },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // Same ordinary-task generation CAS used by taskctl/preparation. A second
+    // UI/agent invocation cannot enter generation while another owner holds it.
+    let generation_id = ObjectId::new().to_hex();
+    let claim = tasks.update_one(
+        doc! {"_id": obj_id, "status": {"$in": ["pending", "waiting", "ready", "generation_failed"]}},
+        doc! {"$set": {"status": "generating", "updatedAt": bson::DateTime::now(),
+            "generation": {"id": &generation_id, "phase": "writing", "producerPid": std::process::id() as i64,
+                           "startedAt": bson::DateTime::now()}}}, None).await.map_err(|e| e.to_string())?;
+    if claim.matched_count != 1 { return Err("任务正在运行/生成或状态待核验，拒绝重复生成".into()); }
+    let generated: Result<u64, String> = async {
+        run_python_command(&config, "generate_list", &replacements).await?;
+        let count = client.database("simulation_db").collection::<Document>(name)
+            .count_documents(None, None).await.map_err(|e| e.to_string())?;
+        if count == 0 { return Err("生成器退出成功但候选集合为空".into()); }
+        Ok(count)
+    }.await;
+    let query = doc! {"_id": obj_id, "status": "generating", "generation.id": &generation_id};
+    let fields = match &generated {
+        Ok(count) => doc! {"status": "ready", "expectedCount": *count as i64,
+            "generation.phase": "complete", "generation.finishedAt": bson::DateTime::now()},
+        Err(error) => {
+            let status = if error.contains("超时") || error.to_lowercase().contains("timeout") {
+                "generation_unknown"
+            } else { "generation_failed" };
+            doc! {"status": status, "generation.phase": status,
+                "generation.finishedAt": bson::DateTime::now(), "lastError": error}
+        }
+    };
+    let updated = tasks.update_one(query, doc! {"$set": fields}, None).await.map_err(|e| e.to_string())?;
+    if updated.matched_count != 1 { return Err("生成归属已变化，拒绝覆盖新状态".into()); }
+    generated.map(|_| ())
 
-
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -432,8 +451,47 @@ pub async fn get_all_tasks(
     Ok(tasks)
 }
 
+// Keep the existing delete button/lifecycle. Prepared research templates carry
+// an optional sidecar; archive through the same Python control interface before
+// making any destructive Mongo change. Legacy tasks need no new workflow.
+async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Result<(), String> {
+    let template = task.get_str("templatefile").unwrap_or("");
+    if template.is_empty() || !template.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+        return Ok(());
+    }
+    let folder = if task.get_str("taskType").ok() == Some("super") { "super_templates" } else { "templates" };
+    let root = PathBuf::from(&config.env.working_dir);
+    let sidecar = root.join(folder).join(format!("{template}.research.json"));
+    if !sidecar.is_file() { return Ok(()); }
+    let binding: JsonValue = serde_json::from_str(&fs::read_to_string(&sidecar).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("研究绑定无效，未删除任务：{e}"))?;
+    if binding.get("kind").and_then(|v| v.as_str()) != Some("dataset") { return Ok(()); }
+    if task.get_str("status").ok() == Some("running") {
+        return Err("请先暂停整个研究任务，再删除；不逐条删除候选".into());
+    }
+    let name = task.get_str("name").map_err(|e| e.to_string())?;
+    let id = task.get_object_id("_id").map_err(|e| e.to_string())?.to_hex();
+    let remote = if task.get_bool("isRemote").unwrap_or(false) { "true" } else { "false" };
+    let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
+    command.current_dir(&root).env("PYTHONPATH", &root).kill_on_drop(true)
+        .args([".agents/skills/manage-quantnight-frontend/scripts/taskctl.py", "archive-research",
+               "--name", name, "--expected-task-id", &id, "--expected-remote", remote]);
+    let output = timeout(Duration::from_secs(90), command.output()).await
+        .map_err(|_| "研究统计归档超时；未删除任务".to_string())?
+        .map_err(|e| format!("研究统计归档无法启动；未删除任务：{e}"))?;
+    let receipt: JsonValue = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "研究统计归档未返回有效回执；未删除任务".to_string())?;
+    if !output.status.success() || receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
+        || receipt.get("task").and_then(|v| v.as_str()) != Some(name)
+        || receipt.get("archivePath").and_then(|v| v.as_str()).map_or(true, str::is_empty) {
+        return Err(format!("研究统计归档失败；未删除任务：{}", receipt));
+    }
+    Ok(())
+}
+
 #[command]
-pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> Result<(), String> {
+pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>) -> Result<(), String> {
     let client = &clients.local;
 
     let db = client.database("simulation_mission");
@@ -446,13 +504,24 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> R
         .find_one(doc! { "_id": obj_id }, None)
         .await
         .map_err(|e| e.to_string())?;
+    if matches!(probe.as_ref().and_then(|d| d.get_str("status").ok()), Some("generating" | "generation_unknown")) {
+        return Err("任务生成中或生成状态待核验，不能删除".into());
+    }
     if probe.is_none() {
         return delete_remote_registered_task(&clients, obj_id).await;
     }
+    archive_prepared_research(probe.as_ref().unwrap(), &app_config).await?;
 
+    let mut delete_filter = doc! { "_id": obj_id };
+    for field in ["name", "status", "updatedAt", "isRemote", "templatefile", "taskType", "auth_profile"] {
+        match probe.as_ref().unwrap().get(field) {
+            Some(value) => { delete_filter.insert(field, value.clone()); },
+            None => { delete_filter.insert(field, doc! { "$exists": false }); },
+        }
+    }
     let update_result = tasks
         .update_one(
-            doc! { "_id": obj_id },
+            delete_filter,
             doc! { "$set": { "status": "deactive" } },
             None,
         )
@@ -460,7 +529,7 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>) -> R
         .map_err(|e| e.to_string())?;
 
     if update_result.matched_count == 0 {
-        return Err("未找到指定的任务".to_string());
+        return Err("任务身份或状态已改变，未删除任务".to_string());
     }
 
 
@@ -524,6 +593,9 @@ pub async fn start_task(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "任务未找到".to_string())?;
 
+    if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
+        return Err("任务生成中或生成状态待核验，不能启动回测".into());
+    }
     let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
     let is_remote_str = if is_remote { "true" } else { "false" };
 
@@ -588,6 +660,9 @@ pub async fn start_super_task(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "任务未找到".to_string())?;
 
+    if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
+        return Err("任务生成中或生成状态待核验，不能启动回测".into());
+    }
     let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
     let is_remote_str = if is_remote { "true" } else { "false" };
 
@@ -1194,6 +1269,9 @@ pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<Stri
     let id = task.get_object_id("_id").map_err(|e| e.to_string())?;
     if task.get_bool("isRemote").unwrap_or(false) != is_remote {
         return Err("停止请求未发出：执行目标已经变更".into());
+    }
+    if matches!(task.get_str("status").ok(), Some("generating" | "generation_unknown")) {
+        return Err("当前是候选生成，不是回测消费者；请先核验生成作业".into());
     }
     let (stdout, _) = run_bash_script("pause_task", &[("task_name", &task_name)],
         is_remote, &app_config).await?;
