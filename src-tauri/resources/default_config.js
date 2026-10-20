@@ -1,7 +1,7 @@
 export const AppConfig = {
   "paths": {
-    "superTemplatePath": "./templates/super",
-    "templatePath": "./templates",
+    "superTemplatePath": "./templates/generated/super",
+    "templatePath": "./templates/generated/regular",
     "priorityTemplatePath": "./templates/priority"
   },
   "dataFilterOptions": [

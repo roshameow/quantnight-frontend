@@ -29,6 +29,7 @@
           <n-tag type="info" size="small">支持热修复</n-tag>
         </template>
         <n-card title="Template Paths" size="small" style="margin-bottom: 16px;">
+          <n-text depth="3">默认：&lt;quantnight-root&gt;/templates/generated/regular 与 super。仅迁移已知旧默认，保留自定义路径；旧模板仍可按名称手动选择。</n-text>
           <div style="display: flex; flex-direction: column; gap: 6px;">
             <div style="display: flex; align-items: center; margin-bottom: 6px;">
               <span style="width: 140px; margin-right: 8px;">Super Template Path:</span>
@@ -223,6 +224,7 @@ import {
   NButton,
   NTable,
   NTag,
+  NText,
   NCode,
   NTooltip,
   NSelect,
@@ -264,8 +266,8 @@ const localEnvConfig = ref({
 
 // Initialize local state from the store
 onMounted(async () => {
-  // Wait for the store to be loaded before initializing local state
-  await new Promise(resolve => setTimeout(resolve, 100));
+  // The root-aware defaults and persisted custom paths must finish loading first.
+  await configStore.ready;
   
   // Deep copy to avoid direct mutation
   localPaths.value = JSON.parse(JSON.stringify(configStore.paths || {}));

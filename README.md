@@ -64,3 +64,33 @@ npm run tauri:dev
 当前源码版本为 **1.2.4**；可下载版本以 Releases 为准。历史 `v1.2.3` 安装包曾使用 `0.1.0` 文件名，详情见版本记录。
 
 [MIT](LICENSE)
+
+### Template runtime directories
+
+REGULAR and SUPER defaults now use the configured QuantNight backend root:
+`templates/generated/regular/` and `templates/generated/super/`. Frozen task
+entries are `<name>.research.json`; genuinely custom entries may be `<name>.py`.
+Priority templates are unchanged. The settings store migrates only exact known
+old defaults (including packaged `./templates` / `./templates/super`); user-custom
+paths are retained, not replaced on refresh.
+
+Both add dialogs use persisted settings, accept descriptor/Python filenames, and
+store only the bare template name. The file picker associates an **already
+published backend template**; it does not upload or deploy it. When the generated
+directory is empty, manually enter a legacy name or select its file; regular
+`templates/<name>.py` and SUPER `super_templates/<name>.py` remain compatible.
+Existing task records are not rewritten.
+
+Native discovery and pre-delete research binding lookup call the backend's pure
+`python -m templates.catalog` CLI through `<root>/.venv/bin/python`. This requires
+the matching backend revision. Discovery accepts the relevant legacy/generated
+directory only; a preserved unsupported custom path produces an explicit error,
+not a silent fallback. Helpers/claims/temp files are excluded; duplicate names
+within one task kind fail rather than shadowing. Dataset deletion still archives
+statistics via original `taskctl archive-research` with exact task ID/remote target
+and validated receipt before mutation; refine descriptors are not dataset bundles.
+
+No automatic deployment or service restart is included. Remote generation still
+requires the original dependency/sync preflight; ignored runtime files are not
+proof that the executor has their manifests or loaders. See `tests/README.md` for
+offline checks; these are not native-app or real-task smoke tests.

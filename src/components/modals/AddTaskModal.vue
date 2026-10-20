@@ -29,6 +29,11 @@
         />
       </n-form-item>
 
+      <n-form-item label="模板名称（支持旧目录中的模板；不含扩展名）">
+        <n-input v-model:value="form.templateFilename" placeholder="例如 my_template" />
+        <n-button secondary @click="loadLatestTemplate">发现最新模板</n-button>
+      </n-form-item>
+      <n-text depth="3">选择文件只关联已发布到后端的同名模板，不上传或部署文件；新目录为空时仍可手动填写旧模板名。</n-text>
       <n-form-item>
         <template #label>
           <n-space align="center" style="justify-content: space-between; width: 100%">
@@ -40,7 +45,7 @@
               style="margin-left: auto"
             >
               <n-text depth="3" style="margin-left: auto">
-                {{ form.templateFilename }}.py
+                {{ form.templateFilename }}
               </n-text>
             </n-tag>
           </n-space>
@@ -49,10 +54,10 @@
         <n-upload
           :show-file-list="true"
           :max="1"
-          accept=".py"
+          accept=".py,.json"
           @change="handleTemplateUpload"
         >
-          <n-button secondary type="primary"> 上传 .py 模板文件 </n-button>
+          <n-button secondary type="primary"> 选择 .py / .research.json 模板文件 </n-button>
         </n-upload>
       </n-form-item>
     </n-form>
@@ -65,17 +70,21 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from "vue";
+import { ref, watch } from "vue";
 import { useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
-import { AppConfig } from "@/config";
+import { useConfigStore } from "@/stores/configStore";
+import { templateName } from "@/utils/templatePaths";
+
+const configStore = useConfigStore();
+let previousDefaultPath = configStore.paths.templatePath || "";
 
 
 // ✅ 预填表单数据
 const form = ref({
   taskName: "",
   authProfile: "user1",
-  templatePath: AppConfig.paths.templatePath,
+  templatePath: previousDefaultPath,
   templateFilename: "",
   templateCode: "",
   isRemote: false, // ✅ 本地（false）/远程（true）标记
@@ -100,37 +109,58 @@ const message = useMessage();
 
 
 
+let latestRequestId = 0;
+async function loadLatestTemplate() {
+  const requestId = ++latestRequestId;
+  const requestedPath = form.value.templatePath;
+  const previousName = form.value.templateFilename;
+  try {
+    const latestTemplate = await invoke("read_latest_py_file", {
+      folderPath: requestedPath,
+      taskType: "regular",
+    });
+    if (requestId !== latestRequestId || form.value.templatePath !== requestedPath
+        || form.value.templateFilename !== previousName) return;
+    form.value.templateFilename = templateName(latestTemplate);
+    form.value.templateCode = "";
+  } catch (err) {
+    console.error("读取模板失败:", err);
+    message.warning(`无法自动选择模板：${err}。可手动填写旧模板名。`);
+  }
+}
+
 watch(
   () => props.show,
   async (v) => {
-    showModal.value = v;
-    if (v) {
-      try {
-        const latestTemplate = await invoke("read_latest_py_file", {
-          folderPath: form.value.templatePath,
-        });
-        form.value.templateFilename = latestTemplate.replace(/\.py$/i, "");
-        console.log("添加任务弹窗打开时，最新模板文件:", form.value.templateFilename);
-      } catch (err) {
-        console.error("读取模板失败:", err);
-        message.warning("无法自动读取模板文件，请手动上传");
-      }
+    if (!v) return;
+    await configStore.ready;
+    const currentDefault = configStore.paths.templatePath || "";
+    // Refresh a default, never overwrite an explicitly edited modal path/name.
+    if (!form.value.templatePath || form.value.templatePath === previousDefaultPath) {
+      form.value.templatePath = currentDefault;
     }
+    previousDefaultPath = currentDefault;
+    if (!form.value.templateFilename) await loadLatestTemplate();
   }
 );
 
-
 const handleTemplateUpload = ({ file }) => {
+  if (file.status === "removed" || !file.file) return;
+  let name;
+  try { name = templateName(file.name); }
+  catch (err) { message.error(err.message); return; }
   const reader = new FileReader();
   reader.onload = () => {
-    form.value.templateCode = reader.result;
-    form.value.templateFilename = file.name.replace(/\.py$/i, ""); // 存储文件名
-    console.log("templateFilename:：", form.value.templateFilename);
+    form.value.templateFilename = name;
+    // A descriptor is data consumed by the catalog, not Python source.
+    form.value.templateCode = /\.py$/i.test(file.name) ? reader.result : "";
   };
   reader.readAsText(file.file);
 };
 
 const handleSubmit = () => {
+  try { form.value.templateFilename = templateName(form.value.templateFilename); }
+  catch (err) { message.error(err.message); return; }
   if (!form.value.taskName || !form.value.templateFilename) {
     message.error("请完整填写任务信息");
     return;

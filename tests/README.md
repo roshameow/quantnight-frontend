@@ -89,3 +89,39 @@ E0514. Use an explicitly matched installed toolchain/cache; do not clean or
 install dependencies as a diagnostic shortcut. These tests do not prove the
 running Native app has loaded the patch; that requires a separately authorized
 frontend build/reload, not a Python consumer restart.
+
+## Template layout and binding migration (offline)
+
+```sh
+node --test tests/templateLayout.test.mjs tests/researchArchive.test.mjs
+cargo test --manifest-path src-tauri/Cargo.toml --offline --locked \
+  --bin quantnight-frontend commands::template_catalog_tests::
+# Optional cross-repo CLI contract: copy only catalog.py into a temporary fixture;
+# the interpreter executes stdlib discovery, never imports template code or taskctl.
+QUANTNIGHT_CATALOG_SOURCE=/path/to/quantnight/templates/catalog.py \
+QUANTNIGHT_TEST_PYTHON=/path/to/quantnight/.venv/bin/python \
+cargo test --manifest-path src-tauri/Cargo.toml --offline --locked \
+  --bin quantnight-frontend commands::template_catalog_tests:: -- --include-ignored
+node node_modules/vite/bin/vite.js build --outDir tmp/template-layout-build
+```
+
+Verified: real SFC handlers and configStore with fake Tauri IO preserve custom
+paths, migrate only shipped defaults, persist unknown config keys, use task-kind
+specific discovery, strip the full `.research.json` suffix, and allow manual legacy
+selection after empty discovery. Real native archive/discovery consumers use a
+temporary fake executable to prove CLI arguments, exact task/host archive identity,
+fail-closed errors and command/task/nonempty archivePath receipt validation.
+The optional real catalog test covers both kinds with the same name, descriptors,
+helper/claim/temp exclusion without execution, legacy selection, collision and
+manifest tampering. It changes only temporary directories and cleans them afterward.
+
+Verified pitfalls (template-layout worker): the packaged config had relative old
+defaults, different from `src/config.js` absolute defaults; updating only one misses
+installed applications. Also macOS temp `/var/...` aliases `/private/var/...`:
+canonicalize fixture roots before handing absolute directory paths to the catalog.
+The initial alias mismatch correctly failed closed, rather than discovering an
+unrelated template. Deployment/environment aliases remain a backend contract issue,
+not a reason to bypass its containment checks.
+A deferred fake discovery response also verifies that late auto-selection cannot
+overwrite a user-entered legacy name or changed directory; initial empty-name checks
+alone are insufficient once the native command is asynchronous.

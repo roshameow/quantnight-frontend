@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use futures_util::stream::TryStreamExt;
 use mongodb::{
@@ -207,41 +207,56 @@ pub async fn update_remote_status(id: String, updates: Updates,clients: State<'_
 }
 
 
+// Discovery and binding share Python's pure catalog with generation. Do not
+// replicate sidecar/hash/root-containment logic here or execute template code.
+async fn run_template_catalog(
+    root: &Path, action: &str, kind: &str, name: Option<&str>, directory: Option<&str>,
+) -> Result<JsonValue, String> {
+    let root = root.canonicalize().map_err(|e| format!("模板根目录不可用：{e}"))?;
+    let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
+    command.current_dir(&root).env("PYTHONPATH", &root).kill_on_drop(true)
+        .args(["-m", "templates.catalog", action, "--root"])
+        .arg(&root).args(["--kind", kind]);
+    if let Some(name) = name { command.args(["--name", name]); }
+    if let Some(directory) = directory { command.args(["--directory", directory]); }
+    let output = timeout(Duration::from_secs(30), command.output()).await
+        .map_err(|_| "模板目录查询超时".to_string())?
+        .map_err(|e| format!("无法启动 templates.catalog：{e}"))?;
+    let value: JsonValue = serde_json::from_slice(&output.stdout)
+        .map_err(|_| format!("templates.catalog 未返回有效 JSON：{}", String::from_utf8_lossy(&output.stderr)))?;
+    if !output.status.success() || value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(format!("模板目录查询失败：{}", value));
+    }
+    Ok(value)
+}
+
+fn latest_catalog_name(value: &JsonValue, kind: &str) -> Result<String, String> {
+    let entry = value.get("entry").filter(|v| v.is_object())
+        .ok_or_else(|| "该目录没有已发布模板；可手动选择旧模板名称".to_string())?;
+    if entry.get("taskType").and_then(|v| v.as_str()) != Some(kind) {
+        return Err("模板类型与请求不符".into());
+    }
+    entry.get("name").and_then(|v| v.as_str()).filter(|name| !name.is_empty())
+        .map(str::to_owned).ok_or_else(|| "模板目录结果缺少裸名称".into())
+}
+
 #[command]
-pub fn read_latest_py_file(folder_path: String) -> Result<String, String> {
-    let path = PathBuf::from(folder_path);
-    if !path.is_dir() {
-        return Err("路径不是文件夹".into());
-    }
+pub async fn read_latest_py_file(
+    folder_path: String, task_type: Option<String>, config: State<'_, AppConfig>,
+) -> Result<String, String> {
+    latest_template_from_directory(Path::new(&config.env.working_dir), &folder_path, task_type.as_deref()).await
+}
 
-    let mut latest_file: Option<(SystemTime, PathBuf)> = None;
-
-    for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let metadata = entry.metadata().map_err(|e| e.to_string())?;
-        let modified = metadata.modified().map_err(|e| e.to_string())?;
-        let file_path = entry.path();
-
-        if file_path.extension().map(|ext| ext == "py").unwrap_or(false) {
-            if let Some((latest_time, _)) = &latest_file {
-                if modified > *latest_time {
-                    latest_file = Some((modified, file_path));
-                }
-            } else {
-                latest_file = Some((modified, file_path));
-            }
-        }
-    }
-
-    if let Some((_, path)) = latest_file {
-        if let Some(file_name) = path.file_name() {
-            Ok(file_name.to_string_lossy().to_string())
-        } else {
-            Err("无法获取文件名".into())
-        }
-    } else {
-        Err("没有找到 .py 文件".into())
-    }
+async fn latest_template_from_directory(root: &Path, folder_path: &str, task_type: Option<&str>) -> Result<String, String> {
+    // Old callers may omit taskType. No change to stored task.templatefile IDs.
+    let kind = task_type.unwrap_or_else(|| {
+        let folder = PathBuf::from(folder_path);
+        if folder == root.join("super_templates") || folder == root.join("templates/generated/super") {
+            "super"
+        } else { "regular" }
+    });
+    let result = run_template_catalog(root, "latest", kind, None, Some(folder_path)).await?;
+    latest_catalog_name(&result, kind)
 }
 
 #[command]
@@ -456,15 +471,17 @@ pub async fn get_all_tasks(
 // making any destructive Mongo change. Legacy tasks need no new workflow.
 async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Result<(), String> {
     let template = task.get_str("templatefile").unwrap_or("");
-    if template.is_empty() || !template.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
-        return Ok(());
-    }
-    let folder = if task.get_str("taskType").ok() == Some("super") { "super_templates" } else { "templates" };
+    if template.is_empty() { return Ok(()); }
+    let kind = task.get_str("taskType").unwrap_or("regular");
+    if kind == "priority" { return Ok(()); } // Priority has its own unchanged templates.
     let root = PathBuf::from(&config.env.working_dir);
-    let sidecar = root.join(folder).join(format!("{template}.research.json"));
-    if !sidecar.is_file() { return Ok(()); }
-    let binding: JsonValue = serde_json::from_str(&fs::read_to_string(&sidecar).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("研究绑定无效，未删除任务：{e}"))?;
+    let result = run_template_catalog(&root, "binding", kind, Some(template), None).await
+        .map_err(|e| format!("研究绑定无法核验，未删除任务：{e}"))?;
+    let binding = result.get("binding").ok_or("研究绑定查询缺少 binding；未删除任务")?;
+    if !binding.is_null() && !binding.is_object() {
+        return Err("研究绑定查询无效；未删除任务".into());
+    }
+    // Refine descriptors are not dataset manifests. Keep the original binding's kind.
     if binding.get("kind").and_then(|v| v.as_str()) != Some("dataset") { return Ok(()); }
     if task.get_str("status").ok() == Some("running") {
         return Err("请先暂停整个研究任务，再删除；不逐条删除候选".into());
@@ -482,6 +499,7 @@ async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Resul
     let receipt: JsonValue = serde_json::from_slice(&output.stdout)
         .map_err(|_| "研究统计归档未返回有效回执；未删除任务".to_string())?;
     if !output.status.success() || receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
+        || receipt.get("command").and_then(|v| v.as_str()) != Some("archive-research")
         || receipt.get("task").and_then(|v| v.as_str()) != Some(name)
         || receipt.get("archivePath").and_then(|v| v.as_str()).map_or(true, str::is_empty) {
         return Err(format!("研究统计归档失败；未删除任务：{}", receipt));
@@ -1678,4 +1696,177 @@ mod dispatch_state_tests {
         assert!(start.elapsed() < Duration::from_secs(3));
         assert_eq!(dispatch_status_output(PANE, None), PANE);
     }
+}
+
+#[cfg(all(test, unix))]
+mod template_catalog_tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Fake process IO only: never invokes real Python, taskctl, Mongo or a service.
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("quantnight-template-{}", ObjectId::new()));
+            fs::create_dir_all(root.join(".venv/bin")).unwrap();
+            let root = root.canonicalize().unwrap();
+            let executable = root.join(".venv/bin/python");
+            fs::write(&executable, r#"#!/bin/sh
+printf '%s\n' "$@" >> calls
+if [ "$1" = '-m' ]; then
+  [ "$2" = 'templates.catalog' ] || exit 91
+  [ "$4" = '--root' ] || exit 92
+  [ "$5" = "$PWD" ] || exit 93
+  [ "$6" = '--kind' ] || exit 94
+  cat catalog.json
+  exit "$(cat catalog.exit)"
+fi
+[ "$1" = '.agents/skills/manage-quantnight-frontend/scripts/taskctl.py' ] || exit 95
+cat archive.json
+exit "$(cat archive.exit)"
+"#).unwrap();
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(root.join("catalog.exit"), "0").unwrap();
+            fs::write(root.join("archive.exit"), "0").unwrap();
+            Self(root)
+        }
+        fn catalog(&self, value: JsonValue) {
+            fs::write(self.0.join("catalog.json"), value.to_string()).unwrap();
+        }
+        fn receipt(&self, value: JsonValue) {
+            fs::write(self.0.join("archive.json"), value.to_string()).unwrap();
+        }
+        fn calls(&self) -> String { fs::read_to_string(self.0.join("calls")).unwrap_or_default() }
+        fn config(&self) -> AppConfig {
+            serde_json::from_value(json!({"env":{"working_dir":self.0},
+                "python":{"scripts":{}}, "bash":{"scripts":{}},
+                "mongodb":{"local_uri":"unused", "remote_uri":"unused",
+                    "databases":{"mission":"unused", "simulation":"unused", "alpha":"unused"}}})).unwrap()
+        }
+        fn task(&self) -> Document {
+            doc! {"_id": ObjectId::new(), "name":"task", "templatefile":"same_name",
+                "taskType":"super", "status":"paused", "isRemote":true}
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[tokio::test]
+    async fn latest_uses_catalog_kind_directory_and_bare_name() {
+        let f = Fixture::new();
+        f.catalog(json!({"ok":true,"entry":{"name":"published","taskType":"super","format":"descriptor"}}));
+        let folder = f.0.join("templates/generated/super").to_string_lossy().into_owned();
+        assert_eq!(latest_template_from_directory(&f.0, &folder, None).await.unwrap(), "published");
+        assert!(f.calls().contains(&format!("--kind\nsuper\n--directory\n{folder}\n")));
+        f.catalog(json!({"ok":true,"entry":null}));
+        assert!(latest_template_from_directory(&f.0, &folder, Some("super")).await.is_err());
+        f.catalog(json!({"ok":true,"entry":{"name":"wrong_kind","taskType":"regular"}}));
+        assert!(latest_template_from_directory(&f.0, &folder, Some("super")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dataset_binding_archives_original_task_and_exact_target_before_delete() {
+        let f = Fixture::new();
+        f.catalog(json!({"ok":true,"binding":{"kind":"dataset","loader":"frozen_research","extension":"kept"}}));
+        f.receipt(json!({"ok":true,"command":"archive-research","task":"task","archivePath":"/fake/archive.json"}));
+        let task = f.task();
+        archive_prepared_research(&task, &f.config()).await.unwrap();
+        let calls = f.calls();
+        assert!(calls.contains("--kind\nsuper\n--name\nsame_name\n"));
+        assert!(calls.contains(&format!("archive-research\n--name\ntask\n--expected-task-id\n{}\n--expected-remote\ntrue\n", task.get_object_id("_id").unwrap().to_hex())));
+        assert!(calls.find("templates.catalog").unwrap() < calls.find("archive-research").unwrap());
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_invalid_binding_collision_process_error_and_wrong_receipt() {
+        for binding in [json!({"ok":false,"error":"ambiguous template name collision"}),
+                        json!({"ok":true}), json!({"ok":true,"binding":false})] {
+            let f = Fixture::new(); f.catalog(binding);
+            assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
+            assert!(!f.calls().contains("archive-research"));
+        }
+        for receipt in [json!({"ok":false}),
+            json!({"ok":true,"command":"archive-research","task":"other","archivePath":"/fake"}),
+            json!({"ok":true,"command":"verify-registration","task":"task","archivePath":"/fake"}),
+            json!({"ok":true,"command":"archive-research","task":"task","archivePath":""})] {
+            let f = Fixture::new();
+            f.catalog(json!({"ok":true,"binding":{"kind":"dataset"}})); f.receipt(receipt);
+            assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
+        }
+        let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":null}));
+        fs::write(f.0.join("catalog.exit"), "1").unwrap();
+        assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_binding_refine_and_priority_do_not_archive_dataset() {
+        for binding in [JsonValue::Null, json!({"loader":"frozen_refine","schemaVersion":3})] {
+            let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":binding}));
+            archive_prepared_research(&f.task(), &f.config()).await.unwrap();
+            assert!(!f.calls().contains("archive-research"));
+        }
+        let f = Fixture::new(); let mut task = f.task(); task.insert("taskType", "priority");
+        archive_prepared_research(&task, &f.config()).await.unwrap();
+        assert!(f.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_dataset_requires_pause_and_nonzero_archive_is_not_success() {
+        let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":{"kind":"dataset"}}));
+        let mut task = f.task(); task.insert("status", "running");
+        assert!(archive_prepared_research(&task, &f.config()).await.is_err());
+        assert!(!f.calls().contains("archive-research"));
+        task.insert("status", "paused");
+        f.receipt(json!({"ok":true,"command":"archive-research","task":"task","archivePath":"/fake"}));
+        fs::write(f.0.join("archive.exit"), "1").unwrap();
+        assert!(archive_prepared_research(&task, &f.config()).await.is_err());
+    }
+    #[tokio::test]
+    #[ignore = "set QUANTNIGHT_CATALOG_SOURCE and QUANTNIGHT_TEST_PYTHON for offline cross-repo CLI contract"]
+    async fn actual_catalog_cli_in_temporary_repository() {
+        let source = std::env::var("QUANTNIGHT_CATALOG_SOURCE").unwrap();
+        let python = std::env::var("QUANTNIGHT_TEST_PYTHON").unwrap();
+        let f = Fixture::new();
+        fs::remove_file(f.0.join(".venv/bin/python")).unwrap();
+        std::os::unix::fs::symlink(python, f.0.join(".venv/bin/python")).unwrap();
+        fs::create_dir_all(f.0.join("templates/generated/regular")).unwrap();
+        fs::create_dir_all(f.0.join("templates/generated/super")).unwrap();
+        fs::create_dir_all(f.0.join("super_templates")).unwrap();
+        fs::write(f.0.join("templates/__init__.py"), "").unwrap();
+        fs::copy(source, f.0.join("templates/catalog.py")).unwrap();
+        for (kind, sha) in [
+            ("regular", "d95d5532c10b09a6348b70512ce53fe3a3228c28000d123c20970c882001b4b8"),
+            ("super", "f7a4d0ead7dff04008c915c6d41d69f9ee407a863e04fa4361ae77d638327375"),
+        ] {
+            let manifest = format!("{{\"schemaVersion\":1,\"taskType\":\"{kind}\",\"provenance\":{{\"kind\":\"dataset\"}}}}");
+            fs::write(f.0.join(format!("{kind}.json")), manifest).unwrap();
+            let folder = f.0.join(format!("templates/generated/{kind}"));
+            fs::write(folder.join("same_name.research.json"), json!({
+                "taskType":kind,"loader":"frozen_research","manifest":format!("{kind}.json"),
+                "sha256":sha,"kind":"dataset","extension":"preserved"}).to_string()).unwrap();
+            // These newer modules/claims must never be executed or selected.
+            for name in ["helper.py", "__init__.py", ".claim.py", "incomplete.tmp.py"] {
+                fs::write(folder.join(name), "raise RuntimeError('must not execute')\n").unwrap();
+            }
+            assert_eq!(latest_template_from_directory(&f.0, folder.to_str().unwrap(), Some(kind)).await.unwrap(), "same_name");
+            let binding = run_template_catalog(&f.0, "binding", kind, Some("same_name"), None).await.unwrap();
+            assert_eq!(binding["binding"]["taskType"], kind);
+            assert_eq!(binding["binding"]["extension"], "preserved");
+        }
+        let regular = f.0.join("templates/generated/regular");
+        fs::write(f.0.join("templates/same_name.py"), "async def generate_parms(session): pass\n").unwrap();
+        assert!(latest_template_from_directory(&f.0, regular.to_str().unwrap(), Some("regular")).await.unwrap_err().contains("collision"));
+        fs::remove_file(f.0.join("templates/same_name.py")).unwrap();
+        fs::write(f.0.join("regular.json"), "tampered").unwrap();
+        assert!(run_template_catalog(&f.0, "binding", "regular", Some("same_name"), None).await.is_err());
+        // A legacy Python entry is still manually resolvable when generated is empty.
+        fs::remove_file(regular.join("same_name.research.json")).unwrap();
+        fs::write(f.0.join("templates/legacy.py"), "raise RuntimeError('not executed')\nasync def generate_parms(session): pass\n").unwrap();
+        assert!(latest_template_from_directory(&f.0, regular.to_str().unwrap(), Some("regular")).await.is_err());
+        assert_eq!(latest_template_from_directory(&f.0, f.0.join("templates").to_str().unwrap(), Some("regular")).await.unwrap(), "legacy");
+        assert!(run_template_catalog(&f.0, "binding", "regular", Some("legacy"), None).await.unwrap()["binding"].is_null());
+    }
+
 }

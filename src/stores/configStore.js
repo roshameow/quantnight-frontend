@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import TOML from '@iarna/toml';
+import { migrateTemplatePaths } from '../utils/templatePaths.js';
 
 export const useConfigStore = defineStore('config', () => {
   // --- State ---
@@ -54,7 +55,13 @@ export const useConfigStore = defineStore('config', () => {
     try {
       const content = await invoke('get_config_js_content');
       const config = _parseContent(content);
-      paths.value = config.paths || { superTemplatePath: '', templatePath: '', priorityTemplatePath: '' };
+      const migrated = migrateTemplatePaths(config.paths, backendConfig.value.env?.working_dir);
+      paths.value = migrated;
+      // Persist only explicit defaults; retain all other configuration keys.
+      if (JSON.stringify(migrated) !== JSON.stringify(config.paths)) {
+        try { await saveFrontendConfig({ ...config, paths: migrated }); }
+        catch (e) { console.error('Default template paths migrated in memory but could not be persisted:', e); }
+      }
       dataFilterOptions.value = config.dataFilterOptions || [];
       embeddingOptions.value = config.embeddingOptions || [];
     } catch (e) {
@@ -196,11 +203,15 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   // --- Initial Load ---
-  fetchFrontendConfig();
-  fetchBackendConfig();
-  fetchButtonMappings();
+  // Resolve the backend root before migrating persisted frontend defaults.
+  const ready = (async () => {
+    await fetchBackendConfig();
+    await fetchFrontendConfig();
+    await fetchButtonMappings();
+  })();
 
   return {
+    ready,
     paths,
     dataFilterOptions,
     embeddingOptions,
