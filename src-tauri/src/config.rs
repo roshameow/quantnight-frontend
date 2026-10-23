@@ -313,7 +313,7 @@ pub async fn run_bash_script_observed(
             return Ok((stdout_lines.join("\n"), stderr_lines.join("\n"))),
         Ok(Ok((status, _, _))) => format!("脚本退出非 0: {:?}", status.code()),
         Ok(Err(error)) => error,
-        Err(_) => format!("Bash 脚本执行超时（预算 {} ms）；仅清理本次子进程，不自动重试", budget.as_millis()),
+        Err(_) => format!("Bash 脚本执行超时（预算 {} ms）", budget.as_millis()),
     };
     // Only this child PID (and for diagnostic=true its private group) is owned.
     // No task-name lookup, tmux kill, job cancellation or retry is performed.
@@ -524,6 +524,9 @@ mod bash_runner_tests {
         assert!(!run.is_finished(), "stdout must be observed while script is still running");
         let error = run.await.unwrap().unwrap_err();
         assert!(error.contains("200 ms") && error.contains("detailed-timeout-cause"), "{error}");
+        assert_eq!(error.lines().next(), Some("Bash 脚本执行超时（预算 200 ms）"));
+        assert!(!error.contains('不'));
+        assert!(error.contains("stage-line"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

@@ -57,7 +57,7 @@ async function render(runtime, patch = {}) {
 function preserved(text) {
   assert.match(text, /✓ 7\+4.*✗ 2\+1.*Σ 80\+20/);
   assert.match(text, /最大并发: 8.*子任务上限: 10/);
-  assert.match(text, /进度刷新失败，保留上次统计并重试/);
+  assert.match(text, /进度刷新失败：/);
 }
 
 test('actual native-string normalization keeps process truth and separates reconciliation, quota reset and ready', async () => {
@@ -83,9 +83,9 @@ test('actual native-string normalization keeps process truth and separates recon
 });
 
 test('valid wait metadata never masks absent/unknown process, empty output, timeout or permission/startup errors', async () => {
-  for (const [process, error, label] of [[negative, null, '未检测到运行消费者'], ['', null, '运行检查输出不符合协议'],
-    [positive + '\nPermission denied', null, '运行检查输出不符合协议'], ['SSH timeout', null, '运行检查输出不符合协议'],
-    [positive.replace('pid=21733', 'pid=0'), null, '运行检查输出不符合协议'],
+  for (const [process, error, label] of [[negative, null, '未检测到运行消费者'], ['', null, '运行检查输出校验失败'],
+    [positive + '\nPermission denied', null, '运行检查输出校验失败'], ['SSH timeout', null, '运行检查输出校验失败'],
+    [positive.replace('pid=21733', 'pid=0'), null, '运行检查输出校验失败'],
     [positive, 'Native timed out', '运行检查超时'], [positive, 'script_config failed', '运行检查执行失败']]) {
     const html = await render(observation(meta(), process, Date.now(), error));
     assert.ok(html.includes(label)); preserved(html);
@@ -137,7 +137,7 @@ test('stop lifecycle wins over dispatch pause and metadata cannot serve as stop 
 test('ID/host/profile replacement and old observation expiry fences still win over fresh capability', () => {
   const now = Date.now(); const runtime = observation(meta('waiting_reconciliation', now), positive, now);
   for (const patch of [{ _id: 'other' }, { name: 'other' }, { isRemote: false }, { auth_profile: 'user2' }]) {
-    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行检查身份不匹配');
+    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行检查身份校验失败');
   }
   const old = { ...runtime, observedAt: now - card.REGULAR_RUNTIME_MAX_AGE };
   assert.equal(card.regularDisplayStatus(task(), old, null, now), '运行检查结果已过期');

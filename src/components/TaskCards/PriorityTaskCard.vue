@@ -47,9 +47,9 @@
       <n-text type="warning">{{ progressError || '进度加载中，尚未收到实际计数…' }}</n-text>
       <n-text v-if="displayProgress" depth="3">（保留上次实际统计）</n-text>
     </div>
-    <div>{{ stopStatus || hasProcessDiagnostic || !(roundEnabled || runtime) ? '任务状态' : '研究状态（非进程存活状态）' }}：{{ displayRuntimeStatus }}</div>
+    <div>{{ stopStatus || hasProcessDiagnostic || !(roundEnabled || runtime) ? '任务状态' : '研究状态' }}：{{ displayRuntimeStatus }}</div>
     <div v-if="(stopStatus || hasProcessDiagnostic) && (roundEnabled || runtime)">
-      研究状态（非进程存活状态）：{{ researchStatus }}
+      研究状态：{{ researchStatus }}
     </div>
     <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
       <template v-if="!legacyRuntime">
@@ -67,12 +67,12 @@
           R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
         <div v-if="sourceGroupsUnconfirmed"><n-text type="warning">来源分组未确认，请更新状态</n-text></div>
       </template>
-      <n-text v-else type="warning">旧 campaign（只读）：不自动迁移、重排或重新派发</n-text>
+      <n-text v-else type="warning">旧 campaign 记录（只读）</n-text>
       <div v-if="legacyRuntime || !sourceGroups.length">来源任务：{{ sourceNames }}</div>
       <div v-if="runtimeWarning"><n-text type="warning">{{ runtimeWarning }}</n-text></div>
       <div v-if="runtime?.data_source === 'own_task_fallback'"><n-text type="warning">仅旧本任务集合（账本未确认）</n-text></div>
       <div v-if="runtime?.reason === 'source_consumer_upgrade_required'"><n-text type="warning">
-        原来源任务 normal consumer 须支持 protocol3；未升级则等待，勿启 standalone Consumer 抢槽
+        等待来源任务 normal consumer 的 protocol3 支持
       </n-text></div>
       <details class="runtime-details">
         <summary>详情 / Details</summary>
@@ -84,14 +84,14 @@
             R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
           <div v-for="group in sourceGroups" :key="'host:' + group.key">来源执行：{{ group.source_task }} ·
             {{ typeof group.source_remote === 'boolean' ? (group.source_remote ? 'remote' : 'local') : '主机未确认' }}</div>
-          <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计 · 无池全局预算</div>
-          <div>具体cap按各root冻结配置，不随活跃来源切换重置；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</div>
+          <div>每 root ≤3阶段 · ≤60/阶段 · ≤180累计</div>
+          <div>各 root 使用冻结配置中的阶段上限；Priority运行主机可local/remote；来源执行独立按source_remote，可local/remote</div>
           <div>待规划 {{ runtime?.stage_distribution?.['0'] ?? '—' }} · 待反馈 {{ runtime?.waiting_feedback ?? '—' }} · 待slots {{ runtime?.waiting_slots ?? '—' }} ·
             完成roots {{ runtime?.completed ?? '—' }} · 阻塞roots {{ runtime?.blocked ?? '—' }}</div>
         </template>
         <div>来源选择：动态 active regular（所选Priority主机control同 auth，来源可local/remote）；指定来源以来源任务列表为准</div>
         <div v-if="runtime?.reason">状态说明：{{ runtime.reason }}</div>
-        <div>未完成 {{ runtime?.unresolved ?? '—' }}（含等待与未确认结果，不计为失败）</div>
+        <div>待完成 {{ runtime?.unresolved ?? '—' }}（含等待与待核验结果）</div>
         <div v-if="priorityConfig?.filter_params">Filter Params: {{ priorityConfig.filter_params }}</div>
       </details>
     </div>
@@ -196,7 +196,7 @@ export function priorityDisplayStatus(runtime, roundEnabled, controlStatus, stop
   if (status === 'paused') return '暂停标记无有效停止凭据';
   if (runtime && ['completed', 'done', 'success'].includes(status) &&
       (!runtime.counts || runtime.unresolved !== 0)) return 'waiting';
-  return String(status).toLowerCase() === 'unknown' ? `研究状态缺少有效结果：${runtime?.reason || runtime?.last_error || '历史状态未附具体原因，需刷新 root 池元数据'}` : status;
+  return String(status).toLowerCase() === 'unknown' ? `研究状态缺少有效结果：${runtime?.reason || runtime?.last_error || '缺少阶段及原因，请刷新 root 池元数据'}` : status;
 }
 
 // unresolved includes ordinary pending/processing and cannot identify UNKNOWN.
@@ -208,7 +208,7 @@ export function priorityRuntimeWarning(runtime) {
     'round_limit_reached', 'root_stage_limit_reached', 'no_eligible_successful_feedback',
     'no_improvement', 'no_new_legal_variants'];
   if (runtime?.reason && (abnormal || !routineReasons.includes(runtime.reason))) return runtime.reason;
-  if (status === 'unknown') return runtime?.last_error || '历史研究元数据只有 unknown，未附有效结果或失败原因；请刷新 root 池元数据';
+  if (status === 'unknown') return runtime?.last_error || '研究元数据缺少有效结果及失败原因；请刷新 root 池元数据';
   if (runtime?.blocked > 0) return `阻塞roots ${runtime.blocked}：请检查来源反馈并更新状态`;
   return null;
 }

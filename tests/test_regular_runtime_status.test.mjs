@@ -44,7 +44,7 @@ async function render(props) {
 function assertPreserved(html) {
   const text = plain(html);
   assert.match(text, /✓ 7\+4.*✗ 2\+1.*Σ 80\+20/);
-  assert.match(text, /进度刷新失败，保留上次统计并重试/);
+  assert.match(text, /进度刷新失败：/);
   assert.match(text, /最大并发: 3.*子任务上限: 10/);
   assert.match(text, /glb_spread/);
   assert.match(text, /user1/);
@@ -53,8 +53,8 @@ function assertPreserved(html) {
 test('real regular SFC SSR: initial running control is pending; fresh positive, bash-only and unknown are distinct', async () => {
   for (const [runtime, label] of [[null, '尚未执行运行检查'], [observation(), '消费者存活（缺少有效派发快照）'],
     [observation({ state: 'not_running', raw: '❌ Pane 0 (pid=21733) is running: bash' }), '未检测到运行消费者'],
-    [observation({ state: 'unknown' }), '运行检查输出不符合协议'], [observation({ state: 'checking' }), '运行检查进行中'],
-    [observation({ state: 'paused' }), '运行检查输出不符合协议']]) {
+    [observation({ state: 'unknown' }), '运行检查输出校验失败'], [observation({ state: 'checking' }), '运行检查进行中'],
+    [observation({ state: 'paused' }), '运行检查输出校验失败']]) {
     const input = { task: task(), progress, taskRuntimeStatus: runtime };
     const before = JSON.stringify(input);
     const html = await render(input);
@@ -73,7 +73,7 @@ test('freshness and identity boundary rejects stale, future, invalid and wrong t
     { observedAt: now - card.REGULAR_RUNTIME_MAX_AGE }, { observedAt: now + 60000 },
     { observedAt: -1 }, { observedAt: null }, { observedAt: NaN }, { observedAt: '123' }]) {
     const runtime = observation(patch);
-    const expected = ['taskId', 'name', 'isRemote'].some(key => key in patch) ? '运行检查身份不匹配'
+    const expected = ['taskId', 'name', 'isRemote'].some(key => key in patch) ? '运行检查身份校验失败'
       : typeof patch.observedAt === 'number' && patch.observedAt > 0 && patch.observedAt <= now ? '运行检查结果已过期' : '运行检查时间无效';
     assert.equal(card.regularDisplayStatus(task(), runtime, null, now), expected);
     const html = await render({ task: task(), progress, taskRuntimeStatus: runtime });
@@ -143,16 +143,16 @@ test('mounted real card updates evidence/status without losing counters/config a
     assert.match(mounted.text(), /glb_spread 尚未执行运行检查/);
     for (const [runtime, label] of [[observation(), '消费者存活（缺少有效派发快照）'],
       [observation({ state: 'not_running' }), '未检测到运行消费者'],
-      [observation({ state: 'unknown' }), '运行检查输出不符合协议'], [observation(), '消费者存活（缺少有效派发快照）']]) {
+      [observation({ state: 'unknown' }), '运行检查输出校验失败'], [observation(), '消费者存活（缺少有效派发快照）']]) {
       props.taskRuntimeStatus = runtime;
       await nextTick();
       assert.match(mounted.text(), new RegExp(`glb_spread ${label}`));
       assertPreserved(mounted.text());
     }
     props.task = task({ _id: 'replacement' }); await nextTick();
-    assert.match(mounted.text(), /glb_spread 运行检查身份不匹配/);
+    assert.match(mounted.text(), /glb_spread 运行检查身份校验失败/);
     props.task = task({ isRemote: true }); await nextTick();
-    assert.match(mounted.text(), /glb_spread 运行检查身份不匹配/);
+    assert.match(mounted.text(), /glb_spread 运行检查身份校验失败/);
     props.task = task();
     props.stopOperation = { _id: 'regular-id', name: 'glb_spread', isRemote: false, status: 'stop_unconfirmed' };
     await nextTick();
@@ -211,13 +211,13 @@ test('mounted positive badge expires without any new props or native polling and
 test('actual Regular/Super SFC body shows full stage and failure reasons, not merely tooltip/toast or renamed unknown', async () => {
   for (const taskType of ['regular', 'super']) {
     for (const [runtime, label, cause] of [
-      [null, '尚未执行运行检查', '初次尚未执行消费者检查'],
+      [null, '尚未执行运行检查', '等待首次消费者检查'],
       [observation({ state: 'checking', stage: 'ssh', detail: 'SSH 正在握手' }), '运行检查进行中', 'SSH 正在握手'],
       [observation({ state: 'unknown', stage: 'process', detail: '枚举后代进程', error: '[process] /proc/341/status Permission denied；退出码=13' }), '运行检查执行失败', '/proc/341/status Permission denied；退出码=13'],
       [observation({ state: 'unknown', stage: 'tmux', detail: '正在枚举精确会话', error: '15 秒检查超时：tmux 未返回；保留原回执' }), '运行检查超时', '15 秒检查超时：tmux 未返回；保留原回执'],
-      [observation({ taskId: 'old-id', stage: 'identity', detail: '核对身份' }), '运行检查身份不匹配', 'identity mismatch'],
+      [observation({ taskId: 'old-id', stage: 'identity', detail: '核对身份' }), '运行检查身份校验失败', '身份校验失败'],
       [observation({ observedAt: Date.now() - card.REGULAR_RUNTIME_MAX_AGE, stage: 'complete', detail: '旧进程快照' }), '运行检查结果已过期', '旧进程快照'],
-      [observation({ state: 'unknown', stage: 'complete', detail: '枚举返回', raw: 'SSH banner\nPermission denied: actual output' }), '运行检查输出不符合协议', 'Permission denied: actual output'],
+      [observation({ state: 'unknown', stage: 'complete', detail: '枚举返回', raw: 'SSH banner\nPermission denied: actual output' }), '运行检查输出校验失败', 'Permission denied: actual output'],
     ]) {
       const html = await render({ task: task({ taskType }), progress, taskRuntimeStatus: runtime });
       const body = html.replace(/<[^>]*>/g, ' ');
@@ -232,7 +232,7 @@ test('actual Regular/Super SFC body shows full stage and failure reasons, not me
     const html = await render({ task: task({ taskType }), progress, taskRuntimeStatus: observation(), stopOperation: operation });
     assert.match(plain(html), /glb_spread 停止执行失败/);
     assert.ok(html.includes('[control_write]')); assert.ok(html.includes(operation.error));
-    assert.match(plain(html), /执行退出已核验，但 control_write 控制记录写入失败/);
+    assert.match(plain(html), /执行退出已核验；control_write 控制记录写入失败/);
     assert.doesNotMatch(plain(html), /glb_spread paused/);
     assertPreserved(html);
   }
@@ -288,9 +288,9 @@ test('legacy paused body identifies the actual missing, invalid or mismatched pr
   for (const [patch, reason] of [[{ stopConfirmedAt: null }, '缺少 stopConfirmedAt'],
     [{ stopConfirmedAt: 'invalid' }, 'stopConfirmedAt 停止时间凭据格式无效'],
     [{ stopConfirmedTaskId: null }, '缺少 stopConfirmedTaskId'],
-    [{ stopConfirmedTaskId: 'old-id' }, 'identity mismatch：停止凭据的任务 ID'],
+    [{ stopConfirmedTaskId: 'old-id' }, '身份校验失败：停止凭据 stopConfirmedTaskId 的任务 ID'],
     [{ stopConfirmedRemote: null }, '缺少有效 stopConfirmedRemote'],
-    [{ stopConfirmedRemote: true }, '停止凭据的执行主机与当前本地/远程目标不匹配']]) {
+    [{ stopConfirmedRemote: true }, '身份校验失败：停止凭据 stopConfirmedRemote 的执行主机与当前本地/远程目标存在差异']]) {
     const text = plain(await render({ task: { ...valid, ...patch } }));
     assert.match(text, /glb_spread 暂停标记无有效停止凭据/);
     assert.ok(text.includes(reason)); assert.doesNotMatch(text, /glb_spread paused/);
@@ -305,8 +305,37 @@ test('actual Regular SFC shows control_write timeout/disposal as missing final e
       error: failureSource === 'client_disposed' ? '页面已离开，最终停止回执尚未收到' : '[control_write] 等待最终停止回执超时；写入结果尚未观测' };
     const text = plain(await render({ task: task(), stopOperation: operation, progress }));
     assert.ok(text.includes(operation.error));
-    assert.match(text, /执行退出已核验，已进入 control_write；最终写入结果尚未收到，不能断定 CAS 成功或失败/);
+    assert.match(text, /执行退出已核验，已进入 control_write；control_write 最终写入结果待核对/);
     assert.doesNotMatch(text, /控制记录写入失败|glb_spread paused/);
     assertPreserved(text);
+  }
+});
+
+test('copy regression: local/remote checks preserve facts, raw failures, existing results and badge colors', async () => {
+  for (const isRemote of [false, true]) {
+    const current = task({ isRemote });
+    const snapshot = patch => observation({ isRemote, stage: 'process', detail: '核验进程', ...patch });
+    for (const [runtime, label, detail, color] of [
+      [snapshot({ state: 'checking' }), '运行检查进行中', '正等待本次检查结果。', 'warning'],
+      [snapshot({}), '消费者存活（缺少有效派发快照）', '已识别 Python/uv 消费者进程。', 'warning'],
+      [snapshot({ state: 'session_absent' }), '已暂停（tmux会话缺失）', '已核验目标主机的精确 tmux 会话缺失。', 'warning'],
+      [snapshot({ state: 'unknown', raw: '' }), '运行检查输出校验失败', '检查输出缺少可校验的 Python/uv 或 shell/sleep 进程行。', 'error'],
+      [snapshot({ authProfile: 'other' }), '运行检查身份校验失败', '身份校验失败：检查结果的任务 ID、名称、执行主机或账号与当前任务存在差异', 'error'],
+    ]) {
+      const input = { task: current, taskRuntimeStatus: runtime, progress };
+      const before = JSON.stringify(input);
+      const html = await render(input);
+      assert.ok(plain(html).includes(label)); assert.ok(plain(html).includes(detail));
+      assert.match(html, new RegExp(`class="runtime-badge" type="${color}"`));
+      assert.doesNotMatch(plain(html), /不是|不代表|不能|不得|不匹配|不符合/);
+      assertPreserved(html);
+      assert.equal(JSON.stringify(input), before);
+    }
+    const error = '[ssh] 身份校验失败：auth_profile 不匹配；taskId=regular-id；不代表进程退出';
+    const html = await render({ task: current, taskRuntimeStatus: snapshot({ state: 'unknown', error }), progress });
+    assert.ok(plain(html).includes(error), 'upstream error remains verbatim, including negative wording');
+    assert.match(html, /class="runtime-badge" type="error"/);
+    assert.match(plain(html), /glb_spread 运行检查执行失败/);
+    assertPreserved(html);
   }
 });

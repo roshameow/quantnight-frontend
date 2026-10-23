@@ -146,7 +146,7 @@ export function normalizeTaskRuntime(target, output, observedAt, error = null) {
     try {
       if (!line.startsWith(TASK_STAGE_MARKER)) throw new Error('阶段 marker 位置无效');
       const value = JSON.parse(line.slice(TASK_STAGE_MARKER.length));
-      if (!validRuntimeStage(value, target)) throw new Error('阶段任务/主机/operation/格式不匹配');
+      if (!validRuntimeStage(value, target)) throw new Error('阶段记录校验失败：任务身份、运行主机、操作类型或字段格式有差异');
       stage = value.stage; detail = value.message;
     } catch (err) { stageError = `阶段诊断校验失败：${String(err)}`; }
     return false;
@@ -325,7 +325,7 @@ const setRemoteSource = (task, isRemote) => mutateTaskSource({
 const syncRemoteTask = async (taskName) => {
   try {
     const targetTask = tasks.value.find((task) => task.name === taskName);
-    if (!targetTask) throw new Error("任务不存在");
+    if (!targetTask) throw new Error("任务列表缺少所选任务记录");
     await syncTaskToRemote({
       sync: () => invoke("sync_remote_task", { alphaMissionList: taskName }),
       updateSource: () => setRemoteSource(targetTask, true),
@@ -343,7 +343,7 @@ const syncRemoteTask = async (taskName) => {
 const updateIsRemote = async (id, isRemote) => {
   try {
     const targetTask = tasks.value.find((task) => getObjectId(task._id) === getObjectId(id));
-    if (!targetTask) throw new Error("任务不存在");
+    if (!targetTask) throw new Error("任务列表缺少所选任务记录");
     await setRemoteSource(targetTask, isRemote);
     if (!disposed) message.success(`运行方式已更新为 ${isRemote ? "远程" : "本地"}`);
     await fetchTasks();
@@ -376,7 +376,7 @@ const pauseTask = async (task) => {
               timer = setTimeout(() => {
                 pending.completed = true;
                 pending.failureSource = 'client_timeout';
-                reject(new Error("停止确认超时（120 秒）；未收到有效最终回执，请核对，不要盲目重试"));
+                reject(new Error("停止确认超时（120 秒）；最终暂停回执待核对"));
               }, 120000);
               pending.cancelTimer = () => clearTimeout(timer);
             }),
@@ -384,7 +384,7 @@ const pauseTask = async (task) => {
         } finally { pending.completed = true; clearTimeout(timer); }
         if (!validStopReceipt(target, receipt)) {
           pending.failureSource = 'receipt_validation';
-          throw new Error("停止回执未确认或身份/执行目标不匹配");
+          throw new Error("暂停回执校验失败：回执字段、任务身份或执行主机有差异");
         }
       },
       commit: () => { if (!disposed) taskStore.confirmTaskPaused(target, receipt, operation); },

@@ -29,11 +29,11 @@
         />
       </n-form-item>
 
-      <n-form-item label="模板名称（支持旧目录中的模板；不含扩展名）">
+      <n-form-item label="模板名称（裸名称，支持旧目录模板）">
         <n-input v-model:value="form.templateFilename" placeholder="例如 my_template" />
         <n-button secondary @click="loadLatestTemplate">发现最新模板</n-button>
       </n-form-item>
-      <n-text depth="3">选择文件只关联已发布到后端的同名模板，不上传或部署文件；新目录为空时仍可手动填写旧模板名。</n-text>
+      <n-text depth="3">选择文件会提取模板名称，关联后端已发布的同名模板；支持手动填写旧模板名。</n-text>
       <n-form-item>
         <template #label>
           <n-space align="center" style="justify-content: space-between; width: 100%">
@@ -125,7 +125,7 @@ async function loadLatestTemplate() {
     form.value.templateCode = "";
   } catch (err) {
     console.error("读取模板失败:", err);
-    message.warning(`无法自动选择模板：${err}。可手动填写旧模板名。`);
+    message.warning(`自动选择模板失败：${err}。可手动填写旧模板名。`);
   }
 }
 

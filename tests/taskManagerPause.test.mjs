@@ -150,7 +150,7 @@ test('resolved void, stdout claims and malformed/mismatched receipts fail closed
     try {
       const pausing = h.state.pauseTask(h.store.tasks[0]);
       h.command.resolve(response);
-      await assert.rejects(pausing, /停止回执未确认/);
+      await assert.rejects(pausing, /暂停回执校验失败/);
       assert.equal(h.store.tasks[0].status, 'running');
       assert.equal(stopStatus(h), '停止回执校验失败');
       assert.equal(h.lists.length, 0);
@@ -674,7 +674,7 @@ test('control_write followed by client timeout/disposal records missing final re
       assert.equal(h.store.tasks[0].status, 'running');
       const { stopDiagnostic } = await import('../src/utils/taskDiagnostics.js');
       const detail = stopDiagnostic(h.store.tasks[0], op, stopStatus(h)).detail;
-      assert.match(detail, /最终写入结果尚未收到，不能断定 CAS 成功或失败/);
+      assert.match(detail, /control_write 最终写入结果待核对/);
       assert.doesNotMatch(detail, /控制记录写入失败/);
       if (outcome === 'timeout') { h.command.resolve(receipt()); await tick(); assert.equal(h.store.tasks[0].status, 'running'); }
     } finally { h.stop(); }

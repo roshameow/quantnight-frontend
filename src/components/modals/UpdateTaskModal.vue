@@ -138,7 +138,7 @@ const onConfirm = () => {
       ? validatePriorityConfig(form.value.config)
       : parseTaskConfig(form.value.config);
     if (!props.task || !props.task.name) {
-      message.error("任务信息缺失，无法更新");
+      message.error("任务信息缺失");
       return;
     }
 

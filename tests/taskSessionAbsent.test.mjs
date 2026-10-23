@@ -49,7 +49,7 @@ for (const remote of [false, true]) test(`exact successful session absence is pa
   assert.equal(observed.error, null);
   assert.equal(validOperationStage({ operation: 'runtime', ...target(remote), requestId: 'request-1', stage: 'session_absent', message: '精确会话不存在' }), true);
   const text = await card('RegularTaskCard', { task: task({ isRemote: remote }), taskRuntimeStatus: observed });
-  assert.match(text, /已暂停（tmux会话不存在）/);
+  assert.match(text, /已暂停（tmux会话缺失）/);
   assert.doesNotMatch(text, /运行状态未确认|停止状态未确认|运行检查执行失败/);
 });
 
@@ -64,7 +64,7 @@ test('no-session progress alone, wrong name/host, mixed pane and transport failu
 test('Priority root snapshot cannot override an actual successful absent session observation', async () => {
   const observed = manager.normalizeTaskRuntime(target(), `${stage()}\n${absence()}`, stamp);
   const text = await card('PriorityTaskCard', { task: task({ taskType: 'priority', mission_config: { rounds: { enabled: true } } }), taskRuntimeStatus: observed });
-  assert.match(text, /已暂停（tmux会话不存在）/);
+  assert.match(text, /已暂停（tmux会话缺失）/);
   assert.doesNotMatch(text, /尚未取得 root 池状态/);
 });
 
@@ -79,7 +79,7 @@ test('absence-basis stop receipt is scoped, persisted, and never described as or
   assert.equal(store.tasks[0].stopConfirmationBasis, 'session_absent');
   assert.equal(taskStopDisplayStatus(store.tasks[0], store.taskStopOperationMap.exact_task), 'paused');
   const detail = stopDiagnostic(store.tasks[0], store.taskStopOperationMap.exact_task, 'paused').detail;
-  assert.match(detail, /会话不存在/); assert.match(detail, /未单独核验历史孤儿PID/);
+  assert.match(detail, /tmux会话缺失/); assert.match(detail, /已核验目标主机的精确会话缺失、任务身份、执行目标及暂停记录回写/);
   assert.doesNotMatch(detail, /原记录执行进程退出及控制记录写入均匹配/);
   store.clearTaskStop(store.tasks[0]); assert.equal(store.tasks[0].stopConfirmationBasis, undefined);
 });

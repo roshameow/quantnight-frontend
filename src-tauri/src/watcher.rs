@@ -294,9 +294,9 @@ fn priority_ledger_filter(name: &str, auth: &str, campaign: &str) -> Document {
 
 fn apply_summary(runtime: &mut PriorityRuntime, summary: Option<&Document>) -> Result<()> {
     let Some(summary) = summary else { return Ok(()); };
-    runtime.campaign_id = Some(summary.get_str("campaign_id").context("Priority registry 缺少 campaign_id")?
+    runtime.campaign_id = Some(summary.get_str("campaign_id").context("Priority 登记记录缺少 campaign_id")?
         .to_owned());
-    if runtime.campaign_id.as_deref() == Some("") { return Err(anyhow!("Priority registry campaign_id 为空")); }
+    if runtime.campaign_id.as_deref() == Some("") { return Err(anyhow!("Priority 登记记录的 campaign_id 为空")); }
     for (name, target) in [("stage", &mut runtime.stage), ("status", &mut runtime.status), ("reason", &mut runtime.reason)] {
         *target = summary.get_str(name).ok().map(str::to_owned);
     }
@@ -313,7 +313,7 @@ fn apply_legacy_monitor_summary(task: &Document, summary: Result<Option<Document
     runtime: &mut PriorityRuntime) -> Result<bool> {
     let summary = summary?;
     if round_enabled(task) || runtime.pool_id.is_some() || runtime.mode.as_deref() == Some("per_root") {
-        return Err(anyhow!("Root mode cannot use legacy control-only monitoring"));
+        return Err(anyhow!("当前任务采用逐root模式，需要对应的root池进度记录"));
     }
     let control_only = summary.is_none()
         && task.get_str("taskType").ok().or_else(|| task.get_str("task_type").ok()) == Some("priority")
@@ -345,40 +345,40 @@ fn root_source_summaries(summary: &Document, name: &str, root_count: usize,
     let rows = match summary.get("source_summaries") {
         None | Some(Bson::Null) => return Ok(None),
         Some(Bson::Array(rows)) => rows,
-        _ => return Err(anyhow!("Root source_summaries must be an array")),
+        _ => return Err(anyhow!("root池来源汇总格式错误：source_summaries需要数组")),
     };
     let mut groups = Vec::new();
     let mut bindings = std::collections::HashSet::new();
     let mut total = 0_usize;
     let mut stages = [0_usize; 4];
     for row in rows {
-        let row = row.as_document().context("Root source summary must be an object")?;
-        let source = row.get_str("source_task").context("Root source summary 缺少 source_task")?;
+        let row = row.as_document().context("root池来源条目格式错误：需要对象")?;
+        let source = row.get_str("source_task").context("root池来源条目缺少 source_task")?;
         if source.is_empty() || source == name || source.starts_with("system.") || source.contains(['$', '\0']) {
-            return Err(anyhow!("Root source_task invalid"));
+            return Err(anyhow!("root池来源任务名称校验失败：source_task格式或任务归属有误"));
         }
-        let remote = row.get_bool("source_remote").context("Root source summary 缺少 source_remote")?;
-        if !bindings.insert((source.to_owned(), remote)) { return Err(anyhow!("Root source summary duplicate")); }
+        let remote = row.get_bool("source_remote").context("root池来源条目缺少 source_remote")?;
+        if !bindings.insert((source.to_owned(), remote)) { return Err(anyhow!("root池来源汇总包含重复的任务和运行主机")); }
         let count = count_field(row, "root_count")?;
         let stage_counts = row.get_document("stage_distribution")?;
-        if stage_counts.len() != 4 { return Err(anyhow!("Root source stages must be exactly 0..3")); }
+        if stage_counts.len() != 4 { return Err(anyhow!("root池来源阶段统计需要包含0、1、2、3四个阶段")); }
         let mut stage_distribution = std::collections::BTreeMap::new();
         let mut sum = 0_usize;
         for (index, stage) in ["0", "1", "2", "3"].iter().enumerate() {
             let value = count_field(stage_counts, stage)?;
-            sum = sum.checked_add(value).context("Root source stage sum overflow")?;
-            stages[index] = stages[index].checked_add(value).context("Root source stage total overflow")?;
+            sum = sum.checked_add(value).context("root池来源阶段数量求和超出数值范围")?;
+            stages[index] = stages[index].checked_add(value).context("root池各来源阶段总数超出数值范围")?;
             stage_distribution.insert((*stage).to_owned(), value);
         }
-        if sum != count { return Err(anyhow!("Root source stage sum/root_count mismatch")); }
-        total = total.checked_add(count).context("Root source root_count total overflow")?;
+        if sum != count { return Err(anyhow!("root池来源的阶段数量之和与root总数存在差异")); }
+        total = total.checked_add(count).context("root池各来源root数量求和超出数值范围")?;
         groups.push(PrioritySourceSummary { source_task: source.into(), source_remote: remote,
             root_count: count, stage_distribution });
     }
-    if total != root_count { return Err(anyhow!("Root source/global root_count mismatch")); }
+    if total != root_count { return Err(anyhow!("各来源root数量之和与root池总数存在差异")); }
     for (index, stage) in ["0", "1", "2", "3"].iter().enumerate() {
         if stages[index] != distribution.get(*stage).copied().unwrap_or(0) {
-            return Err(anyhow!("Root source/global stage distribution mismatch"));
+            return Err(anyhow!("各来源阶段统计之和与root池阶段统计存在差异"));
         }
     }
     Ok(Some(groups))
@@ -389,13 +389,13 @@ fn apply_root_summary(runtime: &mut PriorityRuntime, summary: &Document) -> Resu
     runtime.source_summaries = None;
     if summary.get_str("_id").ok() != Some(&format!("{}:{}", runtime.auth_profile, runtime.collection))
         || summary.get_str("mode").ok() != Some("per_root") {
-        return Err(anyhow!("Priority root pool identity/mode mismatch"));
+        return Err(anyhow!("Priority root池身份或模式校验失败"));
     }
-    let pool = summary.get_str("pool_id").context("Root registry 缺少 pool_id")?;
-    if pool.is_empty() { return Err(anyhow!("Root registry pool_id 为空")); }
+    let pool = summary.get_str("pool_id").context("root池登记记录缺少 pool_id")?;
+    if pool.is_empty() { return Err(anyhow!("root池登记记录的 pool_id 为空")); }
     let distribution = summary.get_document("stage_distribution")?
         .iter().map(|(key, _)| {
-            if !["0", "1", "2", "3"].contains(&key.as_str()) { return Err(anyhow!("Root stage distribution key invalid")); }
+            if !["0", "1", "2", "3"].contains(&key.as_str()) { return Err(anyhow!("root池阶段统计字段有误：有效阶段为0、1、2、3")); }
             Ok((key.clone(), count_field(summary.get_document("stage_distribution")?, key)?))
         }).collect::<Result<_>>()?;
     let root_count = count_field(summary, "root_count")?;
@@ -413,7 +413,7 @@ fn apply_root_summary(runtime: &mut PriorityRuntime, summary: &Document) -> Resu
     runtime.reason = summary.get_str("reason").ok().map(str::to_owned);
     if let Ok(names) = summary.get_array("source_tasks") {
         runtime.source_tasks = names.iter().map(|name| name.as_str().filter(|s| !s.is_empty())
-            .map(str::to_owned).ok_or_else(|| anyhow!("Root source_tasks invalid"))).collect::<Result<_>>()?;
+            .map(str::to_owned).ok_or_else(|| anyhow!("root池来源任务列表格式错误：需要有效任务名"))).collect::<Result<_>>()?;
     }
     // No task-level round or denominator maximum; registry counts are metadata.
     runtime.current_round = None;
@@ -436,42 +436,42 @@ fn root_ledger_selection(rows: &[Document], name: &str, auth: &str, pool: &str) 
     let mut stages = std::collections::BTreeMap::new();
     for row in rows {
         for (key, value) in [("priority_task", name), ("auth_profile", auth), ("pool_id", pool)] {
-            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("Root ledger scope mismatch: {key}")); }
+            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("root阶段账本归属校验失败：{key}与当前任务记录存在差异")); }
         }
-        let root = row.get_str("root_alpha_id").context("Root ledger 缺少 root_alpha_id")?;
-        if root.is_empty() { return Err(anyhow!("Root alpha ID 为空")); }
-        let source = row.get_str("source_task").context("Root ledger 缺少 source_task")?;
+        let root = row.get_str("root_alpha_id").context("root阶段账本缺少 root_alpha_id")?;
+        if root.is_empty() { return Err(anyhow!("root的alpha ID为空")); }
+        let source = row.get_str("source_task").context("root阶段账本缺少 source_task")?;
         if source.is_empty() || source == name || source.starts_with("system.") || source.contains(['$', '\0']) {
-            return Err(anyhow!("Root source_task invalid"));
+            return Err(anyhow!("root池来源任务名称校验失败：source_task格式或任务归属有误"));
         }
-        let remote = row.get_bool("source_remote").context("Root ledger 缺少 source_remote")?;
+        let remote = row.get_bool("source_remote").context("root阶段账本缺少 source_remote")?;
         let binding = (remote, source.to_owned());
         if let Some(previous) = roots.insert(root.to_owned(), binding.clone()) {
-            if previous != binding { return Err(anyhow!("Root immutable source binding changed")); }
+            if previous != binding { return Err(anyhow!("同一root对应了多个来源任务或运行主机")); }
         }
         let number = count_field(row, "number")?;
-        if !(1..=3).contains(&number) { return Err(anyhow!("Root stage number 必须为1..3")); }
-        let entries = row.get_array("entries").context("Root ledger 缺少 exact entries")?;
-        if entries.len() > 60 { return Err(anyhow!("Root stage entries 超过60")); }
+        if !(1..=3).contains(&number) { return Err(anyhow!("root阶段编号需要为1、2或3")); }
+        let entries = row.get_array("entries").context("root阶段账本缺少候选条目明细")?;
+        if entries.len() > 60 { return Err(anyhow!("root单阶段候选条目超过60条")); }
         // Duplicate stage records must be byte-for-byte identical, not extend a
         // reserved stage. There is deliberately no pool-wide 60/180 check.
         if let Some(previous) = stages.insert((root.to_owned(), number), entries.clone()) {
-            if previous != *entries { return Err(anyhow!("Root stage reservation changed")); }
+            if previous != *entries { return Err(anyhow!("同一root阶段的候选登记内容存在差异")); }
         }
         for entry in entries {
-            let entry = entry.as_document().context("Root entry 不是对象")?;
+            let entry = entry.as_document().context("root候选条目格式错误：需要对象")?;
             if entry.get_str("collection").ok() != Some(source) {
-                return Err(anyhow!("Root entry must route to immutable source_task"));
+                return Err(anyhow!("root候选的集合与登记来源任务存在差异"));
             }
             let id = match entry.get("item_id") {
                 Some(Bson::ObjectId(id)) => *id,
-                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("Root item_id invalid")?,
-                _ => return Err(anyhow!("Root item_id must be ObjectId/hex")),
+                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("root候选的 item_id 格式错误")?,
+                _ => return Err(anyhow!("root候选的 item_id 需要ObjectId或十六进制ID")),
             };
-            let hash = entry.get_str("payload_hash").context("Root entry 缺少 payload_hash")?;
-            if hash.is_empty() { return Err(anyhow!("Root payload_hash 为空")); }
+            let hash = entry.get_str("payload_hash").context("root候选条目缺少 payload_hash")?;
+            if hash.is_empty() { return Err(anyhow!("root候选的 payload_hash 为空")); }
             if let Some(previous) = unique.insert((remote, source.to_owned(), id), hash.to_owned()) {
-                if previous != hash { return Err(anyhow!("Root exact ID payload hash conflict")); }
+                if previous != hash { return Err(anyhow!("同一root候选ID对应了多个表达式与参数摘要")); }
             }
         }
     }
@@ -486,10 +486,20 @@ fn select_host<'a, T>(local: &'a T, remote: &'a T, is_remote: bool) -> &'a T {
     if is_remote { remote } else { local }
 }
 
-fn missing_root_pool(runtime: &mut PriorityRuntime) -> Result<ProgressCounts> {
+fn missing_root_pool(runtime: &mut PriorityRuntime, registration: &Document) -> Result<ProgressCounts> {
     runtime.mode = Some("per_root".into());
     runtime.reason = Some("root_pool_not_registered".into());
-    Err(anyhow!("所选运行主机的root池尚未登记：不读取或迁移parked旧global campaign"))
+    let host = if runtime.is_remote { "远程" } else { "本地" };
+    // Describe the recorded stage; numeric progress still requires the root pool.
+    let awaiting_start = registration.get_str("status").ok() == Some("pending")
+        && !["startedAt", "launchAttemptId", "launchAttemptAt", "launchHistory",
+             "launchAttempts", "launchReceipt", "startReceipt", "consumerPid", "simulatorRuntime"]
+            .iter().any(|field| registration.contains_key(*field));
+    if awaiting_start {
+        Err(anyhow!("{host} Priority 任务已登记，等待启动"))
+    } else {
+        Err(anyhow!("{host} Priority 任务已登记，等待进度记录（root池）"))
+    }
 }
 
 async fn query_root_counts(clients: &MongoClients, client: &Client, name: &str, config: &AppConfig,
@@ -531,27 +541,27 @@ fn ledger_selection(rows: &[Document], name: &str, auth: &str, campaign: &str) -
     let mut current_round = 0;
     for row in rows {
         for (key, value) in [("task", name), ("auth_profile", auth), ("campaign_id", campaign)] {
-            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("Priority ledger scope mismatch: {key}")); }
+            if row.get_str(key).ok() != Some(value) { return Err(anyhow!("Priority阶段账本归属校验失败：{key}与当前任务记录存在差异")); }
         }
         let number = count_field(row, "number")?;
-        if number == 0 { return Err(anyhow!("Priority ledger round number 必须为正数")); }
+        if number == 0 { return Err(anyhow!("Priority账本轮次编号需要为正整数")); }
         current_round = current_round.max(number);
-        for entry in row.get_array("entries").context("Priority ledger 缺少 entries，旧账本需要补齐")? {
-            let entry = entry.as_document().context("Priority ledger entry 不是对象")?;
-            let collection = entry.get_str("collection").context("Priority ledger entry 缺少 collection")?;
+        for entry in row.get_array("entries").context("Priority阶段账本缺少候选条目 entries")? {
+            let entry = entry.as_document().context("Priority候选条目格式错误：需要对象")?;
+            let collection = entry.get_str("collection").context("Priority候选条目缺少 collection")?;
             if collection.is_empty() || collection.starts_with("system.") || collection.contains(['$', '\0']) {
-                return Err(anyhow!("Priority ledger collection 无效"));
+                return Err(anyhow!("Priority候选的集合名称格式错误"));
             }
             let id = match entry.get("item_id") {
                 Some(Bson::ObjectId(id)) => *id,
-                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("Priority ledger item_id 无效")?,
-                _ => return Err(anyhow!("Priority ledger item_id 必须是 ObjectId/hex")),
+                Some(Bson::String(id)) => bson::oid::ObjectId::parse_str(id).context("Priority候选的 item_id 格式错误")?,
+                _ => return Err(anyhow!("Priority候选的 item_id 需要ObjectId或十六进制ID")),
             };
-            let hash = entry.get_str("payload_hash").context("Priority ledger 缺少 payload_hash")?;
-            if hash.is_empty() { return Err(anyhow!("Priority ledger payload_hash 为空")); }
+            let hash = entry.get_str("payload_hash").context("Priority候选条目缺少 payload_hash")?;
+            if hash.is_empty() { return Err(anyhow!("Priority候选的 payload_hash 为空")); }
             let key = (collection.to_owned(), id);
             if let Some(previous) = unique.insert(key, hash.to_owned()) {
-                if previous != hash { return Err(anyhow!("Priority ledger 同一 collection/item_id 有冲突 payload_hash")); }
+                if previous != hash { return Err(anyhow!("同一Priority候选ID对应了多个表达式与参数摘要")); }
             }
         }
     }
@@ -591,7 +601,7 @@ fn priority_stats_pipeline(ids: Option<&[bson::oid::ObjectId]>) -> Vec<Document>
 
 fn reserved_counts(total: usize, observed: ProgressCounts) -> Result<(ProgressCounts, usize)> {
     if observed.total > total || observed.success + observed.error > observed.total {
-        return Err(anyhow!("Priority actual states 超出 ledger 保留数量"));
+        return Err(anyhow!("Priority实际状态计数超出账本登记数量"));
     }
     let unresolved = total - observed.success - observed.error;
     Ok((ProgressCounts { total, priority_total: total, priority_success: observed.success,
@@ -600,7 +610,7 @@ fn reserved_counts(total: usize, observed: ProgressCounts) -> Result<(ProgressCo
 
 fn confirmed_priority_fallback(counts: ProgressCounts) -> Result<(ProgressCounts, usize)> {
     if counts.total == 0 {
-        return Err(anyhow!("Priority ledger 缺失且本任务集合为空：进度未确认（旧条目可能仍在 priority_collection）"));
+        return Err(anyhow!("Priority阶段账本缺失，当前任务集合为空，待取得进度记录"));
     }
     reserved_counts(counts.total, counts)
 }
@@ -615,7 +625,7 @@ async fn query_priority_counts(client: &Client, name: &str, config: &AppConfig, 
         // Transitional fallback only to the task's own collection. Never adopt all
         // priority_collection items, nor pretend a missing old ledger is empty work.
         if runtime.reserved.unwrap_or(0) > 0 {
-            return Err(anyhow!("Priority 已保留条目但缺少 exact-ID ledger，等待账本补齐"));
+            return Err(anyhow!("Priority已有登记候选，阶段账本缺少对应的候选ID明细"));
         }
         let counts = read_counts(simulation.collection::<Document>(name)
             .aggregate(priority_stats_pipeline(None), None).await?).await?;
@@ -625,7 +635,7 @@ async fn query_priority_counts(client: &Client, name: &str, config: &AppConfig, 
         return Ok(counts);
     }
     let selection = ledger_selection(&rows, name, &runtime.auth_profile, runtime.campaign_id.as_deref().unwrap())?;
-    if selection.total == 0 { return Err(anyhow!("Priority ledger 尚无保留 IDs：进度未确认")); }
+    if selection.total == 0 { return Err(anyhow!("Priority阶段账本的候选ID列表为空，待取得进度记录")); }
     runtime.current_round = Some(runtime.current_round.unwrap_or(0).max(selection.current_round));
     let mut observed = ProgressCounts::default();
     for (collection, ids) in selection.by_collection {
@@ -645,7 +655,7 @@ fn count_field(document: &Document, name: &str) -> Result<usize> {
     let value = match document.get(name) {
         Some(Bson::Int32(n)) => i64::from(*n),
         Some(Bson::Int64(n)) => *n,
-        _ => return Err(anyhow!("统计字段 {name} 不是整数")),
+        _ => return Err(anyhow!("统计字段 {name} 格式错误：需要整数")),
     };
     usize::try_from(value).map_err(|_| anyhow!("统计字段 {name} 超出范围"))
 }
@@ -689,7 +699,7 @@ async fn read_counts(mut cursor: impl futures_util::TryStream<Ok = Document, Err
 async fn query_counts(client: &Client, name: &str, config: &AppConfig) -> Result<ProgressCounts> {
     with_deadline(PROGRESS_TIMEOUT, async {
         let collection = client.database(&config.mongodb.databases.simulation).collection::<Document>(name);
-        let cursor = collection.aggregate(stats_pipeline(), None).await.context("Mongo aggregate failed")?;
+        let cursor = collection.aggregate(stats_pipeline(), None).await.context("MongoDB任务统计查询失败")?;
         read_counts(cursor).await
     }).await
 }
@@ -720,12 +730,12 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
                     let _ = app.emit("task-priority-runtime-update", &runtime);
                     query_root_counts(clients, client, &request.collection, config, &mut runtime).await.map(Some)
                 } else if round_enabled(&task.registration) {
-                    missing_root_pool(&mut runtime).map(Some)
+                    missing_root_pool(&mut runtime, &task.registration).map(Some)
                 } else {
                     // Read-only legacy diagnosis. No migration, requeue, reset,
                     // standalone consumer or RuntimeJob redispatch from watcher.
                     let legacy = client.database(&config.mongodb.databases.mission).collection::<Document>("priority_campaign_tasks")
-                        .find_one(filter, None).await.context("查询 legacy Priority registry 失败");
+                        .find_one(filter, None).await.context("查询旧版Priority登记记录失败");
                     if apply_legacy_monitor_summary(&task.registration, legacy, &mut runtime)? {
                         return Ok(None); // No numeric/zero-count event or refresh-error log.
                     }
@@ -742,7 +752,7 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
                     runtime.stats_confirmed = true;
                     runtime.counts = Some(counts.clone());
                     runtime.stale = !["ledger", "root_ledger"].contains(&runtime.data_source.as_str());
-                    if runtime.stale { runtime.last_error = Some("轮次账本缺失：仅显示本任务集合，无法确认完整保留数量".into()); }
+                    if runtime.stale { runtime.last_error = Some("阶段账本缺失；当前统计范围为本任务集合".into()); }
                     let _ = app.emit("task-priority-runtime-update", &runtime);
                     priority_campaign = Some(runtime);
                     counts
@@ -766,7 +776,7 @@ async fn emit_progress(app: &AppHandle, clients: &MongoClients, config: &AppConf
     }.await;
     if let Err(error) = result {
         let message = format!("{error:#}");
-        eprintln!("⚠️ 任务进度刷新失败 [{}]: {}（保留上次统计）", request.collection, message);
+        eprintln!("⚠️ 任务进度读取提示 [{}]: {}", request.collection, message);
         let _ = app.emit("task-progress-error", TaskProgressError {
             collection: request.collection, task_id, is_remote, error: message, updated_at, priority_campaign,
         });
@@ -793,7 +803,7 @@ async fn emit_all_collections_once(app: AppHandle, clients: Arc<MongoClients>, c
     let local_tasks = match registered_tasks(&clients.local, &config).await {
         Ok(tasks) => tasks,
         Err(error) => {
-            eprintln!("⚠️ 无法加载本地任务进度列表: {error:#}");
+            eprintln!("⚠️ 本地任务进度列表读取失败: {error:#}");
             emit_discovery_error(&app, "all", &error, local_discovery_version);
             return; // Cannot determine local precedence; do not guess the source.
         }
@@ -827,7 +837,7 @@ async fn emit_all_collections_once(app: AppHandle, clients: Arc<MongoClients>, c
                 emit_requests(&app, &clients, &config, requests).await;
             }
             Err(error) => {
-                eprintln!("⚠️ 远程任务列表暂时不可用: {error:#}（后台将重试）");
+                eprintln!("⚠️ 远程任务列表读取失败: {error:#}（下一轮刷新重试）");
                 emit_discovery_error(&app, "remote", &error, remote_discovery_version);
             }
         }
@@ -894,7 +904,7 @@ async fn watch_source(app: AppHandle, client: Arc<Client>, config: AppConfig, so
                     }
                 }
             }
-            Ok(Err(error)) => eprintln!("⚠️ 无法建立进度 watcher [{source:?}]: {error}（定时刷新兜底）"),
+            Ok(Err(error)) => eprintln!("⚠️ 进度事件订阅建立失败 [{source:?}]: {error}（定时刷新继续运行）"),
             Err(_) => eprintln!("⚠️ 建立进度 watcher 超时 [{source:?}]（定时刷新兜底）"),
         }
         if tx.is_closed() { return; }
@@ -1089,13 +1099,43 @@ mod tests {
             }
             // Missing selected-host root registry is authoritative absence, not
             // permission to consult an old local/remote global campaign.
-            assert!(missing_root_pool(&mut runtime).is_err());
+            assert!(missing_root_pool(&mut runtime, &registration).is_err());
             assert_eq!(runtime.is_remote, cp_remote);
             assert_eq!(runtime.reason.as_deref(), Some("root_pool_not_registered"));
             assert_eq!(runtime.mode.as_deref(), Some("per_root"));
             assert!(runtime.campaign_id.is_none());
             assert!(runtime.counts.is_none());
             assert!(!runtime.stats_confirmed);
+        }
+    }
+
+    #[test]
+    fn missing_root_pool_explains_selected_host_and_recorded_stage() {
+        for remote in [false, true] {
+            let host = if remote { "远程" } else { "本地" };
+            for status in ["pending", "running", "paused"] {
+                let mut task = priority_task();
+                task.insert("isRemote", remote);
+                task.insert("status", status);
+                let mut runtime = priority_runtime(&resolved_task(&task, remote).unwrap(), "pipeline__priority", 100);
+                let message = missing_root_pool(&mut runtime, &task).unwrap_err().to_string();
+                let expected = if status == "pending" {
+                    format!("{host} Priority 任务已登记，等待启动")
+                } else {
+                    format!("{host} Priority 任务已登记，等待进度记录（root池）")
+                };
+                assert_eq!(message, expected);
+                assert_eq!(runtime.reason.as_deref(), Some("root_pool_not_registered"));
+                assert!(runtime.counts.is_none());
+                assert!(!runtime.stats_confirmed);
+            }
+            let mut task = priority_task();
+            task.insert("isRemote", remote);
+            task.insert("status", "pending");
+            task.insert("startedAt", "2026-10-23T00:00:00Z");
+            let mut runtime = priority_runtime(&resolved_task(&task, remote).unwrap(), "pipeline__priority", 100);
+            assert_eq!(missing_root_pool(&mut runtime, &task).unwrap_err().to_string(),
+                format!("{host} Priority 任务已登记，等待进度记录（root池）"));
         }
     }
 
@@ -1324,7 +1364,7 @@ mod tests {
         overflowing.insert("root_count", i64::MAX);
         overflowing.insert("stage_distribution", doc! { "0": i64::MAX, "1": i64::MAX, "2": 2_i64, "3": 0 });
         summary.insert("source_summaries", vec![overflowing]);
-        assert!(apply_root_summary(&mut runtime, &summary).unwrap_err().to_string().contains("stage sum overflow"));
+        assert!(apply_root_summary(&mut runtime, &summary).unwrap_err().to_string().contains("来源阶段数量求和超出数值范围"));
         assert!(runtime.source_summaries.is_none());
         for same_stage in [false, true] {
             let groups: Vec<_> = (0..3).map(|index| {
@@ -1333,7 +1373,7 @@ mod tests {
             }).collect();
             summary.insert("source_summaries", groups);
             let error = apply_root_summary(&mut runtime, &summary).unwrap_err().to_string();
-            assert!(error.contains(if same_stage { "stage total overflow" } else { "root_count total overflow" }), "{error}");
+            assert!(error.contains(if same_stage { "各来源阶段总数超出数值范围" } else { "各来源root数量求和超出数值范围" }), "{error}");
             assert!(runtime.source_summaries.is_none());
         }
     }
@@ -1498,7 +1538,7 @@ mod tests {
         task.insert("status", "paused");
         let mut runtime = priority_runtime(&resolved_task(&task, false).unwrap(), "pipeline__priority", 100);
         assert!(apply_legacy_monitor_summary(&task, Ok(None), &mut runtime).is_err());
-        assert!(missing_root_pool(&mut runtime).is_err());
+        assert!(missing_root_pool(&mut runtime, &task).is_err());
         assert_eq!(runtime.reason.as_deref(), Some("root_pool_not_registered"));
         assert_ne!(runtime.data_source, "control_only");
         let legacy_task = legacy_paused_task();

@@ -45,7 +45,7 @@
     </div>
     <div v-if="progress?.stale" style="font-size: 12px; margin-bottom: 4px">
       <n-text type="warning" :title="progress.lastError || '等待进度统计'">
-        {{ progress.lastError ? '进度刷新失败，保留上次统计并重试：' + progress.lastError : '进度加载中…' }}
+        {{ progress.lastError ? '进度刷新失败：' + progress.lastError : '进度加载中…' }}
       </n-text>
     </div>
     <div v-if="task.status === 'running'">

@@ -226,12 +226,12 @@ test('root pool SSR shows independent distribution, origins and more than 180 en
   assert.match(html, /R3 1/);
   assert.match(html, /regular-a/);
   assert.match(html, /待slots 1/);
-  assert.match(html, /无池全局预算/);
-  assert.match(html, /未完成 190（含等待与未确认结果，不计为失败）/);
+  assert.match(html, /每 root ≤3阶段 · ≤60\/阶段 · ≤180累计/);
+  assert.match(html, /待完成 190（含等待与待核验结果）/);
   const { main, details } = sections(html);
   assert.match(main, /Σ 240|Roots 4|regular-a/);
-  assert.doesNotMatch(main, /待slots|无池全局预算|未完成|UNKNOWN/);
-  assert.match(details, /待slots 1|无池全局预算/);
+  assert.doesNotMatch(main, /待slots|无池全局预算|待完成|UNKNOWN/);
+  assert.match(details, /待slots 1/);
   assert.doesNotMatch(html, /Round|Σ\s*240\s*\/\s*180/);
 });
 
@@ -250,7 +250,7 @@ test('pool identity isolates counts; metadata timeout keeps root distribution vi
 test('legacy campaign has read-only warning and no whole-task round UI', async () => {
   const saved = event({ mode: 'legacy' });
   const html = await render({ task, progress: { stale: false, updated_at: saved.updated_at, priority_campaign: saved } });
-  assert.match(html, /旧 campaign（只读）/);
+  assert.match(html, /旧 campaign 记录（只读）/);
   assert.doesNotMatch(html, /Round|R1 1|Roots/);
 });
 
@@ -305,10 +305,10 @@ test('pending/processing totals are not UNKNOWN and all-zero secondary counters 
     for (const value of [/✓ 0/, /✗ 0/, /Σ 60/, /Roots 4/, /R0 0 \/\s*R1 4/, /R2 0/, /R3 0/, /regular-a/]) {
       assert.match(main, value);
     }
-    assert.doesNotMatch(main, /待规划|待反馈|待slots|完成roots|阻塞roots|无池全局预算|冻结配置|source_remote|未完成|UNKNOWN|不是失败|awaiting_consumer/);
+    assert.doesNotMatch(main, /待规划|待反馈|待slots|完成roots|阻塞roots|无池全局预算|冻结配置|source_remote|待完成|UNKNOWN|不是失败|awaiting_consumer/);
     for (const value of [/待规划 0/, /待反馈 0/, /待slots 0/, /完成roots 0/, /阻塞roots 0/,
-      /每 root ≤3阶段/, /≤60\/阶段/, /≤180累计/, /无池全局预算/, /冻结配置/,
-      /source_remote/, /未完成 60/]) assert.match(details, value);
+      /每 root ≤3阶段/, /≤60\/阶段/, /≤180累计/, /每 root ≤3阶段 · ≤60\/阶段 · ≤180累计/, /冻结配置/,
+      /source_remote/, /待完成 60/]) assert.match(details, value);
     assert.doesNotMatch(html, /未完成\/UNKNOWN|不是失败/);
     const { state } = await setupCard({ task, progress: { stale: false, priority_campaign: saved } });
     assert.deepEqual(state.displayProgress.value, saved.counts); // all six raw counters survive
@@ -333,8 +333,8 @@ test('explicit uncertainty/blockers and actual failures remain prominent, not fa
     assert.match(main, /✗ 2/);
     assert.match(main, /Σ 60/);
     assert.match(main, extra.reason ? new RegExp(extra.reason) : extra.status === 'UNKNOWN'
-      ? /历史研究元数据只有 unknown，未附有效结果或失败原因/ : /阻塞roots 2：请检查来源反馈并更新状态/);
-    if (extra.reason === 'source_consumer_upgrade_required') assert.match(main, /勿启 standalone Consumer 抢槽/);
+      ? /研究元数据缺少有效结果及失败原因/ : /阻塞roots 2：请检查来源反馈并更新状态/);
+    if (extra.reason === 'source_consumer_upgrade_required') assert.match(main, /等待来源任务 normal consumer 的 protocol3 支持/);
     assert.doesNotMatch(main, /未完成\/UNKNOWN|53（不是失败）/);
   }
 });
@@ -347,7 +347,7 @@ test('stale/missing/fallback metadata and legacy read-only warning stay outside 
     [{ ...saved, counts: null, stats_confirmed: false, stale: true, reason: 'root_pool_not_registered',
       last_error: 'selected host registry missing' }, /selected host registry missing/],
     [{ ...saved, data_source: 'own_task_fallback' }, /仅旧本任务集合（账本未确认）/],
-    [event({ mode: 'legacy' }), /旧 campaign（只读）/],
+    [event({ mode: 'legacy' }), /旧 campaign 记录（只读）/],
   ];
   for (const [payload, warning] of cases) {
     const html = await render({ task, progress: { stale: false, priority_campaign: payload } });
@@ -571,17 +571,17 @@ test('actual SFC SSR keeps paused in header and control line for active/blocked/
       assert.match(text, /pipeline__priority\s*paused/); // actual header slot, not just helper
       assert.match(text, /任务状态：paused/);
       assert.doesNotMatch(text, /任务状态：(active|blocked|running|等待root池状态确认)/);
-      if (payload || rounds) assert.match(text, /研究状态（非进程存活状态）：/);
+      if (payload || rounds) assert.match(text, /研究状态：/);
       if (payload?.pool_id && payload.counts) {
         assert.match(text, /glb_spread · Roots 118 · R0 29 \/ R1 89 \/ R2 0 \/ R3 0/);
         assert.match(text, /asi_revision · Roots 26 · R0 7 \/ R1 3 \/ R2 8 \/ R3 8/);
         assert.match(text, /✓ 50/);
         assert.match(text, /✗ 0/);
         assert.match(text, /Σ 240/);
-        assert.match(plainText(details), /≤60\/阶段 · ≤180累计 · 无池全局预算/);
+        assert.match(plainText(details), /每 root ≤3阶段 · ≤60\/阶段 · ≤180累计/);
         if (payload.stale) assert.match(text, /registry timeout.*保留上次实际统计/);
       }
-      if (payload?.mode === 'legacy') assert.match(text, /旧 campaign（只读）/);
+      if (payload?.mode === 'legacy') assert.match(text, /旧 campaign 记录（只读）/);
     }
   }
 });
@@ -618,7 +618,7 @@ test('research status is explicitly not liveness; paused-only precedence preserv
   const saved = groupedEvent();
   const html = await render({ task: { ...task, status: 'running' }, taskRuntimeStatus: 'error',
     progress: { stale: false, priority_campaign: saved } });
-  assert.match(plainText(html), /研究状态（非进程存活状态）：active/);
+  assert.match(plainText(html), /研究状态：active/);
   assert.equal(card.priorityDisplayStatus(event(), true, 'error'), 'blocked');
   assert.equal(card.priorityDisplayStatus(saved, true, 'error'), 'active');
   assert.equal(card.priorityDisplayStatus(null, true, 'paused'), '暂停标记无有效停止凭据');
@@ -719,19 +719,19 @@ test('actual Priority SFC receives structured consumer diagnostics and displays 
   const current = { ...task, status: 'running' };
   const observation = extra => ({ taskId: 'id-a', name: task.name, isRemote: true, observedAt: Date.now(),
     state: 'unknown', stage: 'process', detail: '核验所有 pane 及消费者进程树', ...extra });
-  for (const [runtime, expected, reason] of [[null, '尚未执行运行检查', '初次尚未执行消费者检查'],
+  for (const [runtime, expected, reason] of [[null, '尚未执行运行检查', '等待首次消费者检查'],
     [observation({ state: 'checking' }), '运行检查进行中', '核验所有 pane 及消费者进程树'],
     [observation({ error: '[process] Permission denied: /proc/99/stat；exit=13，未发送停止命令' }), '运行检查执行失败', 'Permission denied: /proc/99/stat；exit=13，未发送停止命令'],
     [observation({ error: 'SSH 检查超时（15秒）；等待原连接返回，不重启任务' }), '运行检查超时', 'SSH 检查超时（15秒）；等待原连接返回，不重启任务'],
-    [observation({ taskId: 'other' }), '运行检查身份不匹配', 'identity mismatch'],
-    [observation({ observedAt: Date.now() - 600000 }), '运行检查结果已过期', '旧结果不能继续证明消费者存活'],
+    [observation({ taskId: 'other' }), '运行检查身份校验失败', '身份校验失败'],
+    [observation({ observedAt: Date.now() - 600000 }), '运行检查结果已过期', '运行检查快照已达到 600 秒有效期'],
   ]) {
     const html = await render({ task: current, taskRuntimeStatus: runtime,
       progress: { stale: false, priority_campaign: groupedEvent() } });
     const { main } = sections(html); const text = plainText(main);
     assert.ok(text.includes(`消费者检查：${expected}`)); assert.ok(text.includes(reason));
     if (runtime?.stage) assert.ok(text.includes(`[${runtime.stage}]`));
-    assert.match(text, /研究状态（非进程存活状态）：active/);
+    assert.match(text, /研究状态：active/);
     assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
     assert.match(text, /glb_spread · Roots 118/);
     assert.doesNotMatch(text, /消费者检查：(unknown|未知|运行状态未确认)/i);
@@ -744,7 +744,7 @@ test('actual Priority SFC receives structured consumer diagnostics and displays 
   const { main } = sections(html); const text = plainText(main);
   assert.match(text, /pipeline__priority\s*停止执行失败/);
   assert.ok(text.includes(operation.error)); assert.ok(text.includes('[control_write]'));
-  assert.match(text, /执行退出已核验，但 control_write 控制记录写入失败/);
+  assert.match(text, /执行退出已核验；control_write 控制记录写入失败/);
   assert.doesNotMatch(text, /pipeline__priority\s*paused|任务状态：paused/);
   assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
 });
@@ -776,8 +776,38 @@ test('actual Priority SFC does not invent a CAS failure after control_write time
       progress: { stale: false, priority_campaign: groupedEvent() } }));
     const text = plainText(main);
     assert.ok(text.includes(operation.error));
-    assert.match(text, /最终写入结果尚未收到，不能断定 CAS 成功或失败/);
+    assert.match(text, /control_write 最终写入结果待核对/);
     assert.doesNotMatch(text, /控制记录写入失败|pipeline__priority\s*paused/);
     assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
+  }
+});
+
+test('copy regression: Priority local/remote waiting, failed refresh and existing results remain factual', async () => {
+  for (const isRemote of [false, true]) {
+    const current = { ...task, status: 'running', isRemote };
+    const snapshot = poolEvent({ is_remote: isRemote, status: 'waiting', reason: 'source_consumer_upgrade_required' });
+    const input = { task: current, progress: { stale: false, priority_campaign: snapshot } };
+    const before = JSON.stringify(input);
+    const text = plainText(await render(input));
+    assert.match(text, /研究状态：waiting/);
+    assert.match(text, /等待来源任务 normal consumer 的 protocol3 支持/);
+    assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
+    assert.match(text, /每 root ≤3阶段 · ≤60\/阶段 · ≤180累计/);
+    assert.match(text, /待完成 190（含等待与待核验结果）/);
+    assert.doesNotMatch(text, /不是|不代表|不能|不计为|不自动|standalone Consumer|无池全局预算/);
+    assert.equal(JSON.stringify(input), before);
+    const error = '读取失败：账号不匹配；host=selected；taskId=id-a';
+    const failed = { ...snapshot, stats_confirmed: false, counts: null, stale: true, last_error: error };
+    const failedText = plainText(await render({ task: current, progress: { stale: true, priority_campaign: failed } }));
+    assert.ok(failedText.includes(error));
+    assert.match(failedText, /✓ —.*✗ —.*Σ —（进度未确认）/);
+    const { hooks, state } = await setupCard(input);
+    try {
+      await hooks.mount();
+      hooks.handler({ payload: failed });
+      assert.deepEqual(state.displayProgress.value, snapshot.counts);
+      assert.equal(state.progressStale.value, true);
+      assert.equal(state.progressError.value, error);
+    } finally { hooks.unmount(); }
   }
 });

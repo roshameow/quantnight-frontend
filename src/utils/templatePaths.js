@@ -26,7 +26,7 @@ export function migrateTemplatePaths(paths = {}, workingDir = BUNDLED_QUANTNIGHT
 export function templateName(filename) {
   const name = filename.trim().replace(/\.research\.json$/i, '').replace(/\.py$/i, '');
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
-    throw new Error('请输入裸模板名称（或 .py / .research.json 文件名），不能包含路径');
+    throw new Error('请输入裸模板名称（或 .py / .research.json 文件名）：以字母或数字开头，仅支持字母、数字、下划线和连字符');
   }
   return name;
 }

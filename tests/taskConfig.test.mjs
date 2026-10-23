@@ -6,7 +6,7 @@ import { reactive, nextTick } from 'vue';
 import { parse, compileScript } from '@vue/compiler-sfc';
 import {
   PRIORITY_TEMPLATES, DEFAULT_PRIORITY_TEMPLATES, DEFAULT_PRIORITY_ROUNDS, PRIORITY_CONFIG_HINT, priorityDefaultConfig,
-  resolveTaskConfig, validatePriorityConfig, priorityTaskPayload,
+  resolveTaskConfig, parseTaskConfig, validatePriorityConfig, priorityTaskPayload,
 } from '../src/utils/taskConfig.js';
 
 const helperUrl = new URL('../src/utils/taskConfig.js', import.meta.url).href;
@@ -43,15 +43,15 @@ test('new priority defaults to pipeline auto with per-root stage budget 3x60 and
   assert.equal(DEFAULT_PRIORITY_TEMPLATES.length, 5);
   assert.match(PRIORITY_CONFIG_HINT, /9种模板中默认启用前5种 ablation、turnover_adjust、operator_transfer、group_op_add、event_op_add/);
   assert.match(PRIORITY_CONFIG_HINT, /每模板默认10条/);
-  assert.match(PRIORITY_CONFIG_HINT, /每个 root 累计最多180次，池无全局60\/180预算/);
+  assert.match(PRIORITY_CONFIG_HINT, /每个 root 独立最多3阶段×每阶段60次实际回测，每个 root 累计最多180次/);
   assert.equal(config.source_scope, 'active');
   assert.equal(Object.hasOwn(config, 'source_task'), false);
   assert.equal(Object.hasOwn(config, 'source_tasks'), false);
-  assert.match(PRIORITY_CONFIG_HINT, /同一 root 每阶段等实际反馈/);
+  assert.match(PRIORITY_CONFIG_HINT, /每个 root 在本阶段取得实际反馈后晋级前5名/);
   assert.match(PRIORITY_CONFIG_HINT, /sign 方向规范化为免费前置/);
-  assert.match(PRIORITY_CONFIG_HINT, /独立 ablation 只消融结构、绝不改变 settings/);
-  assert.match(PRIORITY_CONFIG_HINT, /turnover_adjust 仅产生0\/1条 decay-only 变体、无消融/);
-  assert.match(PRIORITY_CONFIG_HINT, /sign_flip 登记在最后，仅供legacy纯翻转/);
+  assert.match(PRIORITY_CONFIG_HINT, /独立 ablation 只消融结构并保留 settings/);
+  assert.match(PRIORITY_CONFIG_HINT, /turnover_adjust 仅产生0\/1条 decay-only 变体/);
+  assert.match(PRIORITY_CONFIG_HINT, /sign_flip 登记在最后，适用于legacy纯翻转/);
   assert.match(PRIORITY_CONFIG_HINT, /max_variants_per_alpha 默认40/);
   assert.match(PRIORITY_CONFIG_HINT, /num_variants 默认6、max_attempts 默认60/);
   assert.deepEqual(validatePriorityConfig(config), config);
@@ -408,13 +408,13 @@ test('dynamic sources remain omitted; optional list validates even before templa
   assert.deepEqual(resolveTaskConfig({ mission_config: saved }, priorityDefaultConfig()), saved);
   assert.deepEqual(validatePriorityConfig(saved), saved); // no silent source migration
   assert.match(PRIORITY_CONFIG_HINT, /protocol3/);
-  assert.match(PRIORITY_CONFIG_HINT, /禁止启动 standalone Consumer/);
+  assert.match(PRIORITY_CONFIG_HINT, /来源任务 normal consumer 需支持 protocol3，缺少该支持时处于等待阶段/);
 });
 
 
 test('selected Priority CP host is independent from immutable source execution', () => {
   assert.match(PRIORITY_CONFIG_HINT, /所选 Priority 主机 control 注册表中同 auth/);
-  assert.match(PRIORITY_CONFIG_HINT, /前端仅启动和监控/);
+  assert.match(PRIORITY_CONFIG_HINT, /前端负责启动和监控/);
   assert.match(PRIORITY_CONFIG_HINT, /CP目标独立于来源执行/);
   assert.match(PRIORITY_CONFIG_HINT, /来源按root.source_remote路由/);
   assert.doesNotMatch(PRIORITY_CONFIG_HINT, /始终本地|固定本地/);
@@ -457,8 +457,8 @@ for (const [name, handler, eventName] of [
 // Scheduling weight is the existing priority field, not a stage/generation cap.
 test('priority is a finite positive scheduling weight, default 1, independent of budgets', () => {
   assert.equal(priorityDefaultConfig().priority, 1);
-  assert.match(PRIORITY_CONFIG_HINT, /priority（默认1）为有限正数调度权重，不是回测预算/);
-  assert.match(PRIORITY_CONFIG_HINT, /数值越大越优先；先任务优先级，再R3→R2→R1，同阶段已开始root优先；不抢占正在运行模拟/);
+  assert.match(PRIORITY_CONFIG_HINT, /priority（默认1）为有限正数调度权重/);
+  assert.match(PRIORITY_CONFIG_HINT, /数值越大越优先；先任务优先级，再R3→R2→R1，同阶段已开始root优先；正在运行的模拟继续执行/);
   for (const priority of [0.5, 1, 2, 200, 1e100]) {
     const config = { priority, rounds: { enabled: true, max_rounds: 2, max_simulations_per_round: 17 },
       max_variants_per_alpha: 9, refine_templates: [] };
@@ -513,3 +513,16 @@ for (const [name, handler, event] of [
     }
   });
 }
+
+test('configuration copy retains actionable formats and bounds without defensive prohibitions', () => {
+  assert.doesNotMatch(PRIORITY_CONFIG_HINT, /不|禁止|standalone|wrong-route|UNKNOWN|全局/);
+  for (const detail of ['rounds.enabled:true', 'rounds.max_rounds', 'max_simulations_per_round', '20%探索',
+    'max_variants_per_alpha 默认40', 'source_scope 默认 active', 'source_tasks', 'source_task/source_remote',
+    'enabled:false', '[] 全部关闭', 'open_events / exit_events', 'num_variants 默认6', 'max_attempts 默认60', 'include_regional']) {
+    assert.ok(PRIORITY_CONFIG_HINT.includes(detail));
+  }
+  assert.throws(() => parseTaskConfig([]), /配置必须是 JSON 对象（例如 {}）/);
+  assert.throws(() => validatePriorityConfig({ refine_templates: null }), /refine_templates 必须为 auto、逗号分隔字符串或数组/);
+  assert.throws(() => validatePriorityConfig({ refine_templates: [{ name: 'ablation', params: { auth_profile: 'other' } }] }),
+    /ablation.params 必须为模板参数对象；runner 的身份\/内部参数由运行器管理/);
+});

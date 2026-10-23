@@ -150,7 +150,7 @@ const onConfirm = () => {
       : parseTaskConfig(form.value.config);
 
     if (!props.task || !props.task.name) {
-      message.error("任务信息缺失，无法启动");
+      message.error("任务信息缺失");
       return;
     }
 

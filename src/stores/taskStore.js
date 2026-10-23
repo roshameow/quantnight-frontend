@@ -50,13 +50,13 @@ export function validStopReceipt(target, receipt) {
 export function taskStopProofIssue(task) {
   if (task?.status !== 'paused') return ''
   const issues = []
-  if (typeof taskId(task) !== 'string' || !taskId(task)) issues.push('当前任务缺少有效 ID，无法绑定停止凭据')
-  if (task.stopConfirmedAt == null) issues.push('旧 paused 记录缺少 stopConfirmedAt 停止时间凭据')
+  if (typeof taskId(task) !== 'string' || !taskId(task)) issues.push('身份校验失败：当前任务缺少有效 ID，停止凭据绑定待核验')
+  if (task.stopConfirmedAt == null) issues.push('缺少 stopConfirmedAt 停止时间凭据')
   else if (stopProofMillis(task.stopConfirmedAt) === null) issues.push('stopConfirmedAt 停止时间凭据格式无效')
-  if (task.stopConfirmedTaskId == null) issues.push('缺少 stopConfirmedTaskId，停止凭据未绑定任务身份')
-  else if (task.stopConfirmedTaskId !== taskId(task)) issues.push('identity mismatch：停止凭据的任务 ID 与当前任务不匹配')
-  if (typeof task.stopConfirmedRemote !== 'boolean') issues.push('缺少有效 stopConfirmedRemote，停止凭据未绑定执行主机')
-  else if (task.stopConfirmedRemote !== (task.isRemote === true)) issues.push('停止凭据的执行主机与当前本地/远程目标不匹配')
+  if (task.stopConfirmedTaskId == null) issues.push('身份校验失败：缺少 stopConfirmedTaskId 任务身份凭据')
+  else if (task.stopConfirmedTaskId !== taskId(task)) issues.push('身份校验失败：停止凭据 stopConfirmedTaskId 的任务 ID 与当前任务存在差异')
+  if (typeof task.stopConfirmedRemote !== 'boolean') issues.push('身份校验失败：缺少有效 stopConfirmedRemote 执行主机凭据')
+  else if (task.stopConfirmedRemote !== (task.isRemote === true)) issues.push('身份校验失败：停止凭据 stopConfirmedRemote 的执行主机与当前本地/远程目标存在差异')
   if (!validStopBasis(task.stopConfirmationBasis)) issues.push('暂停依据 stopConfirmationBasis 无效')
   return issues.join('；')
 }

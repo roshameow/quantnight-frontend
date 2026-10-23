@@ -151,3 +151,12 @@ for (const [name, kind, event] of [['AddTaskModal', 'regular', 'add-task'], ['Ad
     assert.equal(events.find(e => e[0] === event)[1].templatefile, 'legacy');
   });
 }
+
+for (const name of ['AddTaskModal', 'AddSuperTaskModal']) test(`${name}: factual template help preserves discovery error and filename validation`, async () => {
+  const error = '目录不存在：/selected/templates';
+  const { template, messages } = await modal(name, new Error(error));
+  assert.match(template, /选择文件会提取模板名称，关联后端已发布的同名模板；支持手动填写旧模板名/);
+  assert.doesNotMatch(template, /不上传|不含|不部署/);
+  assert.ok(messages.some(message => message.includes(`自动选择模板失败：Error: ${error}`)));
+  assert.throws(() => templateName('../invalid.py'), /以字母或数字开头，仅支持字母、数字、下划线和连字符/);
+});

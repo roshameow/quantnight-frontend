@@ -153,7 +153,7 @@ pub async fn generate_list(id: String, clients: State<'_, Arc<MongoClients>>,
         doc! {"$set": {"status": "generating", "updatedAt": bson::DateTime::now(),
             "generation": {"id": &generation_id, "phase": "writing", "producerPid": std::process::id() as i64,
                            "startedAt": bson::DateTime::now()}}}, None).await.map_err(|e| e.to_string())?;
-    if claim.matched_count != 1 { return Err("任务正在运行/生成或状态待核验，拒绝重复生成".into()); }
+    if claim.matched_count != 1 { return Err("生成认领失败：任务正在运行、生成或等待状态核验".into()); }
     let generated: Result<u64, String> = async {
         run_python_command(&config, "generate_list", &replacements).await?;
         let count = client.database("simulation_db").collection::<Document>(name)
@@ -174,7 +174,7 @@ pub async fn generate_list(id: String, clients: State<'_, Arc<MongoClients>>,
         }
     };
     let updated = tasks.update_one(query, doc! {"$set": fields}, None).await.map_err(|e| e.to_string())?;
-    if updated.matched_count != 1 { return Err("生成归属已变化，拒绝覆盖新状态".into()); }
+    if updated.matched_count != 1 { return Err("生成归属已变化；保留当前状态".into()); }
     generated.map(|_| ())
 
 }
@@ -213,7 +213,7 @@ pub async fn update_remote_status(id: String, updates: Updates,clients: State<'_
 async fn run_template_catalog(
     root: &Path, action: &str, kind: &str, name: Option<&str>, directory: Option<&str>,
 ) -> Result<JsonValue, String> {
-    let root = root.canonicalize().map_err(|e| format!("模板根目录不可用：{e}"))?;
+    let root = root.canonicalize().map_err(|e| format!("模板根目录解析失败：{e}"))?;
     let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
     command.current_dir(&root).env("PYTHONPATH", &root).kill_on_drop(true)
         .args(["-m", "templates.catalog", action, "--root"])
@@ -235,7 +235,7 @@ fn latest_catalog_name(value: &JsonValue, kind: &str) -> Result<String, String> 
     let entry = value.get("entry").filter(|v| v.is_object())
         .ok_or_else(|| "该目录没有已发布模板；可手动选择旧模板名称".to_string())?;
     if entry.get("taskType").and_then(|v| v.as_str()) != Some(kind) {
-        return Err("模板类型与请求不符".into());
+        return Err("模板类型与请求存在差异".into());
     }
     entry.get("name").and_then(|v| v.as_str()).filter(|name| !name.is_empty())
         .map(str::to_owned).ok_or_else(|| "模板目录结果缺少裸名称".into())
@@ -479,15 +479,15 @@ async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Resul
     if kind == "priority" { return Ok(()); } // Priority has its own unchanged templates.
     let root = PathBuf::from(&config.env.working_dir);
     let result = run_template_catalog(&root, "binding", kind, Some(template), None).await
-        .map_err(|e| format!("研究绑定无法核验，未删除任务：{e}"))?;
-    let binding = result.get("binding").ok_or("研究绑定查询缺少 binding；未删除任务")?;
+        .map_err(|e| format!("研究绑定核验失败；任务记录保留：{e}"))?;
+    let binding = result.get("binding").ok_or("研究绑定查询缺少 binding；任务记录保留")?;
     if !binding.is_null() && !binding.is_object() {
-        return Err("研究绑定查询无效；未删除任务".into());
+        return Err("研究绑定类型应为对象或 null；任务记录保留".into());
     }
     // Refine descriptors are not dataset manifests. Keep the original binding's kind.
     if binding.get("kind").and_then(|v| v.as_str()) != Some("dataset") { return Ok(()); }
     if task.get_str("status").ok() == Some("running") {
-        return Err("请先暂停整个研究任务，再删除；不逐条删除候选".into());
+        return Err("当前研究任务正在运行；完成整任务暂停后可删除".into());
     }
     let name = task.get_str("name").map_err(|e| e.to_string())?;
     let id = task.get_object_id("_id").map_err(|e| e.to_string())?.to_hex();
@@ -497,15 +497,15 @@ async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Resul
         .args([".agents/skills/manage-quantnight-frontend/scripts/taskctl.py", "archive-research",
                "--name", name, "--expected-task-id", &id, "--expected-remote", remote]);
     let output = timeout(Duration::from_secs(90), command.output()).await
-        .map_err(|_| "研究统计归档超时；未删除任务".to_string())?
-        .map_err(|e| format!("研究统计归档无法启动；未删除任务：{e}"))?;
+        .map_err(|_| "研究统计归档超时；任务记录保留".to_string())?
+        .map_err(|e| format!("研究统计归档启动失败；任务记录保留：{e}"))?;
     let receipt: JsonValue = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "研究统计归档未返回有效回执；未删除任务".to_string())?;
+        .map_err(|_| "研究统计归档回执 JSON 解析失败；任务记录保留".to_string())?;
     if !output.status.success() || receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
         || receipt.get("command").and_then(|v| v.as_str()) != Some("archive-research")
         || receipt.get("task").and_then(|v| v.as_str()) != Some(name)
         || receipt.get("archivePath").and_then(|v| v.as_str()).map_or(true, str::is_empty) {
-        return Err(format!("研究统计归档失败；未删除任务：{}", receipt));
+        return Err(format!("研究统计归档失败；任务记录保留：{}", receipt));
     }
     Ok(())
 }
@@ -526,7 +526,7 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>,
         .await
         .map_err(|e| e.to_string())?;
     if matches!(probe.as_ref().and_then(|d| d.get_str("status").ok()), Some("generating" | "generation_unknown")) {
-        return Err("任务生成中或生成状态待核验，不能删除".into());
+        return Err("当前处于候选生成阶段；完成生成核验后可删除".into());
     }
     if probe.is_none() {
         return delete_remote_registered_task(&clients, obj_id).await;
@@ -550,7 +550,7 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>,
         .map_err(|e| e.to_string())?;
 
     if update_result.matched_count == 0 {
-        return Err("任务身份或状态已改变，未删除任务".to_string());
+        return Err("任务身份或状态已改变；任务记录保留".to_string());
     }
 
 
@@ -615,7 +615,7 @@ pub async fn start_task(
         .ok_or_else(|| "任务未找到".to_string())?;
 
     if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err("任务生成中或生成状态待核验，不能启动回测".into());
+        return Err("当前处于候选生成阶段；完成生成核验后可启动回测".into());
     }
     let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
     let is_remote_str = if is_remote { "true" } else { "false" };
@@ -682,7 +682,7 @@ pub async fn start_super_task(
         .ok_or_else(|| "任务未找到".to_string())?;
 
     if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err("任务生成中或生成状态待核验，不能启动回测".into());
+        return Err("当前处于候选生成阶段；完成生成核验后可启动回测".into());
     }
     let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
     let is_remote_str = if is_remote { "true" } else { "false" };
@@ -1035,7 +1035,7 @@ impl TaskOperationProgress {
         Arc::new(move |event| match event {
             BashScriptEvent::Config => progress.stage("config", "读取原脚本配置与参数"),
             BashScriptEvent::Launch => progress.stage("launch", "启动本次操作的本地脚本子进程"),
-            BashScriptEvent::Wait => progress.stage("wait", "等待脚本 stdout/stderr 与退出；尚未收到更细阶段"),
+            BashScriptEvent::Wait => progress.stage("wait", "等待脚本 stdout/stderr 与退出"),
             BashScriptEvent::Stdout(line) => progress.script_stage(&line),
         })
     }
@@ -1048,7 +1048,7 @@ async fn execute_task_script(progress: &TaskOperationProgress, config: &AppConfi
     let (key, diagnostic) = match progress.operation {
         "runtime" => ("check_task_status", true),
         "stop" => ("pause_task", false),
-        _ => return Err(progress.failure("不支持的原生任务操作")),
+        _ => return Err(progress.failure("原生任务操作类型无效")),
     };
     run_bash_script_observed(key, &[("task_name", &progress.name)], progress.remote,
         config, budget, diagnostic, Some(progress.observer())).await
@@ -1060,7 +1060,7 @@ fn operation_task_identity(task: &Document, name: &str, remote: bool) -> Result<
         return Err("原任务名称/活动身份已变化".into());
     }
     if task.get_bool("isRemote").unwrap_or(false) != remote {
-        return Err("执行目标已经变更；未向其它执行端发送请求".into());
+        return Err("执行目标已经变更；请求停留在身份核验阶段".into());
     }
     task.get_object_id("_id").map_err(|e| format!("任务ID无效：{e}"))
 }
@@ -1073,9 +1073,9 @@ async fn operation_task(clients: &MongoClients, task_id: Option<&str>, name: &st
     }
     let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
     timeout(budget, tasks.find_one(filter, None)).await
-        .map_err(|_| format!("本地控制面任务身份查询超时（{} ms）；操作脚本未启动", budget.as_millis()))?
+        .map_err(|_| format!("本地控制面任务身份查询超时（{} ms）；请求停留在身份核验阶段", budget.as_millis()))?
         .map_err(|e| format!("本地控制面任务身份查询失败：{e}"))?
-        .ok_or_else(|| "原任务不存在；操作脚本未启动".into())
+        .ok_or_else(|| "本地控制面缺少原任务记录；请求停留在身份核验阶段".into())
 }
 
 // Keep legacy pane text intact while removing diagnostic protocol lines before
@@ -1102,7 +1102,7 @@ pub async fn check_task_status(
     let started = Instant::now();
     let mut progress = TaskOperationProgress::new(app, "runtime", task_id.as_deref(),
         &task_name, is_remote, request_id);
-    progress.stage("initial", "已接收运行时检查；总预算12秒，不停止研究任务");
+    progress.stage("initial", "运行检查已接收；总预算12秒");
     // Final aggregate guard includes identity, script readers/exit/cleanup and
     // dispatch. Dropping an in-flight diagnostic also cleans its private group.
     timeout(RUNTIME_BUDGET, async {
@@ -1116,16 +1116,16 @@ pub async fn check_task_status(
         let budget = RUNTIME_BUDGET.saturating_sub(started.elapsed())
             .saturating_sub(Duration::from_secs(2)).min(Duration::from_secs(8));
         let (stdout, stderr) = execute_task_script(&progress, &app_config, budget).await?;
-        progress.stage("receipt_validate", "检查运行时脚本输出；保留原 Pane 文本，不信任脚本控制状态");
+        progress.stage("receipt_validate", "检查运行时脚本输出；保留原 Pane 文本");
         let process_output = runtime_process_output(&stdout, &stderr).map_err(|e| progress.failure(e))?;
-        progress.stage("dispatch_read", "有界读取实际执行库的派发证据（缺证不伪造控制状态）");
+        progress.stage("dispatch_read", "有界读取实际执行库的派发证据");
         let remaining = RUNTIME_BUDGET.saturating_sub(started.elapsed());
         let dispatch = timeout(remaining, read_dispatch_state(&clients, &id.to_hex(), &task_name, is_remote))
             .await.unwrap_or(None);
         let output = dispatch_status_output(&process_output, dispatch);
         progress.stage("completed", "运行时检查已返回；状态仍由原 Pane/原生派发证据解析");
         Ok(output)
-    }).await.map_err(|_| progress.failure("运行检查总预算12秒耗尽（包含身份查询、脚本stdout/stderr、退出与派发证据）；仅清理本次诊断，不停止目标任务"))?
+    }).await.map_err(|_| progress.failure("运行检查总预算12秒耗尽（包含身份查询、脚本stdout/stderr、退出与派发证据）"))?
 }
 
 #[command]
@@ -1444,7 +1444,7 @@ impl StopConfirmationBasis {
     fn description(self) -> &'static str {
         match self {
             Self::RunnersExited => "原会话与已捕获执行进程退出均已核验",
-            Self::SessionAbsent => "原精确tmux会话不存在（暂停依据）；未核验历史孤儿PID退出或平台取消",
+            Self::SessionAbsent => "已确认目标主机上精确tmux会话缺失",
         }
     }
 }
@@ -1456,11 +1456,15 @@ fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<StopCon
         line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")).collect();
     if receipts.len() != 1 || stdout.lines().last().and_then(|line|
         line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")) != receipts.first().copied() {
-        return Err("停止状态未确认：缺少唯一的最终结构化暂停回执；不会自动重试停止".into());
+        return Err(match receipts.len() {
+            0 => "暂停回执校验失败：缺少结构化暂停回执".into(),
+            1 => "暂停回执校验失败：结构化暂停回执后仍有输出，最终行应为暂停回执".into(),
+            count => format!("暂停回执校验失败：收到{count}条结构化暂停回执，要求唯一回执"),
+        });
     }
-    if receipts[0].len() > 8192 { return Err("停止状态未确认：最终回执超出8192字节上限".into()); }
+    if receipts[0].len() > 8192 { return Err("暂停回执校验失败：最终回执超出8192字节上限".into()); }
     let proof: ExecutionStopProof = serde_json::from_str(receipts[0])
-        .map_err(|e| format!("停止状态未确认：回执无效：{e}"))?;
+        .map_err(|e| format!("暂停回执解析失败：{e}"))?;
     match proof {
         ExecutionStopProof::Exited(ExecutionStopProofV1 { schema_version: 1, task_name,
             target_remote, session_absent: true, runners_exited: true })
@@ -1469,7 +1473,7 @@ fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<StopCon
             target_remote, session_absent: true, runners_exited: (),
             confirmation_basis: StopConfirmationBasis::SessionAbsent })
             if task_name == name && target_remote == remote => Ok(StopConfirmationBasis::SessionAbsent),
-        _ => Err("停止状态未确认：任务/执行目标不匹配，或V1退出证明/V2会话缺失依据不合法".into()),
+        proof => Err(format!("暂停回执校验失败：任务身份、执行主机或停止依据存在字段差异；期望 task_name={name:?}, target_remote={remote}, session_absent=true，V1 runners_exited=true 或 V2 runners_exited=null/confirmation_basis=session_absent；收到 {proof:?}")),
     }
 }
 
@@ -1505,7 +1509,7 @@ fn pause_control_write(id: ObjectId, name: &str, original: &Document,
 }
 
 fn validate_stop_output(progress: &TaskOperationProgress, stdout: &str, stderr: &str) -> Result<StopConfirmationBasis, String> {
-    progress.stage("receipt_validate", "验证唯一最终暂停回执、任务/执行端与V1进程退出或V2会话不存在依据");
+    progress.stage("receipt_validate", "验证唯一最终暂停回执、任务/执行端与V1进程退出或V2会话缺失依据");
     verified_stop_proof(stdout, &progress.name, progress.remote)
         .map_err(|e| progress.failure(format!("{e}；stderr: {stderr}；stdout: {stdout}")))
 }
@@ -1513,7 +1517,7 @@ fn validate_stop_output(progress: &TaskOperationProgress, stdout: &str, stderr: 
 fn confirmed_stop_after_write(progress: &TaskOperationProgress, id: ObjectId, at: bson::DateTime,
     basis: StopConfirmationBasis, matched_count: u64) -> Result<ConfirmedTaskStop, String> {
     if matched_count != 1 {
-        return Err(progress.failure(format!("{}；但原任务身份/执行目标/控制版本已变化，未回写暂停", basis.description())));
+        return Err(progress.failure(format!("{}；暂停回写匹配失败：原任务身份/执行目标/控制版本已变化", basis.description())));
     }
     progress.stage("completed", &format!("{}；控制面CAS回写已确认", basis.description()));
     Ok(ConfirmedTaskStop { confirmed: true, task_id: id.to_hex(), task_name: progress.name.clone(),
@@ -1526,14 +1530,14 @@ pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<Stri
     clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<ConfirmedTaskStop, String> {
     let mut progress = TaskOperationProgress::new(app, "stop", task_id.as_deref(),
         &task_name, is_remote, request_id);
-    progress.stage("initial", "已接收暂停请求；只发送一次停止操作，超时不自动重试");
-    progress.stage("identity", "核对本地控制面原任务与执行目标；尚未发送停止请求");
+    progress.stage("initial", "暂停请求已接收；停止操作次数1次，脚本预算75秒");
+    progress.stage("identity", "核对本地控制面原任务与执行目标");
     let task = operation_task(&clients, task_id.as_deref(), &task_name, Duration::from_secs(5)).await
         .map_err(|e| progress.failure(e))?;
     let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
     progress.task_id = id.to_hex();
     if matches!(task.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err(progress.failure("当前是候选生成，不是回测消费者；请先核验生成作业"));
+        return Err(progress.failure("当前处于候选生成阶段；请先核验生成作业"));
     }
     let (stdout, stderr) = execute_task_script(&progress, &app_config, PAUSE_SCRIPT_BUDGET).await?;
     let basis = validate_stop_output(&progress, &stdout, &stderr)?;
@@ -1542,8 +1546,8 @@ pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<Stri
     progress.stage("control_write", &format!("{}；按原任务ID/名称/执行目标/控制版本CAS回写暂停（5秒）", basis.description()));
     let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
     let result = timeout(Duration::from_secs(5), tasks.update_one(filter, update, None)).await
-        .map_err(|_| progress.failure(format!("{}；但控制记录回写超时，不要盲目重试停止", basis.description())))?
-        .map_err(|e| progress.failure(format!("{}；但控制记录回写失败：{e}", basis.description())))?;
+        .map_err(|_| progress.failure(format!("{}；控制记录回写超时（预算5秒）", basis.description())))?
+        .map_err(|e| progress.failure(format!("{}；控制记录回写失败：{e}", basis.description())))?;
     confirmed_stop_after_write(&progress, id, at, basis, result.matched_count)
 }
 
@@ -1584,6 +1588,38 @@ mod verified_pause_tests {
             assert!(verified_stop_proof(&proof(changes), "pipeline__priority", true).is_err());
         }
         assert!(verified_stop_proof("QUANTNIGHT_PAUSE_CONFIRMED {broken}", "pipeline__priority", true).is_err());
+    }
+
+    #[test]
+    fn pause_copy_reports_receipt_gap_and_field_values() {
+        let valid = proof(json!({}));
+        for (raw, expected) in [
+            (String::new(), "缺少结构化暂停回执"),
+            (valid.clone() + &valid, "收到2条结构化暂停回执，要求唯一回执"),
+            (valid.clone() + "more output\n", "结构化暂停回执后仍有输出，最终行应为暂停回执"),
+            (format!("QUANTNIGHT_PAUSE_CONFIRMED {}", "x".repeat(8193)), "最终回执超出8192字节上限"),
+        ] {
+            let error = verified_stop_proof(&raw, "pipeline__priority", true).unwrap_err();
+            assert_eq!(error, format!("暂停回执校验失败：{expected}"));
+            assert!(!error.contains('不'));
+        }
+        for (changes, actual) in [
+            (json!({"task_name":"other"}), "task_name: \"other\""),
+            (json!({"target_remote":false}), "target_remote: false"),
+            (json!({"session_absent":false}), "session_absent: false"),
+            (json!({"runners_exited":false}), "runners_exited: false"),
+            (json!({"schema_version":3}), "schema_version: 3"),
+        ] {
+            let error = verified_stop_proof(&proof(changes), "pipeline__priority", true).unwrap_err();
+            assert!(error.starts_with("暂停回执校验失败：任务身份、执行主机或停止依据存在字段差异"), "{error}");
+            assert!(error.contains("期望 task_name=\"pipeline__priority\", target_remote=true"), "{error}");
+            assert!(error.contains(actual), "{error}");
+            assert!(!error.contains('不'));
+        }
+        let error = verified_stop_proof("QUANTNIGHT_PAUSE_CONFIRMED {broken}", "pipeline__priority", true).unwrap_err();
+        assert!(error.starts_with("暂停回执解析失败："));
+        assert_eq!(StopConfirmationBasis::SessionAbsent.description(), "已确认目标主机上精确tmux会话缺失");
+        assert_eq!(StopConfirmationBasis::RunnersExited.description(), "原会话与已捕获执行进程退出均已核验");
     }
 
     #[test]
@@ -2347,7 +2383,8 @@ mod session_absent_v2_tests {
             assert_eq!(runtime_process_output(&out, &err).unwrap(), legacy);
             assert_eq!(dispatch_status_output(&runtime_process_output(&out, &err).unwrap(), None), legacy);
             assert_eq!(progress.last.lock().unwrap().0, "session_absent");
-            assert!(events.lock().unwrap().iter().any(|event| event.stage == "session_absent"));
+            assert!(events.lock().unwrap().iter().any(|event| event.stage == "session_absent"
+                && event.message == stage("runtime", remote, "session_absent")["message"].as_str().unwrap()));
             assert!(!events.lock().unwrap().iter().any(|event| ["control_write", "paused"].contains(&event.stage.as_str())));
             // Legacy absence output is not itself a structured pause receipt.
             assert!(verified_stop_proof(&out, &progress.name, remote).is_err());
@@ -2386,6 +2423,8 @@ mod session_absent_v2_tests {
                 progress.stage("control_write", basis.description());
                 let rejected = confirmed_stop_after_write(&progress, id, at, basis, 0).unwrap_err();
                 assert!(rejected.contains("stage=control_write") && rejected.contains("控制版本已变化"));
+                assert!(rejected.contains(basis.description()) && rejected.contains("暂停回写匹配失败"));
+                assert!(!rejected.contains('不'));
                 assert!(!events.lock().unwrap().iter().any(|e| e.stage == "completed"));
                 // This is only the pure real-command gate, not a fake DB write.
                 let confirmed = confirmed_stop_after_write(&progress, id, at, basis, 1).unwrap();
@@ -2395,7 +2434,8 @@ mod session_absent_v2_tests {
                 assert_eq!(wire["isRemote"], remote);
                 assert_eq!(wire["confirmationBasis"], basis.as_str());
                 if version == 2 {
-                    assert!(events.lock().unwrap().last().unwrap().message.contains("未核验历史孤儿PID退出或平台取消"));
+                    assert_eq!(events.lock().unwrap().last().unwrap().message,
+                        "已确认目标主机上精确tmux会话缺失；控制面CAS回写已确认");
                 }
             }
         }
