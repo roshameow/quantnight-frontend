@@ -17,6 +17,7 @@ const configModule = new URL('../src/utils/taskConfig.js', import.meta.url).href
 const stopModule = new URL('../src/stores/taskStore.js', import.meta.url).href;
 const compiled = compileScript(descriptor, { id: 'priority-test', inlineTemplate: true });
 const moduleCode = compiled.content
+  .replaceAll("'../../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))
   .replaceAll("'../../stores/taskStore.js'", JSON.stringify(stopModule))
   .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
@@ -81,7 +82,7 @@ test('real card initially renders unconfirmed values, not 0/0/0 or tmux error', 
   const html = await render({ task, taskRuntimeStatus: 'error',
     progress: { success: 0, error: 0, total: 0, stale: true } });
   assert.match(html, /进度未确认/);
-  assert.match(html, /等待root池状态确认/);
+  assert.match(html, /尚未取得 root 池状态：元数据检查尚未返回有效阶段或研究结果/);
   assert.match(html, /Roots — ·\s*R0 — \/\s*R1 — \/\s*R2 — \/\s*R3 —/);
   assert.doesNotMatch(html, /Round.*\/.*3/);
   assert.doesNotMatch(html, /Σ 0|✗ 0|✓ 0|任务状态：error/);
@@ -109,7 +110,8 @@ async function setupCard(initial) {
     const invoke = async (name) => { hooks.refresh++; hooks.command = name; };
   `;
   const code = compileScript(descriptor, { id: `priority-instance-${instanceNumber++}` }).content
-    .replaceAll("'../../stores/taskStore.js'", JSON.stringify(stopModule))
+    .replaceAll("'../../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))
+  .replaceAll("'../../stores/taskStore.js'", JSON.stringify(stopModule))
     .replaceAll("'../../utils/taskConfig.js'", JSON.stringify(configModule))
     .replace('computed, onMounted, onUnmounted, ref, watch', 'computed, ref, watch')
     .replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`)
@@ -255,7 +257,7 @@ test('legacy campaign has read-only warning and no whole-task round UI', async (
 
 // Native details retain their DOM content in SSR, while only summary is visible.
 function sections(html) {
-  const match = html.match(/<details\b([^>]*)>([\s\S]*?)<\/details>/);
+  const match = html.match(/<details\b([^>]*\bclass="runtime-details"[^>]*)>([\s\S]*?)<\/details>/);
   assert.ok(match, 'real card exposes an accessible details disclosure');
   assert.doesNotMatch(match[1], /\bopen(?:\s|=|$)/, 'details are closed by default');
   assert.match(match[2], /<summary>详情 \/ Details<\/summary>/);
@@ -331,7 +333,7 @@ test('explicit uncertainty/blockers and actual failures remain prominent, not fa
     assert.match(main, /✗ 2/);
     assert.match(main, /Σ 60/);
     assert.match(main, extra.reason ? new RegExp(extra.reason) : extra.status === 'UNKNOWN'
-      ? /状态 UNKNOWN：请更新确认实际结果/ : /阻塞roots 2：请检查来源反馈并更新状态/);
+      ? /历史研究元数据只有 unknown，未附有效结果或失败原因/ : /阻塞roots 2：请检查来源反馈并更新状态/);
     if (extra.reason === 'source_consumer_upgrade_required') assert.match(main, /勿启 standalone Consumer 抢槽/);
     assert.doesNotMatch(main, /未完成\/UNKNOWN|53（不是失败）/);
   }
@@ -619,9 +621,9 @@ test('research status is explicitly not liveness; paused-only precedence preserv
   assert.match(plainText(html), /研究状态（非进程存活状态）：active/);
   assert.equal(card.priorityDisplayStatus(event(), true, 'error'), 'blocked');
   assert.equal(card.priorityDisplayStatus(saved, true, 'error'), 'active');
-  assert.equal(card.priorityDisplayStatus(null, true, 'paused'), '暂停（运行状态未确认）');
-  assert.equal(card.priorityDisplayStatus(null, false, 'paused'), '暂停（运行状态未确认）');
-  assert.equal(card.priorityDisplayStatus(saved, true, 'paused'), '暂停（运行状态未确认）');
+  assert.equal(card.priorityDisplayStatus(null, true, 'paused'), '暂停标记无有效停止凭据');
+  assert.equal(card.priorityDisplayStatus(null, false, 'paused'), '暂停标记无有效停止凭据');
+  assert.equal(card.priorityDisplayStatus(saved, true, 'paused'), '暂停标记无有效停止凭据');
   assert.equal(card.priorityDisplayStatus(saved, true, 'paused', 'paused'), 'paused');
 });
 
@@ -636,8 +638,8 @@ test('actual SFC SSR requires stop proof, never mistakes legacy paused control o
         progress: { stale: false, priority_campaign: payload } });
       const { main } = sections(html);
       const text = plainText(main);
-      assert.match(text, /pipeline__priority\s*暂停（运行状态未确认）/);
-      assert.match(text, /任务状态：暂停（运行状态未确认）/);
+      assert.match(text, /pipeline__priority\s*暂停标记无有效停止凭据/);
+      assert.match(text, /任务状态：暂停标记无有效停止凭据/);
       assert.doesNotMatch(text, /任务状态：paused|任务状态：active/);
       if (payload?.counts) { assert.match(text, /✓ 50/); assert.match(text, /Σ 240/); }
     }
@@ -645,7 +647,7 @@ test('actual SFC SSR requires stop proof, never mistakes legacy paused control o
 });
 
 test('real SFC SSR and late events keep stopping/unconfirmed above all research states, preserving real counts and groups', async () => {
-  for (const [status, label] of [['stopping', 'stopping'], ['stop_unconfirmed', '停止状态未确认']]) {
+  for (const [status, label] of [['stopping', '停止执行中'], ['stop_unconfirmed', '停止执行失败']]) {
     const stopOperation = { _id: 'id-a', name: task.name, isRemote: true, status };
     for (const payload of [groupedEvent(), groupedEvent({ stale: true, last_error: 'registry timeout' }), null]) {
       const html = await render({ task: { ...task, status: 'running' }, stopOperation,
@@ -679,7 +681,7 @@ test('actual card operation prop is identity/host-fenced; persisted proof confir
     const html = await render({ task: { ...task, status: 'paused' }, stopOperation: {
       _id: 'id-a', name: task.name, isRemote: true, status: 'stopping', ...extra },
       progress: { stale: false, priority_campaign: groupedEvent() } });
-    assert.match(plainText(html), /任务状态：暂停（运行状态未确认）/);
+    assert.match(plainText(html), /任务状态：暂停标记无有效停止凭据/);
     assert.doesNotMatch(plainText(html), /任务状态：stopping/);
   }
   const persisted = { ...task, status: 'paused', stopConfirmedAt: { $date: { $numberLong: String(Date.now()) } },
@@ -693,7 +695,7 @@ test('actual card operation prop is identity/host-fenced; persisted proof confir
 test('research-only paused metadata cannot produce a confirmed paused badge without proof', async () => {
   const html = await render({ task: { ...task, status: 'running' }, taskRuntimeStatus: 'paused',
     progress: { stale: false, priority_campaign: groupedEvent({ status: 'paused' }) } });
-  assert.match(plainText(html), /pipeline__priority\s*暂停（运行状态未确认）/);
+  assert.match(plainText(html), /pipeline__priority\s*暂停标记无有效停止凭据/);
   assert.doesNotMatch(plainText(html), /pipeline__priority\s*paused/);
 });
 
@@ -710,5 +712,72 @@ test('same-ID BSON object list reload retains real cached runtime counts while p
   props.task = { ...saved, _id: { $oid: 'id-b' } };
   await nextTick();
   assert.equal(state.runtime.value, null);
-  assert.equal(state.displayStatus.value, '暂停（运行状态未确认）');
+  assert.equal(state.displayStatus.value, '暂停标记无有效停止凭据');
+});
+
+test('actual Priority SFC receives structured consumer diagnostics and displays full stages/failure causes above research details', async () => {
+  const current = { ...task, status: 'running' };
+  const observation = extra => ({ taskId: 'id-a', name: task.name, isRemote: true, observedAt: Date.now(),
+    state: 'unknown', stage: 'process', detail: '核验所有 pane 及消费者进程树', ...extra });
+  for (const [runtime, expected, reason] of [[null, '尚未执行运行检查', '初次尚未执行消费者检查'],
+    [observation({ state: 'checking' }), '运行检查进行中', '核验所有 pane 及消费者进程树'],
+    [observation({ error: '[process] Permission denied: /proc/99/stat；exit=13，未发送停止命令' }), '运行检查执行失败', 'Permission denied: /proc/99/stat；exit=13，未发送停止命令'],
+    [observation({ error: 'SSH 检查超时（15秒）；等待原连接返回，不重启任务' }), '运行检查超时', 'SSH 检查超时（15秒）；等待原连接返回，不重启任务'],
+    [observation({ taskId: 'other' }), '运行检查身份不匹配', 'identity mismatch'],
+    [observation({ observedAt: Date.now() - 600000 }), '运行检查结果已过期', '旧结果不能继续证明消费者存活'],
+  ]) {
+    const html = await render({ task: current, taskRuntimeStatus: runtime,
+      progress: { stale: false, priority_campaign: groupedEvent() } });
+    const { main } = sections(html); const text = plainText(main);
+    assert.ok(text.includes(`消费者检查：${expected}`)); assert.ok(text.includes(reason));
+    if (runtime?.stage) assert.ok(text.includes(`[${runtime.stage}]`));
+    assert.match(text, /研究状态（非进程存活状态）：active/);
+    assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
+    assert.match(text, /glb_spread · Roots 118/);
+    assert.doesNotMatch(text, /消费者检查：(unknown|未知|运行状态未确认)/i);
+  }
+  const operation = { _id: 'id-a', name: task.name, isRemote: true, status: 'stop_unconfirmed',
+    stage: 'control_write', failureSource: 'native', detail: '执行退出后回写原控制记录',
+    error: '[control_write] 执行退出已核验，但 CAS matched_count=0，目标变化，未写入 paused（完整原因尾部）' };
+  const html = await render({ task: current, stopOperation: operation,
+    progress: { stale: false, priority_campaign: groupedEvent() } });
+  const { main } = sections(html); const text = plainText(main);
+  assert.match(text, /pipeline__priority\s*停止执行失败/);
+  assert.ok(text.includes(operation.error)); assert.ok(text.includes('[control_write]'));
+  assert.match(text, /执行退出已核验，但 control_write 控制记录写入失败/);
+  assert.doesNotMatch(text, /pipeline__priority\s*paused|任务状态：paused/);
+  assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
+});
+
+// The expiry is a one-shot local presentation timer, never a native task poll.
+test('Priority structured observations expire via one-shot timer and unmount disposes the timer', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1800000000000 });
+  const { hooks, state, nextTick } = await setupCard({ task: { ...task, status: 'running' },
+    taskRuntimeStatus: { taskId: 'id-a', name: task.name, isRemote: true, observedAt: Date.now(), state: 'running' },
+    progress: { stale: false, priority_campaign: groupedEvent() } });
+  try {
+    await hooks.mount();
+    assert.equal(state.consumerStatus.value, '消费者存活（缺少有效派发快照）');
+    t.mock.timers.tick(600000); await nextTick();
+    assert.equal(state.consumerStatus.value, '运行检查结果已过期');
+    assert.match(state.diagnosticDetails.value, /600 秒/);
+    hooks.unmount(); t.mock.timers.tick(600000); await nextTick();
+    assert.equal(state.consumerStatus.value, '运行检查结果已过期');
+  } finally { hooks.unmount(); t.mock.timers.reset(); }
+});
+
+test('actual Priority SFC does not invent a CAS failure after control_write timeout/disposal', async () => {
+  for (const failureSource of ['client_timeout', 'client_disposed', 'native']) {
+    const operation = { _id: 'id-a', name: task.name, isRemote: true, status: 'stop_unconfirmed',
+      stage: 'control_write', detail: '执行退出已核验；CAS 写入中', failureSource,
+      failureKind: failureSource === 'client_disposed' ? 'error' : 'timeout',
+      error: failureSource === 'client_disposed' ? '页面已离开，未收到最终回执' : '[control_write] 等待最终回执超时' };
+    const { main } = sections(await render({ task: { ...task, status: 'running' }, stopOperation: operation,
+      progress: { stale: false, priority_campaign: groupedEvent() } }));
+    const text = plainText(main);
+    assert.ok(text.includes(operation.error));
+    assert.match(text, /最终写入结果尚未收到，不能断定 CAS 成功或失败/);
+    assert.doesNotMatch(text, /控制记录写入失败|pipeline__priority\s*paused/);
+    assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
+  }
 });

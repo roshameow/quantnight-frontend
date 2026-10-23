@@ -11,13 +11,20 @@
         <div class="progress-background" :style="progressBarStyle" />
         <div class="header-content">
           <span class="task-name">{{ task.name }}</span>
-          <n-tag :type="getStatusType(displayStatus)" size="small" round>
+          <n-tag class="runtime-badge" :type="getStatusType(displayStatus)" size="small" round>
             {{ displayStatus }}
           </n-tag>
         </div>
       </div>
     </template>
 
+    <details class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
+      <summary style="cursor: pointer">运行 / 停止详情<span v-if="diagnosticStage"> · {{ diagnosticStage }}</span></summary>
+      <div style="white-space: pre-wrap; overflow-wrap: anywhere">
+        <div>消费者检查：{{ consumerStatus }}</div>
+        <div v-if="diagnosticDetails">{{ diagnosticDetails }}</div>
+      </div>
+    </details>
     <div v-if="displayProgress" style="margin-bottom: 4px">
       <div style="font-size: 12px; margin-bottom: 2px">
         <n-text type="success" title="成功">
@@ -37,12 +44,12 @@
       <n-text depth="3">✓ — | ✗ — | Σ —（进度未确认）</n-text>
     </div>
     <div v-if="progressStale" style="font-size: 12px; margin-bottom: 4px">
-      <n-text type="warning">{{ progressError || '进度加载中，尚未确认统计…' }}</n-text>
+      <n-text type="warning">{{ progressError || '进度加载中，尚未收到实际计数…' }}</n-text>
       <n-text v-if="displayProgress" depth="3">（保留上次实际统计）</n-text>
     </div>
-    <div>{{ stopStatus || !(roundEnabled || runtime) ? '任务状态' : '研究状态（非进程存活状态）' }}：{{ displayRuntimeStatus }}</div>
-    <div v-if="stopStatus && (roundEnabled || runtime)">
-      研究状态（非进程存活状态）：{{ runtime?.status || runtime?.stage || '未确认' }}
+    <div>{{ stopStatus || hasProcessDiagnostic || !(roundEnabled || runtime) ? '任务状态' : '研究状态（非进程存活状态）' }}：{{ displayRuntimeStatus }}</div>
+    <div v-if="(stopStatus || hasProcessDiagnostic) && (roundEnabled || runtime)">
+      研究状态（非进程存活状态）：{{ researchStatus }}
     </div>
     <div v-if="roundEnabled || runtime" style="font-size: 12px; margin-top: 4px">
       <template v-if="!legacyRuntime">
@@ -184,12 +191,12 @@ export function prioritySourceGroups(runtime, configuredSources) {
 export function priorityDisplayStatus(runtime, roundEnabled, controlStatus, stopStatus) {
   // Research events cannot confirm process exit or replace an operation result.
   if (stopStatus) return stopStatus;
-  if (controlStatus === 'paused') return '暂停（运行状态未确认）';
+  if (controlStatus === 'paused') return '暂停标记无有效停止凭据';
   const status = runtime?.status || runtime?.stage || (roundEnabled ? 'waiting' : controlStatus);
-  if (status === 'paused') return '暂停（运行状态未确认）';
+  if (status === 'paused') return '暂停标记无有效停止凭据';
   if (runtime && ['completed', 'done', 'success'].includes(status) &&
       (!runtime.counts || runtime.unresolved !== 0)) return 'waiting';
-  return status;
+  return String(status).toLowerCase() === 'unknown' ? `研究状态缺少有效结果：${runtime?.reason || runtime?.last_error || '历史状态未附具体原因，需刷新 root 池元数据'}` : status;
 }
 
 // unresolved includes ordinary pending/processing and cannot identify UNKNOWN.
@@ -201,15 +208,15 @@ export function priorityRuntimeWarning(runtime) {
     'round_limit_reached', 'root_stage_limit_reached', 'no_eligible_successful_feedback',
     'no_improvement', 'no_new_legal_variants'];
   if (runtime?.reason && (abnormal || !routineReasons.includes(runtime.reason))) return runtime.reason;
-  if (status === 'unknown') return '状态 UNKNOWN：请更新确认实际结果';
+  if (status === 'unknown') return runtime?.last_error || '历史研究元数据只有 unknown，未附有效结果或失败原因；请刷新 root 池元数据';
   if (runtime?.blocked > 0) return `阻塞roots ${runtime.blocked}：请检查来源反馈并更新状态`;
   return null;
 }
 
 export function priorityStatusType(status) {
   if (['completed', 'done', 'success'].includes(status)) return 'success';
-  if (['stopping', '停止状态未确认', '暂停（运行状态未确认）', 'blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
-  if (['error', 'failed'].includes(status)) return 'error';
+  if (['stopping', '停止执行中', '停止确认超时', '停止回执核验中断', '暂停标记无有效停止凭据', 'blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
+  if (['error', 'failed', '停止执行失败', '停止回执校验失败'].includes(status)) return 'error';
   return 'default';
 }
 </script>
@@ -219,7 +226,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
-import { taskStopDisplayStatus } from '../../stores/taskStore.js';
+import { RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
+import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 
 const props = defineProps({
   task: {
@@ -227,8 +235,8 @@ const props = defineProps({
     required: true,
   },
   taskRuntimeStatus: {
-    type: String,
-    default: "未知",
+    type: Object,
+    default: null,
   },
   progress: {
     type: Object,
@@ -269,15 +277,34 @@ const displayProgress = computed(() => {
 const progressStale = computed(() => props.progress?.stale || runtime.value?.stale || !displayProgress.value);
 const progressError = computed(() => runtime.value?.last_error || props.progress?.lastError);
 const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
-const displayStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status, stopStatus.value));
-const displayRuntimeStatus = computed(() => stopStatus.value ? stopStatus.value
-  : roundEnabled.value || runtime.value
-    ? (runtime.value?.status || runtime.value?.stage ? displayStatus.value : '等待root池状态确认')
-    : props.taskRuntimeStatus === 'paused' ? '暂停（运行状态未确认）' : props.taskRuntimeStatus);
+const runtimeNow = ref(Date.now());
+let expiryTimer;
+const refreshRuntimeExpiry = () => {
+  clearTimeout(expiryTimer);
+  runtimeNow.value = Date.now();
+  if (disposed || !props.taskRuntimeStatus) return;
+  const remaining = nextRuntimeExpiry(props.task, props.taskRuntimeStatus, runtimeNow.value) - runtimeNow.value;
+  if (remaining > 0 && remaining <= RUNTIME_MAX_AGE) expiryTimer = setTimeout(refreshRuntimeExpiry, remaining);
+};
+const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
+const consumerStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
+const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
+const diagnosticStage = computed(() => diagnosticDetails.value?.match(/最后到达阶段 \[([a-z_]+)\]/)?.[1] || '');
+const researchStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status));
+// A research snapshot cannot mask the current operation's actual process check.
+const hasProcessDiagnostic = computed(() => props.task.status === 'running' && props.taskRuntimeStatus &&
+  typeof props.taskRuntimeStatus === 'object' &&
+  (props.taskRuntimeStatus.state !== 'running' || /检查/.test(consumerStatus.value)));
+const displayStatus = computed(() => stopStatus.value || hasProcessDiagnostic.value ? consumerStatus.value
+  : (roundEnabled.value || runtime.value) ? researchStatus.value : consumerStatus.value);
+const displayRuntimeStatus = computed(() => !stopStatus.value && !hasProcessDiagnostic.value && (roundEnabled.value || runtime.value) &&
+  !runtime.value?.status && !runtime.value?.stage
+    ? `尚未取得 root 池状态：${runtime.value?.last_error || '元数据检查尚未返回有效阶段或研究结果'}` : displayStatus.value);
 
 let disposed = false;
 let unlisten;
 onMounted(async () => {
+  refreshRuntimeExpiry();
   try {
     const cleanup = await listen('task-priority-runtime-update', ({ payload }) => {
       if (!disposed && acceptPriorityRuntime(payload, props.task, {
@@ -294,7 +321,7 @@ onMounted(async () => {
     if (!disposed) runtime.value = { ...runtime.value, stale: true, last_error: `Root池状态加载失败：${String(error)}` };
   }
 });
-onUnmounted(() => { disposed = true; unlisten?.(); });
+onUnmounted(() => { disposed = true; clearTimeout(expiryTimer); stopExpiryWatch(); unlisten?.(); });
 
 const progressBarStyle = computed(() => {
   const p = displayProgress.value || {};
@@ -385,7 +412,7 @@ const getStatusType = priorityStatusType;
 .card-header {
   position: relative;
   width: 100%;
-  height: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -413,6 +440,21 @@ const getStatusType = priorityStatusType;
   padding: 0 12px;
   font-weight: bold;
   font-size: 14px;
+  gap: 6px;
+  align-items: center;
+}
+.runtime-badge {
+  max-width: 72%;
+  height: auto;
+  min-height: 20px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  flex-shrink: 0;
+}
+.runtime-badge :deep(.n-tag__content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 .task-name {
   white-space: nowrap;

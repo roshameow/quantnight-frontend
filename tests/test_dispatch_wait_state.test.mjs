@@ -10,12 +10,13 @@ import { renderToString } from '@vue/server-renderer';
 // Execute the actual SFC normalizer exports and actual compiled Regular card,
 // not copied badge logic or a stand-in component.
 const managerSource = await readFile(new URL('../src/views/TaskManager.vue', import.meta.url), 'utf8');
-const manager = await import(`data:text/javascript;base64,${Buffer.from(parse(managerSource).descriptor.script.content).toString('base64')}`);
+const manager = await import(`data:text/javascript;base64,${Buffer.from(parse(managerSource).descriptor.script.content.replaceAll("'../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))).toString('base64')}`);
 const require = createRequire(import.meta.url);
 const vueModule = pathToFileURL(require.resolve('vue/dist/vue.runtime.esm-bundler.js')).href;
 const storeModule = new URL('../src/stores/taskStore.js', import.meta.url).href;
 const cardSource = await readFile(new URL('../src/components/TaskCards/RegularTaskCard.vue', import.meta.url), 'utf8');
 const compiled = compileScript(parse(cardSource).descriptor, { id: 'dispatch-card', inlineTemplate: true }).content
+  .replaceAll("'../../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))
   .replaceAll("'../../stores/taskStore.js'", JSON.stringify(storeModule))
   .replaceAll("'../../utils/taskGeneration.js'", JSON.stringify(new URL('../src/utils/taskGeneration.js', import.meta.url).href))
   .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
@@ -30,7 +31,7 @@ const negative = '❌ Pane 0 (pid=21733) is running: bash';
 const marker = 'QUANTNIGHT_DISPATCH_STATE ';
 const wait = '请求结果待核验（派发暂停，消费者存活）';
 const quotaWait = '等待配额恢复（派发暂停，消费者存活）';
-const unknownDispatch = '消费者存活（派发状态未确认）';
+const unknownDispatch = '消费者存活（缺少有效派发快照）';
 const meta = (state = 'waiting_reconciliation', now = Date.now()) => ({ schemaVersion: 1, ...target,
   submissionState: state,
   submissionReason: state === 'ready' ? null : state === 'waiting_quota_reset'
@@ -82,10 +83,10 @@ test('actual native-string normalization keeps process truth and separates recon
 });
 
 test('valid wait metadata never masks absent/unknown process, empty output, timeout or permission/startup errors', async () => {
-  for (const [process, error, label] of [[negative, null, '未检测到运行消费者'], ['', null, '运行状态未确认'],
-    [positive + '\nPermission denied', null, '运行状态未确认'], ['SSH timeout', null, '运行状态未确认'],
-    [positive.replace('pid=21733', 'pid=0'), null, '运行状态未确认'],
-    [positive, 'Native timed out', '运行状态未确认'], [positive, 'script_config failed', '运行状态未确认']]) {
+  for (const [process, error, label] of [[negative, null, '未检测到运行消费者'], ['', null, '运行检查输出不符合协议'],
+    [positive + '\nPermission denied', null, '运行检查输出不符合协议'], ['SSH timeout', null, '运行检查输出不符合协议'],
+    [positive.replace('pid=21733', 'pid=0'), null, '运行检查输出不符合协议'],
+    [positive, 'Native timed out', '运行检查超时'], [positive, 'script_config failed', '运行检查执行失败']]) {
     const html = await render(observation(meta(), process, Date.now(), error));
     assert.ok(html.includes(label)); preserved(html);
     assert.ok(!html.includes(wait)); assert.ok(!html.includes(quotaWait));
@@ -119,14 +120,14 @@ test('empty, malformed, stale/future, fake identity/profile/PID/run/quota never 
 
 test('stop lifecycle wins over dispatch pause and metadata cannot serve as stop proof', async () => {
   const runtime = observation();
-  for (const [status, label] of [['stopping', 'stopping'], ['stop_unconfirmed', '停止状态未确认'], ['paused', 'paused']]) {
+  for (const [status, label] of [['stopping', '停止执行中'], ['stop_unconfirmed', '停止执行失败'], ['paused', 'paused']]) {
     const stopOperation = { _id: id, name: target.name, isRemote: true, status,
       receipt: { confirmed: true, taskId: id, taskName: target.name, isRemote: true, stopConfirmedAt: Date.now() } };
     const html = await render(runtime, { stopOperation });
     assert.ok(html.includes(label)); assert.ok(!html.includes(wait));
     assert.doesNotMatch(html, /消费者存活|重置时间|上次配额/); preserved(html);
   }
-  for (const [input, label] of [[task({ status: 'paused' }), '暂停（运行状态未确认）'],
+  for (const [input, label] of [[task({ status: 'paused' }), '暂停标记无有效停止凭据'],
     [task({ status: 'paused', stopConfirmedAt: Date.now(), stopConfirmedTaskId: id, stopConfirmedRemote: true }), 'paused']]) {
     const html = await render(runtime, { task: input });
     assert.ok(html.includes(label)); assert.ok(!html.includes(wait));
@@ -136,10 +137,10 @@ test('stop lifecycle wins over dispatch pause and metadata cannot serve as stop 
 test('ID/host/profile replacement and old observation expiry fences still win over fresh capability', () => {
   const now = Date.now(); const runtime = observation(meta('waiting_reconciliation', now), positive, now);
   for (const patch of [{ _id: 'other' }, { name: 'other' }, { isRemote: false }, { auth_profile: 'user2' }]) {
-    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行状态未确认');
+    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行检查身份不匹配');
   }
   const old = { ...runtime, observedAt: now - card.REGULAR_RUNTIME_MAX_AGE };
-  assert.equal(card.regularDisplayStatus(task(), old, null, now), '运行状态未确认');
+  assert.equal(card.regularDisplayStatus(task(), old, null, now), '运行检查结果已过期');
   assert.equal(card.regularDisplayStatus(task(), runtime, null, now + manager.DISPATCH_MAX_AGE), unknownDispatch);
   assert.equal(card.regularDisplayStatus(task({ taskType: 'super' }), runtime, null, now), 'running');
 });
@@ -166,10 +167,69 @@ test('mounted real SFC expires dispatch heartbeat at 120s then process cache at 
     t.mock.timers.tick(1); await nextTick(); assert.ok(mounted.text().includes(unknownDispatch));
     assert.doesNotMatch(mounted.text(), /重置时间|上次配额/);
     t.mock.timers.tick(card.REGULAR_RUNTIME_MAX_AGE - manager.DISPATCH_MAX_AGE); await nextTick();
-    assert.match(mounted.text(), /运行状态未确认/); assert.doesNotMatch(mounted.text(), /消费者存活/); preserved(mounted.text());
+    assert.match(mounted.text(), /运行检查结果已过期/); assert.doesNotMatch(mounted.text(), /regular-source 消费者存活|可派发|派发暂停，消费者存活/); preserved(mounted.text());
     for (const [state, label] of [['waiting_reconciliation', wait], ['waiting_quota_reset', quotaWait], ['ready', '消费者存活（可派发）']]) {
       props.taskRuntimeStatus = observation(meta(state)); await nextTick(); assert.ok(mounted.text().includes(label)); preserved(mounted.text());
     }
     props.taskRuntimeStatus = observation(meta(), negative); await nextTick(); assert.match(mounted.text(), /未检测到运行消费者/);
   } finally { mounted.stop(); t.mock.timers.reset(); }
+});
+
+const stageLine = (extra = {}) => 'QUANTNIGHT_TASK_STAGE ' + JSON.stringify({ operation: 'runtime',
+  task_name: target.name, target_remote: target.isRemote, stage: 'process',
+  message: '正在核对所有 pane 的进程身份及后代进程', ...extra });
+
+test('real stdout normalizer strips valid stages, keeps last specific diagnostic and preserves strict process/dispatch truth', () => {
+  const now = Date.now();
+  const raw = [stageLine({ stage: 'ssh', message: '连接原执行主机' }), positive,
+    stageLine(), `${marker}${JSON.stringify(meta('ready', now))}`,
+    stageLine({ stage: 'complete', message: '全部进程检查已返回' })].join('\n');
+  const result = manager.normalizeTaskRuntime(target, raw, now);
+  assert.equal(result.state, 'running');
+  assert.equal(result.raw, positive);
+  assert.equal(result.stage, 'complete');
+  assert.equal(result.detail, '全部进程检查已返回');
+  assert.equal(result.dispatch.submissionState, 'ready');
+  for (const raw of [stageLine({ message: positive }), stageLine({ message: 'QUANTNIGHT_PAUSE_CONFIRMED {"confirmed":true}' }),
+    stageLine({ message: `${marker}${JSON.stringify(meta('ready', now))}` })]) {
+    const normalized = manager.normalizeTaskRuntime(target, raw, now);
+    assert.equal(normalized.state, 'unknown');
+    assert.equal(normalized.raw, '');
+    assert.equal(normalized.dispatch, null);
+    assert.equal(normalized.receipt, undefined);
+  }
+  const withError = manager.normalizeTaskRuntime(target, `${positive}\nPermission denied: cannot inspect /proc\n${stageLine()}`, now);
+  assert.equal(withError.state, 'unknown');
+  assert.match(withError.raw, /Permission denied: cannot inspect \/proc/);
+  assert.equal(withError.stage, 'process');
+});
+
+test('invalid/foreign/malformed stage lines poison positive evidence and cannot launder dispatch, stop proof or running', () => {
+  for (const invalid of ['QUANTNIGHT_TASK_STAGE {broken}', 'prefix ' + stageLine(),
+    stageLine({ operation: 'stop' }), stageLine({ task_name: 'other' }), stageLine({ target_remote: false }),
+    stageLine({ target_remote: 'true' }), stageLine({ stage: 'completed' }), stageLine({ stage: 'arbitrary' }),
+    stageLine({ message: '' }), stageLine({ message: 'bad\nline' }), stageLine({ extra: true }),
+    stageLine({ message: 'x'.repeat(1025) })]) {
+    const output = `${positive}\n${stageLine()}\n${invalid}\n${marker}${JSON.stringify(meta())}`;
+    const result = manager.normalizeTaskRuntime(target, output, Date.now());
+    assert.equal(result.state, 'unknown');
+    assert.equal(result.dispatch, null);
+    assert.equal(result.stage, 'process'); // last VALID diagnostic is retained, not the spoof
+    assert.match(result.diagnostic, /阶段诊断校验失败/);
+    assert.equal(result.raw, positive);
+    assert.equal(result.receipt, undefined);
+  }
+});
+
+test('every actual native runtime script stage is accepted by the real stdout normalizer, with the last diagnostic retained', async () => {
+  const native = await readFile(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+  const section = native.match(/let allowed: &\[&str\] = match self.operation \{([\s\S]*?)_ => &\[\]/)?.[1];
+  const ids = [...section.match(/"runtime" => &\[([\s\S]*?)\]/)[1].matchAll(/"([a-z_]+)"/g)].map(match => match[1]);
+  const { TASK_SCRIPT_STAGES } = await import('../src/utils/taskDiagnostics.js');
+  assert.deepEqual([...TASK_SCRIPT_STAGES.runtime], ids);
+  for (const stage of ids) {
+    const normalized = manager.normalizeTaskRuntime(target, `${positive}\n${stageLine({ stage, message: `原生阶段 ${stage}` })}`, Date.now());
+    assert.equal(normalized.state, 'running'); assert.equal(normalized.stage, stage);
+    assert.equal(normalized.detail, `原生阶段 ${stage}`); assert.equal(normalized.raw, positive);
+  }
 });

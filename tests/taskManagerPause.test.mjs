@@ -37,9 +37,10 @@ async function harness(initial = task()) {
     .replaceAll('from "pinia"', `from ${JSON.stringify(piniaModule)}`)
     .replace('"../stores/taskStore"', JSON.stringify(new URL('../src/stores/taskStore.js', import.meta.url).href))
     .replace('"../utils/taskProgress.js"', JSON.stringify(new URL('../src/utils/taskProgress.js', import.meta.url).href))
+    .replaceAll("'../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))
     .replace("'../utils/taskGeneration.js'", JSON.stringify(new URL('../src/utils/taskGeneration.js', import.meta.url).href))
     .replace(/import \{ invoke \} from "@tauri-apps\/api\/core";/, 'const invoke = (...args) => hooks.invoke(...args);')
-    .replace(/import \{ listen \} from "@tauri-apps\/api\/event";/, 'const listen = async () => () => {};')
+    .replace(/import \{ listen \} from "@tauri-apps\/api\/event";/, 'const listen = (...args) => hooks.listen(...args);')
     .replace(/import \{ useRoute, useRouter \} from "vue-router";/,
       'const useRoute = () => ({ fullPath: "/tasks" }); const useRouter = () => ({ push() {} });')
     .replace(/import \{ useMessage, useDialog \} from "naive-ui";/,
@@ -49,14 +50,20 @@ async function harness(initial = task()) {
     const setTimeout = (callback, delay) => { const id = ++hooks.nextTimer; hooks.timers.set(id, { callback, delay }); return id; };
     const clearTimeout = (id) => { hooks.timers.delete(id); };
     const createAutoPauseScheduler = (options) => realAutoPauseScheduler({ ...options, setTimeoutFn: setTimeout, clearTimeoutFn: clearTimeout });
-    const onMounted = () => {};
+    const onMounted = (fn) => { hooks.mount = fn; };
     const onUnmounted = (fn) => { hooks.unmount = fn; };
   `;
   const module = await import(`data:text/javascript;base64,${Buffer.from(hooksCode + code + `\n// ${instance}`).toString('base64')}`);
   const calls = [], lists = [], probes = [], command = deferred();
+  module.hooks.handlers = new Map(); module.hooks.cleaned = [];
+  module.hooks.listen = async (name, handler) => {
+    module.hooks.handlers.set(name, handler);
+    return () => { module.hooks.handlers.delete(name); module.hooks.cleaned.push(name); };
+  };
   let backgroundError = null;
   module.hooks.invoke = (name, args) => {
     calls.push({ name, args, status: store.tasks[0]?.status });
+    if (name === 'frontend_ready') return Promise.resolve();
     if (name === 'pause_task') return command.promise;
     if (name === 'check_task_status') { const probe = deferred(); probes.push(probe); return probe.promise; }
     if (name === 'get_all_tasks') { const request = deferred(); lists.push(request); return request.promise; }
@@ -93,7 +100,7 @@ test('real handler shows stopping until a matching proof receipt, commits before
     const pausing = h.state.pauseTask(h.store.tasks[0]);
     assert.equal(h.store.tasks[0].status, 'running');
     assert.equal(stopStatus(h), 'stopping');
-    assert.deepEqual(h.calls[0], { name: 'pause_task', args: { taskName: 'priority-a', taskId: 'id-a', isRemote: true }, status: 'running' });
+    assert.deepEqual(h.calls[0], { name: 'pause_task', args: { taskName: 'priority-a', taskId: 'id-a', isRemote: true, requestId: h.store.taskStopOperationMap['priority-a'].requestId }, status: 'running' });
     assert.equal(h.lists.length, 0);
     h.command.resolve(receipt());
     await tick();
@@ -122,7 +129,7 @@ test('native failure or proof-verified/DB-writeback failure remains unconfirmed,
       h.command.reject(new Error(error));
       await assert.rejects(pausing, new RegExp(error));
       assert.equal(h.store.tasks[0].status, 'running');
-      assert.equal(stopStatus(h), '停止状态未确认');
+      assert.equal(stopStatus(h), /超时/.test(error) ? '停止确认超时' : '停止执行失败');
       assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
       assert.equal(h.store.taskProgressMap['priority-a'], progress);
       assert.equal(h.lists.length, 0);
@@ -145,7 +152,7 @@ test('resolved void, stdout claims and malformed/mismatched receipts fail closed
       h.command.resolve(response);
       await assert.rejects(pausing, /停止回执未确认/);
       assert.equal(h.store.tasks[0].status, 'running');
-      assert.equal(stopStatus(h), '停止状态未确认');
+      assert.equal(stopStatus(h), '停止回执校验失败');
       assert.equal(h.lists.length, 0);
       assert.equal(h.hooks.timers.size, 0);
     } finally { h.stop(); }
@@ -160,11 +167,11 @@ test('bounded client confirmation timeout stays unconfirmed even if native resol
     assert.equal(timer.delay, 120000);
     timer.callback();
     await assert.rejects(pausing, /停止确认超时/);
-    assert.equal(stopStatus(h), '停止状态未确认');
+    assert.equal(stopStatus(h), '停止确认超时');
     h.command.resolve(receipt());
     await tick();
     assert.equal(h.store.tasks[0].status, 'running');
-    assert.equal(stopStatus(h), '停止状态未确认');
+    assert.equal(stopStatus(h), '停止确认超时');
     assert.equal(h.lists.length, 0);
   } finally { h.stop(); }
 });
@@ -242,7 +249,7 @@ test('capture mutable arguments, reject duplicate pending stop, and do not commi
   unmounted.command.resolve(receipt());
   await pausing;
   assert.equal(unmounted.store.tasks[0].status, 'running');
-  assert.equal(stopStatus(unmounted), '停止状态未确认');
+  assert.equal(stopStatus(unmounted), '停止回执核验中断');
   assert.equal(unmounted.lists.length, 0);
 });
 
@@ -267,14 +274,14 @@ test('store itself rejects no-proof confirmations; valid BSON persisted proof su
       const persisted = task({ status: 'paused', stopConfirmedAt: timestamp,
         stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true });
       assert.equal(taskStopDisplayStatus(persisted), 'paused');
-      assert.equal(taskStopDisplayStatus({ ...persisted, stopConfirmedTaskId: 'other' }), '暂停（运行状态未确认）');
-      assert.equal(taskStopDisplayStatus({ ...persisted, stopConfirmedRemote: false }), '暂停（运行状态未确认）');
-      assert.equal(taskStopDisplayStatus({ ...persisted, _id: undefined, stopConfirmedTaskId: undefined }), '暂停（运行状态未确认）');
+      assert.equal(taskStopDisplayStatus({ ...persisted, stopConfirmedTaskId: 'other' }), '暂停标记无有效停止凭据');
+      assert.equal(taskStopDisplayStatus({ ...persisted, stopConfirmedRemote: false }), '暂停标记无有效停止凭据');
+      assert.equal(taskStopDisplayStatus({ ...persisted, _id: undefined, stopConfirmedTaskId: undefined }), '暂停标记无有效停止凭据');
     }
     for (const value of [null, undefined, false, 0, -1, NaN, Infinity, '', 'today', { $date: 'invalid' }]) {
       assert.equal(stopProofMillis(value), null);
       assert.equal(taskStopDisplayStatus(task({ status: 'paused', stopConfirmedAt: value,
-        stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true })), '暂停（运行状态未确认）');
+        stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true })), '暂停标记无有效停止凭据');
     }
     assert.equal(validStopReceipt(task(), receipt()), true);
   } finally { h.stop(); }
@@ -289,7 +296,7 @@ test('explicit start clears prior action and persisted local proof without clear
     assert.equal(stopStatus(h), 'paused');
     assert.equal(h.store.clearTaskStop(task({ _id: 'wrong' })), false);
     assert.equal(h.store.clearTaskStop(task()), true);
-    assert.equal(stopStatus(h), '暂停（运行状态未确认）');
+    assert.equal(stopStatus(h), '暂停标记无有效停止凭据');
     assert.equal(h.store.taskProgressMap['priority-a'], progress);
     h.store.replaceTasks([task({ status: 'running' })]);
     assert.equal(stopStatus(h), null);
@@ -309,7 +316,7 @@ test('actual generic auto-pause timer does not retry after an uncertain manual s
     await assert.rejects(pausing, /outcome unknown/);
     await timer.callback();
     assert.equal(h.calls.filter(call => call.name === 'pause_task').length, 1);
-    assert.equal(stopStatus(h), '停止状态未确认');
+    assert.equal(stopStatus(h), '停止执行失败');
   } finally { h.stop(); }
 });
 
@@ -322,7 +329,7 @@ test('uncertain operation rejects old persisted proof but accepts a later real m
     const persisted = task({ status: 'paused', stopConfirmedAt: operation.startedAt - 1,
       stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true });
     h.store.replaceTasks([persisted]);
-    assert.equal(stopStatus(h), '停止状态未确认');
+    assert.equal(stopStatus(h), '停止执行失败');
     h.store.replaceTasks([{ ...persisted, stopConfirmedAt: operation.startedAt + 1 }]);
     assert.equal(stopStatus(h), 'paused');
     assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
@@ -339,7 +346,7 @@ test('actual successful start handler clears previous verified pause so stale ac
     h.hooks.invoke = (name, args) => name === 'start_priority_task' ? Promise.resolve() : originalInvoke(name, args);
     await h.state.handlePriorityStartTask({ taskName: 'priority-a', config: {}, isRemote: true });
     assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
-    assert.equal(stopStatus(h), '暂停（运行状态未确认）');
+    assert.equal(stopStatus(h), '暂停标记无有效停止凭据');
     h.lists[0].resolve([task({ status: 'running' })]);
     await tick();
     assert.equal(stopStatus(h), null);
@@ -413,7 +420,8 @@ test('regular runtime captures primitive ID/target, rejects replacement ID/host/
         const mutable = regularTask();
         const check = h.state.checkTaskStatus(mutable);
         mutable._id.$oid = 'mutated'; mutable.isRemote = false; mutable.name = 'other';
-        assert.deepEqual(h.calls[0].args, { taskName: 'priority-a', taskId: 'id-a', isRemote: true });
+        assert.equal(typeof h.calls[0].args.requestId, 'string');
+        assert.deepEqual(h.calls[0].args, { taskName: 'priority-a', taskId: 'id-a', isRemote: true, requestId: h.calls[0].args.requestId });
         h.store.replaceTasks(replacement ? [replacement] : []);
         assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
         h.store.replaceTasks([regularTask()]); // same name/ID/target again is still a new lifecycle
@@ -500,4 +508,175 @@ test('profile changes fence in-flight native dispatch metadata and invalidate pr
     assert.equal(h.state.taskRuntimeStatus.value['priority-a'].authProfile, 'user2');
     assert.equal(h.calls[1].args.taskId, 'id-a');
   } finally { h.stop(); }
+});
+
+const stageEvent = (call, extra = {}) => ({ operation: call.name === 'pause_task' ? 'stop' : 'runtime',
+  taskId: call.args.taskId, name: call.args.taskName, isRemote: call.args.isRemote,
+  requestId: call.args.requestId, stage: 'ssh', message: '正在通过原 SSH 入口连接执行主机', ...extra });
+
+test('actual handler routes only fixed stages for the exact pending operation/request/task/host; stages are not proof', async () => {
+  const h = await harness(regularTask());
+  try {
+    const saved = seedCounts(h.store);
+    const check = h.state.checkTaskStatus(h.store.tasks[0]);
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    const [runtimeCall, stopCall] = h.calls;
+    assert.equal(typeof runtimeCall.args.requestId, 'string');
+    assert.equal(typeof stopCall.args.requestId, 'string');
+    assert.notEqual(runtimeCall.args.requestId, stopCall.args.requestId);
+    for (const patch of [{ taskId: 'other' }, { name: 'other' }, { isRemote: false }, { isRemote: 'true' },
+      { requestId: 'old-request' }, { operation: 'stop' }, { operation: 'start' }, { stage: 'not_a_fixed_stage' },
+      { stage: 'control_write' }, { stage: 'ssh\n' }, { message: '' }, { message: 'line\nbreak' }]) {
+      assert.equal(h.state.handleTaskOperationStage(stageEvent(runtimeCall, patch)), false);
+      assert.equal(h.state.taskRuntimeStatus.value['priority-a'].stage, 'native_request');
+    }
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(runtimeCall)), true);
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].stage, 'ssh');
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'checking');
+    for (const patch of [{ taskId: 'other' }, { name: 'other' }, { isRemote: false },
+      { requestId: runtimeCall.args.requestId }, { operation: 'runtime' }, { stage: 'dispatch_read' }]) {
+      assert.equal(h.state.handleTaskOperationStage(stageEvent(stopCall, patch)), false);
+    }
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(stopCall, { stage: 'completed', message: '伪造成功文字不是回执' })), true);
+    assert.equal(stopStatus(h), 'stopping');
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.taskProgressMap['priority-a'], saved);
+    h.probes[0].reject('[ssh] Permission denied (publickey): exact runtime failure');
+    await check;
+    const observation = h.state.taskRuntimeStatus.value['priority-a'];
+    assert.equal(observation.stage, 'ssh');
+    assert.equal(observation.error, '[ssh] Permission denied (publickey): exact runtime failure');
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(runtimeCall)), false);
+    h.command.reject('[control_write] 执行退出已核验，但 CAS matched_count=0；原任务目标变化，未写入 paused');
+    await assert.rejects(pausing, /matched_count=0/);
+    const operation = h.store.taskStopOperationMap['priority-a'];
+    assert.equal(operation.stage, 'control_write');
+    assert.match(operation.error, /执行退出已核验.*matched_count=0.*原任务目标变化/);
+    assert.equal(operation.status, 'stop_unconfirmed');
+    assert.equal(stopStatus(h), '停止执行失败');
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(stopCall)), false);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.taskProgressMap['priority-a'], saved);
+  } finally { h.stop(); }
+});
+
+test('runtime timeout freezes the last arrived stage; late stage/result cannot revive it or a newer generation', async () => {
+  const h = await harness(regularTask());
+  try {
+    const first = h.state.checkTaskStatus(h.store.tasks[0]);
+    const call = h.calls[0];
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(call, { stage: 'tmux', message: '正在查找精确会话及全部窗口' })), true);
+    [...h.hooks.timers.values()][0].callback();
+    // The queued rejection hasn't reached catch yet: the timeout latch already closes events.
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(call)), false);
+    await first;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].stage, 'tmux');
+    assert.match(h.state.taskRuntimeStatus.value['priority-a'].error, /15 秒/);
+    const next = h.state.checkTaskStatus(h.store.tasks[0]);
+    assert.notEqual(h.calls[1].args.requestId, call.args.requestId);
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(call)), false);
+    h.probes[0].resolve(positivePane); await tick();
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'checking');
+    h.probes[1].resolve(bashPane); await next;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].state, 'not_running');
+  } finally { h.stop(); }
+});
+
+test('stop timeout and away/back replacement fence late stages, proof and older stop generations', async () => {
+  const h = await harness();
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    const old = h.calls[0];
+    h.state.handleTaskOperationStage(stageEvent(old, { stage: 'process_exit', message: '等待已标识消费者退出' }));
+    [...h.hooks.timers.values()][0].callback();
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(old)), false);
+    await assert.rejects(pausing, /120 秒/);
+    assert.equal(h.store.taskStopOperationMap['priority-a'].stage, 'process_exit');
+    assert.equal(stopStatus(h), '停止确认超时');
+    h.store.setTaskSource('priority-a', false); h.store.setTaskSource('priority-a', true);
+    const newer = h.store.beginTaskStop(task());
+    assert.notEqual(newer.requestId, old.args.requestId);
+    assert.equal(h.state.handleTaskOperationStage(stageEvent(old)), false);
+    h.command.resolve(receipt()); await tick();
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.taskStopOperationMap['priority-a'].requestId, newer.requestId);
+  } finally { h.stop(); }
+});
+
+test('real manager listener registers before task loading and cleans up; disposed events cannot publish', async () => {
+  const h = await harness(regularTask());
+  const mounting = h.hooks.mount(); await tick();
+  assert.ok(h.hooks.handlers.has('task-operation-stage'));
+  assert.ok(h.lists.length === 1);
+  const eventHandler = h.hooks.handlers.get('task-operation-stage');
+  const check = h.state.checkTaskStatus(h.store.tasks[0]);
+  eventHandler({ payload: stageEvent(h.calls.find(call => call.name === 'check_task_status')) });
+  assert.equal(h.state.taskRuntimeStatus.value['priority-a'].stage, 'ssh');
+  h.stop();
+  assert.equal(h.hooks.cleaned.filter(name => name === 'task-operation-stage').length, 1);
+  const before = JSON.stringify(h.state.taskRuntimeStatus.value);
+  eventHandler({ payload: stageEvent(h.calls.find(call => call.name === 'check_task_status'), { stage: 'completed' }) });
+  assert.equal(JSON.stringify(h.state.taskRuntimeStatus.value), before);
+  h.lists[0].resolve([regularTask()]); h.probes[0].resolve(positivePane);
+  await mounting; await check;
+  assert.equal(h.hooks.timers.size, 0);
+  assert.equal(h.hooks.handlers.size, 0);
+});
+
+test('a stage-listener promise resolving after unmount is disposed immediately, without registry/native work', async () => {
+  const h = await harness(), registration = deferred();
+  let cleanup = 0;
+  h.hooks.listen = (name) => { assert.equal(name, 'task-operation-stage'); return registration.promise; };
+  const mounting = h.hooks.mount(); h.stop();
+  registration.resolve(() => cleanup++); await mounting;
+  assert.equal(cleanup, 1);
+  assert.equal(h.calls.length, 0);
+});
+
+test('the actual native operation-specific script stage whitelist reaches the real pending UI handlers', async () => {
+  const native = await readFile(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+  const section = native.match(/let allowed: &\[&str\] = match self.operation \{([\s\S]*?)_ => &\[\]/)?.[1];
+  assert.ok(section, 'native script-stage contract must remain inspectable; do not silently replace it with local fixtures');
+  for (const operation of ['runtime', 'stop']) {
+    const ids = [...section.match(new RegExp(`"${operation}" => &\\[([\\s\\S]*?)\\]`))[1].matchAll(/"([a-z_]+)"/g)].map(match => match[1]);
+    const { TASK_SCRIPT_STAGES } = await import('../src/utils/taskDiagnostics.js');
+    assert.deepEqual([...TASK_SCRIPT_STAGES[operation]], ids);
+    const h = await harness(regularTask());
+    try {
+      const pending = operation === 'runtime' ? h.state.checkTaskStatus(h.store.tasks[0]) : h.state.pauseTask(h.store.tasks[0]);
+      const call = h.calls[0];
+      for (const stage of ids) {
+        const detail = `原生实际阶段 ${stage}：跨端合同检查`;
+        assert.equal(h.state.handleTaskOperationStage(stageEvent(call, { stage, message: detail })), true, `${operation}:${stage}`);
+        const diagnostic = operation === 'runtime' ? h.state.taskRuntimeStatus.value['priority-a'] : h.store.taskStopOperationMap['priority-a'];
+        assert.equal(diagnostic.stage, stage); assert.equal(diagnostic.detail, detail);
+      }
+      if (operation === 'runtime') { h.probes[0].resolve(bashPane); await pending; }
+      else { h.command.reject('[receipt] synthetic operation failure'); await assert.rejects(pending); }
+    } finally { h.stop(); }
+  }
+});
+
+test('control_write followed by client timeout/disposal records missing final result, not a definite CAS failure', async () => {
+  for (const outcome of ['timeout', 'dispose', 'native_timeout']) {
+    const h = await harness();
+    try {
+      const pending = h.state.pauseTask(h.store.tasks[0]);
+      h.state.handleTaskOperationStage(stageEvent(h.calls[0], { stage: 'control_write', message: '执行退出已核验；开始 CAS 写入' }));
+      if (outcome === 'timeout') {
+        [...h.hooks.timers.values()][0].callback(); await assert.rejects(pending, /120 秒/);
+      } else if (outcome === 'native_timeout') {
+        h.command.reject('[control_write] 执行退出已核验，但控制记录回写超时；不要盲目重试'); await assert.rejects(pending, /回写超时/);
+      } else { h.stop(); h.command.resolve(receipt()); await pending; }
+      const op = h.store.taskStopOperationMap['priority-a'];
+      assert.equal(op.stage, 'control_write'); assert.equal(op.status, 'stop_unconfirmed');
+      assert.equal(op.failureSource, outcome === 'timeout' ? 'client_timeout' : outcome === 'dispose' ? 'client_disposed' : 'native');
+      assert.equal(h.store.tasks[0].status, 'running');
+      const { stopDiagnostic } = await import('../src/utils/taskDiagnostics.js');
+      const detail = stopDiagnostic(h.store.tasks[0], op, stopStatus(h)).detail;
+      assert.match(detail, /最终写入结果尚未收到，不能断定 CAS 成功或失败/);
+      assert.doesNotMatch(detail, /控制记录写入失败/);
+      if (outcome === 'timeout') { h.command.resolve(receipt()); await tick(); assert.equal(h.store.tasks[0].status, 'running'); }
+    } finally { h.stop(); }
+  }
 });

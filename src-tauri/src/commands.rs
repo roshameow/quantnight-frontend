@@ -9,12 +9,13 @@ use mongodb::{
     bson::{doc, oid::ObjectId, Document},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{command, State};
+use tauri::{command, AppHandle, Emitter, State};
 use tokio::time::timeout;
 use toml;
 use dirs::data_dir;
 
-use crate::config::{run_bash_script, run_python_command, AppConfig};
+use crate::config::{run_bash_script, run_bash_script_observed, run_python_command, AppConfig,
+    BashScriptEvent, BashScriptObserver};
 use crate::mongo_manager::MongoClients;
 
 use serde_json::from_str;
@@ -293,6 +294,8 @@ pub struct Task {
     pub stop_confirmed_remote: Option<bool>,
     #[serde(default, rename = "stopConfirmedTaskId")]
     pub stop_confirmed_task_id: Option<String>,
+    #[serde(default, rename = "stopConfirmationBasis")]
+    pub stop_confirmation_basis: Option<String>,
 
 }
 
@@ -936,25 +939,193 @@ fn dispatch_status_output(stdout: &str, dispatch: Option<DispatchState>) -> Stri
     raw
 }
 
+const TASK_STAGE_PREFIX: &str = "QUANTNIGHT_TASK_STAGE ";
+const RUNTIME_BUDGET: Duration = Duration::from_secs(12);
+const PAUSE_SCRIPT_BUDGET: Duration = Duration::from_secs(75);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptTaskStage {
+    operation: String,
+    task_name: String,
+    target_remote: bool,
+    stage: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskOperationStage {
+    operation: String,
+    task_id: String,
+    name: String,
+    is_remote: bool,
+    request_id: String,
+    stage: String,
+    message: String,
+}
+
+#[derive(Clone)]
+struct TaskOperationProgress {
+    operation: &'static str,
+    task_id: String,
+    name: String,
+    remote: bool,
+    request_id: String,
+    last: Arc<Mutex<(String, String)>>,
+    sink: Arc<dyn Fn(TaskOperationStage) + Send + Sync>,
+}
+
+impl TaskOperationProgress {
+    fn new(app: AppHandle, operation: &'static str, task_id: Option<&str>, name: &str,
+        remote: bool, request_id: Option<String>) -> Self {
+        Self { operation, task_id: task_id.unwrap_or_default().into(), name: name.into(), remote,
+            request_id: request_id.unwrap_or_default(),
+            last: Arc::new(Mutex::new(("initial".into(), "原生桥已接收请求".into()))),
+            sink: Arc::new(move |event| {
+                if let Err(error) = app.emit("task-operation-stage", event) {
+                    eprintln!("task-operation-stage emit failed: {error}");
+                }
+            }) }
+    }
+
+    fn stage(&self, stage: &str, message: &str) {
+        // Serialize updates and emission, so no stale callback can overtake a
+        // receipt/control-write phase. stdout cannot supply native identity.
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *last = (stage.into(), message.into());
+        // Legacy callers have no correlation token. Keep internal diagnostics
+        // and business behavior, but do not emit an unrouteable UI event.
+        if self.request_id.is_empty() { return; }
+        (self.sink)(TaskOperationStage { operation: self.operation.into(), task_id: self.task_id.clone(),
+            name: self.name.clone(), is_remote: self.remote, request_id: self.request_id.clone(),
+            stage: stage.into(), message: message.into() });
+    }
+
+    fn failure(&self, cause: impl std::fmt::Display) -> String {
+        let (stage, message) = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let error = format!("{} stage={}（{}）：{}", self.operation, stage, message, cause);
+        // Keep the actual failed step, never collapse it into generic unknown.
+        self.stage(&stage, &error);
+        error
+    }
+
+    fn script_stage(&self, line: &str) {
+        // Parse only a bounded, exact line/schema and operation-specific fixed
+        // IDs. Markers are diagnostic hints, NEVER stop/dispatch authority.
+        if line.len() > 4096 { return; }
+        let Some(json) = line.strip_prefix(TASK_STAGE_PREFIX) else { return; };
+        let Ok(event) = serde_json::from_str::<ScriptTaskStage>(json) else { return; };
+        if event.operation != self.operation || event.task_name != self.name ||
+            event.target_remote != self.remote || event.message.trim().is_empty() ||
+            event.message.len() > 1024 || event.message.chars().any(char::is_control) {
+            return;
+        }
+        let allowed: &[&str] = match self.operation {
+            "runtime" => &["config", "ssh", "remote_environment", "tmux", "process", "receipt", "session_absent", "complete"],
+            "stop" => &["config", "ssh", "remote_environment", "tmux", "process", "interrupt", "session_exit",
+                "process_exit", "receipt", "session_absent", "complete"],
+            _ => &[],
+        };
+        if allowed.contains(&event.stage.as_str()) { self.stage(&event.stage, &event.message); }
+    }
+
+    fn observer(&self) -> BashScriptObserver {
+        let progress = self.clone();
+        Arc::new(move |event| match event {
+            BashScriptEvent::Config => progress.stage("config", "读取原脚本配置与参数"),
+            BashScriptEvent::Launch => progress.stage("launch", "启动本次操作的本地脚本子进程"),
+            BashScriptEvent::Wait => progress.stage("wait", "等待脚本 stdout/stderr 与退出；尚未收到更细阶段"),
+            BashScriptEvent::Stdout(line) => progress.script_stage(&line),
+        })
+    }
+}
+
+// Both commands and their offline regression tests take this same route to
+// the original runner. No mock transport/config or second runner is involved.
+async fn execute_task_script(progress: &TaskOperationProgress, config: &AppConfig,
+    budget: Duration) -> Result<(String, String), String> {
+    let (key, diagnostic) = match progress.operation {
+        "runtime" => ("check_task_status", true),
+        "stop" => ("pause_task", false),
+        _ => return Err(progress.failure("不支持的原生任务操作")),
+    };
+    run_bash_script_observed(key, &[("task_name", &progress.name)], progress.remote,
+        config, budget, diagnostic, Some(progress.observer())).await
+        .map_err(|e| progress.failure(e))
+}
+
+fn operation_task_identity(task: &Document, name: &str, remote: bool) -> Result<ObjectId, String> {
+    if task.get_str("name").ok() != Some(name) || task.get_str("status").ok() == Some("deactive") {
+        return Err("原任务名称/活动身份已变化".into());
+    }
+    if task.get_bool("isRemote").unwrap_or(false) != remote {
+        return Err("执行目标已经变更；未向其它执行端发送请求".into());
+    }
+    task.get_object_id("_id").map_err(|e| format!("任务ID无效：{e}"))
+}
+
+async fn operation_task(clients: &MongoClients, task_id: Option<&str>, name: &str,
+    budget: Duration) -> Result<Document, String> {
+    let mut filter = doc! { "name": name, "status": { "$ne": "deactive" } };
+    if let Some(id) = task_id {
+        filter.insert("_id", ObjectId::parse_str(id).map_err(|e| format!("任务ID无效：{e}"))?);
+    }
+    let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
+    timeout(budget, tasks.find_one(filter, None)).await
+        .map_err(|_| format!("本地控制面任务身份查询超时（{} ms）；操作脚本未启动", budget.as_millis()))?
+        .map_err(|e| format!("本地控制面任务身份查询失败：{e}"))?
+        .ok_or_else(|| "原任务不存在；操作脚本未启动".into())
+}
+
+// Keep legacy pane text intact while removing diagnostic protocol lines before
+// the existing strict process/dispatch parser sees the response.
+fn runtime_process_output(stdout: &str, stderr: &str) -> Result<String, String> {
+    let stdout = stdout.lines().filter(|line| !line.starts_with(TASK_STAGE_PREFIX))
+        .collect::<Vec<_>>().join("\n");
+    if stdout.trim().is_empty() {
+        return Err(format!("运行时脚本未返回 Pane 检查结果（stdout 为空或仅有阶段信息）；stderr: {stderr}"));
+    }
+    Ok(if stderr.trim().is_empty() { stdout } else { format!("{stdout}\n{stderr}") })
+}
+
 #[command]
 pub async fn check_task_status(
     task_name: String,
     is_remote: bool,
     task_id: Option<String>,
+    request_id: Option<String>,
+    app: AppHandle,
     clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>,
 ) -> Result<String, String> {
-    let (stdout, stderr) = run_bash_script(
-        "check_task_status", &[ ("task_name", &task_name) ], is_remote, &app_config,
-    ).await.map_err(|e| e.to_string())?;
-    let dispatch = match task_id {
-        Some(id) => read_dispatch_state(&clients, &id, &task_name, is_remote).await,
-        None => None, // Legacy callers still receive their process-only string.
-    };
-    // A successful shell exit with stderr diagnostics is still not a clean
-    // positive process observation. Preserve them for the strict UI parser.
-    let process_output = if stderr.trim().is_empty() { stdout } else { format!("{stdout}\n{stderr}") };
-    Ok(dispatch_status_output(&process_output, dispatch))
+    let started = Instant::now();
+    let mut progress = TaskOperationProgress::new(app, "runtime", task_id.as_deref(),
+        &task_name, is_remote, request_id);
+    progress.stage("initial", "已接收运行时检查；总预算12秒，不停止研究任务");
+    // Final aggregate guard includes identity, script readers/exit/cleanup and
+    // dispatch. Dropping an in-flight diagnostic also cleans its private group.
+    timeout(RUNTIME_BUDGET, async {
+        progress.stage("identity", "查询本地控制面的原任务ID、名称与执行目标");
+        let task = operation_task(&clients, task_id.as_deref(), &task_name, Duration::from_secs(2)).await
+            .map_err(|e| progress.failure(e))?;
+        let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
+        progress.task_id = id.to_hex();
+        // Reserve two seconds for dispatch evidence and cleanup. This probe must
+        // finish before the UI's 15s deadline; it never inherits the generic 300s.
+        let budget = RUNTIME_BUDGET.saturating_sub(started.elapsed())
+            .saturating_sub(Duration::from_secs(2)).min(Duration::from_secs(8));
+        let (stdout, stderr) = execute_task_script(&progress, &app_config, budget).await?;
+        progress.stage("receipt_validate", "检查运行时脚本输出；保留原 Pane 文本，不信任脚本控制状态");
+        let process_output = runtime_process_output(&stdout, &stderr).map_err(|e| progress.failure(e))?;
+        progress.stage("dispatch_read", "有界读取实际执行库的派发证据（缺证不伪造控制状态）");
+        let remaining = RUNTIME_BUDGET.saturating_sub(started.elapsed());
+        let dispatch = timeout(remaining, read_dispatch_state(&clients, &id.to_hex(), &task_name, is_remote))
+            .await.unwrap_or(None);
+        let output = dispatch_status_output(&process_output, dispatch);
+        progress.stage("completed", "运行时检查已返回；状态仍由原 Pane/原生派发证据解析");
+        Ok(output)
+    }).await.map_err(|_| progress.failure("运行检查总预算12秒耗尽（包含身份查询、脚本stdout/stderr、退出与派发证据）；仅清理本次诊断，不停止目标任务"))?
 }
 
 #[command]
@@ -1232,7 +1403,7 @@ fn get_script_description(script_key: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExecutionStopProof {
+struct ExecutionStopProofV1 {
     schema_version: u32,
     task_name: String,
     target_remote: bool,
@@ -1240,22 +1411,66 @@ struct ExecutionStopProof {
     runners_exited: bool,
 }
 
-// Exit zero or a printed success message is insufficient. The stop script
-// must verify both the exact session and its recorded execution processes.
-fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<(), String> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionAbsentStopProofV2 {
+    schema_version: u32,
+    task_name: String,
+    target_remote: bool,
+    session_absent: bool,
+    // Unit requires an explicit JSON null, not an omitted Option or a bool.
+    runners_exited: (),
+    confirmation_basis: StopConfirmationBasis,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExecutionStopProof {
+    Exited(ExecutionStopProofV1),
+    Absent(SessionAbsentStopProofV2),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StopConfirmationBasis {
+    RunnersExited,
+    SessionAbsent,
+}
+
+impl StopConfirmationBasis {
+    fn as_str(self) -> &'static str {
+        match self { Self::RunnersExited => "runners_exited", Self::SessionAbsent => "session_absent" }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Self::RunnersExited => "原会话与已捕获执行进程退出均已核验",
+            Self::SessionAbsent => "原精确tmux会话不存在（暂停依据）；未核验历史孤儿PID退出或平台取消",
+        }
+    }
+}
+
+// Only the unique final receipt binds a stop basis. A runtime stage/event or
+// plain legacy absence line is NEVER pause/control-write authority.
+fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<StopConfirmationBasis, String> {
     let receipts: Vec<_> = stdout.lines().filter_map(|line|
         line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")).collect();
     if receipts.len() != 1 || stdout.lines().last().and_then(|line|
         line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")) != receipts.first().copied() {
-        return Err("停止状态未确认：缺少唯一的最终执行退出核验回执，请更新停止脚本后核对；不会自动重试停止".into());
+        return Err("停止状态未确认：缺少唯一的最终结构化暂停回执；不会自动重试停止".into());
     }
+    if receipts[0].len() > 8192 { return Err("停止状态未确认：最终回执超出8192字节上限".into()); }
     let proof: ExecutionStopProof = serde_json::from_str(receipts[0])
         .map_err(|e| format!("停止状态未确认：回执无效：{e}"))?;
-    if proof.schema_version != 1 || proof.task_name != name || proof.target_remote != remote
-        || !proof.session_absent || !proof.runners_exited {
-        return Err("停止状态未确认：任务/执行目标不匹配，或会话/执行进程尚未确认退出".into());
+    match proof {
+        ExecutionStopProof::Exited(ExecutionStopProofV1 { schema_version: 1, task_name,
+            target_remote, session_absent: true, runners_exited: true })
+            if task_name == name && target_remote == remote => Ok(StopConfirmationBasis::RunnersExited),
+        ExecutionStopProof::Absent(SessionAbsentStopProofV2 { schema_version: 2, task_name,
+            target_remote, session_absent: true, runners_exited: (),
+            confirmation_basis: StopConfirmationBasis::SessionAbsent })
+            if task_name == name && target_remote == remote => Ok(StopConfirmationBasis::SessionAbsent),
+        _ => Err("停止状态未确认：任务/执行目标不匹配，或V1退出证明/V2会话缺失依据不合法".into()),
     }
-    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1266,46 +1481,70 @@ pub struct ConfirmedTaskStop {
     task_name: String,
     is_remote: bool,
     stop_confirmed_at: i64,
+    confirmation_basis: StopConfirmationBasis,
 }
 
-fn confirmed_pause_update(id: ObjectId, remote: bool, at: bson::DateTime) -> Document {
-    doc! { "status": "paused", "pausedAt": at, "stopConfirmedAt": at,
-        "stopConfirmedRemote": remote, "stopConfirmedTaskId": id.to_hex() }
+fn confirmed_pause_update(id: ObjectId, remote: bool, at: bson::DateTime,
+    basis: StopConfirmationBasis) -> Document {
+    doc! { "status": "paused", "pausedAt": at, "stopConfirmedAt": at, "updatedAt": at,
+        "stopConfirmedRemote": remote, "stopConfirmedTaskId": id.to_hex(),
+        "stopConfirmationBasis": basis.as_str() }
+}
+
+fn pause_control_write(id: ObjectId, name: &str, original: &Document,
+    remote: bool, at: bson::DateTime, basis: StopConfirmationBasis) -> (Document, Document) {
+    let mut filter = doc! { "_id": id, "name": name };
+    // Preserve the same task/host AND the captured control revision. This uses
+    // existing updatedAt/launch/evidence fields, not a new version mechanism.
+    for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "launchAttemptAt", "startedAt",
+        "generation", "startupBinding", "stopConfirmedAt", "stopConfirmedRemote",
+        "stopConfirmedTaskId", "stopConfirmationBasis"] {
+        filter.insert(key, original.get(key).cloned().unwrap_or_else(|| bson::Bson::Document(doc! { "$exists": false })));
+    }
+    (filter, doc! { "$set": confirmed_pause_update(id, remote, at, basis) })
+}
+
+fn validate_stop_output(progress: &TaskOperationProgress, stdout: &str, stderr: &str) -> Result<StopConfirmationBasis, String> {
+    progress.stage("receipt_validate", "验证唯一最终暂停回执、任务/执行端与V1进程退出或V2会话不存在依据");
+    verified_stop_proof(stdout, &progress.name, progress.remote)
+        .map_err(|e| progress.failure(format!("{e}；stderr: {stderr}；stdout: {stdout}")))
+}
+
+fn confirmed_stop_after_write(progress: &TaskOperationProgress, id: ObjectId, at: bson::DateTime,
+    basis: StopConfirmationBasis, matched_count: u64) -> Result<ConfirmedTaskStop, String> {
+    if matched_count != 1 {
+        return Err(progress.failure(format!("{}；但原任务身份/执行目标/控制版本已变化，未回写暂停", basis.description())));
+    }
+    progress.stage("completed", &format!("{}；控制面CAS回写已确认", basis.description()));
+    Ok(ConfirmedTaskStop { confirmed: true, task_id: id.to_hex(), task_name: progress.name.clone(),
+        is_remote: progress.remote, stop_confirmed_at: at.timestamp_millis(), confirmation_basis: basis })
 }
 
 #[command]
 pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<String>,
+    request_id: Option<String>, app: AppHandle,
     clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<ConfirmedTaskStop, String> {
-    let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
-    let mut filter = doc! { "name": &task_name, "status": { "$ne": "deactive" } };
-    if let Some(id) = task_id {
-        filter.insert("_id", ObjectId::parse_str(id).map_err(|e| format!("任务ID无效：{e}"))?);
-    }
-    let task = timeout(Duration::from_secs(5), tasks.find_one(filter, None)).await
-        .map_err(|_| "停止请求未发出：任务身份查询超时".to_string())?
-        .map_err(|e| e.to_string())?.ok_or("停止请求未发出：原任务不存在")?;
-    let id = task.get_object_id("_id").map_err(|e| e.to_string())?;
-    if task.get_bool("isRemote").unwrap_or(false) != is_remote {
-        return Err("停止请求未发出：执行目标已经变更".into());
-    }
+    let mut progress = TaskOperationProgress::new(app, "stop", task_id.as_deref(),
+        &task_name, is_remote, request_id);
+    progress.stage("initial", "已接收暂停请求；只发送一次停止操作，超时不自动重试");
+    progress.stage("identity", "核对本地控制面原任务与执行目标；尚未发送停止请求");
+    let task = operation_task(&clients, task_id.as_deref(), &task_name, Duration::from_secs(5)).await
+        .map_err(|e| progress.failure(e))?;
+    let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
+    progress.task_id = id.to_hex();
     if matches!(task.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err("当前是候选生成，不是回测消费者；请先核验生成作业".into());
+        return Err(progress.failure("当前是候选生成，不是回测消费者；请先核验生成作业"));
     }
-    let (stdout, _) = run_bash_script("pause_task", &[("task_name", &task_name)],
-        is_remote, &app_config).await?;
-    verified_stop_proof(&stdout, &task_name, is_remote)?;
+    let (stdout, stderr) = execute_task_script(&progress, &app_config, PAUSE_SCRIPT_BUDGET).await?;
+    let basis = validate_stop_output(&progress, &stdout, &stderr)?;
     let at = bson::DateTime::now();
-    let result = timeout(Duration::from_secs(5), tasks.update_one(
-        doc! { "_id": id, "name": &task_name, "status": { "$ne": "deactive" },
-            "isRemote": task.get("isRemote").cloned().unwrap_or(bson::Bson::Null) },
-        doc! { "$set": confirmed_pause_update(id, is_remote, at) }, None)).await
-        .map_err(|_| "执行退出已核验，但控制记录回写超时；停止状态未完成确认，请核对，不要盲目重试".to_string())?
-        .map_err(|e| format!("执行退出已核验，但控制记录回写失败：{e}"))?;
-    if result.matched_count != 1 {
-        return Err("执行退出已核验，但原任务身份/执行目标已变化；未回写暂停".into());
-    }
-    Ok(ConfirmedTaskStop { confirmed: true, task_id: id.to_hex(), task_name,
-        is_remote, stop_confirmed_at: at.timestamp_millis() })
+    let (filter, update) = pause_control_write(id, &task_name, &task, is_remote, at, basis);
+    progress.stage("control_write", &format!("{}；按原任务ID/名称/执行目标/控制版本CAS回写暂停（5秒）", basis.description()));
+    let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
+    let result = timeout(Duration::from_secs(5), tasks.update_one(filter, update, None)).await
+        .map_err(|_| progress.failure(format!("{}；但控制记录回写超时，不要盲目重试停止", basis.description())))?
+        .map_err(|e| progress.failure(format!("{}；但控制记录回写失败：{e}", basis.description())))?;
+    confirmed_stop_after_write(&progress, id, at, basis, result.matched_count)
 }
 
 #[command]
@@ -1351,7 +1590,7 @@ mod verified_pause_tests {
     fn task_list_preserves_persisted_stop_evidence_for_remounts() {
         let id = ObjectId::new();
         let at = bson::DateTime::now();
-        let mut record = confirmed_pause_update(id, true, at);
+        let mut record = confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited);
         record.insert("_id", id);
         record.insert("name", "pipeline__priority");
         record.insert("isRemote", true);
@@ -1366,14 +1605,14 @@ mod verified_pause_tests {
     fn persisted_and_returned_stop_identity_are_fenced_and_explicit() {
         let id = ObjectId::new();
         let at = bson::DateTime::now();
-        let update = confirmed_pause_update(id, true, at);
+        let update = confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited);
         assert_eq!(update.get_str("status").unwrap(), "paused");
         assert_eq!(update.get_str("stopConfirmedTaskId").unwrap(), id.to_hex());
         assert!(update.get_bool("stopConfirmedRemote").unwrap());
         assert_eq!(*update.get_datetime("stopConfirmedAt").unwrap(), at);
         let response = serde_json::to_value(ConfirmedTaskStop { confirmed: true,
             task_id: id.to_hex(), task_name: "pipeline__priority".into(), is_remote: true,
-            stop_confirmed_at: at.timestamp_millis() }).unwrap();
+            stop_confirmed_at: at.timestamp_millis(), confirmation_basis: StopConfirmationBasis::RunnersExited }).unwrap();
         assert_eq!(response["taskId"], id.to_hex());
         assert_eq!(response["isRemote"], true);
         assert_eq!(response["confirmed"], true);
@@ -1869,4 +2108,369 @@ exit "$(cat archive.exit)"
         assert!(run_template_catalog(&f.0, "binding", "regular", Some("legacy"), None).await.unwrap()["binding"].is_null());
     }
 
+}
+
+#[cfg(test)]
+mod task_stage_diagnostics_tests {
+    use super::*;
+    use crate::config::bash_test_support::FakeBash;
+    use serde_json::json;
+
+    fn progress(operation: &'static str) -> (TaskOperationProgress, Arc<Mutex<Vec<TaskOperationStage>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        (TaskOperationProgress { operation, task_id: "0123456789abcdef01234567".into(),
+            name: "exact__priority".into(), remote: true, request_id: "request-native-1".into(),
+            last: Arc::new(Mutex::new(("initial".into(), "原生请求".into()))),
+            sink: Arc::new(move |event| recorded.lock().unwrap().push(event)) }, events)
+    }
+
+    fn stage(operation: &str, phase: &str) -> JsonValue {
+        json!({"operation": operation, "task_name": "exact__priority", "target_remote": true,
+            "stage": phase, "message": "正在核对精确任务的执行步骤"})
+    }
+
+    fn shell_line(value: &JsonValue) -> String {
+        format!("printf '%s\\n' '{}{}'\n", TASK_STAGE_PREFIX, value)
+    }
+
+    fn stop_receipt() -> String {
+        format!("QUANTNIGHT_PAUSE_CONFIRMED {}", json!({"schema_version":1,
+            "task_name":"exact__priority", "target_remote":true,
+            "session_absent":true, "runners_exited":true}))
+    }
+
+    #[test]
+    fn bounded_exact_schema_identity_cannot_forge_scope_or_control_authority() {
+        let (p, events) = progress("runtime");
+        p.script_stage(&format!("{TASK_STAGE_PREFIX}{}", stage("runtime", "ssh")));
+        for change in [json!({"operation":"stop"}), json!({"task_name":"exact"}),
+            json!({"target_remote":false}), json!({"target_remote":"true"}),
+            json!({"stage":"control_write"}), json!({"stage":"paused"}), json!({"stage":"interrupt"}),
+            json!({"message":""}), json!({"message":"\n"}), json!({"message":"x".repeat(1025)}),
+            json!({"requestId":"spoof"}), json!({"taskId":"spoof"}), json!({"confirmed":true})] {
+            let mut value = stage("runtime", "ssh");
+            for (key, val) in change.as_object().unwrap() { value[key] = val.clone(); }
+            p.script_stage(&format!("{TASK_STAGE_PREFIX}{value}"));
+        }
+        for line in ["QUANTNIGHT_TASK_STAGE {broken}".to_string(),
+            format!(" {}{}", TASK_STAGE_PREFIX, stage("runtime", "ssh")),
+            format!("{}{}", TASK_STAGE_PREFIX, "x".repeat(4097)),
+            "QUANTNIGHT_PAUSE_CONFIRMED {\"confirmed\":true}".into(),
+            format!("{TASK_STAGE_PREFIX}{{\"operation\":\"runtime\",\"operation\":\"stop\"}}"),
+            format!("{TASK_STAGE_PREFIX}{}", "[".repeat(300))] { p.script_stage(&line); }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(serde_json::to_value(&events[0]).unwrap(), json!({"operation":"runtime",
+            "taskId":"0123456789abcdef01234567", "name":"exact__priority", "isRemote":true,
+            "requestId":"request-native-1", "stage":"ssh", "message":"正在核对精确任务的执行步骤"}));
+        drop(events);
+        let (p, events) = progress("stop");
+        for phase in ["config", "ssh", "tmux", "process", "interrupt", "session_exit", "process_exit", "receipt", "complete"] {
+            p.script_stage(&format!("{TASK_STAGE_PREFIX}{}", stage("stop", phase)));
+        }
+        assert_eq!(events.lock().unwrap().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn native_operation_real_runner_reports_stages_and_preserves_legacy_pane() {
+        let pane = "✅ Pane 0 (pid=123) is running: python";
+        let script = shell_line(&stage("runtime", "ssh")) + &shell_line(&stage("runtime", "process"))
+            + &format!("printf '%s\\n' '{pane}'\n");
+        let fake = FakeBash::new(&script);
+        let (p, events) = progress("runtime");
+        let (stdout, stderr) = execute_task_script(&p, &fake.config, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(runtime_process_output(&stdout, &stderr).unwrap(), pane);
+        let events = events.lock().unwrap();
+        assert_eq!(events.iter().map(|e| e.stage.as_str()).collect::<Vec<_>>(),
+            ["config", "launch", "wait", "ssh", "process"]);
+        assert!(events.iter().all(|e| e.task_id == p.task_id && e.request_id == p.request_id && e.is_remote));
+    }
+
+    #[tokio::test]
+    async fn native_nonzero_timeout_keep_last_script_stage_and_stderr() {
+        for (tail, cause, budget) in [
+            ("echo exact-ssh-denied >&2; exit 7", "exact-ssh-denied", Duration::from_secs(2)),
+            ("echo exact-ssh-stall >&2; exec /bin/sleep 30", "exact-ssh-stall", Duration::from_millis(100)),
+        ] {
+            let fake = FakeBash::new(&(shell_line(&stage("runtime", "ssh")) + tail));
+            let (p, events) = progress("runtime");
+            let error = execute_task_script(&p, &fake.config, budget).await.unwrap_err();
+            assert!(error.contains("stage=ssh") && error.contains(cause), "{error}");
+            let events = events.lock().unwrap();
+            assert_eq!(events.last().unwrap().stage, "ssh");
+            assert!(events.last().unwrap().message.contains(cause));
+            assert!(!events.iter().any(|e| ["control_write", "completed"].contains(&e.stage.as_str())));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_configuration_launch_errors_emit_specific_failed_step() {
+        let mut fake = FakeBash::new(":");
+        fake.config.bash.scripts.remove("check_task_status");
+        let (p, events) = progress("runtime");
+        let error = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap_err();
+        assert!(error.contains("stage=config") && error.contains("未找到 check_task_status"));
+        assert_eq!(events.lock().unwrap().last().unwrap().stage, "config");
+        let mut fake = FakeBash::new(":");
+        fake.config.bash.scripts.get_mut("check_task_status").unwrap().command = Some("/not/a/command".into());
+        let error = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap_err();
+        assert!(error.contains("stage=launch") && error.contains("启动命令失败"));
+        assert_eq!(events.lock().unwrap().last().unwrap().stage, "launch");
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_fake_stop_success_never_confirmed() {
+        for source in [":", "echo 'QUANTNIGHT_TASK_STAGE {}'"] {
+            let fake = FakeBash::new(source);
+            let (p, _) = progress("runtime");
+            let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
+            p.stage("receipt_validate", "核验运行时输出");
+            let error = runtime_process_output(&out, &err).map_err(|e| p.failure(e)).unwrap_err();
+            assert!(error.contains("stage=receipt_validate") && error.contains("为空或仅有阶段信息"));
+        }
+        for source in [":", "echo 已暂停", "echo 'QUANTNIGHT_PAUSE_CONFIRMED {broken}'",
+            "echo 'QUANTNIGHT_PAUSE_CONFIRMED {\"schema_version\":1,\"confirmed\":true}'"] {
+            let fake = FakeBash::new(source);
+            let (p, events) = progress("stop");
+            let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
+            let error = validate_stop_output(&p, &out, &err).unwrap_err();
+            assert!(error.contains("stage=receipt_validate"), "{error}");
+            assert!(!events.lock().unwrap().iter().any(|e| e.stage == "control_write"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_receipt_final_and_control_write_builder_retains_cas() {
+        let receipt = stop_receipt();
+        let script = shell_line(&stage("stop", "process_exit")) + &format!("printf '%s\\n' '{receipt}'");
+        let fake = FakeBash::new(&script);
+        let (p, events) = progress("stop");
+        let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
+        validate_stop_output(&p, &out, &err).unwrap();
+        assert_eq!(out.lines().last(), Some(receipt.as_str()));
+        let id = ObjectId::parse_str(&p.task_id).unwrap();
+        let at = bson::DateTime::now();
+        let (filter, update) = pause_control_write(id, &p.name, &doc! {"isRemote":true, "status":"running"}, true, at, StopConfirmationBasis::RunnersExited);
+        assert_eq!(filter.get_object_id("_id").unwrap(), id);
+        assert_eq!(filter.get_str("name").unwrap(), "exact__priority");
+        assert_eq!(filter.get_str("status").unwrap(), "running");
+        assert_eq!(filter.get_bool("isRemote").unwrap(), true);
+        assert_eq!(filter.get_document("updatedAt").unwrap(), &doc! {"$exists":false});
+        assert_eq!(update, doc! {"$set": confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited)});
+        let (null_filter, _) = pause_control_write(id, &p.name, &doc! {"isRemote":bson::Bson::Null}, false, at, StopConfirmationBasis::RunnersExited);
+        assert_eq!(null_filter.get("isRemote"), Some(&bson::Bson::Null));
+        p.stage("control_write", "仅构造原CAS；本测试不连接数据库");
+        let error = p.failure("synthetic write rejected: original host changed");
+        assert!(error.contains("stage=control_write") && error.contains("host changed"));
+        assert_eq!(events.lock().unwrap().last().unwrap().stage, "control_write");
+        assert!(verified_stop_proof(&(out + "\n" + TASK_STAGE_PREFIX + &stage("stop", "complete").to_string()),
+            &p.name, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_missing_request_id_suppresses_only_events_not_operation_or_diagnostics() {
+        for operation in ["runtime", "stop"] {
+            let result_line = if operation == "stop" { stop_receipt() }
+                else { "✅ Pane 0 (pid=123) is running: python".into() };
+            let fake = FakeBash::new(&(shell_line(&stage(operation, "process"))
+                + &format!("printf '%s\\n' '{result_line}'")));
+            let (mut p, events) = progress(operation);
+            p.request_id.clear();
+            p.stage("initial", "legacy调用不发送缺少requestId的事件");
+            let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
+            assert_eq!(p.last.lock().unwrap().0, "process");
+            assert!(p.failure("synthetic diagnostic").contains("stage=process"));
+            if operation == "stop" { validate_stop_output(&p, &out, &err).unwrap(); }
+            else { assert_eq!(runtime_process_output(&out, &err).unwrap(), result_line); }
+            assert!(events.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_binding_rejects_changed_host_identity_and_budgets_fit_ui() {
+        let id = ObjectId::new();
+        let mut task = doc! {"_id":id, "name":"exact__priority", "isRemote":true, "status":"running"};
+        assert_eq!(operation_task_identity(&task, "exact__priority", true).unwrap(), id);
+        assert!(operation_task_identity(&task, "exact__priority", false).unwrap_err().contains("执行目标已经变更"));
+        assert!(operation_task_identity(&task, "exact", true).is_err());
+        task.insert("status", "deactive");
+        assert!(operation_task_identity(&task, "exact__priority", true).is_err());
+        assert!(RUNTIME_BUDGET < Duration::from_secs(15));
+        assert!(PAUSE_SCRIPT_BUDGET > Duration::from_secs(60));
+        assert!(PAUSE_SCRIPT_BUDGET + Duration::from_secs(10) < Duration::from_secs(120));
+    }
+}
+
+#[cfg(test)]
+mod session_absent_v2_tests {
+    use super::*;
+    use crate::config::bash_test_support::FakeBash;
+    use serde_json::json;
+
+    fn progress(operation: &'static str, remote: bool) -> (TaskOperationProgress, Arc<Mutex<Vec<TaskOperationStage>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        (TaskOperationProgress { operation, task_id: "0123456789abcdef01234567".into(),
+            name: "exact__priority".into(), remote, request_id: "session-absent-v2-request".into(),
+            last: Arc::new(Mutex::new(("initial".into(), "请求已接收".into()))),
+            sink: Arc::new(move |event| sink_events.lock().unwrap().push(event)) }, events)
+    }
+    fn stage(operation: &str, remote: bool, phase: &str) -> JsonValue {
+        json!({"operation":operation, "task_name":"exact__priority", "target_remote":remote,
+            "stage":phase, "message":"精确tmux会话不存在；不代表历史孤儿进程退出或平台取消"})
+    }
+    fn proof(version: u32, remote: bool) -> JsonValue {
+        let mut proof = json!({"schema_version":version, "task_name":"exact__priority", "target_remote":remote,
+            "session_absent":true, "runners_exited":true});
+        if version == 2 {
+            proof["runners_exited"] = JsonValue::Null;
+            proof["confirmation_basis"] = json!("session_absent");
+        }
+        proof
+    }
+    fn receipt(proof: &JsonValue) -> String { format!("QUANTNIGHT_PAUSE_CONFIRMED {proof}") }
+    fn print_line(line: &str) -> String {
+        let escaped = line.replace('\'', "'\"'\"'");
+        format!("printf '%s\\n' '{escaped}'\n")
+    }
+
+    #[tokio::test]
+    async fn real_runner_absent_runtime_is_success_and_stage_never_writes_control() {
+        for remote in [false, true] {
+            let legacy = format!("❌ Session 'exact__priority' 不存在 ({})", if remote { "remote" } else { "local" });
+            let script = print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("runtime", remote, "session_absent")))
+                + &print_line(&legacy) + "exit 0\n";
+            let fake = FakeBash::new(&script);
+            let (progress, events) = progress("runtime", remote);
+            let (out, err) = execute_task_script(&progress, &fake.config, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(runtime_process_output(&out, &err).unwrap(), legacy);
+            assert_eq!(dispatch_status_output(&runtime_process_output(&out, &err).unwrap(), None), legacy);
+            assert_eq!(progress.last.lock().unwrap().0, "session_absent");
+            assert!(events.lock().unwrap().iter().any(|event| event.stage == "session_absent"));
+            assert!(!events.lock().unwrap().iter().any(|event| ["control_write", "paused"].contains(&event.stage.as_str())));
+            // Legacy absence output is not itself a structured pause receipt.
+            assert!(verified_stop_proof(&out, &progress.name, remote).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn real_runner_v2_and_v1_preserve_distinct_basis_through_metadata_and_cas_gate() {
+        for remote in [false, true] {
+            for (version, expected) in [(1, StopConfirmationBasis::RunnersExited), (2, StopConfirmationBasis::SessionAbsent)] {
+                let final_line = receipt(&proof(version, remote));
+                let script = print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("stop", remote, if version == 2 { "session_absent" } else { "receipt" })))
+                    + &print_line(&final_line);
+                let fake = FakeBash::new(&script);
+                let (progress, events) = progress("stop", remote);
+                let (out, err) = execute_task_script(&progress, &fake.config, Duration::from_secs(2)).await.unwrap();
+                let basis = validate_stop_output(&progress, &out, &err).unwrap();
+                assert_eq!(basis, expected);
+                assert_eq!(out.lines().last(), Some(final_line.as_str()));
+                assert!(!events.lock().unwrap().iter().any(|e| e.stage == "control_write"));
+                let id = ObjectId::parse_str(&progress.task_id).unwrap();
+                let at = bson::DateTime::now();
+                let original = doc! {"_id":id, "name":&progress.name, "isRemote":remote, "status":"running",
+                    "updatedAt":"original-control-revision", "launchAttemptId":"original-launch"};
+                let (filter, update) = pause_control_write(id, &progress.name, &original, remote, at, basis);
+                assert_eq!(filter.get_str("updatedAt").unwrap(), "original-control-revision");
+                assert_eq!(filter.get_str("launchAttemptId").unwrap(), "original-launch");
+                assert_eq!(filter.get_bool("isRemote").unwrap(), remote);
+                let set = update.get_document("$set").unwrap();
+                assert_eq!(set.get_str("stopConfirmationBasis").unwrap(), basis.as_str());
+                assert!(!set.contains_key("runners_exited") && !set.contains_key("platformCancelled"));
+                let mut persisted = set.clone();
+                persisted.insert("_id", id); persisted.insert("name", &progress.name); persisted.insert("isRemote", remote);
+                let mapped: Task = bson::from_document(persisted).unwrap();
+                assert_eq!(serde_json::to_value(mapped).unwrap()["stopConfirmationBasis"], basis.as_str());
+                progress.stage("control_write", basis.description());
+                let rejected = confirmed_stop_after_write(&progress, id, at, basis, 0).unwrap_err();
+                assert!(rejected.contains("stage=control_write") && rejected.contains("控制版本已变化"));
+                assert!(!events.lock().unwrap().iter().any(|e| e.stage == "completed"));
+                // This is only the pure real-command gate, not a fake DB write.
+                let confirmed = confirmed_stop_after_write(&progress, id, at, basis, 1).unwrap();
+                let wire = serde_json::to_value(confirmed).unwrap();
+                assert_eq!(wire["confirmed"], true);
+                assert_eq!(wire["taskId"], id.to_hex());
+                assert_eq!(wire["isRemote"], remote);
+                assert_eq!(wire["confirmationBasis"], basis.as_str());
+                if version == 2 {
+                    assert!(events.lock().unwrap().last().unwrap().message.contains("未核验历史孤儿PID退出或平台取消"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_runner_strict_v2_rejects_forged_missing_wrong_type_duplicate_and_nonfinal_proofs() {
+        let valid = proof(2, true);
+        let mut bad = Vec::new();
+        for change in [json!({"schema_version":true}), json!({"schema_version":2.0}), json!({"schema_version":3}),
+            json!({"task_name":"exact"}), json!({"target_remote":false}), json!({"target_remote":"true"}),
+            json!({"session_absent":false}), json!({"session_absent":"true"}),
+            json!({"runners_exited":true}), json!({"runners_exited":false}), json!({"runners_exited":"null"}),
+            json!({"confirmation_basis":"runners_exited"}), json!({"confirmation_basis":null}),
+            json!({"confirmation_basis":false}), json!({"extra":"forged"})] {
+            let mut invalid = valid.clone();
+            for (key, value) in change.as_object().unwrap() { invalid[key] = value.clone(); }
+            bad.push(receipt(&invalid));
+        }
+        for missing in ["schema_version", "task_name", "target_remote", "session_absent", "runners_exited", "confirmation_basis"] {
+            let mut invalid = valid.clone(); invalid.as_object_mut().unwrap().remove(missing);
+            bad.push(receipt(&invalid));
+        }
+        bad.push(format!("QUANTNIGHT_PAUSE_CONFIRMED {}", valid.to_string().replacen("{", "{\"schema_version\":2,", 1)));
+        bad.push(receipt(&valid) + "\n" + &receipt(&valid));
+        bad.push(receipt(&valid) + "\n" + TASK_STAGE_PREFIX + &stage("stop", true, "complete").to_string());
+        bad.push(format!("{TASK_STAGE_PREFIX}{}", stage("stop", true, "session_absent")));
+        for stdout in bad {
+            let script = stdout.lines().map(print_line).collect::<String>();
+            let fake = FakeBash::new(&script);
+            let (progress, events) = progress("stop", true);
+            let (out, err) = execute_task_script(&progress, &fake.config, Duration::from_secs(2)).await.unwrap();
+            let error = validate_stop_output(&progress, &out, &err).unwrap_err();
+            assert!(error.contains("stage=receipt_validate"), "{stdout}: {error}");
+            assert!(!events.lock().unwrap().iter().any(|e| ["control_write", "completed"].contains(&e.stage.as_str())));
+        }
+        // V1 remains exact: adding the V2 basis or changing true->null is invalid.
+        for change in [json!({"confirmation_basis":"session_absent"}), json!({"confirmation_basis":null}),
+            json!({"runners_exited":null})] {
+            let mut invalid = proof(1, true);
+            for (key, value) in change.as_object().unwrap() { invalid[key] = value.clone(); }
+            assert!(verified_stop_proof(&receipt(&invalid), "exact__priority", true).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn real_runner_progress_cannot_fake_control_write_or_confirmation() {
+        let (progress, events) = progress("runtime", true);
+        let script = print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("runtime", true, "session_absent")))
+            + &print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("runtime", true, "control_write")))
+            + &print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("stop", true, "session_absent")))
+            + &print_line(&receipt(&proof(2, true)))
+            + &print_line("❌ Session 'exact__priority' 不存在 (remote)");
+        let fake = FakeBash::new(&script);
+        let (out, _) = execute_task_script(&progress, &fake.config, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(progress.last.lock().unwrap().0, "session_absent");
+        assert!(!events.lock().unwrap().iter().any(|e| ["control_write", "paused", "completed"].contains(&e.stage.as_str())));
+        assert!(verified_stop_proof(&out, &progress.name, true).is_err());
+    }
+
+    #[test]
+    fn control_cas_retains_original_status_revision_host_launch_and_absent_fields() {
+        let id = ObjectId::new(); let at = bson::DateTime::now();
+        let original = doc! {"status":"running", "isRemote":true, "updatedAt":17_i64,
+            "launchAttemptId":"launch-v1", "generation":{"id":"generation-v1"}, "stopConfirmedAt":bson::Bson::Null};
+        let (filter, set) = pause_control_write(id, "exact__priority", &original, true, at, StopConfirmationBasis::SessionAbsent);
+        for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "generation", "stopConfirmedAt"] {
+            assert_eq!(filter.get(key), original.get(key));
+        }
+        for key in ["startedAt", "stopConfirmationBasis", "stopConfirmedTaskId"] {
+            assert_eq!(filter.get_document(key).unwrap(), &doc! {"$exists":false});
+        }
+        assert_eq!(set.get_document("$set").unwrap().get_datetime("updatedAt").unwrap(), &at);
+        // Legacy records without basis still deserialize instead of inventing it.
+        let task: Task = bson::from_document(doc! {"_id":id, "name":"legacy", "status":"paused"}).unwrap();
+        assert!(serde_json::to_value(task).unwrap()["stopConfirmationBasis"].is_null());
+    }
 }

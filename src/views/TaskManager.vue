@@ -29,7 +29,7 @@
             <PriorityTaskCard
               :task="task"
               :progress="taskProgressMap[task.name]"
-              :task-runtime-status="taskRuntimeStatus[task.name]?.raw"
+              :task-runtime-status="taskRuntimeStatus[task.name]"
               :stop-operation="taskStopOperationMap[task.name]"
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @start="openStartModal(task)"
@@ -108,6 +108,7 @@
 </template>
 
 <script>
+import { TASK_STAGE_MARKER, validRuntimeStage, errorStage } from '../utils/taskDiagnostics.js';
 // Wire metadata is constructed by Native, never by the process script. Reject
 // malformed/duplicated/non-terminal markers without weakening process parsing.
 export const DISPATCH_MAX_AGE = 120000;
@@ -135,21 +136,43 @@ export function validDispatchState(value, target, now) {
 export function normalizeTaskRuntime(target, output, observedAt, error = null) {
   const input = typeof output === 'string' ? output.trim() : '';
   const allLines = input.split(/\r?\n/).filter(Boolean);
-  const markers = allLines.filter(line => line.includes('QUANTNIGHT_DISPATCH_STATE'));
-  const lines = allLines.filter(line => !line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  let stage = null;
+  let detail = null;
+  let stageError = null;
+  // Strip every marker-bearing line, but malformed/foreign diagnostics poison
+  // the process observation. Marker text is NEVER parsed as a Pane or receipt.
+  const processLines = allLines.filter(line => {
+    if (!line.includes('QUANTNIGHT_TASK_STAGE')) return true;
+    try {
+      if (!line.startsWith(TASK_STAGE_MARKER)) throw new Error('阶段 marker 位置无效');
+      const value = JSON.parse(line.slice(TASK_STAGE_MARKER.length));
+      if (!validRuntimeStage(value, target)) throw new Error('阶段任务/主机/operation/格式不匹配');
+      stage = value.stage; detail = value.message;
+    } catch (err) { stageError = `阶段诊断校验失败：${String(err)}`; }
+    return false;
+  });
+  const markers = processLines.filter(line => line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  const lines = processLines.filter(line => !line.includes('QUANTNIGHT_DISPATCH_STATE'));
   let dispatch = null;
-  if (!error && markers.length === 1 && allLines.at(-1) === markers[0] && markers[0].startsWith(DISPATCH_MARKER)) {
+  if (!error && !stageError && markers.length === 1 && processLines.at(-1) === markers[0] && markers[0].startsWith(DISPATCH_MARKER)) {
     try {
       const value = JSON.parse(markers[0].slice(DISPATCH_MARKER.length));
       if (validDispatchState(value, target, observedAt)) dispatch = value;
     } catch { /* Missing/invalid capability is NOT a quota wait. */ }
   }
-  const raw = lines.join('\n'); // Priority cards retain their legacy process-only string.
+  const raw = lines.join('\n');
   const positive = /^✅ Pane \d+ \(pid=[1-9]\d*\) is running: (?:python(?:\d+(?:\.\d+)*)?|uv)$/;
   const negative = /^❌ Pane \d+ \(pid=[1-9]\d*\) is running: (?:bash|sh|zsh|sleep)$/;
-  const recognized = !error && lines.length > 0 && lines.every(line => positive.test(line) || negative.test(line));
-  const state = recognized ? (lines.some(line => positive.test(line)) ? 'running' : 'not_running') : 'unknown';
-  return { ...target, observedAt, state, raw, dispatch, error: error ? String(error) : null };
+  const recognized = !error && !stageError && lines.length > 0 && lines.every(line => positive.test(line) || negative.test(line));
+  const absenceLine = `❌ Session '${target.name}' 不存在 (${target.isRemote ? 'remote' : 'local'})`;
+  // Absence is a normal read-only paused observation, never a DB write or proof
+  // inferred from a progress event. Reject mixed/mismatched/error output.
+  const absent = !error && !stageError && lines.length === 1 && lines[0] === absenceLine;
+  const state = absent ? 'session_absent' : recognized ? (lines.some(line => positive.test(line)) ? 'running' : 'not_running') : 'unknown';
+  return { ...target, observedAt, state, raw, dispatch,
+    stage: errorStage(error) ?? stage, detail,
+    diagnostic: stageError || (lines.length ? '进程输出含未识别行或无效 PID/进程格式。' : '原生检查返回空进程输出。'),
+    error: error ? String(error) : null };
 }
 </script>
 
@@ -160,6 +183,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, syncTaskToRemote, mutateTaskSource } from "../utils/taskProgress.js";
+import { newTaskRequestId, validOperationStage } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
 import { useMessage, useDialog } from "naive-ui";
@@ -209,6 +233,7 @@ const matchesRuntimeTarget = (task, target) => task?.status === 'running' &&
   (task.auth_profile ?? "user1") === target.authProfile;
 const invalidateRuntime = (name) => {
   delete taskRuntimeStatus.value[name];
+  runtimeRequests.get(name)?.cancelTimer?.();
   runtimeRequests.delete(name);
 };
 const pendingStops = new Map();
@@ -241,6 +266,22 @@ const handleTaskProgressError = (error) => {
 };
 const handleTaskProgressRefreshError = (error) => {
   if (!disposed) taskStore.markProgressStale(error);
+};
+
+// Live stages are diagnostics only, strictly scoped to a still-pending request.
+const handleTaskOperationStage = (event) => {
+  if (disposed || !validOperationStage(event)) return false;
+  if (event.operation === 'runtime') {
+    const request = runtimeRequests.get(event.name);
+    if (!request || request.completed || event.requestId !== request.requestId ||
+        event.taskId !== request.target.taskId || event.isRemote !== request.target.isRemote ||
+        !matchesRuntimeTarget(tasks.value.find(task => task.name === event.name), request.target)) return false;
+    taskRuntimeStatus.value[event.name] = { ...taskRuntimeStatus.value[event.name], stage: event.stage, detail: event.message };
+    return true;
+  }
+  const entry = [...pendingStops.values()].find(({ operation }) => operation.requestId === event.requestId);
+  if (!entry || entry.completed) return false;
+  return taskStore.updateTaskStopStage(entry.target, entry.operation, event);
 };
 
 // --- Task Actions (invoking Rust backend) ---
@@ -318,7 +359,8 @@ const pauseTask = async (task) => {
   if (disposed) return false;
   const operation = taskStore.beginTaskStop(target);
   if (!operation) return false; // missing/replaced task or an already pending stop
-  pendingStops.set(operation.generation, { target, operation });
+  const pending = { target, operation, completed: false, failureSource: 'native' };
+  pendingStops.set(operation.generation, pending);
   let receipt;
   let timer;
   try {
@@ -329,20 +371,28 @@ const pauseTask = async (task) => {
       update: async () => {
         try {
           receipt = await Promise.race([
-            invoke("pause_task", { taskName: target.name, taskId: target._id, isRemote: target.isRemote }),
+            invoke("pause_task", { taskName: target.name, taskId: target._id, isRemote: target.isRemote, requestId: operation.requestId }),
             new Promise((_, reject) => {
-              timer = setTimeout(() => reject(new Error("停止确认超时；请核对运行状态，不要盲目重试")), 120000);
+              timer = setTimeout(() => {
+                pending.completed = true;
+                pending.failureSource = 'client_timeout';
+                reject(new Error("停止确认超时（120 秒）；未收到有效最终回执，请核对，不要盲目重试"));
+              }, 120000);
+              pending.cancelTimer = () => clearTimeout(timer);
             }),
           ]);
-        } finally { clearTimeout(timer); }
-        if (!validStopReceipt(target, receipt)) throw new Error("停止回执未确认或身份/执行目标不匹配");
+        } finally { pending.completed = true; clearTimeout(timer); }
+        if (!validStopReceipt(target, receipt)) {
+          pending.failureSource = 'receipt_validation';
+          throw new Error("停止回执未确认或身份/执行目标不匹配");
+        }
       },
       commit: () => { if (!disposed) taskStore.confirmTaskPaused(target, receipt, operation); },
     });
   } catch (error) {
     if (!disposed) {
-      taskStore.markTaskStopUnconfirmed(target, operation, error);
-      message.error("停止状态未确认：" + String(error));
+      taskStore.markTaskStopUnconfirmed(target, operation, error, pending.failureSource);
+      message.error("停止操作失败：" + String(error));
     }
     throw error;
   } finally { pendingStops.delete(operation.generation); }
@@ -376,23 +426,39 @@ const checkTaskStatus = async (task) => {
   const target = runtimeTarget(task); // primitives captured before any await
   if (disposed || !matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target) ||
       runtimeRequests.has(target.name)) return;
-  const request = { target };
+  const request = { target, requestId: newTaskRequestId('runtime'), completed: false };
   runtimeRequests.set(target.name, request);
   // Never leave an old positive badge visible while the next probe hangs.
-  taskRuntimeStatus.value[target.name] = { ...target, observedAt: Date.now(), state: 'checking' };
+  taskRuntimeStatus.value[target.name] = { ...target, observedAt: Date.now(), state: 'checking',
+    stage: 'native_request', detail: '已发起原生消费者检查，等待阶段回报' };
   let timer;
   const ownsRequest = () => !disposed && runtimeRequests.get(target.name) === request &&
     matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target);
   try {
     const status = await Promise.race([
-      invoke("check_task_status", { taskName: target.name, taskId: target.taskId, isRemote: target.isRemote }),
+      invoke("check_task_status", { taskName: target.name, taskId: target.taskId, isRemote: target.isRemote, requestId: request.requestId }),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('消费者状态检查超时')), 15000);
+        timer = setTimeout(() => {
+          request.completed = true;
+          reject(new Error('消费者状态检查超时（15 秒），未收到最终检查结果'));
+        }, 15000);
+        request.cancelTimer = () => clearTimeout(timer);
       }),
     ]);
-    if (ownsRequest()) taskRuntimeStatus.value[target.name] = normalizeTaskRuntime(target, status, Date.now());
+    request.completed = true;
+    if (ownsRequest()) {
+      const result = normalizeTaskRuntime(target, status, Date.now());
+      const last = taskRuntimeStatus.value[target.name];
+      taskRuntimeStatus.value[target.name] = { ...result, stage: result.stage ?? last?.stage, detail: result.detail ?? last?.detail };
+    }
   } catch (err) {
-    if (ownsRequest()) taskRuntimeStatus.value[target.name] = normalizeTaskRuntime(target, null, Date.now(), err);
+    request.completed = true;
+    if (ownsRequest()) {
+      const last = taskRuntimeStatus.value[target.name];
+      const result = normalizeTaskRuntime(target, null, Date.now(), err);
+      taskRuntimeStatus.value[target.name] = { ...result, stage: result.stage ?? last?.stage,
+        detail: result.stage && result.stage !== last?.stage ? '原生桥在该阶段返回错误（完整原因见下文）' : last?.detail };
+    }
   } finally {
     clearTimeout(timer);
     if (runtimeRequests.get(target.name) === request) runtimeRequests.delete(target.name);
@@ -570,8 +636,12 @@ const progressLifecycle = createTaskProgressLifecycle({
 });
 
 let registryUnlisten;
+let operationUnlisten;
 onMounted(async () => {
   try {
+    const stageCleanup = await listen('task-operation-stage', ({ payload }) => handleTaskOperationStage(payload));
+    if (disposed) { stageCleanup(); return; }
+    operationUnlisten = stageCleanup;
     const unlisten = await listen('task-registry-changed', () => {
       if (!disposed) fetchTasks();
     });
@@ -580,6 +650,8 @@ onMounted(async () => {
     await progressLifecycle.start();
     if (!disposed) autoPause.reconcile();
   } catch (error) {
+    operationUnlisten?.();
+    operationUnlisten = undefined;
     registryUnlisten?.();
     registryUnlisten = undefined;
     console.error("启动任务进度监听失败", error);
@@ -589,12 +661,16 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true;
+  operationUnlisten?.();
+  operationUnlisten = undefined;
   registryUnlisten?.();
   registryUnlisten = undefined;
-  for (const { target, operation } of pendingStops.values()) {
-    taskStore.markTaskStopUnconfirmed(target, operation, '页面已离开，停止回执未完成确认');
+  for (const { target, operation, cancelTimer } of pendingStops.values()) {
+    cancelTimer?.();
+    taskStore.markTaskStopUnconfirmed(target, operation, '页面已离开，停止回执未完成确认', 'client_disposed');
   }
   pendingStops.clear();
+  for (const request of runtimeRequests.values()) request.cancelTimer?.();
   runtimeRequests.clear();
   stopRuntimeWatch();
   progressLifecycle.stop();

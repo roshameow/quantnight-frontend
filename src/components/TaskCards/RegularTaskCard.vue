@@ -23,9 +23,11 @@
         </div>
       </div>
     </template>
-    <div v-if="dispatchDetails" style="font-size: 12px; margin-bottom: 4px">
-      <n-text depth="3">{{ dispatchDetails }}</n-text>
-    </div>
+    <details v-if="diagnosticDetails || dispatchDetails" class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
+      <summary style="cursor: pointer">运行 / 停止详情<span v-if="diagnosticStage"> · {{ diagnosticStage }}</span></summary>
+      <div v-if="diagnosticDetails" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ diagnosticDetails }}</div>
+      <div v-if="dispatchDetails" style="overflow-wrap: anywhere"><n-text depth="3">{{ dispatchDetails }}</n-text></div>
+    </details>
     <div v-if="progress">
       <div style="font-size: 12px; margin-bottom: 4px">
         <n-text type="success" title="成功 (普通+插队)">
@@ -43,7 +45,7 @@
     </div>
     <div v-if="progress?.stale" style="font-size: 12px; margin-bottom: 4px">
       <n-text type="warning" :title="progress.lastError || '等待进度统计'">
-        {{ progress.lastError ? '进度刷新失败，保留上次统计并重试' : '进度加载中…' }}
+        {{ progress.lastError ? '进度刷新失败，保留上次统计并重试：' + progress.lastError : '进度加载中…' }}
       </n-text>
     </div>
     <div v-if="task.status === 'running'">
@@ -104,43 +106,15 @@
   </template>
 
 <script>
-export const REGULAR_RUNTIME_MAX_AGE = 600000; // existing manager poll cadence
-export const REGULAR_DISPATCH_MAX_AGE = 120000;
-
-export function regularDispatchState(task, observation, now = Date.now()) {
-  const d = observation?.dispatch;
-  const id = typeof task._id === 'object' ? task._id?.$oid : task._id;
-  if (task.taskType === 'super' || !d || d.schemaVersion !== 1 || d.taskId !== id || d.name !== task.name ||
-      d.isRemote !== (task.isRemote === true) || d.authProfile !== (task.auth_profile ?? 'user1') ||
-      !Number.isSafeInteger(d.heartbeatAt) || d.heartbeatAt > now + 5000 || now - d.heartbeatAt >= REGULAR_DISPATCH_MAX_AGE) return null;
-  return d;
-}
-
-export function regularDisplayStatus(task, observation, stopStatus, now = Date.now()) {
-  if (stopStatus) return stopStatus;
-  if (task.status !== 'running') return task.status;
-  if (!observation) return '运行状态待确认';
-  const id = typeof task._id === 'object' ? task._id?.$oid : task._id;
-  if (typeof id !== 'string' || !id || observation.taskId !== id || observation.name !== task.name ||
-      observation.isRemote !== (task.isRemote === true) ||
-      (observation.authProfile !== undefined && observation.authProfile !== (task.auth_profile ?? 'user1')) ||
-      !Number.isSafeInteger(observation.observedAt) || observation.observedAt > now ||
-      now - observation.observedAt >= REGULAR_RUNTIME_MAX_AGE) return '运行状态未确认';
-  if (observation.state === 'running') {
-    const dispatch = regularDispatchState(task, observation, now);
-    if (dispatch?.submissionState === 'waiting_reconciliation') return '请求结果待核验（派发暂停，消费者存活）';
-    if (dispatch?.submissionState === 'waiting_quota_reset') return '等待配额恢复（派发暂停，消费者存活）';
-    if (dispatch?.submissionState === 'ready') return '消费者存活（可派发）';
-    return task.taskType === 'super' ? 'running' : '消费者存活（派发状态未确认）';
-  }
-  if (observation.state === 'not_running') return '未检测到运行消费者';
-  return '运行状态未确认';
-}
+// Public exports retained for callers/tests; presentation shared with Priority.
+export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR_DISPATCH_MAX_AGE,
+  regularDispatchState, regularDisplayStatus } from '../../utils/taskDiagnostics.js';
 </script>
 
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
-import { taskStopDisplayStatus } from '../../stores/taskStore.js';
+import { RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
+import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 import { isGenerating, canGenerate, generationBusyOrUnknown } from '../../utils/taskGeneration.js';
 
 const props = defineProps({
@@ -174,21 +148,19 @@ const refreshRuntimeExpiry = () => {
   clearTimeout(expiryTimer);
   runtimeNow.value = Date.now();
   const observation = props.taskRuntimeStatus;
-  if (mounted && observation?.state === 'running' && Number.isSafeInteger(observation.observedAt)) {
-    const dispatch = regularDispatchState(props.task, observation, runtimeNow.value);
-    const expiresAt = Math.min(observation.observedAt + REGULAR_RUNTIME_MAX_AGE,
-      dispatch ? dispatch.heartbeatAt + REGULAR_DISPATCH_MAX_AGE : Infinity);
+  if (mounted && observation) {
+    const expiresAt = nextRuntimeExpiry(props.task, observation, runtimeNow.value);
     const remaining = expiresAt - runtimeNow.value;
-    if (remaining > 0 && remaining <= REGULAR_RUNTIME_MAX_AGE) {
-      expiryTimer = setTimeout(refreshRuntimeExpiry, remaining);
-    }
+    if (remaining > 0 && remaining <= RUNTIME_MAX_AGE) expiryTimer = setTimeout(refreshRuntimeExpiry, remaining);
   }
 };
 const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
 onMounted(() => { mounted = true; refreshRuntimeExpiry(); });
 onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(); });
-const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus,
-  taskStopDisplayStatus(props.task, props.stopOperation), runtimeNow.value));
+const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
+const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
+const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
+const diagnosticStage = computed(() => diagnosticDetails.value?.match(/最后到达阶段 \[([a-z_]+)\]/)?.[1] || '');
 const dispatchDetails = computed(() => {
   if (!['请求结果待核验（派发暂停，消费者存活）', '等待配额恢复（派发暂停，消费者存活）', '消费者存活（可派发）'].includes(displayStatus.value)) return '';
   const d = regularDispatchState(props.task, props.taskRuntimeStatus, runtimeNow.value);
@@ -196,13 +168,12 @@ const dispatchDetails = computed(() => {
   const q = d.quota;
   const quota = q?.remaining != null && q?.limit != null
     ? `${q.budgetConfirmed ? '配额快照' : '上次配额（未核验）'}: ${q.remaining}/${q.limit}` : '配额未核验';
-  const reset = Number.isSafeInteger(d.resetAt) ? `重置时间（UTC）: ${new Date(d.resetAt).toISOString()}` : '重置时间未知';
+  const reset = Number.isSafeInteger(d.resetAt) ? `重置时间（UTC）: ${new Date(d.resetAt).toISOString()}` : '快照未提供重置时间';
   return [d.submissionReason, quota, reset].filter(Boolean).join(' · ');
 });
 const getStatusType = (status) =>
-  status === "done" ? "success" : ["running", "stopping", "停止状态未确认", "暂停（运行状态未确认）",
-    "运行状态待确认", "运行状态未确认", "未检测到运行消费者", "请求结果待核验（派发暂停，消费者存活）",
-    "等待配额恢复（派发暂停，消费者存活）", "消费者存活（可派发）", "消费者存活（派发状态未确认）"].includes(status) ? "warning" : "default";
+  ["done", "paused"].includes(status) ? "success" : /失败|超时|不匹配|无效|不符合/.test(status) ? "error"
+    : props.task.status === 'running' || props.stopOperation ? "warning" : "default";
 
 const progressBarStyle = computed(() => {
   const p = props.progress || {};

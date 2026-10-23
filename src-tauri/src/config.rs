@@ -206,103 +206,120 @@ pub fn replace_args(args: &[String], vars: &[(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
+/// Observations are diagnostics only; callers must validate any stdout protocol.
+#[derive(Debug)]
+pub enum BashScriptEvent {
+    Config,
+    Launch,
+    Wait,
+    Stdout(String),
+}
+
+pub type BashScriptObserver = std::sync::Arc<dyn Fn(BashScriptEvent) + Send + Sync>;
+
+/// The original entry point retains its signature and five-minute budget.
 pub async fn run_bash_script(
     script_key: &str,
     vars: &[(&str, &str)],
     is_remote: bool,
     app_config: &AppConfig,
 ) -> Result<(String, String), String> {
-    let script_cfg = app_config
-        .bash
-        .scripts
-        .get(script_key)
-        .ok_or(format!("未找到 {} 脚本配置", script_key))?;
-    let command = script_cfg.command.as_deref().unwrap_or("bash");
-    let script = script_cfg
-        .script
-        .as_ref()
-        .ok_or(format!("{} 缺少 script 字段", script_key))?;
+    run_bash_script_observed(script_key, vars, is_remote, app_config,
+        Duration::from_secs(300), false, None).await
+}
 
-    let mut args = vec![script.clone()];
-
-    args.extend(replace_args(&script_cfg.args, vars));
-    if is_remote {
-        args.push("--remote".to_string());
+// A read-only probe owns a fresh process group containing ONLY its diagnostic
+// shell/SSH descendants. Never enable this for a stop/start/research operation.
+// Drop also covers cancellation while waiting on stdout inherited by a child.
+struct DiagnosticGroup(Option<u32>);
+impl Drop for DiagnosticGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).status();
+        }
     }
+}
 
+/// Same configuration, argv construction, transport and readers as the legacy
+/// entry point. The deadline includes pipe draining, not just child.wait().
+pub async fn run_bash_script_observed(
+    script_key: &str,
+    vars: &[(&str, &str)],
+    is_remote: bool,
+    app_config: &AppConfig,
+    budget: Duration,
+    diagnostic: bool,
+    observer: Option<BashScriptObserver>,
+) -> Result<(String, String), String> {
+    let observe = |event| { if let Some(callback) = &observer { callback(event); } };
+    observe(BashScriptEvent::Config);
+    let script_cfg = app_config.bash.scripts.get(script_key)
+        .ok_or_else(|| format!("未找到 {} 脚本配置", script_key))?;
+    let command = script_cfg.command.as_deref().unwrap_or("bash");
+    let script = script_cfg.script.as_ref()
+        .ok_or_else(|| format!("{} 缺少 script 字段", script_key))?;
+    let mut args = vec![script.clone()];
+    args.extend(replace_args(&script_cfg.args, vars));
+    if is_remote { args.push("--remote".to_string()); }
     let quoted_args: Vec<String> = args.iter().map(|arg| format!("'{}'", arg)).collect();
     println!("Executing Bash command: {} {}", command, quoted_args.join(" "));
 
-    // 启动异步进程并管道 stdout/stderr
-    let mut child = TokioCommand::new(command)
-        .args(&args)
-        .current_dir(&app_config.env.working_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动命令失败：{}", e))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("无法获取 stdout pipe")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("无法获取 stderr pipe")?;
-
+    observe(BashScriptEvent::Launch);
+    let mut command = TokioCommand::new(command);
+    command.args(&args).current_dir(&app_config.env.working_dir)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    if diagnostic { command.process_group(0); }
+    let mut child = command.spawn().map_err(|e| format!("启动命令失败：{}", e))?;
+    let _diagnostic_group = DiagnosticGroup(if diagnostic { child.id() } else { None });
+    let stdout = child.stdout.take().ok_or("无法获取 stdout pipe")?;
+    let stderr = child.stderr.take().ok_or("无法获取 stderr pipe")?;
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
-
-    let (out_accum_tx, mut out_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (err_accum_tx, mut err_accum_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-    let out_task = tokio::spawn(async move {
-        while let Ok(Some(line)) = stdout_reader.next_line().await {
-            println!("[bash stdout] {}", line);
-            let _ = out_accum_tx.send(line);
-        }
-    });
-
-    let err_task = tokio::spawn(async move {
-        while let Ok(Some(line)) = stderr_reader.next_line().await {
-            eprintln!("[bash stderr] {}", line);
-            let _ = err_accum_tx.send(line);
-        }
-    });
-
-    // 等待退出，带超时
-    let status = match timeout(Duration::from_secs(300), child.wait()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("等待子进程失败: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err("Bash 脚本执行超时，已终止".to_string());
-        }
-    };
-
-    let _ = try_join(out_task, err_task).await;
-
-    // 收集输出
     let mut stdout_lines = Vec::new();
-    while let Ok(line) = out_accum_rx.try_recv() {
-        stdout_lines.push(line);
-    }
     let mut stderr_lines = Vec::new();
-    while let Ok(line) = err_accum_rx.try_recv() {
-        stderr_lines.push(line);
-    }
-
-    if !status.success() {
-        return Err(format!(
-            "脚本退出非 0: {:?}\nstderr: {:?}\nstdout: {:?}",
-            status.code(),
-            stderr_lines,
-            stdout_lines
-        ));
-    }
-
-    Ok((stdout_lines.join("\n"), stderr_lines.join("\n")))
+    observe(BashScriptEvent::Wait);
+    // No detached reader tasks/channels: cancellation cannot leave a reader
+    // alive indefinitely, and partial stderr survives timeout/read/wait errors.
+    let execution = timeout(budget, async {
+        tokio::try_join!(
+            async { child.wait().await.map_err(|e| format!("等待子进程失败: {e}")) },
+            async {
+                while let Some(line) = stdout_reader.next_line().await
+                    .map_err(|e| format!("读取 stdout 失败: {e}"))? {
+                    println!("[bash stdout] {}", line);
+                    observe(BashScriptEvent::Stdout(line.clone()));
+                    stdout_lines.push(line);
+                }
+                Ok::<_, String>(())
+            },
+            async {
+                while let Some(line) = stderr_reader.next_line().await
+                    .map_err(|e| format!("读取 stderr 失败: {e}"))? {
+                    eprintln!("[bash stderr] {}", line);
+                    stderr_lines.push(line);
+                }
+                Ok::<_, String>(())
+            }
+        )
+    }).await;
+    let result = match execution {
+        Ok(Ok((status, _, _))) if status.success() =>
+            return Ok((stdout_lines.join("\n"), stderr_lines.join("\n"))),
+        Ok(Ok((status, _, _))) => format!("脚本退出非 0: {:?}", status.code()),
+        Ok(Err(error)) => error,
+        Err(_) => format!("Bash 脚本执行超时（预算 {} ms）；仅清理本次子进程，不自动重试", budget.as_millis()),
+    };
+    // Only this child PID (and for diagnostic=true its private group) is owned.
+    // No task-name lookup, tmux kill, job cancellation or retry is performed.
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_millis(250), child.wait()).await;
+    Err(format!("{result}\nstderr: {:?}\nstdout: {:?}", stderr_lines, stdout_lines))
 }
 
 
@@ -426,4 +443,133 @@ pub async fn run_python_command(
 
     // 返回 stdout（也可以返回 summary.to_string() 依据上层需要）
     Ok(stdout_lines.join("\n"))
+}
+#[cfg(test)]
+pub(crate) mod bash_test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    // Lowest-layer fake only: real TOML loader, argv, bash process, both pipe
+    // readers, wait and deadline remain under the original config owner.
+    pub struct FakeBash {
+        pub config: AppConfig,
+        directory: PathBuf,
+    }
+    impl FakeBash {
+        pub fn new(source: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!("quantnight-native-{}-{}",
+                std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("fake.sh"), source).unwrap();
+            let quoted_dir = serde_json::to_string(directory.to_str().unwrap()).unwrap();
+            let mut toml = format!(r#"
+[env]
+working_dir = {quoted_dir}
+[python.scripts]
+[mongodb]
+local_uri = "mongodb://offline.invalid"
+remote_uri = "mongodb://offline.invalid"
+[mongodb.databases]
+mission = "unused"
+simulation = "unused"
+alpha = "unused"
+"#);
+            for key in ["probe", "check_task_status", "pause_task"] {
+                toml.push_str(&format!(r#"
+[bash.scripts.{key}]
+command = "/bin/bash"
+script = "fake.sh"
+args = ["{{task_name}}"]
+"#));
+            }
+            let path = directory.join("config.toml");
+            std::fs::write(&path, toml).unwrap();
+            Self { config: load_config(&path).unwrap(), directory }
+        }
+    }
+    impl Drop for FakeBash {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.directory); }
+    }
+}
+
+#[cfg(test)]
+mod bash_runner_tests {
+    use super::*;
+    use super::bash_test_support::FakeBash;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn original_entry_point_retains_argv_and_both_streams() {
+        let fake = FakeBash::new("printf '%s\\n' \"$@\"; echo 原stderr >&2");
+        let (out, err) = run_bash_script("probe", &[("task_name", "exact-name")], true, &fake.config).await.unwrap();
+        assert_eq!(out, "exact-name\n--remote");
+        assert_eq!(err, "原stderr");
+    }
+
+    #[tokio::test]
+    async fn real_runner_streams_stdout_before_exit_and_preserves_timeout_stderr() {
+        let fake = FakeBash::new("echo stage-line; echo detailed-timeout-cause >&2; exec /bin/sleep 30");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let observer: BashScriptObserver = Arc::new(move |event| { let _ = tx.send(event); });
+        let config = fake.config.clone();
+        let started = std::time::Instant::now();
+        let run = tokio::spawn(async move { run_bash_script_observed("probe", &[], false,
+            &config, Duration::from_millis(200), true, Some(observer)).await });
+        assert!(matches!(rx.recv().await, Some(BashScriptEvent::Config)));
+        assert!(matches!(rx.recv().await, Some(BashScriptEvent::Launch)));
+        assert!(matches!(rx.recv().await, Some(BashScriptEvent::Wait)));
+        let event = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(event, BashScriptEvent::Stdout(ref line) if line == "stage-line"));
+        assert!(!run.is_finished(), "stdout must be observed while script is still running");
+        let error = run.await.unwrap().unwrap_err();
+        assert!(error.contains("200 ms") && error.contains("detailed-timeout-cause"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn nonzero_empty_and_configuration_launch_errors_keep_actual_causes() {
+        let fake = FakeBash::new("echo partial; echo precise-error >&2; exit 23");
+        let error = run_bash_script("probe", &[], false, &fake.config).await.unwrap_err();
+        assert!(error.contains("23") && error.contains("precise-error") && error.contains("partial"));
+        let fake = FakeBash::new(":");
+        assert_eq!(run_bash_script("probe", &[], false, &fake.config).await.unwrap(), ("".into(), "".into()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let observer: BashScriptObserver = Arc::new(move |event| recorded.lock().unwrap().push(format!("{event:?}")));
+        let error = run_bash_script_observed("absent", &[], false, &fake.config,
+            Duration::from_secs(1), true, Some(observer.clone())).await.unwrap_err();
+        assert!(error.contains("未找到 absent"));
+        assert_eq!(*seen.lock().unwrap(), vec!["Config"]);
+        let mut config = fake.config.clone();
+        config.bash.scripts.get_mut("probe").unwrap().command = Some("/definitely/not/a/command".into());
+        let error = run_bash_script_observed("probe", &[], false, &config,
+            Duration::from_secs(1), true, Some(observer)).await.unwrap_err();
+        assert!(error.contains("启动命令失败"));
+        assert_eq!(*seen.lock().unwrap(), vec!["Config", "Config", "Launch"]);
+        let fake = FakeBash::new("printf '\\377\\n'");
+        let error = run_bash_script("probe", &[], false, &fake.config).await.unwrap_err();
+        assert!(error.contains("读取 stdout 失败"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn total_deadline_includes_inherited_pipes_and_cleans_only_diagnostic_group() {
+        let fake = FakeBash::new("echo pipe-child; /bin/sleep 30 & echo $! > diagnostic-child.pid; echo error-before-parent-exit >&2; exit 0");
+        // An unrelated process must survive even though this diagnostic's
+        // process group (including the child holding the pipe) is cleaned up.
+        let mut unrelated = TokioCommand::new("/bin/sleep").arg("30").kill_on_drop(true).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let result = run_bash_script_observed("probe", &[], false, &fake.config,
+            Duration::from_millis(100), true, None).await.unwrap_err();
+        assert!(result.contains("超时") && result.contains("error-before-parent-exit"), "{result}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(unrelated.try_wait().unwrap().is_none());
+        let pid = std::fs::read_to_string(Path::new(&fake.config.env.working_dir).join("diagnostic-child.pid")).unwrap();
+        let state = std::process::Command::new("/bin/ps").args(["-p", pid.trim(), "-o", "stat="])
+            .output().unwrap();
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(state.trim().is_empty() || state.trim().starts_with('Z'),
+            "diagnostic descendant must be exited, not an orphaned live probe: {state}");
+        unrelated.kill().await.unwrap();
+    }
 }
