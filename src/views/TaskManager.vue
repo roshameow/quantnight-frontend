@@ -108,7 +108,7 @@
 </template>
 
 <script>
-import { TASK_STAGE_MARKER, validRuntimeStage, errorStage } from '../utils/taskDiagnostics.js';
+import { TASK_STAGE_MARKER, validRuntimeStage, errorStage, BUSINESS_DIAGNOSTIC_MARKER, validBusinessDiagnostic } from '../utils/taskDiagnostics.js';
 // Wire metadata is constructed by Native, never by the process script. Reject
 // malformed/duplicated/non-terminal markers without weakening process parsing.
 export const DISPATCH_MAX_AGE = 120000;
@@ -151,10 +151,19 @@ export function normalizeTaskRuntime(target, output, observedAt, error = null) {
     } catch (err) { stageError = `阶段诊断校验失败：${String(err)}`; }
     return false;
   });
-  const markers = processLines.filter(line => line.includes('QUANTNIGHT_DISPATCH_STATE'));
-  const lines = processLines.filter(line => !line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  const businessMarkers = processLines.filter(line => line.includes('QUANTNIGHT_BUSINESS_DIAGNOSTIC'));
+  let businessDiagnostic = null;
+  if (!error && !stageError && businessMarkers.length === 1 && processLines.at(-1) === businessMarkers[0] && businessMarkers[0].startsWith(BUSINESS_DIAGNOSTIC_MARKER)) {
+    try {
+      const value = JSON.parse(businessMarkers[0].slice(BUSINESS_DIAGNOSTIC_MARKER.length));
+      if (validBusinessDiagnostic(value, target, observedAt)) businessDiagnostic = value;
+    } catch { /* Not process/control authority or an exit cause. */ }
+  }
+  const evidenceLines = processLines.filter(line => !line.includes('QUANTNIGHT_BUSINESS_DIAGNOSTIC'));
+  const markers = evidenceLines.filter(line => line.includes('QUANTNIGHT_DISPATCH_STATE'));
+  const lines = evidenceLines.filter(line => !line.includes('QUANTNIGHT_DISPATCH_STATE'));
   let dispatch = null;
-  if (!error && !stageError && markers.length === 1 && processLines.at(-1) === markers[0] && markers[0].startsWith(DISPATCH_MARKER)) {
+  if (!error && !stageError && markers.length === 1 && evidenceLines.at(-1) === markers[0] && markers[0].startsWith(DISPATCH_MARKER)) {
     try {
       const value = JSON.parse(markers[0].slice(DISPATCH_MARKER.length));
       if (validDispatchState(value, target, observedAt)) dispatch = value;
@@ -162,14 +171,14 @@ export function normalizeTaskRuntime(target, output, observedAt, error = null) {
   }
   const raw = lines.join('\n');
   const positive = /^✅ Pane \d+ \(pid=[1-9]\d*\) is running: (?:python(?:\d+(?:\.\d+)*)?|uv)$/;
-  const negative = /^❌ Pane \d+ \(pid=[1-9]\d*\) is running: (?:bash|sh|zsh|sleep)$/;
+  const negative = /^❌ Pane \d+ \(pid=[1-9]\d*\) (?:is running: (?:bash|sh|zsh|sleep)|exited \(retained tmux pane\))$/;
   const recognized = !error && !stageError && lines.length > 0 && lines.every(line => positive.test(line) || negative.test(line));
   const absenceLine = `❌ Session '${target.name}' 不存在 (${target.isRemote ? 'remote' : 'local'})`;
   // Absence is a normal read-only paused observation, never a DB write or proof
   // inferred from a progress event. Reject mixed/mismatched/error output.
   const absent = !error && !stageError && lines.length === 1 && lines[0] === absenceLine;
   const state = absent ? 'session_absent' : recognized ? (lines.some(line => positive.test(line)) ? 'running' : 'not_running') : 'unknown';
-  return { ...target, observedAt, state, raw, dispatch,
+  return { ...target, observedAt, state, raw, dispatch, businessDiagnostic,
     stage: errorStage(error) ?? stage, detail,
     diagnostic: stageError || (lines.length ? '进程输出含未识别行或无效 PID/进程格式。' : '原生检查返回空进程输出。'),
     error: error ? String(error) : null };
@@ -226,11 +235,11 @@ const isPriorityForUpdate = ref(false);
 // Other reactive state
 const taskRuntimeStatus = ref({});
 const runtimeRequests = new Map();
-const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true, authProfile: task.auth_profile ?? "user1" });
+const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true, authProfile: task.auth_profile ?? "user1", launchAttemptId: task.launchAttemptId ?? null });
 const matchesRuntimeTarget = (task, target) => task?.status === 'running' &&
   typeof target.taskId === 'string' && !!target.taskId && getObjectId(task._id) === target.taskId &&
   task.name === target.name && (task.isRemote === true) === target.isRemote &&
-  (task.auth_profile ?? "user1") === target.authProfile;
+  (task.auth_profile ?? "user1") === target.authProfile && (task.launchAttemptId ?? null) === (target.launchAttemptId ?? null);
 const invalidateRuntime = (name) => {
   delete taskRuntimeStatus.value[name];
   runtimeRequests.get(name)?.cancelTimer?.();

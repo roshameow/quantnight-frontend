@@ -904,26 +904,202 @@ fn validated_dispatch_state(cap: &Document, task: &Document, id: ObjectId,
         quota: DispatchQuota { limit, remaining, stop_floor: floor, budget_confirmed: quota.get_bool("budget_confirmed").ok()? }, reset_at })
 }
 
-async fn read_dispatch_state(clients: &MongoClients, task_id: &str, name: &str, remote: bool) -> Option<DispatchState> {
-    let id = ObjectId::parse_str(task_id).ok()?;
-    // One total deadline covers control identity + execution capability. Remote
-    // capability is NEVER read from local Mongo, including on tunnel failure.
-    timeout(Duration::from_secs(2), async {
+// Diagnostic metadata shares the original capability/runtime read. It never
+// changes task state, receipt authority or the supervisor's retry schedule.
+const RUNTIME_HISTORY_MARKER: &str = "QUANTNIGHT_RUNTIME_HISTORY ";
+const BUSINESS_DIAGNOSTIC_MARKER: &str = "QUANTNIGHT_BUSINESS_DIAGNOSTIC ";
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BusinessDiagnostic {
+    schema_version: u8, task_id: String, name: String, is_remote: bool, auth_profile: String,
+    source: String, source_detail: Option<String>, consumer_run_id: String, launch_attempt_id: Option<String>,
+    launch_matched: bool, heartbeat_at: i64, occurred_at: i64,
+    error_class: String, reason: String, phase: String, scope: String,
+    timeout_seconds: Option<f64>, recovery_state: String, next_retry_at: Option<i64>,
+}
+
+fn safe_diagnostic_text(value: &str) -> String {
+    // Remove complete capability URLs (including webhook paths), not only query
+    // strings. Defense in depth even when the original writer already sanitizes.
+    let urls = regex::Regex::new(r#"(?i)[a-z][a-z0-9+.-]*://[^\s<>"']+"#).unwrap();
+    let secrets = regex::Regex::new(r"(?i)\b(authorization|cookie|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^,;]+|\bBearer\s+\S+").unwrap();
+    let text = urls.replace_all(value, "[redacted-uri]");
+    secrets.replace_all(&text, "[redacted-credential]").chars()
+        .map(|c| if c.is_control() { ' ' } else { c }).take(1024).collect()
+}
+
+fn diagnostic_time(doc: &Document, key: &str) -> Option<i64> {
+    match doc.get(key)? {
+        bson::Bson::DateTime(t) => Some(t.timestamp_millis()),
+        bson::Bson::String(s) => {
+            let t = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+            (t.offset().local_minus_utc() == 0).then_some(t.timestamp_millis())
+        },
+        _ => None,
+    }
+}
+
+fn diagnostic_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 100 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+
+fn validated_business_diagnostic(runtime: &Document, task: &Document, id: ObjectId,
+    name: &str, remote: bool, now: i64) -> Option<BusinessDiagnostic> {
+    let profile = task.get_str("auth_profile").ok()?;
+    let kind = task.get_str("taskType").ok()?;
+    if !diagnostic_id(profile) || task.get_object_id("_id").ok()? != id ||
+        task.get_str("name").ok()? != name || task.get_bool("isRemote").ok()? != remote ||
+        task.get_str("status").ok()? == "deactive" || runtime.get_str("auth_profile").ok()? != profile ||
+        runtime.get_str("taskType").ok()? != kind ||
+        runtime.get_str("dist").ok()? != if remote { "remote" } else { "local" } { return None; }
+    if kind == "regular" {
+        if runtime.get_str("_id").ok()? != format!("{profile}:{name}") ||
+            runtime.get_str("task").ok()? != name || runtime.get_str("source_collection").ok()? != name ||
+            runtime.get_str("source_task_id").ok()? != id.to_hex() ||
+            runtime.get_bool("source_remote").ok()? != remote ||
+            runtime.get_str("heartbeat_clock").ok()? != "utc" ||
+            dispatch_integer(runtime, "protocol_version")? < 3 { return None; }
+    } else if kind != "super" { return None; }
+    u32::try_from(dispatch_integer(runtime, "pid")?).ok().filter(|pid| *pid > 1)?;
+    let d = runtime.get_document("runtimeDiagnostic").ok()?;
+    if dispatch_integer(d, "schemaVersion")? != 1 { return None; }
+    let run = runtime.get_str("consumer_run_id").ok()?;
+    if run.len() != 32 || !run.bytes().all(|b| b.is_ascii_hexdigit()) ||
+        d.get_str("consumerRunId").ok()? != run { return None; }
+    let heartbeat = diagnostic_time(runtime, "heartbeatAt")?;
+    let occurred = diagnostic_time(d, "occurredAt")?;
+    if occurred <= 0 || occurred > now || heartbeat < occurred || heartbeat > now + 5000 { return None; }
+    // A newer normal start fences old evidence, even if an old consumer wrote
+    // a recently timestamped heartbeat. Missing legacy launch proof is history.
+    let launch = d.get_str("launchAttemptId").ok().filter(|v| diagnostic_id(v));
+    let task_launch = task.get_str("launchAttemptId").ok();
+    if launch.zip(task_launch).map_or(false, |(a,b)| a != b) { return None; }
+    let mut launch_matched = launch.zip(task_launch).map_or(false, |(a,b)| a == b);
+    if kind == "super" {
+        let binding = task.get_document("startupBinding").ok()?;
+        if binding.get_str("taskId").ok()? != id.to_hex() || binding.get_str("name").ok()? != name ||
+            binding.get_str("auth_profile").ok()? != profile || binding.get_bool("remote").ok()? != remote ||
+            binding.get_str("consumer_run_id").ok()? != run { return None; }
+        launch_matched = launch_matched && binding.get_str("launchAttemptId").ok() == launch;
+        if !launch_matched { return None; }
+    }
+    for key in ["launchAttemptAt", "startedAt"] {
+        if diagnostic_time(task, key).map_or(false, |at| occurred < at) { return None; }
+        if task.contains_key(key) && diagnostic_time(task, key).is_none() { launch_matched = false; }
+    }
+    let class = d.get_str("errorClass").ok()?;
+    let phase = d.get_str("phase").ok()?;
+    let scope = d.get_str("scope").ok()?;
+    if !diagnostic_id(class) || !diagnostic_id(phase) ||
+        !["item", "accepted_receipts", "new_dispatch", "consumer"].contains(&scope) { return None; }
+    let reason = d.get_str("reason").ok()?;
+    let recovery = d.get_str("recoveryState").ok()?;
+    if reason.trim().is_empty() || reason.len() > 8192 || recovery.trim().is_empty() || recovery.len() > 1024 { return None; }
+    let budget = match d.get("timeoutSeconds") {
+        None | Some(bson::Bson::Null) => None,
+        Some(bson::Bson::Double(n)) if n.is_finite() && *n > 0.0 && *n <= 86400.0 => Some(*n),
+        _ => Some(dispatch_integer(d, "timeoutSeconds").filter(|n| *n > 0 && *n <= 86400)? as f64),
+    };
+    let retry = match d.get("nextRetryAt") {
+        None | Some(bson::Bson::Null) => None,
+        _ => Some(diagnostic_time(d, "nextRetryAt")?),
+    };
+    if retry.map_or(false, |t| t < occurred || t > 8_640_000_000_000_000) { return None; }
+    Some(BusinessDiagnostic { schema_version: 1, task_id: id.to_hex(), name: name.into(), is_remote: remote,
+        auth_profile: profile.into(), source: if kind == "super" { "simulatorRuntime" } else { "priority_capability" }.into(),
+        source_detail: None, consumer_run_id: run.into(), launch_attempt_id: launch.map(str::to_owned), launch_matched,
+        heartbeat_at: heartbeat, occurred_at: occurred, error_class: class.into(), reason: safe_diagnostic_text(reason),
+        phase: phase.into(), scope: scope.into(), timeout_seconds: budget, recovery_state: safe_diagnostic_text(recovery), next_retry_at: retry })
+}
+
+fn validated_history_diagnostic(stdout: &str, task: &Document, id: ObjectId,
+    name: &str, remote: bool, now: i64) -> Option<BusinessDiagnostic> {
+    // Only the trusted original checker emits this envelope; captured pane text
+    // itself is never relayed as a status/identity marker. History is not proof
+    // of a task exit cause and never becomes a current dispatch/recovery state.
+    let markers: Vec<_> = stdout.lines().filter(|l| l.contains("QUANTNIGHT_RUNTIME_HISTORY")).collect();
+    if markers.len() != 1 || !markers[0].starts_with(RUNTIME_HISTORY_MARKER) || markers[0].len() > 8192 { return None; }
+    let raw: JsonValue = serde_json::from_str(markers[0].strip_prefix(RUNTIME_HISTORY_MARKER)?).ok()?;
+    let d = raw.as_object()?;
+    if d.len() != 10 || d.get("schemaVersion")?.as_u64()? != 1 || d.get("name")?.as_str()? != name ||
+        d.get("isRemote")?.as_bool()? != remote || operation_task_identity(task, name, remote).ok()? != id { return None; }
+    let process = runtime_process_output(stdout, "").ok()?;
+    let negative = regex::Regex::new(r"^❌ Pane [0-9]+ \(pid=[1-9][0-9]*\) (is running: (bash|sh|zsh|sleep)|exited \(retained tmux pane\))$").ok()?;
+    if process.lines().count() != 1 || !negative.is_match(process.trim()) { return None; }
+    let sid = d.get("sessionId")?.as_str()?;
+    if !regex::Regex::new(r"^\$[0-9]+$").ok()?.is_match(sid) { return None; }
+    let created = d.get("sessionCreatedAt")?.as_i64()?;
+    let occurred = d.get("occurredAt")?.as_i64()?;
+    if created <= 0 || occurred < created || occurred > now { return None; }
+    // A retained pane from before task creation/start cannot supply this task's
+    // history. Legacy launches with no timestamp remain explicitly unconfirmed.
+    for key in ["createdAt", "startedAt", "launchAttemptAt"] {
+        if diagnostic_time(task, key).map_or(false, |at| created + 1000 < at || occurred < at) { return None; }
+    }
+    let class = d.get("errorClass")?.as_str()?;
+    let phase = d.get("phase")?.as_str()?;
+    let reason = d.get("reason")?.as_str()?;
+    if !class.starts_with("simulation_") || !diagnostic_id(class) ||
+        !["simulation_recovery_phase", "startup_recovery"].contains(&phase) || reason.trim().is_empty() || reason.len() > 4096 { return None; }
+    let budget = if d.get("timeoutSeconds")?.is_null() { None } else {
+        Some(d.get("timeoutSeconds")?.as_i64().filter(|v| *v > 0 && *v <= 86400)?)
+    };
+    Some(BusinessDiagnostic { schema_version: 1, task_id: id.to_hex(), name: name.into(), is_remote: remote,
+        auth_profile: task.get_str("auth_profile").ok()?.into(), source: "tmux_log".into(),
+        source_detail: Some(format!("exact session {sid}; createdAt={created}; bounded fixed logger record; launch unconfirmed")),
+        consumer_run_id: "unavailable".into(), launch_attempt_id: None, launch_matched: false,
+        heartbeat_at: occurred, occurred_at: occurred, error_class: class.into(), reason: safe_diagnostic_text(reason),
+        phase: phase.into(), scope: "accepted_receipts".into(), timeout_seconds: budget.map(|n| n as f64),
+        recovery_state: "历史启动恢复错误；当前恢复状态与退出因果未核验".into(), next_retry_at: None })
+}
+
+async fn read_runtime_evidence(clients: &MongoClients, task_id: &str, name: &str, remote: bool)
+    -> (Option<DispatchState>, Option<BusinessDiagnostic>) {
+    let read = async {
+        let id = ObjectId::parse_str(task_id).ok()?;
         let filter = doc! { "_id": id, "name": name, "status": { "$ne": "deactive" } };
         let local = clients.local.database("simulation_mission").collection::<Document>("tasks");
         let task = match local.find_one(filter.clone(), None).await.ok()? {
             Some(task) => task,
             None if remote => clients.remote.database("simulation_mission").collection::<Document>("tasks")
-                .find_one(filter, None).await.ok()??,
+                .find_one(filter.clone(), None).await.ok()??,
             None => return None,
         };
         let profile = task.get_str("auth_profile").ok()?;
+        if task.get_bool("isRemote").ok()? != remote { return None; }
         let client = if remote { &clients.remote } else { &clients.local };
-        let cap = client.database("simulation_mission").collection::<Document>("priority_consumer_capabilities")
-            .find_one(doc! { "_id": format!("{profile}:{name}"), "source_task_id": id.to_hex(), "source_remote": remote }, None)
-            .await.ok()??;
-        validated_dispatch_state(&cap, &task, id, name, remote, bson::DateTime::now().timestamp_millis())
-    }).await.ok().flatten()
+        let runtime = if task.get_str("taskType").ok()? == "super" {
+            let execution = if remote { client.database("simulation_mission").collection::<Document>("tasks")
+                .find_one(filter, None).await.ok()?? } else { task.clone() };
+            // Execution-side proof must be exactly the original control launch.
+            for key in ["auth_profile", "isRemote", "startupBinding", "launchAttemptId"] {
+                if execution.get(key) != task.get(key) { return None; }
+            }
+            execution.get_document("simulatorRuntime").ok()?.clone()
+        } else {
+            client.database("simulation_mission").collection::<Document>("priority_consumer_capabilities")
+                .find_one(doc! { "_id": format!("{profile}:{name}"), "source_task_id": id.to_hex(), "source_remote": remote }, None)
+                .await.ok()??
+        };
+        let now = bson::DateTime::now().timestamp_millis();
+        Some((validated_dispatch_state(&runtime, &task, id, name, remote, now),
+            validated_business_diagnostic(&runtime, &task, id, name, remote, now)))
+    };
+    timeout(Duration::from_secs(2), read).await.ok().flatten().unwrap_or((None, None))
+}
+
+#[cfg(test)]
+async fn read_dispatch_state(clients: &MongoClients, task_id: &str, name: &str, remote: bool) -> Option<DispatchState> {
+    read_runtime_evidence(clients, task_id, name, remote).await.0
+}
+
+fn business_diagnostic_output(stdout: &str, diagnostic: Option<BusinessDiagnostic>) -> String {
+    let mut raw = stdout.lines().filter(|line| !line.contains("QUANTNIGHT_BUSINESS_DIAGNOSTIC"))
+        .collect::<Vec<_>>().join("\n");
+    if let Some(diagnostic) = diagnostic {
+        if let Ok(json) = serde_json::to_string(&diagnostic) { raw.push_str(&format!("\n{BUSINESS_DIAGNOSTIC_MARKER}{json}")); }
+    }
+    raw
 }
 
 fn dispatch_status_output(stdout: &str, dispatch: Option<DispatchState>) -> String {
@@ -993,18 +1169,19 @@ impl TaskOperationProgress {
         // Serialize updates and emission, so no stale callback can overtake a
         // receipt/control-write phase. stdout cannot supply native identity.
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        *last = (stage.into(), message.into());
+        let message = safe_diagnostic_text(message);
+        *last = (stage.into(), message.clone());
         // Legacy callers have no correlation token. Keep internal diagnostics
         // and business behavior, but do not emit an unrouteable UI event.
         if self.request_id.is_empty() { return; }
         (self.sink)(TaskOperationStage { operation: self.operation.into(), task_id: self.task_id.clone(),
             name: self.name.clone(), is_remote: self.remote, request_id: self.request_id.clone(),
-            stage: stage.into(), message: message.into() });
+            stage: stage.into(), message });
     }
 
     fn failure(&self, cause: impl std::fmt::Display) -> String {
         let (stage, message) = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let error = format!("{} stage={}（{}）：{}", self.operation, stage, message, cause);
+        let error = safe_diagnostic_text(&format!("{} stage={}（{}）：{}", self.operation, stage, message, cause));
         // Keep the actual failed step, never collapse it into generic unknown.
         self.stage(&stage, &error);
         error
@@ -1081,12 +1258,13 @@ async fn operation_task(clients: &MongoClients, task_id: Option<&str>, name: &st
 // Keep legacy pane text intact while removing diagnostic protocol lines before
 // the existing strict process/dispatch parser sees the response.
 fn runtime_process_output(stdout: &str, stderr: &str) -> Result<String, String> {
-    let stdout = stdout.lines().filter(|line| !line.starts_with(TASK_STAGE_PREFIX))
+    let stdout = stdout.lines().filter(|line| !line.starts_with(TASK_STAGE_PREFIX) && !line.contains("QUANTNIGHT_RUNTIME_HISTORY"))
         .collect::<Vec<_>>().join("\n");
     if stdout.trim().is_empty() {
         return Err(format!("运行时脚本未返回 Pane 检查结果（stdout 为空或仅有阶段信息）；stderr: {stderr}"));
     }
-    Ok(if stderr.trim().is_empty() { stdout } else { format!("{stdout}\n{stderr}") })
+    Ok((if stderr.trim().is_empty() { stdout } else { format!("{stdout}\n{stderr}") })
+        .lines().map(safe_diagnostic_text).collect::<Vec<_>>().join("\n"))
 }
 
 #[command]
@@ -1120,9 +1298,12 @@ pub async fn check_task_status(
         let process_output = runtime_process_output(&stdout, &stderr).map_err(|e| progress.failure(e))?;
         progress.stage("dispatch_read", "有界读取实际执行库的派发证据");
         let remaining = RUNTIME_BUDGET.saturating_sub(started.elapsed());
-        let dispatch = timeout(remaining, read_dispatch_state(&clients, &id.to_hex(), &task_name, is_remote))
-            .await.unwrap_or(None);
-        let output = dispatch_status_output(&process_output, dispatch);
+        let (dispatch, diagnostic) = timeout(remaining, read_runtime_evidence(&clients, &id.to_hex(), &task_name, is_remote))
+            .await.unwrap_or((None, None));
+        let diagnostic = diagnostic.or_else(|| if stderr.trim().is_empty() {
+            validated_history_diagnostic(&stdout, &task, id, &task_name, is_remote, bson::DateTime::now().timestamp_millis())
+        } else { None });
+        let output = business_diagnostic_output(&dispatch_status_output(&process_output, dispatch), diagnostic);
         progress.stage("completed", "运行时检查已返回；状态仍由原 Pane/原生派发证据解析");
         Ok(output)
     }).await.map_err(|_| progress.failure("运行检查总预算12秒耗尽（包含身份查询、脚本stdout/stderr、退出与派发证据）"))?
@@ -2512,5 +2693,137 @@ mod session_absent_v2_tests {
         // Legacy records without basis still deserialize instead of inventing it.
         let task: Task = bson::from_document(doc! {"_id":id, "name":"legacy", "status":"paused"}).unwrap();
         assert!(serde_json::to_value(task).unwrap()["stopConfirmationBasis"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod business_diagnostics_tests {
+    use super::*;
+    use crate::config::bash_test_support::FakeBash;
+    const NOW: i64 = 1_790_000_000_000;
+    fn fixture() -> (ObjectId, Document, Document) {
+        let id = ObjectId::parse_str("0123456789abcdef01234567").unwrap();
+        let task = doc! {"_id":id,"name":"fixture","isRemote":false,"taskType":"regular","status":"running","auth_profile":"user1", "launchAttemptId":"launch1"};
+        let runtime = doc! {"_id":"user1:fixture","task":"fixture","source_collection":"fixture", "source_task_id":id.to_hex(),
+            "source_remote":false,"auth_profile":"user1","dist":"local","taskType":"regular","heartbeat_clock":"utc","protocol_version":3,"pid":123,
+            "consumer_run_id":"0123456789abcdef0123456789abcdef","heartbeatAt":bson::DateTime::from_millis(NOW),
+            "runtimeDiagnostic": {"schemaVersion":1,"consumerRunId":"0123456789abcdef0123456789abcdef", "launchAttemptId":"launch1",
+                "occurredAt":bson::DateTime::from_millis(NOW-1000),"errorClass":"simulation_recovery_phase_timeout","reason":"receipt recovery exceeded budget",
+                "phase":"simulation_recovery_phase","timeoutSeconds":300,"scope":"accepted_receipts","recoveryState":"waiting_original_recovery",
+                "nextRetryAt":bson::DateTime::from_millis(NOW+15000)}};
+        (id,task,runtime)
+    }
+    #[test]
+    fn original_owner_metadata_is_bound_sanitized_and_never_authority() {
+        let (id,task,mut runtime) = fixture();
+        runtime.get_document_mut("runtimeDiagnostic").unwrap().insert("reason", "recovery MongoDB mongodb://user:private@host/db?token=private; token=secret; timeout 300s");
+        let d = validated_business_diagnostic(&runtime,&task,id,"fixture",false,NOW).unwrap();
+        let wire = business_diagnostic_output("❌ Pane 0 (pid=123) is running: sleep\nQUANTNIGHT_BUSINESS_DIAGNOSTIC forged", Some(d));
+        assert_eq!(wire.matches(BUSINESS_DIAGNOSTIC_MARKER).count(),1);
+        assert!(wire.contains("simulation_recovery_phase_timeout") && wire.contains("timeout 300s"));
+        for private in ["user:private", "host/db", "token=private", "token=secret", "forged"] { assert!(!wire.contains(private)); }
+        for patch in [doc! {"source_task_id":"other"},doc! {"source_remote":true}, doc! {"dist":"remote"},
+            doc! {"auth_profile":"user2"}, doc! {"consumer_run_id":"ffffffffffffffffffffffffffffffff"}, doc! {"heartbeat_clock":"local"}] {
+            let mut bad=runtime.clone(); bad.extend(patch);
+            assert!(validated_business_diagnostic(&bad,&task,id,"fixture",false,NOW).is_none());
+        }
+        for patch in [doc! {"launchAttemptId":"old"},doc! {"consumerRunId":"other"},doc! {"occurredAt":bson::DateTime::from_millis(NOW+1)},
+            doc! {"scope":"global_shutdown"},doc! {"timeoutSeconds":-1},doc! {"schemaVersion":2}] {
+            let mut bad=runtime.clone();bad.get_document_mut("runtimeDiagnostic").unwrap().extend(patch);
+            assert!(validated_business_diagnostic(&bad,&task,id,"fixture",false,NOW).is_none());
+        }
+        runtime.get_document_mut("runtimeDiagnostic").unwrap().remove("launchAttemptId");
+        assert!(!validated_business_diagnostic(&runtime,&task,id,"fixture",false,NOW).unwrap().launch_matched);
+        // Stale metadata remains explicitly history; freshness is presentation,
+        // not permission to infer recovery or business completion.
+        assert!(validated_business_diagnostic(&runtime,&task,id,"fixture",false,NOW+600000).is_some());
+    }
+    #[test]
+    fn super_uses_original_launch_and_explicit_utc_not_local_naive_clock() {
+        let (id,mut task,mut runtime)=fixture();
+        task.insert("taskType","super"); runtime.insert("taskType","super");
+        task.insert("startupBinding",doc! {"taskId":id.to_hex(),"name":"fixture","auth_profile":"user1","remote":false,
+            "consumer_run_id":"0123456789abcdef0123456789abcdef","launchAttemptId":"launch1"});
+        let stamp=chrono::DateTime::from_timestamp_millis(NOW).unwrap().to_rfc3339();
+        runtime.insert("heartbeatAt",stamp);
+        assert!(validated_business_diagnostic(&runtime,&task,id,"fixture",false,NOW).is_some());
+        for key in ["taskId","name","auth_profile","consumer_run_id","launchAttemptId"] {
+            let mut bad=task.clone();bad.get_document_mut("startupBinding").unwrap().insert(key,"other");
+            assert!(validated_business_diagnostic(&runtime,&bad,id,"fixture",false,NOW).is_none());
+        }
+        runtime.insert("heartbeatAt","2026-09-22T00:00:00");
+        assert!(validated_business_diagnostic(&runtime,&task,id,"fixture",false,NOW).is_none());
+    }
+    #[test]
+    fn history_envelope_cannot_supply_current_state_or_rewrite_identity() {
+        let (id, task,_) = fixture();
+        let record=serde_json::json!({"schemaVersion":1,"name":"fixture","isRemote":false,"sessionId":"$5",
+            "sessionCreatedAt":NOW-300000,"occurredAt":NOW-1000,"errorClass":"simulation_recovery_phase_timeout",
+            "reason":"timeout 300s; original receipts retained","phase":"simulation_recovery_phase","timeoutSeconds":300});
+        let pane="❌ Pane 0 (pid=123) is running: sleep";
+        let wire=format!("{pane}\n{RUNTIME_HISTORY_MARKER}{record}");
+        let d=validated_history_diagnostic(&wire,&task,id,"fixture",false,NOW).unwrap();
+        assert!(!d.launch_matched && d.next_retry_at.is_none());
+        assert_eq!(runtime_process_output(&wire,"").unwrap(),pane);
+        for change in [serde_json::json!({"name":"other"}),serde_json::json!({"isRemote":true}),
+            serde_json::json!({"occurredAt":NOW-400000}),serde_json::json!({"occurredAt":NOW+1}),
+            serde_json::json!({"confirmed":true}),serde_json::json!({"sessionId":"$3147|old"})] {
+            let mut bad=record.clone();bad.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            assert!(validated_history_diagnostic(&format!("{pane}\n{RUNTIME_HISTORY_MARKER}{bad}"),&task,id,"fixture",false,NOW).is_none());
+        }
+        for bad in [wire.replace("❌", "✅"),format!("{wire}\n{RUNTIME_HISTORY_MARKER}{record}"),wire.replace(pane,""),format!("{wire}\nPermission denied")] {
+            assert!(validated_history_diagnostic(&bad,&task,id,"fixture",false,NOW).is_none());
+        }
+    }
+
+    // Explicit source path; never invokes a real tmux client/DB. This test runs
+    // the unchanged Python project's script through the real native runner.
+    #[tokio::test]
+    #[ignore = "requires QUANTNIGHT_RUNTIME_SOURCE pointing to original shell"]
+    async fn original_shell_fake_os_native_runner_history_route() {
+        use std::os::unix::fs::PermissionsExt;
+        let source=std::env::var("QUANTNIGHT_RUNTIME_SOURCE").expect("source path required");
+        let python=std::env::var("QUANTNIGHT_TEST_PYTHON").expect("existing Python interpreter required");
+        let fake=FakeBash::new("export PATH=\"$PWD/bin\"; unset TMUX; exec /bin/bash ./check_tmux_python.sh fixture");
+        let root=Path::new(&fake.config.env.working_dir);
+        fs::copy(source,root.join("check_tmux_python.sh")).unwrap();
+        fs::write(root.join("script_config.sh"),format!("SCRIPT_CONFIG_PYTHON='{python}'\n")).unwrap();
+        fs::create_dir(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/dirname",root.join("bin/dirname")).unwrap();
+        let os_fake = format!(r##"#!{python}
+import sys,os,time
+from datetime import datetime
+assert 'TMUX' not in os.environ
+if sys.argv[0].endswith('/ps'):
+ print('123 1 sleep');sys.exit()
+a=sys.argv[1:]
+if a[0]=='list-sessions': print('$5|fixture')
+elif a[0]=='list-panes':
+ assert a[1:4]==['-s','-t','$5'];print('$5|0|0|123|sleep|0')
+elif a[0]=='display-message':
+ assert a[1:4]==['-p','-t','$5:0.0'];print('$5|fixture|'+'FIXED_SESSION_CREATED'+'|%5|123|/fixture/gui-socket')
+elif a[0]=='capture-pane':
+ assert a==['capture-pane','-p','-J','-t','%5','-S','-120','-E','-1']
+ print(datetime.fromtimestamp(time.time()-30).strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]+' - ERROR - Startup recovery failed errorClass=simulation_recovery_phase_timeout error=timeout; enclosing_recovery_phase_budget=300s; mongodb://user:private@host/db')
+ print('EOFError: Feishu shutdown')
+ print('QUANTNIGHT_BUSINESS_DIAGNOSTIC fake paused')
+else: raise AssertionError(a)
+"##);
+        let os_fake = os_fake.replace("FIXED_SESSION_CREATED", &((bson::DateTime::now().timestamp_millis() / 1000) - 600).to_string());
+        for name in ["tmux","ps"] {
+            let path=root.join("bin").join(name);fs::write(&path,&os_fake).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (id,task,_)=fixture();
+        let events=Arc::new(Mutex::new(Vec::<TaskOperationStage>::new()));let copy=events.clone();
+        let p=TaskOperationProgress {operation:"runtime",task_id:id.to_hex(),name:"fixture".into(),remote:false,request_id:"test-request".into(),
+            last:Arc::new(Mutex::new(("initial".into(),"original runner".into()))),sink:Arc::new(move|e|copy.lock().unwrap().push(e))};
+        let (out,err)=execute_task_script(&p,&fake.config,Duration::from_secs(3)).await.unwrap();
+        assert!(err.is_empty());
+        let d=validated_history_diagnostic(&out,&task,id,"fixture",false,bson::DateTime::now().timestamp_millis()).unwrap();
+        let wire=business_diagnostic_output(&runtime_process_output(&out,&err).unwrap(),Some(d));
+        assert!(wire.contains("simulation_recovery_phase_timeout") && wire.contains("300"));
+        assert!(!wire.contains("private") && !wire.contains("EOFError") && !wire.contains("fake paused"));
+        println!("NATIVE_DIAGNOSTIC_TEST_WIRE {}", serde_json::json!({"taskId":id.to_hex(),"name":"fixture","isRemote":false,"authProfile":"user1","launchAttemptId":"launch1", "observedAt":bson::DateTime::now().timestamp_millis(),"output":wire}));
+        assert!(events.lock().unwrap().iter().all(|e|e.task_id==id.to_hex() && e.request_id=="test-request"));
     }
 }

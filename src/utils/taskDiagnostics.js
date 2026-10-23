@@ -87,7 +87,7 @@ export function runtimeDiagnostic(task, observation, now = Date.now()) {
   if (observation.state === 'session_absent') return { status: '已暂停（tmux会话缺失）',
     detail: `${context} · 已核验目标主机的精确 tmux 会话缺失。` }
   if (observation.state === 'not_running') return { status: '未检测到运行消费者',
-    detail: `${context} · 进程检查仅识别到 shell/sleep。` }
+    detail: `${context} · 进程检查仅识别到 shell/sleep 或保留的已退出 pane。` }
   if (observation.state === 'running') return { status: '消费者存活', detail: `${context} · 已识别 Python/uv 消费者进程。` }
   return { status: '运行检查输出校验失败', detail: `${context} · ${observation.diagnostic || '检查输出缺少可校验的 Python/uv 或 shell/sleep 进程行。'}${observation.raw ? ` · 原始诊断：${observation.raw}` : ''}` }
 }
@@ -116,7 +116,7 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
 }
 export function taskDiagnosticDetails(task, observation, operation, stopStatus, now = Date.now(), proofIssue = '') {
   const stopped = stopDiagnostic(task, operation, stopStatus, proofIssue)
-  if (stopped) return stopped.detail
+  if (stopped) return [stopped.detail, businessDiagnostic(task, observation, now)?.detail].filter(Boolean).join(' · ')
   if (task.status !== 'running') return ''
   const diagnostic = runtimeDiagnostic(task, observation, now)
   const dispatch = regularDispatchState(task, observation, now)
@@ -124,12 +124,73 @@ export function taskDiagnosticDetails(task, observation, operation, stopStatus, 
     ? (observation.dispatch && now - observation.dispatch.heartbeatAt >= DISPATCH_MAX_AGE
       ? '派发快照已过期（120 秒）。'
       : '缺少身份、主机、账号和时效均有效的派发快照。') : ''
-  return [diagnostic.detail, dispatchReason].filter(Boolean).join(' · ')
+  return [diagnostic.detail, dispatchReason, businessDiagnostic(task, observation, now)?.detail,
+    !observation?.businessDiagnostic && ['not_running', 'session_absent'].includes(observation?.state)
+      ? '缺少可信的历史业务错误；检查完成仅表示进程检查结束，业务完成及平台终态仍需原回执核验。' : ''].filter(Boolean).join(' · ')
 }
 export function nextRuntimeExpiry(task, observation, now) {
   if (!Number.isSafeInteger(observation?.observedAt)) return null
   const times = [observation.observedAt + RUNTIME_MAX_AGE]
   const dispatch = regularDispatchState(task, observation, now)
   if (dispatch) times.push(dispatch.heartbeatAt + DISPATCH_MAX_AGE)
+  if (observation?.businessDiagnostic) times.push(observation.businessDiagnostic.heartbeatAt + DISPATCH_MAX_AGE)
   return Math.min(...times.filter(time => time > now))
+}
+
+
+export const BUSINESS_DIAGNOSTIC_MARKER = 'QUANTNIGHT_BUSINESS_DIAGNOSTIC '
+export function safeDiagnosticText(value) {
+  return String(value ?? '').replace(/[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, '[redacted-uri]')
+    .replace(/\b(?:authorization|cookie|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^,;]+|\bBearer\s+\S+/gi, '[redacted-credential]')
+    .replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 1024)
+}
+export function validBusinessDiagnostic(d, target, now) {
+  const instant = n => Number.isSafeInteger(n) && n > 0 && n <= now
+  return !!d && d.schemaVersion === 1 && d.taskId === target.taskId && d.name === target.name &&
+    d.isRemote === target.isRemote && d.authProfile === target.authProfile &&
+    ['priority_capability', 'simulatorRuntime', 'tmux_log'].includes(d.source) &&
+    (d.source === 'tmux_log' ? d.consumerRunId === 'unavailable' && !d.launchMatched && d.launchAttemptId === null && cleanText(d.sourceDetail, 1024) : /^[a-fA-F0-9]{32}$/.test(d.consumerRunId)) &&
+    (d.launchAttemptId === null || cleanText(d.launchAttemptId, 100)) && typeof d.launchMatched === 'boolean' &&
+    (!d.launchMatched || (d.launchAttemptId !== null && d.launchAttemptId === target.launchAttemptId)) &&
+    (!target.launchAttemptId || !d.launchAttemptId || target.launchAttemptId === d.launchAttemptId) &&
+    instant(d.occurredAt) && Number.isSafeInteger(d.heartbeatAt) && d.heartbeatAt >= d.occurredAt && d.heartbeatAt <= now + 5000 &&
+    stageId(d.errorClass) && stageId(d.phase) && cleanText(d.reason, 1024) &&
+    ['item', 'accepted_receipts', 'new_dispatch', 'consumer'].includes(d.scope) && cleanText(d.recoveryState, 1024) &&
+    (d.timeoutSeconds === null || (Number.isFinite(d.timeoutSeconds) && d.timeoutSeconds > 0 && d.timeoutSeconds <= 86400)) &&
+    (d.nextRetryAt === null || (Number.isSafeInteger(d.nextRetryAt) && d.nextRetryAt >= d.occurredAt && d.nextRetryAt <= 8640000000000000))
+}
+export function businessDiagnostic(task, observation, now = Date.now()) {
+  const target = { taskId: typeof task?._id === 'object' ? task._id?.$oid : task?._id,
+    name: task.name, isRemote: task.isRemote === true, authProfile: task.auth_profile ?? 'user1',
+    launchAttemptId: task.launchAttemptId ?? null }
+  // Keep operation failures separate; they cannot supply business causality.
+  if (!observation || observation.error || !['running', 'not_running', 'session_absent'].includes(observation.state) || observation.taskId !== target.taskId || observation.name !== target.name ||
+      observation.isRemote !== target.isRemote || !Number.isSafeInteger(observation.observedAt) ||
+      observation.observedAt <= 0 || observation.observedAt > now ||
+      !validBusinessDiagnostic(observation.businessDiagnostic, target, now)) return null
+  const d = observation.businessDiagnostic
+  const current = observation.state === 'running' && d.launchMatched && task.status === 'running' &&
+    now - observation.observedAt < RUNTIME_MAX_AGE && now - d.heartbeatAt < DISPATCH_MAX_AGE
+  const label = current && /^(waiting|held|blocked|retry_scheduled|awaiting)/.test(d.recoveryState) ? '当前消费者错误 / 等待原恢复' : current ? '当前启动最近业务错误（恢复状态见详情）' :
+    ['not_running', 'session_absent'].includes(observation.state) ? '最后历史业务错误（未证明退出因果）' :
+      '历史业务错误（当前启动或时效未核验）'
+  return { summary: `${label}：${d.errorClass} · ${safeDiagnosticText(d.reason)}`,
+    detail: [`${label}：${d.errorClass}`, `具体原因：${safeDiagnosticText(d.reason)}`,
+      `发生时间（UTC）：${new Date(d.occurredAt).toISOString()}`, `业务阶段：${d.phase}`,
+      d.timeoutSeconds ? `阶段 timeout 预算：${d.timeoutSeconds} 秒` : '阶段 timeout 预算：原证据未提供',
+      `影响 scope：${d.scope}`, `原恢复状态：${safeDiagnosticText(d.recoveryState)}`,
+      d.nextRetryAt ? `${current && d.nextRetryAt > now ? '原有下次合法重试时间' : '历史重试计划（不是当前重试授权）'}（UTC）：${new Date(d.nextRetryAt).toISOString()}`
+        : '下次合法重试：原证据未提供；诊断不安排重试',
+      `来源：${d.source}${d.sourceDetail ? ` (${safeDiagnosticText(d.sourceDetail)})` : ''} · consumer=${d.consumerRunId} · launch=${d.launchAttemptId ?? '缺失'}`,
+      '进程检查完成不代表业务完成；历史错误不自动证明当前退出原因。'].join(' · ') }
+}
+export function taskDiagnosticSummary(task, observation, now = Date.now()) {
+  const business = businessDiagnostic(task, observation, now)
+  if (business) return business.summary
+  const runtime = runtimeDiagnostic(task, observation, now)
+  if (observation?.error) return `${runtime.status}：${safeDiagnosticText(observation.error)}`
+  const dispatch = regularDispatchState(task, observation, now)
+  if (runtime.status === '消费者存活' && dispatch?.submissionReason) return `派发限制：${safeDiagnosticText(dispatch.submissionReason)}`
+  if (['not_running', 'session_absent'].includes(observation?.state)) return '缺少可归因的历史业务错误证据（不根据末条日志推断退出原因）'
+  return ''
 }

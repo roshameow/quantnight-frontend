@@ -19,7 +19,7 @@
     </template>
 
     <details class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
-      <summary style="cursor: pointer">运行 / 停止详情<span v-if="diagnosticStage"> · {{ diagnosticStage }}</span></summary>
+      <summary style="cursor: pointer">运行 / 停止详情</summary>
       <div style="white-space: pre-wrap; overflow-wrap: anywhere">
         <div>消费者检查：{{ consumerStatus }}</div>
         <div v-if="diagnosticDetails">{{ diagnosticDetails }}</div>
@@ -289,7 +289,6 @@ const refreshRuntimeExpiry = () => {
 const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
 const consumerStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
 const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
-const diagnosticStage = computed(() => diagnosticDetails.value?.match(/最后到达阶段 \[([a-z_]+)\]/)?.[1] || '');
 const researchStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status));
 // A research snapshot cannot mask the current operation's actual process check.
 const hasProcessDiagnostic = computed(() => props.task.status === 'running' && props.taskRuntimeStatus &&

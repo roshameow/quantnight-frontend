@@ -680,3 +680,26 @@ test('control_write followed by client timeout/disposal records missing final re
     } finally { h.stop(); }
   }
 });
+
+test('launch changes fence late native business errors through original request owner and real Pinia watcher', async () => {
+  const h = await harness(regularTask({ launchAttemptId: 'old-launch' }));
+  try {
+    const pending = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.store.replaceTasks([regularTask({ launchAttemptId: 'new-launch' })]);
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+    const now = Date.now();
+    const old = { schemaVersion:1, taskId:'id-a', name:'priority-a', isRemote:true, authProfile:'user1',
+      source:'priority_capability', consumerRunId:'0123456789abcdef0123456789abcdef', launchAttemptId:'old-launch', launchMatched:true,
+      heartbeatAt:now, occurredAt:now-1000, errorClass:'simulation_recovery_phase_timeout', reason:'old launch failed',
+      phase:'simulation_recovery_phase', timeoutSeconds:300, scope:'accepted_receipts', recoveryState:'waiting_original_recovery', nextRetryAt:null };
+    h.probes[0].resolve(`${positivePane}\nQUANTNIGHT_BUSINESS_DIAGNOSTIC ${JSON.stringify(old)}`);
+    await pending;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'], undefined);
+    const next = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[1].resolve(bashPane); await next;
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].launchAttemptId, 'new-launch');
+    assert.equal(h.state.taskRuntimeStatus.value['priority-a'].businessDiagnostic, null);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.ok(h.calls.every(call => call.name === 'check_task_status'));
+  } finally { h.stop(); }
+});

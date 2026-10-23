@@ -91,14 +91,15 @@ test('legacy native optional null basis does not invalidate identity-bound persi
 });
 
 
-for (const file of ['RegularTaskCard', 'PriorityTaskCard']) test(`${file}: diagnosis defaults collapsed, stage summary and complete expandable reason remain`, async () => {
+for (const file of ['RegularTaskCard', 'PriorityTaskCard']) test(`${file}: diagnosis defaults collapsed, short title and complete expandable reason remain`, async () => {
   const observation = { ...target(), observedAt: Date.now(), state: 'unknown', stage: 'ssh',
     detail: '等待原配置 SSH 连接', error: '[ssh] Permission denied：具体连接错误' };
   const html = await card(file, { task: task({ taskType: file === 'PriorityTaskCard' ? 'priority' : 'regular' }), taskRuntimeStatus: observation }, true);
   const match = html.match(/<details\b([^>]*class="operation-diagnostics"[^>]*)>([\s\S]*?)<\/details>/);
   assert.ok(match, 'diagnosis must live in native expandable details');
   assert.doesNotMatch(match[1], /(?:^|\s)open(?:\s|=|$)/, 'must not default open');
-  assert.match(match[2], /<summary[^>]*>[\s\S]*?运行 \/ 停止详情[\s\S]*?ssh[\s\S]*?<\/summary>/);
+  assert.equal(match[2].match(/<summary[^>]*>(.*?)<\/summary>/s)[1], '运行 / 停止详情');
+  assert.match(match[2].slice(match[2].indexOf('</summary>')), /ssh/);
   assert.match(match[2], /Permission denied：具体连接错误/, 'expanded body must preserve original cause');
   assert.match(html.slice(0, html.indexOf('<details')), /运行检查执行失败/, 'status badge stays visible outside collapsed content');
 });

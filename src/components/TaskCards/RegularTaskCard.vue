@@ -24,7 +24,7 @@
       </div>
     </template>
     <details v-if="diagnosticDetails || dispatchDetails" class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
-      <summary style="cursor: pointer">运行 / 停止详情<span v-if="diagnosticStage"> · {{ diagnosticStage }}</span></summary>
+      <summary style="cursor: pointer">运行 / 停止详情</summary>
       <div v-if="diagnosticDetails" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ diagnosticDetails }}</div>
       <div v-if="dispatchDetails" style="overflow-wrap: anywhere"><n-text depth="3">{{ dispatchDetails }}</n-text></div>
     </details>
@@ -160,7 +160,6 @@ onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(
 const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
 const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
 const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
-const diagnosticStage = computed(() => diagnosticDetails.value?.match(/最后到达阶段 \[([a-z_]+)\]/)?.[1] || '');
 const dispatchDetails = computed(() => {
   if (!['请求结果待核验（派发暂停，消费者存活）', '等待配额恢复（派发暂停，消费者存活）', '消费者存活（可派发）'].includes(displayStatus.value)) return '';
   const d = regularDispatchState(props.task, props.taskRuntimeStatus, runtimeNow.value);
