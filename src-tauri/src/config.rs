@@ -255,6 +255,15 @@ pub async fn run_bash_script_observed(
     diagnostic: bool,
     observer: Option<BashScriptObserver>,
 ) -> Result<(String, String), String> {
+    run_bash_script_observed_with_env(script_key, vars, is_remote, app_config, budget,
+        diagnostic, observer, &[]).await
+}
+
+pub(crate) async fn run_bash_script_observed_with_env(
+    script_key: &str, vars: &[(&str, &str)], is_remote: bool, app_config: &AppConfig,
+    budget: Duration, diagnostic: bool, observer: Option<BashScriptObserver>,
+    environment: &[(&str, &str)],
+) -> Result<(String, String), String> {
     let observe = |event| { if let Some(callback) = &observer { callback(event); } };
     observe(BashScriptEvent::Config);
     let script_cfg = app_config.bash.scripts.get(script_key)
@@ -268,10 +277,23 @@ pub async fn run_bash_script_observed(
     let quoted_args: Vec<String> = args.iter().map(|arg| format!("'{}'", arg)).collect();
     println!("Executing Bash command: {} {}", command, quoted_args.join(" "));
 
-    observe(BashScriptEvent::Launch);
     let mut command = TokioCommand::new(command);
     command.args(&args).current_dir(&app_config.env.working_dir)
-        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .envs(environment.iter().copied());
+    run_process_observed(command, budget, diagnostic, observer).await
+}
+
+// Atomic subprocess transport shared by the existing shell runner and local
+// taskctl CLI. No task lifecycle, config resolution or tmux selection here.
+pub(crate) async fn run_process_observed(
+    mut command: TokioCommand,
+    budget: Duration,
+    diagnostic: bool,
+    observer: Option<BashScriptObserver>,
+) -> Result<(String, String), String> {
+    let observe = |event| { if let Some(callback) = &observer { callback(event); } };
+    observe(BashScriptEvent::Launch);
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     if diagnostic { command.process_group(0); }

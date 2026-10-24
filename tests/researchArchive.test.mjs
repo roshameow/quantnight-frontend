@@ -7,10 +7,12 @@ test('existing delete button archives prepared dataset before mutation', () => {
   assert.ok(body.indexOf('archive_prepared_research(') < body.indexOf('.update_one('));
   assert.match(body, /delete_filter/);
   const helper = source.slice(source.indexOf('async fn archive_prepared_research'), source.indexOf('pub async fn delete_task('));
-  for (const part of ['archive-research', '--expected-task-id', '--expected-remote', 'archivePath', 'kill_on_drop(true)', 'Duration::from_secs(90)']) {
+  for (const part of ['archive-research', '--expected-task-id', '--expected-remote', 'archivePath', 'run_taskctl(&root', 'Duration::from_secs(90)']) {
     assert.ok(helper.includes(part), part);
   }
   assert.ok(!helper.includes('.drop('));
+  const transport = source.slice(source.indexOf('async fn run_taskctl('), source.indexOf('async fn start_via_taskctl('));
+  for (const part of ['.venv/bin/python', 'PYTHONPATH', 'kill_on_drop(true)', 'run_process_observed']) assert.ok(transport.includes(part), part);
 });
 
 test('native discovery/archive reuse catalog rather than duplicating sidecar resolution', () => {

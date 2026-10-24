@@ -703,3 +703,46 @@ test('launch changes fence late native business errors through original request 
     assert.ok(h.calls.every(call => call.name === 'check_task_status'));
   } finally { h.stop(); }
 });
+
+
+for (const [handler, native, taskType] of [
+  ['handleStartTask', 'start_task', 'regular'],
+  ['handleStartSuperTask', 'start_super_task', 'super'],
+  ['handlePriorityStartTask', 'start_priority_task', 'priority'],
+]) {
+  test(`actual ${handler} binds captured ID/full config/target; failure is specific and never retries`, async () => {
+    const h = await harness(task({ taskType, status: 'paused' }));
+    try {
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        throw 'taskctl start: wrong taskId/host; stdout=receipt stderr=execution_context_unverified';
+      };
+      const config = { max_concurrent: 3, rounds: { enabled: true }, marker: "space ' quote" };
+      await h.state[handler]({ taskName: 'priority-a', config, isRemote: false });
+      assert.deepEqual(calls, [{ name: native, args: { taskName: 'priority-a', taskId: 'id-a',
+        config: JSON.stringify(config), isRemote: false } }]);
+      assert.equal(h.store.tasks[0].status, 'paused');
+      assert.equal(h.lists.length, 0);
+      assert.match(h.hooks.errors[0][0], /wrong taskId\/host.*stdout=receipt stderr=execution_context_unverified/);
+      h.store.replaceTasks([]);
+      await h.state[handler]({ taskName: 'priority-a', config, isRemote: false });
+      assert.equal(calls.length, 1, 'missing GUI identity must not invoke native');
+      assert.match(h.hooks.errors[1][0], /任务身份缺失/);
+    } finally { h.stop(); }
+  });
+}
+
+test('all native GUI start entrypoints delegate once without a second launch or status writer', async () => {
+  const rust = await readFile(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+  for (const name of ['start_task', 'start_super_task', 'start_priority_task']) {
+    const body = rust.slice(rust.indexOf(`pub async fn ${name}(`)).split('\n}')[0];
+    assert.match(body, /task_id: String/);
+    assert.equal((body.match(/start_via_taskctl\(/g) || []).length, 1);
+    assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
+  }
+  const body = rust.slice(rust.indexOf('async fn start_via_taskctl('), rust.indexOf('pub async fn start_task('));
+  assert.equal((body.match(/run_taskctl\(/g) || []).length, 1);
+  assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
+  for (const arg of ['--expected-task-id', '--no-notify', '--no-remote', '--remote', '--config']) assert.ok(body.includes(arg));
+});

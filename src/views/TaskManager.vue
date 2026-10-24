@@ -523,14 +523,15 @@ const handleStartTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
     invalidateRuntime(taskName);
-    await invoke("start_task", { taskName, config: JSON.stringify(config), isRemote });
+    await invoke("start_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
     fetchTasks();
   } catch (err) {
     console.error("启动任务失败", err);
-    message.error("任务启动失败");
+    message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
   }
 };
 
@@ -538,14 +539,15 @@ const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
     invalidateRuntime(taskName);
-    await invoke("start_super_task", { taskName, config: JSON.stringify(config), isRemote });
+    await invoke("start_super_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("Super 任务启动成功");
     fetchTasks();
   } catch (err) {
     console.error("启动 Super 任务失败", err);
-    message.error("Super 任务启动失败");
+    message.error(`Super 任务启动失败：${err instanceof Error ? err.message : String(err)}`);
   }
 };
 
@@ -553,14 +555,15 @@ const handlePriorityStartTask = async ({ taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
+    if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
     invalidateRuntime(taskName);
-    await invoke("start_priority_task", { taskName, config: JSON.stringify(config), isRemote });
+    await invoke("start_priority_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
     if (!disposed && target) taskStore.clearTaskStop(target);
     message.success("任务启动成功");
     fetchTasks();
   } catch (err) {
     console.error("启动任务失败", err);
-    message.error("任务启动失败");
+    message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
   }
 };
 

@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use toml;
 use dirs::data_dir;
 
-use crate::config::{run_bash_script, run_bash_script_observed, run_python_command, AppConfig,
+use crate::config::{run_bash_script, run_bash_script_observed_with_env, run_process_observed, run_python_command, AppConfig,
     BashScriptEvent, BashScriptObserver};
 use crate::mongo_manager::MongoClients;
 
@@ -492,20 +492,17 @@ async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Resul
     let name = task.get_str("name").map_err(|e| e.to_string())?;
     let id = task.get_object_id("_id").map_err(|e| e.to_string())?.to_hex();
     let remote = if task.get_bool("isRemote").unwrap_or(false) { "true" } else { "false" };
-    let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
-    command.current_dir(&root).env("PYTHONPATH", &root).kill_on_drop(true)
-        .args([".agents/skills/manage-quantnight-frontend/scripts/taskctl.py", "archive-research",
-               "--name", name, "--expected-task-id", &id, "--expected-remote", remote]);
-    let output = timeout(Duration::from_secs(90), command.output()).await
-        .map_err(|_| "研究统计归档超时；任务记录保留".to_string())?
-        .map_err(|e| format!("研究统计归档启动失败；任务记录保留：{e}"))?;
-    let receipt: JsonValue = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "研究统计归档回执 JSON 解析失败；任务记录保留".to_string())?;
-    if !output.status.success() || receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
+    let (stdout, stderr) = run_taskctl(&root,
+        &["archive-research", "--name", name, "--expected-task-id", &id, "--expected-remote", remote],
+        Duration::from_secs(90)).await
+        .map_err(|e| format!("研究统计归档失败；任务记录保留：{e}"))?;
+    let receipt: JsonValue = serde_json::from_str(&stdout)
+        .map_err(|e| format!("研究统计归档回执 JSON 解析失败；任务记录保留：{e}\nstdout: {stdout}\nstderr: {stderr}"))?;
+    if receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
         || receipt.get("command").and_then(|v| v.as_str()) != Some("archive-research")
         || receipt.get("task").and_then(|v| v.as_str()) != Some(name)
         || receipt.get("archivePath").and_then(|v| v.as_str()).map_or(true, str::is_empty) {
-        return Err(format!("研究统计归档失败；任务记录保留：{}", receipt));
+        return Err(format!("研究统计归档失败；任务记录保留：{receipt}\nstdout: {stdout}\nstderr: {stderr}"));
     }
     Ok(())
 }
@@ -596,189 +593,64 @@ pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>,
 }
 
 
+// Same local Python/root/PYTHONPATH transport previously used by archive-research.
+// taskctl owns remote transport, configuration, identity CAS and launch evidence.
+async fn run_taskctl(root: &Path, args: &[&str], budget: Duration) -> Result<(String, String), String> {
+    let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
+    command.current_dir(root).env("PYTHONPATH", root).kill_on_drop(true)
+        .arg(".agents/skills/manage-quantnight-frontend/scripts/taskctl.py").args(args);
+    run_process_observed(command, budget, false, None).await
+}
+
+async fn start_via_taskctl(
+    task_name: &str, config: &str, is_remote: bool, task_id: &str,
+    app_config: &AppConfig, budget: Duration,
+) -> Result<(), String> {
+    ObjectId::parse_str(task_id).map_err(|e| format!("启动任务身份无效：{e}"))?;
+    let value: JsonValue = serde_json::from_str(config)
+        .map_err(|e| format!("启动配置 JSON 无效：{e}"))?;
+    if !value.is_object() { return Err("启动配置必须是 JSON 对象".into()); }
+    let (stdout, stderr) = run_taskctl(Path::new(&app_config.env.working_dir),
+        &["start", "--name", task_name, "--config", config,
+          if is_remote { "--remote" } else { "--no-remote" },
+          "--expected-task-id", task_id, "--no-notify"], budget).await
+        .map_err(|e| format!("taskctl start 未获确认；未重试或写入 running，请核对原任务状态：{e}"))?;
+    let receipt: JsonValue = serde_json::from_str(&stdout)
+        .map_err(|e| format!("taskctl start 回执 JSON 无效；未重试：{e}\nstdout: {stdout}\nstderr: {stderr}"))?;
+    if receipt.get("schemaVersion").and_then(JsonValue::as_u64) != Some(1)
+        || receipt.get("command").and_then(JsonValue::as_str) != Some("start")
+        || receipt.get("task").and_then(JsonValue::as_str) != Some(task_name)
+        || receipt.get("ok").and_then(JsonValue::as_bool) != Some(true)
+        || receipt.get("taskId").and_then(JsonValue::as_str) != Some(task_id)
+        || receipt.get("remote").and_then(JsonValue::as_bool) != Some(is_remote) {
+        return Err(format!("taskctl start 失败或回执任务/执行端不匹配；未重试或写入 running\nstdout: {stdout}\nstderr: {stderr}"));
+    }
+    // Startup confirmation is not task completion or platform acceptance.
+    Ok(())
+}
+
 #[command]
 pub async fn start_task(
-    task_name: String,
-    config: String,
-    is_remote: bool,
-    clients: State<'_, Arc<MongoClients>>,
+    task_name: String, config: String, is_remote: bool, task_id: String,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    let task_doc = tasks
-        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "任务未找到".to_string())?;
-
-    if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err("当前处于候选生成阶段；完成生成核验后可启动回测".into());
-    }
-    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
-    let is_remote_str = if is_remote { "true" } else { "false" };
-
-    let (_, _) = run_bash_script(
-        "start_task",
-        &[
-            ("task_name", &task_name),
-            ("config", &config),
-            ("is_remote", is_remote_str),
-            ("auth_profile", auth_profile),
-        ],
-        is_remote,
-        &app_config,
-    )
-    .await?;
-
-    // 解析 config 并准备写入 mission_config
-    let mut set_doc = doc! { "status": "running" };
-
-    if let Ok(json_val) = from_str::<serde_json::Value>(&config) {
-        if let Ok(bson_val) = bson::to_bson(&json_val) {
-            if let bson::Bson::Document(doc_inner) = bson_val {
-                set_doc.insert("mission_config", doc_inner);
-            }
-        } else {
-            eprintln!("config 转 BSON 失败");
-        }
-    } else {
-        eprintln!("config 解析成 JSON 失败");
-    }
-
-    // 组合更新
-    let update = doc! { "$set": set_doc };
-
-    tasks
-        .update_one(
-            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            update,
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
 }
 
 #[command]
 pub async fn start_super_task(
-    task_name: String,
-    config: String,
-    is_remote: bool,
-    clients: State<'_, Arc<MongoClients>>,
+    task_name: String, config: String, is_remote: bool, task_id: String,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    let task_doc = tasks
-        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "任务未找到".to_string())?;
-
-    if matches!(task_doc.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err("当前处于候选生成阶段；完成生成核验后可启动回测".into());
-    }
-    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
-    let is_remote_str = if is_remote { "true" } else { "false" };
-
-    let (_, _) = run_bash_script(
-        "start_super_task",
-        &[
-            ("task_name", &task_name),
-            ("config", &config),
-            ("is_remote", is_remote_str),
-            ("auth_profile", auth_profile),
-        ],
-        is_remote,
-        &app_config,
-    )
-    .await?;
-
-    // 保存启动配置，供任务卡片展示并发参数。
-    // Super 任务此前只更新 status，导致重新读取任务后没有 mission_config。
-    let mut set_doc = doc! { "status": "running" };
-
-    if let Ok(json_val) = from_str::<serde_json::Value>(&config) {
-        if let Ok(bson_val) = bson::to_bson(&json_val) {
-            if let bson::Bson::Document(doc_inner) = bson_val {
-                set_doc.insert("mission_config", doc_inner);
-            }
-        } else {
-            eprintln!("config 转 BSON 失败");
-        }
-    } else {
-        eprintln!("config 解析成 JSON 失败");
-    }
-
-    tasks
-        .update_one(
-            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            doc! { "$set": set_doc },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
 }
 
 #[command]
 pub async fn start_priority_task(
-    task_name: String,
-    config: String,
-    is_remote: bool,
-    clients: State<'_, Arc<MongoClients>>,
+    task_name: String, config: String, is_remote: bool, task_id: String,
     app_config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let set_doc = priority_config_update(&config, is_remote)?;
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    let task_doc = tasks
-        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "任务未找到".to_string())?;
-
-    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
-    let is_remote_str = if is_remote { "true" } else { "false" };
-
-    // 调用后端脚本启动任务
-    let (_, _) = run_bash_script(
-        "start_priority_task",
-        &[
-            ("task_name", &task_name),
-            ("config", &config),
-            ("is_remote", is_remote_str),
-            ("auth_profile", auth_profile),
-        ],
-        is_remote,
-        &app_config,
-    )
-    .await?;
-
-    // Persist exactly the validated object sent to the runner.
-    // Script success means requested config, not an applied-revision acknowledgement.
-    // 组合更新
-    let update = doc! { "$set": set_doc };
-
-    tasks
-        .update_one(
-            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            update,
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
 }
 
 
@@ -1148,6 +1020,7 @@ struct TaskOperationProgress {
     name: String,
     remote: bool,
     request_id: String,
+    tmux_binding: Option<String>,
     last: Arc<Mutex<(String, String)>>,
     sink: Arc<dyn Fn(TaskOperationStage) + Send + Sync>,
 }
@@ -1156,7 +1029,7 @@ impl TaskOperationProgress {
     fn new(app: AppHandle, operation: &'static str, task_id: Option<&str>, name: &str,
         remote: bool, request_id: Option<String>) -> Self {
         Self { operation, task_id: task_id.unwrap_or_default().into(), name: name.into(), remote,
-            request_id: request_id.unwrap_or_default(),
+            request_id: request_id.unwrap_or_default(), tmux_binding: None,
             last: Arc::new(Mutex::new(("initial".into(), "原生桥已接收请求".into()))),
             sink: Arc::new(move |event| {
                 if let Err(error) = app.emit("task-operation-stage", event) {
@@ -1227,9 +1100,21 @@ async fn execute_task_script(progress: &TaskOperationProgress, config: &AppConfi
         "stop" => ("pause_task", false),
         _ => return Err(progress.failure("原生任务操作类型无效")),
     };
-    run_bash_script_observed(key, &[("task_name", &progress.name)], progress.remote,
-        config, budget, diagnostic, Some(progress.observer())).await
+    // Explicitly replace any inherited binding; never adopt Pi/parent authority.
+    let environment = [("QUANTNIGHT_TMUX_BINDING", progress.tmux_binding.as_deref().unwrap_or("{}"))];
+    run_bash_script_observed_with_env(key, &[("task_name", &progress.name)], progress.remote,
+        config, budget, diagnostic, Some(progress.observer()), &environment).await
         .map_err(|e| progress.failure(e))
+}
+
+// Forward only persisted backend evidence. Backend validates it and selects the
+// sole system tmux. No native resolver or inferred neverStarted/newLaunch flags.
+fn task_script_binding(task: &Document, remote: bool) -> Result<String, String> {
+    let id = task.get_object_id("_id").map_err(|e| e.to_string())?;
+    serde_json::to_string(&doc! { "taskId": id.to_hex(), "remote": remote,
+        "launchAttemptId": task.get("launchAttemptId").cloned().unwrap_or(bson::Bson::Null),
+        "tmuxContext": task.get("tmuxContext").cloned().unwrap_or(bson::Bson::Null) })
+        .map_err(|e| format!("任务执行绑定序列化失败：{e}"))
 }
 
 fn operation_task_identity(task: &Document, name: &str, remote: bool) -> Result<ObjectId, String> {
@@ -1258,7 +1143,8 @@ async fn operation_task(clients: &MongoClients, task_id: Option<&str>, name: &st
 // Keep legacy pane text intact while removing diagnostic protocol lines before
 // the existing strict process/dispatch parser sees the response.
 fn runtime_process_output(stdout: &str, stderr: &str) -> Result<String, String> {
-    let stdout = stdout.lines().filter(|line| !line.starts_with(TASK_STAGE_PREFIX) && !line.contains("QUANTNIGHT_RUNTIME_HISTORY"))
+    let stdout = stdout.lines().filter(|line| !line.starts_with(TASK_STAGE_PREFIX)
+        && !line.starts_with("QUANTNIGHT_TMUX_CONTEXT ") && !line.contains("QUANTNIGHT_RUNTIME_HISTORY"))
         .collect::<Vec<_>>().join("\n");
     if stdout.trim().is_empty() {
         return Err(format!("运行时脚本未返回 Pane 检查结果（stdout 为空或仅有阶段信息）；stderr: {stderr}"));
@@ -1289,6 +1175,7 @@ pub async fn check_task_status(
             .map_err(|e| progress.failure(e))?;
         let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
         progress.task_id = id.to_hex();
+        progress.tmux_binding = Some(task_script_binding(&task, is_remote).map_err(|e| progress.failure(e))?);
         // Reserve two seconds for dispatch evidence and cleanup. This probe must
         // finish before the UI's 15s deadline; it never inherits the generic 300s.
         let budget = RUNTIME_BUDGET.saturating_sub(started.elapsed())
@@ -1682,7 +1569,7 @@ fn pause_control_write(id: ObjectId, name: &str, original: &Document,
     // Preserve the same task/host AND the captured control revision. This uses
     // existing updatedAt/launch/evidence fields, not a new version mechanism.
     for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "launchAttemptAt", "startedAt",
-        "generation", "startupBinding", "stopConfirmedAt", "stopConfirmedRemote",
+        "generation", "startupBinding", "tmuxContext", "stopConfirmedAt", "stopConfirmedRemote",
         "stopConfirmedTaskId", "stopConfirmationBasis"] {
         filter.insert(key, original.get(key).cloned().unwrap_or_else(|| bson::Bson::Document(doc! { "$exists": false })));
     }
@@ -1717,6 +1604,7 @@ pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<Stri
         .map_err(|e| progress.failure(e))?;
     let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
     progress.task_id = id.to_hex();
+    progress.tmux_binding = Some(task_script_binding(&task, is_remote).map_err(|e| progress.failure(e))?);
     if matches!(task.get_str("status").ok(), Some("generating" | "generation_unknown")) {
         return Err(progress.failure("当前处于候选生成阶段；请先核验生成作业"));
     }
@@ -2337,7 +2225,7 @@ mod task_stage_diagnostics_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
         (TaskOperationProgress { operation, task_id: "0123456789abcdef01234567".into(),
-            name: "exact__priority".into(), remote: true, request_id: "request-native-1".into(),
+            name: "exact__priority".into(), remote: true, request_id: "request-native-1".into(), tmux_binding: None,
             last: Arc::new(Mutex::new(("initial".into(), "原生请求".into()))),
             sink: Arc::new(move |event| recorded.lock().unwrap().push(event)) }, events)
     }
@@ -2438,7 +2326,7 @@ mod task_stage_diagnostics_tests {
 
     #[tokio::test]
     async fn empty_runtime_fake_stop_success_never_confirmed() {
-        for source in [":", "echo 'QUANTNIGHT_TASK_STAGE {}'"] {
+        for source in [":", "echo 'QUANTNIGHT_TASK_STAGE {}'", "echo 'QUANTNIGHT_TMUX_CONTEXT {}'"] {
             let fake = FakeBash::new(source);
             let (p, _) = progress("runtime");
             let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
@@ -2529,7 +2417,7 @@ mod session_absent_v2_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink_events = events.clone();
         (TaskOperationProgress { operation, task_id: "0123456789abcdef01234567".into(),
-            name: "exact__priority".into(), remote, request_id: "session-absent-v2-request".into(),
+            name: "exact__priority".into(), remote, request_id: "session-absent-v2-request".into(), tmux_binding: None,
             last: Arc::new(Mutex::new(("initial".into(), "请求已接收".into()))),
             sink: Arc::new(move |event| sink_events.lock().unwrap().push(event)) }, events)
     }
@@ -2776,32 +2664,58 @@ mod business_diagnostics_tests {
         }
     }
 
-    // Explicit source path; never invokes a real tmux client/DB. This test runs
-    // the unchanged Python project's script through the real native runner.
+    // Cross-repo original shell + native transport, with only filesystem/process
+    // IO faked. No real tmux, SSH, DB, platform or service operations.
     #[tokio::test]
     #[ignore = "requires QUANTNIGHT_RUNTIME_SOURCE pointing to original shell"]
     async fn original_shell_fake_os_native_runner_history_route() {
         use std::os::unix::fs::PermissionsExt;
-        let source=std::env::var("QUANTNIGHT_RUNTIME_SOURCE").expect("source path required");
+        let source=PathBuf::from(std::env::var("QUANTNIGHT_RUNTIME_SOURCE").expect("source path required"));
         let python=std::env::var("QUANTNIGHT_TEST_PYTHON").expect("existing Python interpreter required");
-        let fake=FakeBash::new("export PATH=\"$PWD/bin\"; unset TMUX; exec /bin/bash ./check_tmux_python.sh fixture");
-        let root=Path::new(&fake.config.env.working_dir);
-        fs::copy(source,root.join("check_tmux_python.sh")).unwrap();
-        fs::write(root.join("script_config.sh"),format!("SCRIPT_CONFIG_PYTHON='{python}'\n")).unwrap();
+        let polluted="export PATH=\"$PWD/bin:/usr/bin:/bin\"; export TMUX=pi-polluted TMUX_PANE=%999 TMUX_TMPDIR=/pi-polluted; ";
+        let fake=FakeBash::new(&(polluted.to_string()+"exec /bin/bash ./check_tmux_python.sh fixture"));
+        let directory=Path::new(&fake.config.env.working_dir).canonicalize().unwrap();
+        let root=directory.as_path();
+        fs::copy(&source,root.join("check_tmux_python.sh")).unwrap();
+        fs::copy(source.parent().unwrap().join("pause_task.sh"),root.join("pause_task.sh")).unwrap();
+        fs::write(root.join("script_config.sh"),format!("SCRIPT_CONFIG_PYTHON='{python}'\nget_local_workdir() {{ pwd; }}\n")).unwrap();
         fs::create_dir(root.join("bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/dirname",root.join("bin/dirname")).unwrap();
+        fs::create_dir(root.join("native")).unwrap();
+        let native=root.join("native/tmux");
+        // Execute the actual backend resolver; substitute only its host binary
+        // candidates with our executable fixture, never a frontend resolver.
+        let owner=fs::read_to_string(source.parent().unwrap().join("script_config.py")).unwrap();
+        let support=owner.split("# BEGIN NATIVE TMUX SUPPORT\n").nth(1).unwrap()
+            .split("# END NATIVE TMUX SUPPORT").next().unwrap();
+        let mut lines: Vec<String>=support.lines().map(str::to_owned).collect();
+        let candidates=lines.iter_mut().find(|line|line.starts_with("NATIVE_TMUX_CANDIDATES =")).unwrap();
+        *candidates=format!("NATIVE_TMUX_CANDIDATES = ({},)",serde_json::to_string(&native).unwrap());
+        let support=lines.join("\n");
+        fs::write(root.join("script_config.py"),format!("{support}\n\ndef tmux_support_source():\n    return {}\n",serde_json::to_string(&support).unwrap())).unwrap();
         let os_fake = format!(r##"#!{python}
 import sys,os,time
 from datetime import datetime
-assert 'TMUX' not in os.environ
 if sys.argv[0].endswith('/ps'):
  print('123 1 sleep');sys.exit()
+assert not any(k in os.environ for k in ('TMUX','TMUX_PANE','TMUX_TMPDIR'))
 a=sys.argv[1:]
+assert a[:2]==['-L','default'], a
+a=a[2:]
+with open('native-calls','a') as f: f.write(repr(a)+'\n')
+if os.path.exists('absent'):
+ assert a[0]=='list-sessions', a
+ print('no server running on /fixture/default',file=sys.stderr);sys.exit(1)
 if a[0]=='list-sessions': print('$5|fixture')
 elif a[0]=='list-panes':
  assert a[1:4]==['-s','-t','$5'];print('$5|0|0|123|sleep|0')
 elif a[0]=='display-message':
- assert a[1:4]==['-p','-t','$5:0.0'];print('$5|fixture|'+'FIXED_SESSION_CREATED'+'|%5|123|/fixture/gui-socket')
+ assert a[1:3]==['-p','-t'], a
+ if a[3]=='$5':
+  assert a[4]=='#{{session_id}}|#{{session_name}}|#{{session_created}}', a
+  print('$5|fixture|'+'FIXED_SESSION_CREATED')
+ else:
+  assert a[3]=='$5:0.0', a
+  print('$5|fixture|'+'FIXED_SESSION_CREATED'+'|%5|123|/fixture/default')
 elif a[0]=='capture-pane':
  assert a==['capture-pane','-p','-J','-t','%5','-S','-120','-E','-1']
  print(datetime.fromtimestamp(time.time()-30).strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]+' - ERROR - Startup recovery failed errorClass=simulation_recovery_phase_timeout error=timeout; enclosing_recovery_phase_budget=300s; mongodb://user:private@host/db')
@@ -2809,13 +2723,24 @@ elif a[0]=='capture-pane':
  print('QUANTNIGHT_BUSINESS_DIAGNOSTIC fake paused')
 else: raise AssertionError(a)
 "##);
-        let os_fake = os_fake.replace("FIXED_SESSION_CREATED", &((bson::DateTime::now().timestamp_millis() / 1000) - 600).to_string());
-        for name in ["tmux","ps"] {
-            let path=root.join("bin").join(name);fs::write(&path,&os_fake).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o755)).unwrap();
+        let created=(bson::DateTime::now().timestamp_millis()/1000)-600;
+        let os_fake=os_fake.replace("FIXED_SESSION_CREATED", &created.to_string());
+        for path in [&native,&root.join("bin/ps")] {
+            fs::write(path,&os_fake).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let (id,task,_)=fixture();
+        let shim=root.join("bin/tmux");
+        fs::write(&shim,"#!/bin/sh\necho BAD_PI_SHIM >> shim-called; exit 97\n").unwrap();
+        fs::set_permissions(&shim,fs::Permissions::from_mode(0o755)).unwrap();
+        let uv=root.join("bin/uv");
+        fs::write(&uv,format!("#!/bin/sh\n[ \"$1 $2 $3\" = 'run --no-sync python' ] || exit 98\nshift 3\nexec '{python}' \"$@\"\n")).unwrap();
+        fs::set_permissions(&uv,fs::Permissions::from_mode(0o755)).unwrap();
+        let (id,mut task,_)=fixture();
+        task.insert("tmuxContext",doc!{"schemaVersion":1,"backend":"tmux","socketName":"default",
+            "binary":native.to_str().unwrap(),"sessionId":"$5","sessionCreatedAt":created*1000,
+            "taskId":id.to_hex(),"launchAttemptId":"launch1","remote":false});
         let events=Arc::new(Mutex::new(Vec::<TaskOperationStage>::new()));let copy=events.clone();
-        let p=TaskOperationProgress {operation:"runtime",task_id:id.to_hex(),name:"fixture".into(),remote:false,request_id:"test-request".into(),
+        let mut p=TaskOperationProgress {operation:"runtime",task_id:id.to_hex(),name:"fixture".into(),remote:false,request_id:"test-request".into(),
+            tmux_binding:Some(task_script_binding(&task,false).unwrap()),
             last:Arc::new(Mutex::new(("initial".into(),"original runner".into()))),sink:Arc::new(move|e|copy.lock().unwrap().push(e))};
         let (out,err)=execute_task_script(&p,&fake.config,Duration::from_secs(3)).await.unwrap();
         assert!(err.is_empty());
@@ -2823,7 +2748,112 @@ else: raise AssertionError(a)
         let wire=business_diagnostic_output(&runtime_process_output(&out,&err).unwrap(),Some(d));
         assert!(wire.contains("simulation_recovery_phase_timeout") && wire.contains("300"));
         assert!(!wire.contains("private") && !wire.contains("EOFError") && !wire.contains("fake paused"));
-        println!("NATIVE_DIAGNOSTIC_TEST_WIRE {}", serde_json::json!({"taskId":id.to_hex(),"name":"fixture","isRemote":false,"authProfile":"user1","launchAttemptId":"launch1", "observedAt":bson::DateTime::now().timestamp_millis(),"output":wire}));
         assert!(events.lock().unwrap().iter().all(|e|e.task_id==id.to_hex() && e.request_id=="test-request"));
+        // Same persisted binding, real pause bootstrap and original V2 proof.
+        fs::write(root.join("absent"),"").unwrap();
+        fs::write(root.join("fake.sh"),polluted.to_string()+"exec /bin/bash ./pause_task.sh fixture false").unwrap();
+        p.operation="stop";
+        let (out,err)=execute_task_script(&p,&fake.config,Duration::from_secs(5)).await.unwrap();
+        let basis=validate_stop_output(&p,&out,&err).unwrap();
+        assert!(matches!(basis,StopConfirmationBasis::SessionAbsent));
+        let (filter,_)=pause_control_write(id,"fixture",&task,false,bson::DateTime::now(),basis);
+        assert_eq!(filter.get_document("tmuxContext").unwrap(),task.get_document("tmuxContext").unwrap());
+        assert!(!root.join("shim-called").exists(),"Pi PATH shim must never be invoked");
+        assert!(!fs::read_to_string(root.join("native-calls")).unwrap().contains("kill-session"));
+    }
+
+}
+
+#[cfg(all(test, unix))]
+mod taskctl_start_tests {
+    use super::*;
+    use crate::config::bash_test_support::FakeBash;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    const ID: &str = "0123456789abcdef01234567";
+    const CONFIG: &str = r#"{"max_concurrent":3,"rounds":{"enabled":true},"marker":"space ' quote"}"#;
+
+    fn fixture(body: &str) -> FakeBash {
+        let mut f = FakeBash::new(":");
+        f.config.env.working_dir = Path::new(&f.config.env.working_dir).canonicalize().unwrap().to_string_lossy().into_owned();
+        let root = Path::new(&f.config.env.working_dir);
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        let path = root.join(".venv/bin/python");
+        fs::write(&path, format!(r#"#!/bin/sh
+[ "$PYTHONPATH" = "$PWD" ] || exit 94
+[ "$1" = '.agents/skills/manage-quantnight-frontend/scripts/taskctl.py' ] || exit 95
+printf '%s\n' "$@" >> calls
+{body}
+"#)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.join("control.json"), r#"{"status":"paused"}"#).unwrap();
+        f
+    }
+    fn success(remote: bool) -> JsonValue {
+        json!({"schemaVersion":1,"command":"start","task":"fixture","ok":true,"taskId":ID,"remote":remote})
+    }
+    fn output(value: &str) -> String {
+        format!("printf '%s\\n' '{}'", value.replace('\'', "'\\''"))
+    }
+    async fn start(f: &FakeBash, remote: bool, budget: Duration) -> Result<(), String> {
+        start_via_taskctl("fixture", CONFIG, remote, ID, &f.config, budget).await
+    }
+    fn assert_one_start_no_control_write(f: &FakeBash, remote: bool) {
+        let root = Path::new(&f.config.env.working_dir);
+        assert_eq!(fs::read_to_string(root.join("calls")).unwrap(), format!(
+            ".agents/skills/manage-quantnight-frontend/scripts/taskctl.py\nstart\n--name\nfixture\n--config\n{CONFIG}\n{}\n--expected-task-id\n{ID}\n--no-notify\n",
+            if remote {"--remote"} else {"--no-remote"}));
+        assert_eq!(fs::read_to_string(root.join("control.json")).unwrap(), r#"{"status":"paused"}"#);
+    }
+    #[tokio::test]
+    async fn real_local_cli_transport_preserves_full_config_id_host_and_disables_notification() {
+        for remote in [false, true] {
+            let f = fixture(&output(&success(remote).to_string()));
+            start(&f, remote, Duration::from_secs(10)).await.unwrap();
+            assert_one_start_no_control_write(&f, remote);
+        }
+    }
+    #[tokio::test]
+    async fn false_wrong_identity_schema_and_invalid_json_never_retry_or_write_running() {
+        let mut receipts = vec!["not-json".into(), "{}".into()];
+        for change in [json!({"ok":false,"error":"execution_context_unverified: specific-host-error"}),
+            json!({"taskId":"replacement-task"}), json!({"remote":true}), json!({"remote":"false"}),
+            json!({"task":"other"}), json!({"command":"status"}), json!({"schemaVersion":2}),
+            json!({"ok":"true"})] {
+            let mut receipt = success(false);
+            receipt.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            receipts.push(receipt.to_string());
+        }
+        for receipt in receipts {
+            let f = fixture(&(output(&receipt) + "\necho precise-stderr >&2"));
+            let error = start(&f, false, Duration::from_secs(10)).await.unwrap_err();
+            assert!(error.contains(&receipt) && error.contains("precise-stderr"), "{error}");
+            assert_one_start_no_control_write(&f, false);
+        }
+    }
+    #[tokio::test]
+    async fn nonzero_and_timeout_preserve_partial_diagnostics_and_do_not_retry() {
+        for (tail, expected, budget) in [
+            ("exit 17", "17", Duration::from_secs(10)),
+            ("exec /bin/sleep 30", "2000 ms", Duration::from_secs(2)),
+        ] {
+            let f = fixture(&(output(&success(false).to_string()) + "\necho host-binding-failure >&2\n" + tail));
+            let error = start(&f, false, budget).await.unwrap_err();
+            assert!(error.contains(expected) && error.contains("host-binding-failure") && error.contains("stdout"), "{error}");
+            assert_one_start_no_control_write(&f, false);
+        }
+    }
+    #[tokio::test]
+    async fn malformed_id_config_and_missing_python_fail_without_launch() {
+        let f = fixture("exit 99");
+        for (id, config) in [("", CONFIG), (ID, "bad-json"), (ID, "[]")] {
+            assert!(start_via_taskctl("fixture", config, false, id, &f.config, Duration::from_secs(1)).await.is_err());
+        }
+        let root = Path::new(&f.config.env.working_dir);
+        assert!(!root.join("calls").exists());
+        fs::remove_file(root.join(".venv/bin/python")).unwrap();
+        let error = start(&f, false, Duration::from_secs(1)).await.unwrap_err();
+        assert!(error.contains("启动命令失败"), "{error}");
+        assert!(!root.join("calls").exists());
     }
 }
