@@ -931,76 +931,29 @@ async fn partial_control_failures_do_not_report_hidden_and_retain_archives() {
 }
 
 #[tokio::test]
-async fn delete_evidence_matches_original_python_checked_short_circuit() {
+async fn historical_delete_predicate_is_unchanged_but_new_archive_retains_every_oracle_row() {
     let cases: Vec<Value> = serde_json::from_str(CHECKED_ORACLE).unwrap();
     for case in cases.into_iter().filter(|v| v["command"] == "delete") {
-        let row = Bson::try_from(case["row"].clone())
-            .unwrap()
-            .as_document()
-            .unwrap()
-            .clone();
+        let row = Bson::try_from(case["row"].clone()).unwrap().as_document().unwrap().clone();
+        // HISTORICAL oracle remains authoritative for the pure predicate, not
+        // the user-changed archive eligibility contract. Do not rewrite its data.
+        let assessment = quantnight_task_core::lifecycle_policy::checked_unresolved_execution_row(&row);
+        assert_eq!(assessment.clone().unwrap_or(true), case["blocked"].as_bool().unwrap(), "{}", case["label"]);
+        if let Some(error) = case["python_error"].as_str() {
+            assert!(assessment.as_ref().unwrap_err().contains(error), "{}", case["label"]);
+        }
         let root = Root::new();
-        let original = if "delete" == "sync" {
-            let mut source = rows(205);
-            source[204] = row.clone();
-            source
-        } else {
-            rows(2)
-        };
-        let store = MemoryStore::new(
-            if "delete" == "sync" {
-                "ready"
-            } else {
-                "paused"
-            },
-            "delete" == "delete",
-            original.clone(),
-        );
-        if "delete" == "delete" {
-            store.remote(vec![row.clone()]);
-        }
-        let result = if "delete" == "sync" {
-            sync(&store, &Runtime::default(), &root).await
-        } else {
-            delete(&store, &Runtime::default(), &root).await
-        };
-        let blocked = case["blocked"].as_bool().unwrap();
-        assert_eq!(
-            result.exit_code,
-            if blocked { 1 } else { 0 },
-            "original Python case {}: {}",
-            case["label"],
-            result.value
-        );
-        if blocked {
-            assert!(
-                store.0.lock().unwrap().writes.is_empty(),
-                "{}",
-                case["label"]
-            );
-            assert!(!store
-                .calls()
-                .iter()
-                .any(|v| v.starts_with("insert:") || v.starts_with("rename:")));
-            assert_eq!(store.collection(Host::Local, NAME).unwrap(), original);
-            if "delete" == "delete" {
-                assert_eq!(store.collection(Host::Remote, NAME).unwrap(), vec![row]);
-            }
-            if let Some(error) = case["python_error"].as_str() {
-                assert!(
-                    result.value["error"].as_str().unwrap().contains(error),
-                    "{}",
-                    result.value
-                );
-            }
-        } else if "delete" == "sync" {
-            assert_eq!(store.collection(Host::Remote, NAME).unwrap(), original);
-        } else {
-            assert_eq!(
-                store.collection(Host::Remote, &archive()).unwrap(),
-                vec![row]
-            );
-        }
+        let original = rows(2);
+        let store = MemoryStore::new("paused", true, original.clone());
+        store.remote(vec![row.clone()]);
+        let result = delete(&store, &Runtime::default(), &root).await;
+        // NEW archive expectation: neither unresolved nor opaque malformed
+        // receipt metadata blocks a stop-confirmed, identity-bound rename.
+        assert_eq!(result.exit_code, 0, "new archive case {}: {}", case["label"], result.value);
+        assert_eq!(result.value["unresolvedItemCount"], u64::from(assessment.clone().unwrap_or(true)));
+        assert_eq!(result.value["receiptAssessmentUnknownCount"], u64::from(assessment.is_err()));
+        assert_eq!(store.collection(Host::Local, &archive()).unwrap(), original);
+        assert_eq!(bson::to_vec(&store.collection(Host::Remote, &archive()).unwrap()[0]).unwrap(), bson::to_vec(&row).unwrap());
     }
 }
 
@@ -1211,38 +1164,27 @@ async fn claim_reread_cannot_adopt_a_changed_execution_host() {
 }
 
 #[tokio::test]
-async fn retry_revalidates_unknown_archived_evidence_without_clearing_research_summary() {
+async fn retry_classifies_unknown_archived_evidence_without_clearing_research_summary() {
     let root = Root::new();
     let store = MemoryStore::new("paused", true, rows(2));
     store.remote(terminal());
     store.fail("rename:local");
-    error(
-        delete(&store, &Runtime::default(), &root).await,
-        "rename:local",
-    );
+    error(delete(&store, &Runtime::default(), &root).await, "rename:local");
     let previous = root.receipt()["researchArchive"].clone();
-    store
-        .0
-        .lock()
-        .unwrap()
-        .collections
-        .get_mut(&(Host::Remote, archive()))
-        .unwrap()[0]
+    store.0.lock().unwrap().collections.get_mut(&(Host::Remote, archive())).unwrap()[0]
         .insert("acceptance", "UNKNOWN");
-    let runtime = Runtime::default();
-    error(
-        delete(&store, &runtime, &root).await,
-        "unresolved simulation receipt",
-    );
+    let retained = store.collection(Host::Remote, &archive()).unwrap();
+    let runtime = Runtime { archive_null: true, ..Default::default() };
+    // Historical UNKNOWN rejection is intentionally replaced by archive-only
+    // success. No clearing, reconciliation or replay of that receipt occurs.
+    let out = delete(&store, &runtime, &root).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert_eq!(out.value["unresolvedItemCount"], 1);
     assert_eq!(root.receipt()["researchArchive"], previous);
-    assert!(!runtime
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|c| c.starts_with("research:")));
-    assert_eq!(store.collection(Host::Local, NAME).unwrap(), rows(2));
-    assert_eq!(store.control().get_str("status").unwrap(), "deleting");
+    assert!(runtime.calls.lock().unwrap().contains(&format!("research:remote:{}", archive())));
+    assert_eq!(store.collection(Host::Local, &archive()).unwrap(), rows(2));
+    assert_eq!(store.collection(Host::Remote, &archive()).unwrap(), retained);
+    assert_eq!(store.control().get_str("status").unwrap(), "deactive");
 }
 
 #[tokio::test]
@@ -2161,4 +2103,154 @@ async fn captured_execution_host_is_rechecked_inside_original_sync_and_cleanup_l
     assert!(runtime.calls.lock().unwrap().is_empty());
     assert!(remote.calls().iter().all(|call| !call.starts_with("rename:") && !call.starts_with("update:")));
     assert!(!root.0.join("reports/missions/fixture.cleanup.json").exists());
+}
+
+// Synthetic receipt evidence only; no live task/DB/platform is consulted.
+fn archive_evidence_rows() -> Vec<Document> {
+    vec![
+        doc! {"_id":"pending", "status":"pending", "_not_posted_":true},
+        doc! {"_id":"accepted", "status":"error", "acceptance":"ACCEPTED", "httpStatus":201,
+            "terminalStatus":Bson::Null, "alphaId":Bson::Null, "errorClass":"simulation_batch_identity_error",
+            "submissionAttempts":[{"httpStatus":201, "progressUrl":"https://example.invalid/original-secret", "acceptance":"ACCEPTED"}],
+            "childSimulationIds":["child-a", "child-b"], "superSlotId":"reserved-token",
+            "reservedHold":{"state":"held", "token":"hold-token"}, "capacityReleased":false},
+        doc! {"_id":"unknown", "status":"timeout_error", "acceptance":"UNKNOWN", "terminalStatus":Bson::Null,
+            "submissionAttempts":[{"httpStatus":Bson::Null}], "superSlotId":"unknown-token"},
+        doc! {"_id":"opaque", "status":"error", "errorClass":[], "submissionAttempts":["malformed-retained"]},
+        terminal().remove(0),
+    ]
+}
+fn row_bytes(rows: &[Document]) -> Vec<Vec<u8>> {
+    rows.iter().map(|row| bson::to_vec(row).unwrap()).collect()
+}
+#[tokio::test]
+async fn archive_retains_pending_accepted_unknown_opaque_and_holds_byte_for_byte_on_both_hosts() {
+    for remote in [false, true] {
+        let root = Root::new();
+        let original = archive_evidence_rows();
+        let store = MemoryStore::new("paused", remote, original.clone());
+        if remote { store.remote(original.clone()); }
+        let runtime = Runtime::default();
+        let out = delete(&store, &runtime, &root).await;
+        assert_eq!(out.exit_code, 0, "{}", out.value);
+        for receipt in [&out.value, &root.receipt()] {
+            assert_eq!(receipt["taskId"], ID);
+            assert_eq!(receipt["remote"], remote);
+            assert_eq!(receipt["unresolvedItemCount"], 3);
+            assert_eq!(receipt["receiptAssessmentUnknownCount"], 1);
+            assert_eq!(receipt["platformRequestsCancelled"], false);
+            assert_eq!(receipt["capacityReleased"], false);
+            assert_eq!(receipt["localArchive"], archive());
+            assert_eq!(receipt["remoteArchive"], if remote { json!(archive()) } else { Value::Null });
+            assert!(receipt["receiptPath"].as_str().unwrap().ends_with("fixture.cleanup.json"));
+            assert!(!receipt.to_string().contains("original-secret"));
+            assert!(!receipt.to_string().contains("submissionAttempts"));
+        }
+        for h in if remote { vec![Host::Local, Host::Remote] } else { vec![Host::Local] } {
+            assert_eq!(row_bytes(&store.collection(h, &archive()).unwrap()), row_bytes(&original));
+            assert!(store.collection(h, NAME).is_none());
+        }
+        assert_eq!(runtime.calls.lock().unwrap().as_slice(), [
+            format!("absence:{}", if remote { "remote" } else { "local" }),
+            format!("research:{}:{NAME}", if remote { "remote" } else { "local" }),
+        ]);
+        // Runtime has only absence/research IO; storage operations are strictly
+        // control CAS + collection rename, never item reset/recovery or release.
+        assert!(!store.calls().iter().any(|c| c.starts_with("insert:") || c.starts_with("reset:")));
+        assert_eq!(store.control().get_str("status").unwrap(), "deactive");
+        let retry = delete(&store, &Runtime::default(), &root).await;
+        assert_eq!(retry.exit_code, 0, "{}", retry.value);
+        assert_eq!(retry.value["unresolvedItemCount"], 3);
+        assert_eq!(retry.value["receiptAssessmentUnknownCount"], 1);
+    }
+}
+#[tokio::test]
+async fn partial_retry_retains_diagnostics_and_archive_identity_even_when_next_read_fails() {
+    let root = Root::new();
+    let original = archive_evidence_rows();
+    let store = MemoryStore::new("paused", true, original.clone());
+    store.remote(original.clone());
+    store.fail("rename:local");
+    let first = error(delete(&store, &Runtime::default(), &root).await, "rename:local");
+    assert_eq!(first["unresolvedItemCount"], 3);
+    store.fail("ping:remote");
+    let failed = error(delete(&store, &Runtime::default(), &root).await, "ping:remote");
+    for key in ["unresolvedItemCount", "receiptAssessmentUnknownCount", "remoteArchive", "taskId", "receiptPath"] {
+        assert_eq!(failed[key], first[key], "{key}");
+        assert_eq!(root.receipt()[key], first[key], "{key}");
+    }
+    assert_eq!(failed["controlHidden"], false);
+    let retry = delete(&store, &Runtime::default(), &root).await;
+    assert_eq!(retry.exit_code, 0, "{}", retry.value);
+    assert_eq!(retry.value["unresolvedItemCount"], 3);
+    for h in [Host::Local, Host::Remote] {
+        assert_eq!(row_bytes(&store.collection(h, &archive()).unwrap()), row_bytes(&original));
+    }
+}
+
+#[tokio::test]
+async fn unresolved_rows_do_not_bypass_control_proof_or_source_archive_failures() {
+    for case in ["generation_unknown", "launch_unknown", "stop-malformed", "host-malformed", "status-malformed", "remote-status-malformed", "source-dependency"] {
+        let root = Root::new();
+        let original = archive_evidence_rows();
+        let store = MemoryStore::new("paused", true, original.clone());
+        store.remote(original.clone());
+        let mut runtime = Runtime::default();
+        {
+            let mut st = store.0.lock().unwrap();
+            let task = &mut st.tasks.get_mut(&Host::Local).unwrap()[0];
+            match case {
+                "generation_unknown" | "launch_unknown" => { task.insert("status", case); }
+                "stop-malformed" => { task.insert("stopConfirmedAt", "invalid-proof"); }
+                "host-malformed" => { task.insert("isRemote", "true"); }
+                "status-malformed" => { task.insert("status", doc! {"not":"a status"}); }
+                "remote-status-malformed" => { st.tasks.get_mut(&Host::Remote).unwrap()[0].insert("status", Bson::Null); }
+                "source-dependency" => runtime.fail_archive = true,
+                _ => unreachable!(),
+            }
+        }
+        let out = delete(&store, &runtime, &root).await;
+        assert_eq!(out.exit_code, 1, "{case}: {}", out.value);
+        assert!(!store.calls().iter().any(|c| c.starts_with("rename:")), "{case}");
+        for h in [Host::Local, Host::Remote] {
+            assert_eq!(row_bytes(&store.collection(h, NAME).unwrap()), row_bytes(&original));
+        }
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_count_is_execution_items_not_unique_batch_or_local_plus_remote_rows() {
+    let root = Root::new();
+    let mut executed = Vec::new();
+    for i in 0..52 {
+        let mut row = if i < 10 { archive_evidence_rows().remove(1) } else { terminal().remove(0) };
+        row.insert("_id", format!("batch-item-{i}"));
+        executed.push(row);
+    }
+    let store = MemoryStore::new("paused", true, rows(52));
+    store.remote(executed.clone());
+    let out = delete(&store, &Runtime::default(), &root).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert_eq!(out.value["unresolvedItemCount"], 10);
+    assert_eq!(out.value["receiptAssessmentUnknownCount"], 0);
+    assert_eq!(row_bytes(&store.collection(Host::Remote, &archive()).unwrap()), row_bytes(&executed));
+}
+
+
+#[tokio::test]
+async fn archive_preconditions_report_the_original_action_without_attempting_archive() {
+    for (status, action) in [
+        ("running", "pause"), ("launch_unknown", "pause"),
+        ("generating", "reconcile_generation_or_sync"),
+        ("generation_unknown", "reconcile_generation_or_sync"),
+        ("syncing", "reconcile_generation_or_sync"),
+    ] {
+        let root = Root::new();
+        let store = MemoryStore::new(status, false, terminal());
+        let out = delete(&store, &Runtime::default(), &root).await;
+        assert_eq!(out.value["ok"], false);
+        assert_eq!(out.value["requiredAction"], action);
+        assert_eq!(out.value["localDeleted"], false);
+        assert_eq!(out.value["controlHidden"], false);
+    }
 }

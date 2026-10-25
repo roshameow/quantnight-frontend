@@ -343,7 +343,7 @@ pub async fn get_all_tasks(
 
 #[command]
 pub async fn delete_task(id: String, expected_remote: Option<bool>, clients: State<'_, Arc<MongoClients>>,
-    app_config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<(), String> {
+    app_config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<JsonValue, String> {
     required_task_id(Some(&id))?;
     let core = control.get(&app_config, &clients).await?;
     // No remote-only fallback and no name adoption. The common owner archives.
@@ -358,7 +358,30 @@ pub async fn delete_task(id: String, expected_remote: Option<bool>, clients: Sta
         || receipt["itemsPreserved"] != true || receipt["canonicalResultsDeleted"] != false {
         return Err(format!("安全归档回执未完成；保留原任务核验：{receipt}"));
     }
-    Ok(())
+    if receipt["taskId"].as_str() != Some(id.as_str())
+        || receipt["remote"].as_bool() != Some(remote)
+        || receipt["unresolvedItemCount"].as_u64().is_none()
+        || receipt["receiptAssessmentUnknownCount"].as_u64().is_none()
+        || receipt["receiptAssessmentUnknownCount"].as_u64() > receipt["unresolvedItemCount"].as_u64()
+        || receipt["platformRequestsCancelled"] != false || receipt["capacityReleased"] != false
+        || !receipt["receiptPath"].as_str().is_some_and(|path| !path.is_empty())
+        || !["localArchive", "remoteArchive"].iter().all(|key| {
+            receipt.get(*key).is_some_and(|value| value.is_null()
+                || value.as_str() == Some(format!("{name}__archive_{id}").as_str()))
+        }) {
+        return Err(format!("安全归档回执未完成；保留原任务核验：{receipt}"));
+    }
+    // Return only the validated compact contract, never task config/attempts.
+    Ok(serde_json::json!({
+        "schemaVersion": 1, "command": "delete", "task": name, "ok": true,
+        "taskId": id, "remote": remote,
+        "controlHidden": true, "localDeleted": true, "remoteDeleted": receipt["remoteDeleted"],
+        "itemsPreserved": true, "canonicalResultsDeleted": false,
+        "receiptPath": receipt["receiptPath"], "localArchive": receipt["localArchive"],
+        "remoteArchive": receipt["remoteArchive"], "unresolvedItemCount": receipt["unresolvedItemCount"],
+        "receiptAssessmentUnknownCount": receipt["receiptAssessmentUnknownCount"],
+        "platformRequestsCancelled": false, "capacityReleased": false
+    }))
 }
 
 fn start_request(task_name: &str, config: &str, remote: bool, task_id: &str, expected_remote: Option<bool>) -> Result<StartRequest, String> {

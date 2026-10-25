@@ -44,9 +44,9 @@ async function harness(initial = task()) {
     .replace(/import \{ useRoute, useRouter \} from "vue-router";/,
       'const useRoute = () => ({ fullPath: "/tasks" }); const useRouter = () => ({ push() {} });')
     .replace(/import \{ useMessage, useDialog \} from "naive-ui";/,
-      'const useMessage = () => ({ error: (...args) => hooks.errors.push(args), success() {} }); const useDialog = () => ({ warning: options => { hooks.dialog = options; } });')
+      'const useMessage = () => ({ error: (...args) => hooks.errors.push(args), success: text => hooks.notices.push({ type: "success", text }), warning: text => hooks.notices.push({ type: "warning", text }), loading: (text, options) => { const entry = { text, options, destroyed: false }; hooks.messages.push(entry); return { destroy: () => { entry.destroyed = true; } }; } }); const useDialog = () => ({ warning: options => { hooks.dialog = options; hooks.dialogClosed = false; return { destroy: () => { hooks.dialogClosed = true; } }; } });')
     .replace(/import (\w+) from "[^"\n]+\.vue";/g, 'const $1 = {};');
-  const hooksCode = `export const hooks = { errors: [], invoke: null, unmount: null, timers: new Map(), nextTimer: 0 };
+  const hooksCode = `export const hooks = { errors: [], messages: [], notices: [], invoke: null, unmount: null, timers: new Map(), nextTimer: 0 };
     const setTimeout = (callback, delay) => { const id = ++hooks.nextTimer; hooks.timers.set(id, { callback, delay }); return id; };
     const clearTimeout = (id) => { hooks.timers.delete(id); };
     const createAutoPauseScheduler = (options) => realAutoPauseScheduler({ ...options, setTimeoutFn: setTimeout, clearTimeoutFn: clearTimeout });
@@ -831,7 +831,7 @@ test('start forwards persisted creation destination separately from captured act
 });
 
 test('delete captures original host/ID at confirmation, rejects duplicate actions and never removes on core refusal', async () => {
-  const h = await harness(task({ status: 'paused', isRemote: true }));
+  const h = await harness(task({ status: 'paused', isRemote: true, stopConfirmedAt: 1000, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true }));
   try {
     const pending = deferred(), calls = [];
     h.hooks.invoke = (name, args) => { calls.push({ name, args }); return pending.promise; };
@@ -839,13 +839,177 @@ test('delete captures original host/ID at confirmation, rejects duplicate action
     assert.match(h.hooks.dialog.content, /保留候选回执和正式结果/);
     h.store.replaceTasks([task({ status: 'paused', isRemote: false })]);
     const first = h.hooks.dialog.onPositiveClick();
+    assert.equal(h.hooks.dialogClosed, true, "close before the native receipt settles");
+    assert.equal(h.store.tasks.length, 1, "do not remove before confirmation");
+    assert.equal(h.hooks.messages.length, 1);
+    assert.equal(h.hooks.messages[0].destroyed, false);
     await h.hooks.dialog.onPositiveClick();
+    assert.equal(h.hooks.messages.length, 1, "duplicate click must not create another operation");
     assert.deepEqual(calls, [{ name: 'delete_task', args: { id: 'id-a', expectedRemote: true } }]);
     pending.reject(new Error('original execution host changed before locked cleanup'));
     await first;
     assert.equal(h.store.tasks.length, 1);
     assert.equal(h.store.tasks[0].isRemote, false);
     assert.match(h.hooks.errors[0][0], /original execution host changed/);
+    assert.equal(h.hooks.messages[0].destroyed, true);
     assert.equal(calls.length, 1);
+  } finally { h.stop(); }
+});
+
+
+test('archive confirmation closes immediately while progress remains until the actual success receipt', async () => {
+  const h = await harness(task({ status: 'paused', stopConfirmedAt: 1000, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true }));
+  try {
+    const pending = deferred();
+    const calls = [];
+    h.hooks.invoke = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'delete_task') return pending.promise;
+      if (name === 'get_all_tasks') return Promise.resolve([]);
+      if (name === 'refresh_task_progress') return Promise.resolve();
+      assert.fail(`unexpected command: ${name}`);
+    };
+    h.state.deleteTask({ $oid: 'id-a' });
+    const operation = h.hooks.dialog.onPositiveClick();
+    assert.equal(h.hooks.dialogClosed, true);
+    assert.equal(h.store.tasks.length, 1);
+    assert.equal(h.hooks.messages[0].options.duration, 0);
+    assert.equal(h.hooks.messages[0].destroyed, false);
+    assert.match(h.hooks.messages[0].text, /核验停止状态.*归档/);
+    pending.resolve();
+    await operation;
+    assert.equal(calls.filter(call => call.name === 'delete_task').length, 1);
+    assert.equal(h.store.tasks.length, 0);
+    assert.equal(h.hooks.messages[0].destroyed, true);
+    assert.equal(h.hooks.errors.length, 0);
+  } finally { h.stop(); }
+});
+
+
+test('one confirmation pauses running, unknown launch and missing-proof tasks before archive', async () => {
+  for (const status of ['running', 'launch_unknown', 'paused']) {
+    const h = await harness(task({ status }));
+    try {
+      const paused = deferred(), archived = deferred(), calls = [];
+      h.hooks.invoke = (name, args) => {
+        calls.push({ name, args });
+        if (name === 'pause_task') return paused.promise;
+        if (name === 'delete_task') return archived.promise;
+        if (name === 'get_all_tasks') return Promise.resolve([]);
+        if (name === 'refresh_task_progress') return Promise.resolve();
+        assert.fail(`unexpected command: ${name}`);
+      };
+      h.state.deleteTask({ $oid: 'id-a' });
+      assert.equal(calls.length, 0, 'opening confirmation must not mutate');
+      assert.match(h.hooks.dialog.content, /先暂停.*归档/);
+      const operation = h.hooks.dialog.onPositiveClick();
+      assert.equal(h.hooks.dialogClosed, true);
+      assert.deepEqual(calls.map(c => c.name), ['pause_task']);
+      await h.hooks.dialog.onPositiveClick();
+      assert.equal(calls.length, 1, 'duplicate confirmation must not start another pause');
+      paused.resolve(receipt()); await tick(); await tick();
+      assert.deepEqual(calls.map(c => c.name), ['pause_task', 'delete_task']);
+      assert.deepEqual(calls[1].args, { id: 'id-a', expectedRemote: true });
+      assert.equal(h.store.tasks.length, 1);
+      archived.resolve({ unresolvedItemCount: 10 });
+      await operation;
+      assert.equal(h.store.tasks.length, 0);
+      assert.equal(h.hooks.errors.length, 0);
+      assert.match(h.hooks.notices[0].text, /已归档.*10条/);
+    } finally { h.stop(); }
+  }
+});
+
+test('failed or invalid stopping proof aborts the single archive workflow', async () => {
+  for (const outcome of ['failure', 'invalid-proof', 'generation']) {
+    const h = await harness(task({ status: outcome === 'generation' ? 'generation_unknown' : 'running' }));
+    try {
+      const calls = [];
+      h.hooks.invoke = async (name) => {
+        calls.push(name); assert.equal(name, 'pause_task');
+        if (outcome === 'invalid-proof') return receipt({ taskId: 'another-id' });
+        throw new Error(outcome === 'generation' ? 'candidate generation is not the simulation consumer; reconcile it before using pause' : 'fixture stop failed');
+      };
+      h.state.deleteTask({ $oid: 'id-a' });
+      await h.hooks.dialog.onPositiveClick();
+      assert.deepEqual(calls, ['pause_task']);
+      assert.equal(h.store.tasks.length, 1);
+      assert.equal(h.hooks.messages[0].destroyed, true);
+      assert.equal(h.hooks.errors.length, 1);
+      if (outcome === 'generation') assert.match(h.hooks.errors[0][0], /生成.*不能代替/);
+    } finally { h.stop(); }
+  }
+});
+
+test('archive joins an already pending original pause without a second confirmation or pause', async () => {
+  const h = await harness(task());
+  try {
+    const paused = deferred(), calls = [];
+    let deleted = false;
+    h.hooks.invoke = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'pause_task') return paused.promise;
+      if (name === 'delete_task') { deleted = true; return Promise.resolve({ unresolvedItemCount: 0 }); }
+      if (name === 'get_all_tasks') return Promise.resolve(deleted ? [] : [task({ status:'paused', stopConfirmedAt:proofAt, stopConfirmedTaskId:'id-a', stopConfirmedRemote:true })]);
+      if (name === 'refresh_task_progress') return Promise.resolve();
+      assert.fail(`unexpected command: ${name}`);
+    };
+    const stopping = h.state.pauseTask(h.store.tasks[0]);
+    h.state.deleteTask({ $oid: 'id-a' });
+    const archiving = h.hooks.dialog.onPositiveClick();
+    assert.equal(calls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(calls.some(c => c.name === 'delete_task'), false);
+    paused.resolve(receipt());
+    await Promise.all([stopping, archiving]);
+    assert.equal(calls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(calls.filter(c => c.name === 'delete_task').length, 1);
+    assert.equal(h.store.tasks.length, 0);
+  } finally { h.stop(); }
+});
+
+test('leaving the view during automatic pause does not start a later archive', async () => {
+  const h = await harness(task());
+  const paused = deferred(), calls = [];
+  h.hooks.invoke = (name) => { calls.push(name); assert.equal(name, 'pause_task'); return paused.promise; };
+  h.state.deleteTask({ $oid: 'id-a' });
+  const operation = h.hooks.dialog.onPositiveClick();
+  h.stop(); paused.resolve(receipt());
+  await operation;
+  assert.deepEqual(calls, ['pause_task']);
+  assert.equal(h.store.tasks.length, 1);
+  assert.equal(h.hooks.messages[0].destroyed, true);
+});
+
+test('stopped task with unresolved receipt summary archives once and reports preservation instead of failure', async () => {
+  const h = await harness(task({ status: 'paused', stopConfirmedAt: 1000, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true }));
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => {
+      calls.push({ name, args });
+      if (name === 'delete_task') return { unresolvedItemCount: 10, receiptAssessmentUnknownCount: 0, itemsPreserved: true, platformRequestsCancelled: false, capacityReleased: false };
+      if (name === 'get_all_tasks') return [];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(`unexpected native action: ${name}`);
+    };
+    h.state.deleteTask({ $oid: 'id-a' });
+    assert.match(h.hooks.dialog.content, /未决 simulation 回执也会保留/);
+    await h.hooks.dialog.onPositiveClick();
+    assert.equal(calls.filter(c => c.name === 'delete_task').length, 1);
+    assert.equal(calls.some(c => c.name === 'pause_task' || c.name === 'start_task'), false);
+    assert.equal(h.store.tasks.length, 0);
+    assert.equal(h.hooks.errors.length, 0);
+    assert.match(h.hooks.notices[0].text, /已归档.*10条.*回执已保留/);
+  } finally { h.stop(); }
+});
+
+test('backend remains authoritative when stop state changed after opening confirmation', async () => {
+  const h = await harness(task({ status: 'paused', stopConfirmedAt: 1000, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true }));
+  try {
+    h.hooks.invoke = async () => { throw '共享 TaskControl delete 未确认：' + JSON.stringify({ command: 'delete', ok: false, error: 'current valid stop confirmation required before delete', taskConfig: { ignoredLargeBody: 'x'.repeat(2000) } }); };
+    h.state.deleteTask({ $oid: 'id-a' });
+    await h.hooks.dialog.onPositiveClick();
+    assert.equal(h.store.tasks.length, 1);
+    assert.match(h.hooks.errors[0][0], /停止状态仍未确认.*归档未执行/);
+    assert.doesNotMatch(h.hooks.errors[0][0], /ignoredLargeBody/);
   } finally { h.stop(); }
 });

@@ -190,7 +190,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
-import { useTaskStore, validStopReceipt } from "../stores/taskStore";
+import { useTaskStore, validStopReceipt, taskStopDisplayStatus } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, mutateTaskSource } from "../utils/taskProgress.js";
 import { newTaskRequestId, validOperationStage } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
@@ -363,7 +363,7 @@ const updateIsRemote = async (id, isRemote) => {
   }
 };
 
-const pauseTask = async (task) => {
+const performPauseTask = async (task, { reportError = true, refreshAfter = true } = {}) => {
   // Capture before awaiting: the current task/host may be replaced meanwhile.
   const target = { _id: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true };
   if (disposed) return false;
@@ -402,39 +402,94 @@ const pauseTask = async (task) => {
   } catch (error) {
     if (!disposed) {
       taskStore.markTaskStopUnconfirmed(target, operation, error, pending.failureSource);
-      message.error("停止操作失败：" + String(error));
+      if (reportError) message.error("停止操作失败：" + String(error));
     }
     throw error;
   } finally { pendingStops.delete(operation.generation); }
-  if (!disposed) await fetchTasks();
+  if (!disposed && refreshAfter) await fetchTasks();
   return true;
+};
+
+// Reuse the original pause request, proof validation, timeout and state owner.
+const pauseTask = (task, options) => {
+  const target = { taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true };
+  const promise = performPauseTask(task, options);
+  const pending = [...pendingStops.values()].find(entry => entry.target._id === target.taskId &&
+    entry.target.name === target.name && entry.target.isRemote === target.isRemote);
+  if (pending && !pending.promise) pending.promise = promise;
+  return promise;
+};
+
+// This only chooses preparation; the native archive rechecks fresh stop/ID/host proof.
+const needsArchivePause = (task) =>
+  ["running", "launch_unknown", "generating", "generation_unknown", "syncing"].includes(task.status) ||
+  taskStopDisplayStatus({ ...task, status: "paused" }, taskStopOperationMap.value[task.name]) !== "paused";
+
+const archiveErrorText = (error) => {
+  let text = String(error);
+  try {
+    const receipt = JSON.parse(text.slice(text.indexOf("{")));
+    if (receipt?.command === "delete" && receipt.ok === false) {
+      if (receipt.requiredAction === "reconcile_generation_or_sync") return "生成或同步状态尚未收敛，请先核对该操作；暂停不能代替生成/同步确认。";
+      if (receipt.requiredAction === "pause") return "停止状态仍未确认，归档未执行；请查看停止详情后重新发起暂停并归档。";
+      if (typeof receipt.error === "string") text = receipt.error;
+    }
+  } catch { /* Original non-JSON error remains diagnostic evidence. */ }
+  if (/pause\/reconcile generation or running\/unconfirmed consumer|current valid stop confirmation required/.test(text)) {
+    return "停止状态仍未确认，归档未执行；请查看停止详情后重新发起暂停并归档。";
+  }
+  if (text.includes("candidate generation is not the simulation consumer")) return "生成或同步状态尚未确认，归档未执行；暂停消费者不能代替生成/同步核验。";
+  if (text.includes("accepted observation is active/unconfirmed")) return "仍有本地回执观察操作未结束，请先完成该操作再归档；不要求等待全部平台 simulation 终态。";
+  return text.length > 400 ? text.slice(0, 400) + "…" : text;
 };
 
 const deleteTask = (id) => {
   const taskId = getObjectId(id);
   const original = tasks.value.find(task => getObjectId(task._id) === taskId);
+  if (!original) { message.error("任务身份缺失，请刷新列表后再归档。"); return; }
   const expectedRemote = original?.isRemote === true;
-  dialog.warning({
-    title: "确认删除",
-    content: "仅在停止与回执核验通过后归档任务；保留候选回执和正式结果。确定继续？",
+  const confirmation = dialog.warning({
+    title: "确认暂停并归档",
+    content: "将先暂停并核验停止，再归档任务并移出列表；已有有效停止证明时直接归档。保留候选回执和正式结果，未决 simulation 回执也会保留，不执行平台取消。确定继续？",
     positiveText: "确认",
     negativeText: "取消",
     onPositiveClick: async () => {
+      // Confirmation is complete; do not keep the modal open for native work.
+      confirmation.destroy();
       try {
         if (!original) throw new Error("任务身份缺失；请刷新列表后再归档");
         await oncePerTask(taskId, async () => {
-          await mutateTaskSource({ fetch: fetchTasks,
-            update: () => invoke("delete_task", { id: taskId, expectedRemote }),
-            commit: () => {
-              const deleted = tasks.value.find((task) => getObjectId(task._id) === taskId);
-              if (!disposed && deleted) taskStore.removeTask(deleted.name);
-            },
-          });
-          if (!disposed) await fetchTasks();
+          const pending = message.loading("正在核验停止状态并归档任务…", { duration: 0 });
+          try {
+            if (needsArchivePause(original)) {
+              const inFlight = [...pendingStops.values()].find(entry => entry.target._id === taskId &&
+                entry.target.name === original.name && entry.target.isRemote === expectedRemote);
+              const stopped = await (inFlight?.promise ?? pauseTask(original, { reportError: false, refreshAfter: false }));
+              if (stopped !== true) throw new Error("停止尚未确认，未执行归档。");
+            }
+            if (disposed) return; // Do not start a second mutation after this view has gone away.
+            let archiveReceipt;
+            await mutateTaskSource({ fetch: fetchTasks,
+              update: async () => { archiveReceipt = await invoke("delete_task", { id: taskId, expectedRemote }); },
+              commit: () => {
+                const deleted = tasks.value.find((task) => getObjectId(task._id) === taskId);
+                if (!disposed && deleted) taskStore.removeTask(deleted.name);
+              },
+            });
+            if (!disposed) {
+              const count = archiveReceipt?.unresolvedItemCount;
+              if (Number.isSafeInteger(count) && count > 0) {
+                message.warning(`任务已归档；${count}条未决或待判定回执已保留，未执行平台取消。`);
+              } else {
+                message.success("任务已归档，候选回执和正式结果已保留。");
+              }
+              await fetchTasks();
+            }
+          } finally { pending.destroy(); }
         });
       } catch (e) {
         console.error("删除任务失败", e);
-        message.error("删除任务失败：" + String(e));
+        if (!disposed) message.error("任务归档未完成：" + archiveErrorText(e));
       }
     },
   });

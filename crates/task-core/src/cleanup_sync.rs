@@ -437,7 +437,10 @@ fn new_receipt(name: &str, task: &Document, remote: bool) -> Result<Value, Strin
     Ok(
         json!({"schemaVersion": 1, "task": name, "taskId": task_id(task)?.to_hex(), "at": now(), "remote": remote,
         "localDeleted": false, "remoteDeleted": if remote { Value::Bool(false) } else { Value::Null },
-        "controlHidden": false, "canonicalResultsDeleted": false, "itemsPreserved": true, "taskConfig": wire_document(&config)}),
+        "controlHidden": false, "canonicalResultsDeleted": false, "itemsPreserved": true,
+        "localArchive": null, "remoteArchive": null, "unresolvedItemCount": 0,
+        "receiptAssessmentUnknownCount": 0, "platformRequestsCancelled": false,
+        "capacityReleased": false, "taskConfig": wire_document(&config)}),
     )
 }
 fn preserve_previous_receipt(path: &Path, receipt: &mut Value) -> Result<(), String> {
@@ -451,6 +454,13 @@ fn preserve_previous_receipt(path: &Path, receipt: &mut Value) -> Result<(), Str
     if previous["taskId"] == receipt["taskId"] && previous["task"] == receipt["task"] {
         if previous["remote"] != receipt["remote"] {
             return Err("cleanup receipt execution host changed".into());
+        }
+        // Retain diagnostics and archive identity across failures before a fresh
+        // assessment. Success flags are still re-verified, never inherited.
+        for field in ["unresolvedItemCount", "receiptAssessmentUnknownCount", "localArchive", "remoteArchive"] {
+            if let Some(value) = previous.get(field) {
+                receipt[field] = value.clone();
+            }
         }
         // Retain actual original research evidence if a partial retry's helper
         // returns null. Never reuse old success flags without re-verification.
@@ -567,6 +577,7 @@ pub async fn delete_with_expected_host(
     if let Err(error) = preserve_previous_receipt(&path, &mut receipt) {
         return failure("delete", name, error);
     }
+    receipt["receiptPath"] = json!(path.to_string_lossy());
     let result = delete_inner(root, store, runtime, name, &original, host, &mut receipt).await;
     match result {
         Ok(()) => receipt["ok"] = json!(true),
@@ -592,7 +603,12 @@ pub async fn delete_with_expected_host(
             name,
             true,
             json!({"receiptPath": path.to_string_lossy(), "localDeleted": true,
-            "remoteDeleted": receipt["remoteDeleted"], "controlHidden": true, "canonicalResultsDeleted": false, "itemsPreserved": true}),
+            "remoteDeleted": receipt["remoteDeleted"], "controlHidden": true, "canonicalResultsDeleted": false, "itemsPreserved": true,
+            "taskId": receipt["taskId"], "remote": receipt["remote"],
+            "localArchive": receipt["localArchive"], "remoteArchive": receipt["remoteArchive"],
+            "unresolvedItemCount": receipt["unresolvedItemCount"],
+            "receiptAssessmentUnknownCount": receipt["receiptAssessmentUnknownCount"],
+            "platformRequestsCancelled": false, "capacityReleased": false}),
         )
     } else {
         outcome("delete", name, false, receipt)
@@ -611,11 +627,16 @@ async fn delete_inner(
         original.get_str("status").ok(),
         Some("generating" | "generation_unknown" | "launch_unknown" | "syncing" | "running")
     ) {
+        receipt["requiredAction"] = json!(if matches!(original.get_str("status").ok(),
+            Some("generating" | "generation_unknown" | "syncing")) {
+            "reconcile_generation_or_sync"
+        } else { "pause" });
         return Err(
             "pause/reconcile generation or running/unconfirmed consumer before delete".into(),
         );
     }
     if !policy::stop_confirmation_valid(original, host.is_remote()) {
+        receipt["requiredAction"] = json!("pause");
         return Err("current valid stop confirmation required before delete".into());
     }
     runtime.assert_consumer_absent(root, original, host).await?;
@@ -640,14 +661,24 @@ async fn delete_inner(
     let rows = store
         .rows(host, evidence_name, Some(receipt_projection()))
         .await?;
+    // Archive is a namespace rename, not request resolution. Count execution
+    // items (not distinct platform simulations); malformed receipt metadata is
+    // retained as opaque unresolved evidence. Only this diagnostic assessment
+    // tolerates classification errors: control/IO/identity gates still fail.
+    let mut unresolved = 0_u64;
+    let mut assessment_unknown = 0_u64;
     for row in &rows {
-        if policy::checked_unresolved_execution_row(row)? {
-            return Err(
-                "unresolved simulation receipt evidence; reconcile original request before cleanup"
-                    .into(),
-            );
+        match policy::checked_unresolved_execution_row(row) {
+            Ok(false) => (),
+            Ok(true) => unresolved += 1,
+            Err(_) => {
+                unresolved += 1;
+                assessment_unknown += 1;
+            }
         }
     }
+    receipt["unresolvedItemCount"] = json!(unresolved);
+    receipt["receiptAssessmentUnknownCount"] = json!(assessment_unknown);
     let research = runtime
         .archive_research(root, original, host, evidence_name)
         .await?;
