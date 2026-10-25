@@ -1,0 +1,433 @@
+//! Offline GUI protocol regressions execute the registered shared pause owner.
+//! Only the lowest TaskStore and stop process IO are synthetic.
+use super::*;
+use quantnight_task_core::{
+    pause::{self},
+    task_store::{CollectionSummary, Host, TaskStore},
+};
+use std::{future::Future, pin::Pin};
+// Explicit boxed futures match the shared async-trait ABI without adding a GUI manifest dependency.
+
+pub(super) struct PauseRoute {
+    pub outcome: pause::PauseOutcome,
+    pub writes: Vec<(Document, Document)>,
+    pub stages: Vec<String>,
+}
+struct Store {
+    task: Document,
+    matched: u64,
+    writes: Mutex<Vec<(Document, Document)>>,
+}
+impl TaskStore for Store {
+    fn find_task<'life0, 'async_trait>(
+        &'life0 self,
+        host: Host,
+        filter: Document,
+        _newest: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Document>, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            assert_eq!(host, Host::Local);
+            let matched = filter.iter().all(|(key, expected)| match expected {
+                bson::Bson::Document(op) if op.contains_key("$ne") => {
+                    self.task.get(key) != op.get("$ne")
+                }
+                bson::Bson::Document(op) if op.contains_key("$exists") => {
+                    self.task.contains_key(key) == op.get_bool("$exists").unwrap()
+                }
+                bson::Bson::Null => matches!(self.task.get(key), None | Some(bson::Bson::Null)),
+                _ => self.task.get(key) == Some(expected),
+            });
+            Ok(matched.then(|| self.task.clone()))
+        })
+    }
+    fn update_task<'life0, 'async_trait>(
+        &'life0 self,
+        host: Host,
+        filter: Document,
+        update: Document,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            assert_eq!(host, Host::Local);
+            self.writes.lock().unwrap().push((filter, update));
+            Ok(self.matched)
+        })
+    }
+    fn collection_names<'life0, 'async_trait>(
+        &'life0 self,
+        _: Host,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected collection IO") })
+    }
+    fn summary<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: Host,
+        _: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = Result<CollectionSummary, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected item IO") })
+    }
+    fn has_rows<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: Host,
+        _: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected item IO") })
+    }
+    fn rows<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: Host,
+        _: &'life1 str,
+        _: Option<Document>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Document>, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected item IO") })
+    }
+    fn insert_rows<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: Host,
+        _: &'life1 str,
+        _: Vec<Document>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected insert") })
+    }
+    fn rename_collection<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _: Host,
+        _: &'life1 str,
+        _: &'life2 str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected rename") })
+    }
+    fn ping<'life0, 'async_trait>(
+        &'life0 self,
+        _: Host,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("unexpected ping") })
+    }
+}
+pub(super) async fn pause_route(task: Document, stdout: String, matched: u64) -> PauseRoute {
+    use quantnight_task_core::{
+        backend_binding::validate_backend_binding, config::bash_test_support::FakeBash,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let fake = FakeBash::new(":");
+    let root = Path::new(&fake.config.env.working_dir);
+    fs::create_dir_all(root.join(".venv/bin")).unwrap();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::write(
+        root.join("credentials.yaml"),
+        "synthetic config, never user credentials",
+    )
+    .unwrap();
+    let python = root.join(".venv/bin/python");
+    fs::write(
+        &python,
+        r#"#!/bin/sh
+[ "$1 $2 $3 $4" = '-B -m backend.mongodb.mongo_config --validate-task-control-binding' ] || exit 97
+echo bootstrap >> bootstrap-calls
+printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok":true}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        root.join("scripts/pause_task.sh"),
+        format!(
+            "printf '%s' \"$QUANTNIGHT_TMUX_BINDING\" > binding.json\nprintf '%s\\n' '{}'\n",
+            stdout.replace('\'', "'\"'\"'")
+        ),
+    )
+    .unwrap();
+    let binding = validate_backend_binding(&fake.config).await.unwrap();
+    let store = Arc::new(Store {
+        task: task.clone(),
+        matched,
+        writes: Mutex::new(vec![]),
+    });
+    let service = TaskControlState::default();
+    let core = service
+        .initialize(async { Ok(TaskControl::with_store(binding, store.clone())) })
+        .await
+        .unwrap();
+    let original_id = task.get_object_id("_id").unwrap().to_hex();
+    assert_eq!(core.task_by_id(&original_id).await.unwrap(), task);
+    assert!(core
+        .task_by_id(&ObjectId::new().to_hex())
+        .await
+        .unwrap_err()
+        .contains("not registered in this local control plane"));
+    assert!(store.writes.lock().unwrap().is_empty());
+    let stages = Arc::new(Mutex::new(vec![]));
+    let sink = stages.clone();
+    let name = task.get_str("name").unwrap();
+    let id = task.get_object_id("_id").unwrap().to_hex();
+    let remote = task.get_bool("isRemote").unwrap_or(false);
+    let outcome = core
+        .pause(
+            name,
+            PauseOptions {
+                expected_task_id: Some(&id),
+                expected_remote: Some(remote),
+                observer: Some(Arc::new(move |event| {
+                    sink.lock().unwrap().push(event.stage.to_string())
+                })),
+                ..Default::default()
+            },
+            StopBudget::Gui,
+            None,
+        )
+        .await;
+    let forwarded: JsonValue =
+        serde_json::from_str(&fs::read_to_string(root.join("binding.json")).unwrap()).unwrap();
+    assert_eq!(forwarded["taskId"], id);
+    assert_eq!(forwarded["remote"], remote);
+    if let Ok(launch) = task.get_str("launchAttemptId") {
+        assert_eq!(forwarded["launchAttemptId"], launch);
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("bootstrap-calls")).unwrap(),
+        "bootstrap\n"
+    );
+    let writes = store.writes.lock().unwrap().clone();
+    PauseRoute {
+        outcome,
+        writes,
+        stages: Arc::try_unwrap(stages).unwrap().into_inner().unwrap(),
+    }
+}
+pub(super) fn proof_line(name: &str, remote: bool, basis: pause::StopConfirmationBasis) -> String {
+    let value = match basis {
+        pause::StopConfirmationBasis::RunnersExited => {
+            serde_json::json!({"schema_version":1,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":true})
+        }
+        pause::StopConfirmationBasis::SessionAbsent => {
+            serde_json::json!({"schema_version":2,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":null,"confirmation_basis":"session_absent"})
+        }
+    };
+    format!("QUANTNIGHT_PAUSE_CONFIRMED {value}")
+}
+
+#[tokio::test]
+async fn real_core_bad_receipts_never_reach_storage_and_cas_failure_never_returns_gui_proof() {
+    let id = ObjectId::new();
+    let task = doc! {"_id":id,"name":"fixture","status":"running","isRemote":true,"launchAttemptId":"original"};
+    for raw in ["", "paused", "QUANTNIGHT_PAUSE_CONFIRMED {bad}"] {
+        let route = pause_route(task.clone(), raw.into(), 1).await;
+        assert_eq!(route.outcome.exit_code, 1);
+        assert!(route.writes.is_empty());
+        assert!(route.outcome.confirmed_stop.is_none());
+    }
+    let route = pause_route(
+        task,
+        proof_line("fixture", true, pause::StopConfirmationBasis::SessionAbsent),
+        0,
+    )
+    .await;
+    assert_eq!(route.writes.len(), 1);
+    assert!(route.outcome.value["error"]
+        .as_str()
+        .unwrap()
+        .contains("CAS failed"));
+    assert!(route.outcome.confirmed_stop.is_none());
+    assert!(!route.stages.iter().any(|s| s == "completed"));
+}
+
+struct NoCleanupIo;
+impl quantnight_task_core::cleanup_sync::OperationsRuntime for NoCleanupIo {
+    fn assert_consumer_absent<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _: &'life1 Path,
+        _: &'life2 Document,
+        _: Host,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("running delete must not probe consumer") })
+    }
+    fn archive_research<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        _: &'life1 Path,
+        _: &'life2 Document,
+        _: Host,
+        _: &'life3 str,
+    ) -> Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { panic!("running delete must not archive") })
+    }
+}
+pub(super) async fn assert_running_delete_refused() {
+    let id = ObjectId::new();
+    let root = std::env::temp_dir().join(format!("gui-delete-{}", id));
+    fs::create_dir_all(&root).unwrap();
+    let store = Store {
+        task: doc! {"_id":id,"name":"dataset","status":"running","isRemote":false},
+        matched: 1,
+        writes: Mutex::new(vec![]),
+    };
+    let result = quantnight_task_core::cleanup_sync::delete(
+        &root,
+        &store,
+        &NoCleanupIo,
+        "dataset",
+        Some(&id.to_hex()),
+    )
+    .await;
+    assert_eq!(result.exit_code, 1);
+    assert!(
+        result.value["error"]
+            .as_str()
+            .unwrap()
+            .contains("pause/reconcile"),
+        "{}",
+        result.value
+    );
+    assert!(store.writes.lock().unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn lazy_service_bootstrap_runs_once_even_when_failed_and_concurrent_buttons_arrive() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let service = TaskControlState::default();
+    let calls = AtomicUsize::new(0);
+    let init = || async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Err("synthetic binding mismatch; no real configuration read".to_string())
+    };
+    let (first, second) = tokio::join!(service.initialize(init()), service.initialize(init()));
+    assert_eq!(first.err(), second.err());
+    assert!(service.initialize(init()).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gui_create_request_retains_config_and_remote_intent_without_authorizing_running_or_force() {
+    let value = serde_json::json!({"name":"fixture", "template":"display", "templatefile":"frozen",
+        "task_type":"super", "auth_profile":"profile", "is_remote":true, "status":"running",
+        "config":{"nested":{"literal":{"$oid":"not-a-bson-id"}},"steps":[]}});
+    let request = create_request(serde_json::from_value(value.clone()).unwrap()).unwrap();
+    assert_eq!(request.name, "fixture");
+    assert_eq!(request.template, "display");
+    assert_eq!(request.templatefile, "frozen");
+    assert_eq!(request.auth_profile, "profile");
+    assert_eq!(request.task_type, "super");
+    assert!(request.target_remote);
+    assert!(!request.force);
+    assert!(request.expected_task_id.is_none());
+    assert_eq!(
+        serde_json::to_value(request.mission_config.unwrap()).unwrap(),
+        value["config"]
+    );
+}
+
+#[test]
+fn void_projection_requires_version_command_name_boolean_success_and_zero_exit() {
+    let valid = serde_json::json!({"schemaVersion":1,"command":"sync","task":"fixture","ok":true});
+    core_receipt(
+        &TaskOutcome {
+            value: valid.clone(),
+            exit_code: 0,
+        },
+        "sync",
+        "fixture",
+    )
+    .unwrap();
+    for patch in [
+        serde_json::json!({"schemaVersion":2}),
+        serde_json::json!({"command":"delete"}),
+        serde_json::json!({"task":"replacement"}),
+        serde_json::json!({"ok":"true"}),
+        serde_json::json!({"ok":false}),
+    ] {
+        let mut invalid = valid.clone();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert!(core_receipt(
+            &TaskOutcome {
+                value: invalid,
+                exit_code: 0
+            },
+            "sync",
+            "fixture"
+        )
+        .is_err());
+    }
+    assert!(core_receipt(
+        &TaskOutcome {
+            value: valid,
+            exit_code: 1
+        },
+        "sync",
+        "fixture"
+    )
+    .is_err());
+}
+
+#[test]
+fn creation_destination_and_captured_actual_host_are_distinct_shared_request_fields() {
+    let id = "0123456789abcdef01234567";
+    let request = start_request("fixture", "{}", true, id, Some(false)).unwrap();
+    assert_eq!(request.remote, Some(true));
+    assert_eq!(request.expected_remote, Some(false));
+    let receipt = |remote| TaskOutcome {
+        value: serde_json::json!({"schemaVersion":1,"command":"start",
+        "task":"fixture","taskId":id,"ok":true,"remote":remote}),
+        exit_code: 0,
+    };
+    assert!(start_receipt(&receipt(false), &request).is_err());
+    start_receipt(&receipt(true), &request).unwrap();
+    // This adapter grants no pristine/history eligibility: core.start owns it.
+}

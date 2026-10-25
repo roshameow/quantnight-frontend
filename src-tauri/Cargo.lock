@@ -3611,6 +3611,7 @@ name = "quantnight-frontend"
 version = "1.2.4"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bson",
  "chrono",
  "config",
@@ -3625,6 +3626,7 @@ dependencies = [
  "mongodb",
  "ndarray",
  "once_cell",
+ "quantnight-task-core",
  "regex",
  "serde",
  "serde_json",
@@ -3634,6 +3636,27 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "toml 0.8.20",
+]
+
+[[package]]
+name = "quantnight-task-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bson",
+ "chrono",
+ "config",
+ "dirs 5.0.1",
+ "futures-util",
+ "libc",
+ "log",
+ "mongodb",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

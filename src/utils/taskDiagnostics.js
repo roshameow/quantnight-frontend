@@ -14,7 +14,7 @@ export const TASK_SCRIPT_STAGES = Object.freeze({
 const scriptStages = TASK_SCRIPT_STAGES
 const nativeStages = ['initial', 'identity', 'config', 'launch', 'wait', 'receipt_validate', 'completed']
 const knownStage = (operation, stage) => stageId(stage) && (scriptStages[operation]?.includes(stage) ||
-  nativeStages.includes(stage) || (operation === 'runtime' && stage === 'dispatch_read') || (operation === 'stop' && stage === 'control_write'))
+  nativeStages.includes(stage) || (operation === 'runtime' && stage === 'dispatch_read') || (operation === 'stop' && ['control_write', 'inventory', 'inventory_recheck', 'stop'].includes(stage)))
 let sequence = 0
 export function newTaskRequestId(operation) {
   return `${operation}:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}:${++sequence}`

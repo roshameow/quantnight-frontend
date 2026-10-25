@@ -191,7 +191,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt } from "../stores/taskStore";
-import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, syncTaskToRemote, mutateTaskSource } from "../utils/taskProgress.js";
+import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, mutateTaskSource } from "../utils/taskProgress.js";
 import { newTaskRequestId, validOperationStage } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
@@ -316,32 +316,33 @@ const generateList = async (id) => {
   }
 };
 
-// Low-level update deliberately throws so a sync failure cannot be swallowed.
+// A target checkbox is not migration authority. Native rejects unsupported
+// intent changes; only shared core sync may change the actual execution host.
 const setRemoteSource = (task, isRemote) => mutateTaskSource({
   fetch: fetchTasks,
   update: () => invoke("update_remote_status", {
-    id: getObjectId(task._id),
-    updates: { is_remote: isRemote },
+    id: getObjectId(task._id), updates: { is_remote: isRemote },
   }),
-  commit: () => {
-    const current = tasks.value.find((item) => item.name === task.name);
-    if (!disposed && current && getObjectId(current._id) === getObjectId(task._id)) {
-      taskStore.setTaskSource(task.name, isRemote);
-    }
-  },
 });
+
+const mutationRequests = new Set();
+const oncePerTask = async (id, action) => {
+  if (disposed || mutationRequests.has(id)) return false;
+  mutationRequests.add(id);
+  try { return await action(); } finally { mutationRequests.delete(id); }
+};
 
 const syncRemoteTask = async (taskName) => {
   try {
-    const targetTask = tasks.value.find((task) => task.name === taskName);
-    if (!targetTask) throw new Error("任务列表缺少所选任务记录");
-    await syncTaskToRemote({
-      sync: () => invoke("sync_remote_task", { alphaMissionList: taskName }),
-      updateSource: () => setRemoteSource(targetTask, true),
-      refresh: () => {
-        if (!disposed) message.success("任务同步成功，运行方式已更新为远程");
-        return fetchTasks();
-      },
+    const task = tasks.value.find((task) => task.name === taskName);
+    if (!task) throw new Error("任务列表缺少所选任务记录");
+    const target = { taskId: getObjectId(task._id), alphaMissionList: task.name, expectedRemote: task.isRemote === true };
+    await oncePerTask(target.taskId, async () => {
+      await mutateTaskSource({ fetch: fetchTasks,
+        update: () => invoke("sync_remote_task", target),
+      });
+      if (!disposed) message.success("任务安全同步完成；实际执行端由共享核心确认");
+      await fetchTasks();
     });
   } catch (err) {
     console.error("同步失败", err);
@@ -410,22 +411,30 @@ const pauseTask = async (task) => {
 };
 
 const deleteTask = (id) => {
+  const taskId = getObjectId(id);
+  const original = tasks.value.find(task => getObjectId(task._id) === taskId);
+  const expectedRemote = original?.isRemote === true;
   dialog.warning({
     title: "确认删除",
-    content: "删除任务后将无法恢复，确定要继续吗？",
+    content: "仅在停止与回执核验通过后归档任务；保留候选回执和正式结果。确定继续？",
     positiveText: "确认",
     negativeText: "取消",
     onPositiveClick: async () => {
       try {
-        await invoke("delete_task", { id: getObjectId(id) });
-        if (!disposed) {
-          const deleted = tasks.value.find((task) => getObjectId(task._id) === getObjectId(id));
-          if (deleted) taskStore.removeTask(deleted.name);
-          await fetchTasks();
-        }
+        if (!original) throw new Error("任务身份缺失；请刷新列表后再归档");
+        await oncePerTask(taskId, async () => {
+          await mutateTaskSource({ fetch: fetchTasks,
+            update: () => invoke("delete_task", { id: taskId, expectedRemote }),
+            commit: () => {
+              const deleted = tasks.value.find((task) => getObjectId(task._id) === taskId);
+              if (!disposed && deleted) taskStore.removeTask(deleted.name);
+            },
+          });
+          if (!disposed) await fetchTasks();
+        });
       } catch (e) {
         console.error("删除任务失败", e);
-        message.error("删除任务失败");
+        message.error("删除任务失败：" + String(e));
       }
     },
   });
@@ -493,7 +502,7 @@ const handleAddTask = async (task) => {
     fetchTasks();
   } catch (err) {
     console.error("添加任务失败：", err);
-    message.error("任务创建失败");
+    message.error("任务创建失败：" + String(err));
   }
 };
 
@@ -504,7 +513,7 @@ const handleAddSuperTask = async (task) => {
     fetchTasks();
   } catch (err) {
     console.error("添加Super任务失败：", err);
-    message.error("Super任务创建失败");
+    message.error("Super任务创建失败：" + String(err));
   }
 };
 
@@ -515,57 +524,38 @@ const handleAddPriorityTask = async (task) => {
     fetchTasks();
   } catch (err) {
     console.error("添加Priority任务失败：", err);
-    message.error("Priority任务创建失败");
+    message.error("Priority任务创建失败：" + String(err));
   }
 };
 
-const handleStartTask = async ({ taskName, config, isRemote }) => {
+const startTask = async (command, { taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
   try {
     if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
-    invalidateRuntime(taskName);
-    await invoke("start_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
-    if (!disposed && target) taskStore.clearTaskStop(target);
-    message.success("任务启动成功");
-    fetchTasks();
+    if (isRemote !== target.isRemote) throw new Error("启动参数不能切换实际执行端；请使用原任务的安全同步/目标意向流程，已有任务不会自动迁移");
+    // Forward saved creation intent, not a new checkbox migration. Only core
+    // may approve pristine Priority destination or require initial sync; GUI
+    // never interprets status/history/receipts to grant a host transition.
+    const requestedRemote = typeof original.targetRemote === "boolean" ? original.targetRemote : target.isRemote;
+    const args = { taskName, taskId: target._id, config: JSON.stringify(config), isRemote: requestedRemote, expectedRemote: target.isRemote };
+    await oncePerTask(target._id, async () => {
+      invalidateRuntime(taskName);
+      await mutateTaskSource({ fetch: fetchTasks, update: () => invoke(command, args) });
+      if (!disposed) {
+        taskStore.clearTaskStop(target);
+        message.success("任务启动已确认（不代表平台完成）");
+        fetchTasks();
+      }
+    });
   } catch (err) {
     console.error("启动任务失败", err);
-    message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
+    if (!disposed) message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
   }
 };
-
-const handleStartSuperTask = async ({ taskName, config, isRemote }) => {
-  const original = tasks.value.find((task) => task.name === taskName);
-  const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
-  try {
-    if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
-    invalidateRuntime(taskName);
-    await invoke("start_super_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
-    if (!disposed && target) taskStore.clearTaskStop(target);
-    message.success("Super 任务启动成功");
-    fetchTasks();
-  } catch (err) {
-    console.error("启动 Super 任务失败", err);
-    message.error(`Super 任务启动失败：${err instanceof Error ? err.message : String(err)}`);
-  }
-};
-
-const handlePriorityStartTask = async ({ taskName, config, isRemote }) => {
-  const original = tasks.value.find((task) => task.name === taskName);
-  const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
-  try {
-    if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
-    invalidateRuntime(taskName);
-    await invoke("start_priority_task", { taskName, taskId: target._id, config: JSON.stringify(config), isRemote });
-    if (!disposed && target) taskStore.clearTaskStop(target);
-    message.success("任务启动成功");
-    fetchTasks();
-  } catch (err) {
-    console.error("启动任务失败", err);
-    message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
-  }
-};
+const handleStartTask = (args) => startTask("start_task", args);
+const handleStartSuperTask = (args) => startTask("start_super_task", args);
+const handlePriorityStartTask = (args) => startTask("start_priority_task", args);
 
 const handleUpdateTask = async ({ task, config, isRemote }) => {
   try {
@@ -584,13 +574,16 @@ const handleUpdateTask = async ({ task, config, isRemote }) => {
 
 const handleUpdatePriorityTask = async ({ taskName, config, isRemote }) => {
   try {
-    await invoke("update_priority_task", { taskName, config: JSON.stringify(config), isRemote });
+    const task = tasks.value.find((task) => task.name === taskName);
+    if (!task) throw new Error("任务身份缺失；请刷新任务列表");
+    if (isRemote !== (task.isRemote === true)) throw new Error("配置更新不能迁移执行端");
+    await invoke("update_priority_task", { taskName, taskId: getObjectId(task._id), config: JSON.stringify(config), isRemote });
     message.success("Priority任务更新成功");
     showUpdateModal.value = false;
     fetchTasks();
   } catch (err) {
     console.error("更新 Priority 任务失败", err);
-    message.error("Priority任务更新失败");
+    message.error("Priority任务更新失败：" + String(err));
   }
 };
 

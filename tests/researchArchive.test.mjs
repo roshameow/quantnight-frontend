@@ -1,26 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-const source = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
-test('existing delete button archives prepared dataset before mutation', () => {
-  const body = source.slice(source.indexOf('pub async fn delete_task('), source.indexOf('pub async fn start_task('));
-  assert.ok(body.indexOf('archive_prepared_research(') < body.indexOf('.update_one('));
-  assert.match(body, /delete_filter/);
-  const helper = source.slice(source.indexOf('async fn archive_prepared_research'), source.indexOf('pub async fn delete_task('));
-  for (const part of ['archive-research', '--expected-task-id', '--expected-remote', 'archivePath', 'run_taskctl(&root', 'Duration::from_secs(90)']) {
-    assert.ok(helper.includes(part), part);
-  }
-  assert.ok(!helper.includes('.drop('));
-  const transport = source.slice(source.indexOf('async fn run_taskctl('), source.indexOf('async fn start_via_taskctl('));
-  for (const part of ['.venv/bin/python', 'PYTHONPATH', 'kill_on_drop(true)', 'run_process_observed']) assert.ok(transport.includes(part), part);
+const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
+const source = read('../src-tauri/src/commands.rs');
+const facade = read('../crates/task-core/src/task_control.rs');
+const cleanup = read('../crates/task-core/src/cleanup_sync.rs');
+const runtime = read('../crates/task-core/src/operations_runtime.rs');
+
+test('existing delete button delegates exact identity to shared safe archive before control mutation', () => {
+  const body = source.slice(source.indexOf('pub async fn delete_task('), source.indexOf('fn start_request('));
+  assert.match(body, /core\.task_by_id\(&id\)/);
+  assert.match(body, /core\.delete_bound\(name, Some\(&id\), Some\(remote\), None, None\)/);
+  for (const field of ['controlHidden', 'localDeleted', 'remoteDeleted', 'itemsPreserved', 'canonicalResultsDeleted']) assert.ok(body.includes(field));
+  assert.doesNotMatch(body, /\.drop\(|\.update_one\(|archive_prepared_research|run_taskctl/);
+  assert.match(facade, /cleanup_sync::delete_with_expected_host\(self\.root\(\), self\.store\.as_ref\(\), &runtime, name, expected_id, expected_remote\)/);
+  const implementation = cleanup.slice(cleanup.indexOf('async fn delete_inner('));
+  assert.ok(implementation.indexOf('.archive_research(') < implementation.indexOf('"delete-begin"'));
+  for (const gate of ['stop_confirmation_valid', 'assert_consumer_absent', 'checked_unresolved_execution_row', 'validate_claim', 'remote_identity']) assert.ok(implementation.includes(gate));
+  assert.match(cleanup, /rename_collection/);
+  assert.doesNotMatch(cleanup, /\.drop\(/);
 });
 
-test('native discovery/archive reuse catalog rather than duplicating sidecar resolution', () => {
-  const helper = source.slice(source.indexOf('async fn archive_prepared_research'), source.indexOf('pub async fn delete_task('));
-  assert.match(helper, /run_template_catalog\(&root, "binding", kind, Some\(template\), None\)/);
-  assert.match(helper, /binding.get\("kind"\)/);
-  assert.match(helper, /receipt.get\("command"\).*Some\("archive-research"\)/);
-  assert.doesNotMatch(helper, /join\(format!\("\{template\}\.research\.json/);
+test('discovery remains a catalog read; shared archive uses original research owner with exact namespace and bounded receipt protocol', () => {
+  const archive = runtime.slice(runtime.indexOf('async fn archive_research('), runtime.indexOf('fn start_task_metadata('));
+  for (const part of ['util.dataset_mission', '--native-archive-statistics', 'configurationBinding', 'evidenceCollection', 'Duration::from_secs(90)', 'schemaVersion', 'command', 'ok', 'result']) assert.ok(archive.includes(part), part);
+  assert.doesNotMatch(archive, /taskctl\.py|\.drop\(|\.research\.json/);
   const discovery = source.slice(source.indexOf('pub async fn read_latest_py_file'), source.indexOf('pub async fn sync_remote_task'));
   assert.match(discovery, /task_type: Option<String>/);
   assert.match(discovery, /run_template_catalog\(root, "latest"/);

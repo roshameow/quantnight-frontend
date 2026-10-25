@@ -1,0 +1,3 @@
+[workspace]
+members = ["task-core", "taskctl"]
+resolver = "2"

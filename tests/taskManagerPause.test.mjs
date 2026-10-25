@@ -44,7 +44,7 @@ async function harness(initial = task()) {
     .replace(/import \{ useRoute, useRouter \} from "vue-router";/,
       'const useRoute = () => ({ fullPath: "/tasks" }); const useRouter = () => ({ push() {} });')
     .replace(/import \{ useMessage, useDialog \} from "naive-ui";/,
-      'const useMessage = () => ({ error: (...args) => hooks.errors.push(args), success() {} }); const useDialog = () => ({});')
+      'const useMessage = () => ({ error: (...args) => hooks.errors.push(args), success() {} }); const useDialog = () => ({ warning: options => { hooks.dialog = options; } });')
     .replace(/import (\w+) from "[^"\n]+\.vue";/g, 'const $1 = {};');
   const hooksCode = `export const hooks = { errors: [], invoke: null, unmount: null, timers: new Map(), nextTimer: 0 };
     const setTimeout = (callback, delay) => { const id = ++hooks.nextTimer; hooks.timers.set(id, { callback, delay }); return id; };
@@ -719,14 +719,14 @@ for (const [handler, native, taskType] of [
         throw 'taskctl start: wrong taskId/host; stdout=receipt stderr=execution_context_unverified';
       };
       const config = { max_concurrent: 3, rounds: { enabled: true }, marker: "space ' quote" };
-      await h.state[handler]({ taskName: 'priority-a', config, isRemote: false });
+      await h.state[handler]({ taskName: 'priority-a', config, isRemote: true });
       assert.deepEqual(calls, [{ name: native, args: { taskName: 'priority-a', taskId: 'id-a',
-        config: JSON.stringify(config), isRemote: false } }]);
+        config: JSON.stringify(config), isRemote: true, expectedRemote: true } }]);
       assert.equal(h.store.tasks[0].status, 'paused');
       assert.equal(h.lists.length, 0);
       assert.match(h.hooks.errors[0][0], /wrong taskId\/host.*stdout=receipt stderr=execution_context_unverified/);
       h.store.replaceTasks([]);
-      await h.state[handler]({ taskName: 'priority-a', config, isRemote: false });
+      await h.state[handler]({ taskName: 'priority-a', config, isRemote: true });
       assert.equal(calls.length, 1, 'missing GUI identity must not invoke native');
       assert.match(h.hooks.errors[1][0], /任务身份缺失/);
     } finally { h.stop(); }
@@ -738,11 +738,114 @@ test('all native GUI start entrypoints delegate once without a second launch or 
   for (const name of ['start_task', 'start_super_task', 'start_priority_task']) {
     const body = rust.slice(rust.indexOf(`pub async fn ${name}(`)).split('\n}')[0];
     assert.match(body, /task_id: String/);
-    assert.equal((body.match(/start_via_taskctl\(/g) || []).length, 1);
+    assert.equal((body.match(/start_via_core\(/g) || []).length, 1);
     assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
   }
-  const body = rust.slice(rust.indexOf('async fn start_via_taskctl('), rust.indexOf('pub async fn start_task('));
-  assert.equal((body.match(/run_taskctl\(/g) || []).length, 1);
+  const body = rust.slice(rust.indexOf('async fn start_via_core('), rust.indexOf('pub async fn start_task('));
+  assert.equal((body.match(/core.start\(/g) || []).length, 1);
   assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
-  for (const arg of ['--expected-task-id', '--no-notify', '--no-remote', '--remote', '--config']) assert.ok(body.includes(arg));
+  const request = rust.slice(rust.indexOf('fn start_request('), rust.indexOf('async fn start_via_core('));
+  for (const arg of ['expected_task_id', 'notification.no_notify = true', 'request.remote = Some(remote)', 'request.config_json = Some(config.into())']) assert.ok(request.includes(arg));
+  assert.match(rust, /use quantnight_task_core::/);
+  assert.match(body, /operation_task_identity/);
+});
+
+for (const handler of ['handleStartTask', 'handleStartSuperTask', 'handlePriorityStartTask']) {
+  test(`${handler} rejects checkbox host migration and duplicate in-flight launches without losing original stop evidence`, async () => {
+    const h = await harness(task({ status: 'paused' }));
+    try {
+      const calls = [], pending = deferred();
+      h.hooks.invoke = (name, args) => { calls.push({ name, args }); return pending.promise; };
+      const args = { taskName: 'priority-a', config: { full: { keep: true } }, isRemote: false };
+      await h.state[handler](args);
+      assert.equal(calls.length, 0);
+      assert.match(h.hooks.errors[0][0], /不能切换实际执行端/);
+      args.isRemote = true;
+      const first = h.state[handler](args);
+      await tick();
+      await h.state[handler](args);
+      assert.equal(calls.length, 1);
+      args.config.full.keep = false;
+      assert.equal(JSON.parse(calls[0].args.config).full.keep, true);
+      assert.equal(h.store.tasks[0].isRemote, true);
+      pending.reject(new Error('launch receipt unconfirmed; do not retry'));
+      await first;
+      assert.equal(calls.length, 1);
+      assert.equal(h.store.tasks[0].status, 'paused');
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.stop(); }
+  });
+}
+
+test('sync sends exact ID once, never follows with a bare host update, and stale host is not optimistically committed', async () => {
+  const h = await harness(task({ status: 'ready', isRemote: false }));
+  try {
+    const calls = [], pending = deferred();
+    h.hooks.invoke = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'sync_remote_task') return pending.promise;
+      if (name === 'get_all_tasks') return Promise.resolve([task({ status: 'ready', isRemote: true })]);
+      return Promise.resolve();
+    };
+    const first = h.state.syncRemoteTask('priority-a');
+    await tick();
+    await h.state.syncRemoteTask('priority-a');
+    assert.deepEqual(calls, [{ name: 'sync_remote_task', args: { taskId: 'id-a', alphaMissionList: 'priority-a', expectedRemote: false } }]);
+    assert.equal(h.store.tasks[0].isRemote, false);
+    pending.resolve();
+    await first;
+    assert.equal(h.store.tasks[0].isRemote, true);
+    assert.ok(!calls.some(call => call.name === 'update_remote_status'));
+  } finally { h.stop(); }
+});
+
+test('host toggle refusal retains original host and Priority update binds original ID/host without marking running', async () => {
+  const h = await harness(task({ status: 'paused' }));
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => { calls.push({ name, args }); throw new Error('shared core refused unsafe mutation'); };
+    await h.state.updateIsRemote('id-a', false);
+    assert.equal(h.store.tasks[0].isRemote, true);
+    await h.state.handleUpdatePriorityTask({ taskName: 'priority-a', config: { rounds: { enabled: true } }, isRemote: true });
+    assert.deepEqual(calls[1], { name: 'update_priority_task', args: { taskName: 'priority-a', taskId: 'id-a', config: '{"rounds":{"enabled":true}}', isRemote: true } });
+    assert.equal(h.store.tasks[0].status, 'paused');
+    await h.state.handleUpdatePriorityTask({ taskName: 'priority-a', config: {}, isRemote: false });
+    assert.equal(calls.length, 2);
+    assert.match(h.hooks.errors.at(-1)[0], /不能迁移执行端/);
+  } finally { h.stop(); }
+});
+
+test('start forwards persisted creation destination separately from captured actual host, never grants eligibility in UI', async () => {
+  const h = await harness(task({ taskType: 'priority', status: 'pending', isRemote: false, targetRemote: true }));
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => { calls.push({ name, args }); throw new Error('core decides pristine destination eligibility'); };
+    await h.state.handlePriorityStartTask({ taskName: 'priority-a', config: { exact: [] }, isRemote: false });
+    assert.deepEqual(calls, [{ name: 'start_priority_task', args: { taskName: 'priority-a', taskId: 'id-a',
+      config: '{"exact":[]}', isRemote: true, expectedRemote: false } }]);
+    assert.equal(h.store.tasks[0].isRemote, false);
+    assert.equal(h.store.tasks[0].status, 'pending');
+    assert.equal(h.hooks.timers.size, 0);
+    assert.match(h.hooks.errors[0][0], /core decides pristine destination eligibility/);
+  } finally { h.stop(); }
+});
+
+test('delete captures original host/ID at confirmation, rejects duplicate actions and never removes on core refusal', async () => {
+  const h = await harness(task({ status: 'paused', isRemote: true }));
+  try {
+    const pending = deferred(), calls = [];
+    h.hooks.invoke = (name, args) => { calls.push({ name, args }); return pending.promise; };
+    h.state.deleteTask({ $oid: 'id-a' });
+    assert.match(h.hooks.dialog.content, /保留候选回执和正式结果/);
+    h.store.replaceTasks([task({ status: 'paused', isRemote: false })]);
+    const first = h.hooks.dialog.onPositiveClick();
+    await h.hooks.dialog.onPositiveClick();
+    assert.deepEqual(calls, [{ name: 'delete_task', args: { id: 'id-a', expectedRemote: true } }]);
+    pending.reject(new Error('original execution host changed before locked cleanup'));
+    await first;
+    assert.equal(h.store.tasks.length, 1);
+    assert.equal(h.store.tasks[0].isRemote, false);
+    assert.match(h.hooks.errors[0][0], /original execution host changed/);
+    assert.equal(calls.length, 1);
+  } finally { h.stop(); }
 });

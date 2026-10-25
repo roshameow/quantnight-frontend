@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,13 +11,46 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, State};
 use tokio::time::timeout;
 use toml;
-use dirs::data_dir;
 
-use crate::config::{run_bash_script, run_bash_script_observed_with_env, run_process_observed, run_python_command, AppConfig,
+use crate::config::{run_bash_script_observed_with_env, AppConfig,
     BashScriptEvent, BashScriptObserver};
 use crate::mongo_manager::MongoClients;
+use quantnight_task_core::{task_control::TaskControl, cleanup_sync::TaskOutcome,
+    create_generate::{CreateRequest, GenerateRequest, gui_created_task, gui_generated},
+    start::StartRequest, pause::{PauseOptions, StopBudget}};
+pub use quantnight_task_core::create_generate::GuiCreatedTask as CreatedTask;
+pub use quantnight_task_core::pause::ConfirmedTaskStop;
 
-use serde_json::from_str;
+/// One lazy bootstrap per app; reuse the existing parsed config and Mongo pools.
+/// A failed bootstrap is also cached, not retried for every button click.
+#[derive(Default)]
+pub struct TaskControlState(tokio::sync::OnceCell<Result<TaskControl, String>>);
+impl TaskControlState {
+    async fn get(&self, config: &AppConfig, clients: &Arc<MongoClients>) -> Result<&TaskControl, String> {
+        self.initialize(TaskControl::with_existing_clients(config, clients.clone())).await
+    }
+    async fn initialize(&self, init: impl std::future::Future<Output = Result<TaskControl, String>>) -> Result<&TaskControl, String> {
+        self.0.get_or_init(|| init).await.as_ref().map_err(Clone::clone)
+    }
+}
+
+fn core_receipt(result: &TaskOutcome, command: &str, name: &str) -> Result<(), String> {
+    let value = &result.value;
+    if result.exit_code != 0 || value["schemaVersion"].as_u64() != Some(1)
+        || value["command"].as_str() != Some(command) || value["task"].as_str() != Some(name)
+        || value["ok"].as_bool() != Some(true) {
+        return Err(format!("共享 TaskControl {command} 未确认；未自动重试：{value}"));
+    }
+    Ok(())
+}
+
+fn required_task_id(id: Option<&str>) -> Result<&str, String> {
+    let id = id.ok_or("任务ID缺失；请刷新列表，禁止按同名接管任务")?;
+    ObjectId::parse_str(id).map_err(|_| "任务ID无效；禁止按同名接管任务")?;
+    Ok(id)
+}
+
+
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Deserialize)]
@@ -34,19 +66,6 @@ pub struct NewTask {
     pub mission_config: Option<JsonValue>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct CreatedTask {
-    pub _id: String,
-    pub name: String,
-    pub template: String,
-    pub templatefile: String,
-    pub auth_profile: Option<String>,
-    pub status: String,
-    pub is_remote: Option<bool>,
-    pub task_type: Option<String>,
-    pub mission_config: Option<JsonValue>,
-}
-
 // Pure helpers: validate before launching a script or writing a task record.
 fn mission_config_document(value: &JsonValue) -> Result<Document, String> {
     if !value.is_object() {
@@ -55,158 +74,55 @@ fn mission_config_document(value: &JsonValue) -> Result<Document, String> {
     bson::to_document(value).map_err(|e| format!("config 转 BSON 失败: {}", e))
 }
 
-fn priority_config_update(config: &str, is_remote: bool) -> Result<Document, String> {
-    let value: JsonValue = serde_json::from_str(config)
-        .map_err(|e| format!("config 解析成 JSON 失败: {}", e))?;
-    let document = mission_config_document(&value)?;
-    // Prepared before launch, persisted only after the requested host's script succeeds.
-    // CP/run host is independent of each root's immutable source_remote.
-    Ok(doc! { "status": "running", "mission_config": document,
-        "isRemote": is_remote, "targetRemote": is_remote })
+fn priority_config_document(config: &str) -> Result<Document, String> {
+    let value: JsonValue = serde_json::from_str(config).map_err(|e| format!("配置 JSON 无效：{e}"))?;
+    mission_config_document(&value)
+}
+
+fn create_request(new_task: NewTask) -> Result<CreateRequest, String> {
+    let mut request = CreateRequest::new(new_task.name, new_task.templatefile);
+    request.template = new_task.template;
+    request.auth_profile = new_task.auth_profile.unwrap_or_else(|| "user1".into());
+    request.task_type = new_task.task_type.unwrap_or_else(|| "regular".into());
+    request.target_remote = new_task.is_remote.unwrap_or(false);
+    request.mission_config = new_task.mission_config.as_ref().map(mission_config_document).transpose()?;
+    // Legacy status is accepted in the DTO, never used as control-write authority.
+    let _ = new_task.status;
+    Ok(request)
 }
 
 #[command]
-pub async fn create_task(
-    new_task: NewTask,
-    clients: State<'_, Arc<MongoClients>>
-) -> Result<CreatedTask, String> {
-    let saved_config = new_task.mission_config.as_ref().map(mission_config_document).transpose()?;
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let coll = db.collection::<Document>("tasks");
-
-    let status = new_task.status.unwrap_or_else(|| "waiting".to_string());
-    let is_remote = new_task.is_remote.unwrap_or(false);
-    let task_type = new_task.task_type.clone().unwrap_or_else(|| "regular".to_string());
-    let auth_profile = new_task.auth_profile.clone().unwrap_or_else(|| "user1".to_string());
-
-    let mut task_doc = doc! {
-        "name": &new_task.name,
-        "template": &new_task.template,
-        "templatefile": &new_task.templatefile,
-        "auth_profile": &auth_profile,
-        "status": &status,
-        "isRemote": is_remote,
-        "taskType": &task_type,
-    };
-    if let Some(config) = saved_config {
-        task_doc.insert("mission_config", config);
-    }
-
-    let result = coll
-        .insert_one(task_doc, None)
-        .await
-        .map_err(|e| format!("插入失败: {}", e))?;
-
-    let inserted_id = result
-        .inserted_id
-        .as_object_id()
-        .ok_or_else(|| "插入失败，无法获取ObjectId".to_string())?;
-
-    Ok(CreatedTask {
-        _id: inserted_id.to_hex(),
-        name: new_task.name,
-        template: new_task.template,
-        templatefile: new_task.templatefile,
-        auth_profile: Some(auth_profile),
-        status,
-        is_remote: Some(is_remote),
-        task_type: Some(task_type),
-        mission_config: new_task.mission_config,
-    })
+pub async fn create_task(new_task: NewTask, clients: State<'_, Arc<MongoClients>>,
+    config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<CreatedTask, String> {
+    let request = create_request(new_task)?;
+    let result = control.get(&config, &clients).await?.create(&request, None).await;
+    core_receipt(&result, "create", &request.name)?;
+    gui_created_task(&result)
 }
-
 
 #[command]
 pub async fn generate_list(id: String, clients: State<'_, Arc<MongoClients>>,
-    config: State<'_, AppConfig>,) -> Result<(), String> {
-
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-    let obj_id = ObjectId::parse_str(&id).map_err(|e| e.to_string())?;
-
-    let task_doc = tasks
-        .find_one(doc! { "_id": obj_id }, None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "任务未找到".to_string())?;
-
-    // 从任务中读取 template 和 name 字段
-    let template = task_doc.get_str("templatefile").map_err(|_| "任务中缺少 template 字段".to_string())?;
-    let name = task_doc.get_str("name").map_err(|_| "任务中缺少 name 字段".to_string())?;
-    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
-    let task_type = task_doc.get_str("taskType").unwrap_or("regular"); // 默认为 regular
-    let is_super = task_type.eq_ignore_ascii_case("super");
-    // 执行python脚本
-    let mut replacements = HashMap::new();
-    replacements.insert("{template}", template);
-    replacements.insert("{name}", name);
-    replacements.insert("{auth_profile}", auth_profile);
-    replacements.insert("{extra_args}", if is_super { "--alpha_type super" } else { "" });
-
-    // Same ordinary-task generation CAS used by taskctl/preparation. A second
-    // UI/agent invocation cannot enter generation while another owner holds it.
-    let generation_id = ObjectId::new().to_hex();
-    let claim = tasks.update_one(
-        doc! {"_id": obj_id, "status": {"$in": ["pending", "waiting", "ready", "generation_failed"]}},
-        doc! {"$set": {"status": "generating", "updatedAt": bson::DateTime::now(),
-            "generation": {"id": &generation_id, "phase": "writing", "producerPid": std::process::id() as i64,
-                           "startedAt": bson::DateTime::now()}}}, None).await.map_err(|e| e.to_string())?;
-    if claim.matched_count != 1 { return Err("生成认领失败：任务正在运行、生成或等待状态核验".into()); }
-    let generated: Result<u64, String> = async {
-        run_python_command(&config, "generate_list", &replacements).await?;
-        let count = client.database("simulation_db").collection::<Document>(name)
-            .count_documents(None, None).await.map_err(|e| e.to_string())?;
-        if count == 0 { return Err("生成器退出成功但候选集合为空".into()); }
-        Ok(count)
-    }.await;
-    let query = doc! {"_id": obj_id, "status": "generating", "generation.id": &generation_id};
-    let fields = match &generated {
-        Ok(count) => doc! {"status": "ready", "expectedCount": *count as i64,
-            "generation.phase": "complete", "generation.finishedAt": bson::DateTime::now()},
-        Err(error) => {
-            let status = if error.contains("超时") || error.to_lowercase().contains("timeout") {
-                "generation_unknown"
-            } else { "generation_failed" };
-            doc! {"status": status, "generation.phase": status,
-                "generation.finishedAt": bson::DateTime::now(), "lastError": error}
-        }
-    };
-    let updated = tasks.update_one(query, doc! {"$set": fields}, None).await.map_err(|e| e.to_string())?;
-    if updated.matched_count != 1 { return Err("生成归属已变化；保留当前状态".into()); }
-    generated.map(|_| ())
-
+    config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<(), String> {
+    required_task_id(Some(&id))?;
+    let core = control.get(&config, &clients).await?;
+    let task = core.task_by_id(&id).await?;
+    let mut request = GenerateRequest::new(task.get_str("name").map_err(|e| e.to_string())?);
+    request.expected_task_id = Some(id);
+    request.timeout_seconds = 900; // Original generator budget, not a candidate cap.
+    let result = core.generate(&request, None).await;
+    core_receipt(&result, "generate", &request.name)?;
+    gui_generated(&result)
 }
 
 #[derive(Deserialize)]
-pub struct Updates {
-    is_remote: bool,
-}
+pub struct Updates { is_remote: bool }
 
 #[tauri::command]
-pub async fn update_remote_status(id: String, updates: Updates,clients: State<'_, Arc<MongoClients>>) -> Result<(), String> {
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let collection = db.collection::<mongodb::bson::Document>("tasks");
-
-    // 转换 id
-    let obj_id = ObjectId::parse_str(&id)
-        .map_err(|e| format!("解析 ObjectId 失败: {}", e))?;
-
-    // 更新任务
-    collection
-        .update_one(
-            doc! { "_id": obj_id },
-            doc! { "$set": { "isRemote": updates.is_remote } },
-            None,
-        )
-        .await
-        .map_err(|e| format!("更新失败: {}", e))?;
-
-    Ok(())
+pub async fn update_remote_status(id: String, updates: Updates) -> Result<(), String> {
+    required_task_id(Some(&id))?;
+    let target = if updates.is_remote { "远程" } else { "本地" };
+    Err(format!("禁止通过开关改写实际执行端为{target}；新任务请在创建时选择目标，初次远程执行须使用安全同步。已有任务不会自动迁移"))
 }
-
 
 // Discovery and binding share Python's pure catalog with generation. Do not
 // replicate sidecar/hash/root-containment logic here or execute template code.
@@ -261,12 +177,17 @@ async fn latest_template_from_directory(root: &Path, folder_path: &str, task_typ
 }
 
 #[command]
-pub async fn sync_remote_task(alpha_mission_list: String, config: State<'_, AppConfig>) -> Result<(), String> {
-
-    let (_, _) = run_bash_script("sync_remote_task", &[("alpha_mission_list", &alpha_mission_list)], false, &config).await?;
-    Ok(())
+pub async fn sync_remote_task(alpha_mission_list: String, task_id: Option<String>, expected_remote: Option<bool>,
+    clients: State<'_, Arc<MongoClients>>, config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>) -> Result<(), String> {
+    let id = required_task_id(task_id.as_deref())?;
+    let core = control.get(&config, &clients).await?;
+    let task = core.task_by_id(id).await?;
+    if task.get_str("name").ok() != Some(&alpha_mission_list) { return Err("原任务名称已变化".into()); }
+    let remote = expected_remote.unwrap_or(task.get_bool("isRemote").unwrap_or(false));
+    let result = core.sync_bound(&alpha_mission_list, Some(id), Some(remote), None).await;
+    core_receipt(&result, "sync", &alpha_mission_list)
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
@@ -281,12 +202,16 @@ pub struct Task {
     pub status: String,
     #[serde(rename = "isRemote")] // 👈 加上这个
     pub is_remote: Option<bool>, // 可选字段
+    #[serde(default, rename = "targetRemote")]
+    pub target_remote: Option<bool>,
     #[serde(rename = "taskType")] // 👈 加上这个
     pub task_type: Option<String>, // 或者 task_type: Option<String>
     #[serde(rename = "mission_config")]
     pub mission_config: Option<JsonValue>, // 加上这一行，接收嵌套的 config
     #[serde(rename = "startConfig")]
     pub start_config: Option<JsonValue>,
+    #[serde(default, rename = "launchAttemptId")]
+    pub launch_attempt_id: Option<String>,
     pub config: Option<JsonValue>,
     #[serde(default, rename = "stopConfirmedAt")]
     pub stop_confirmed_at: Option<bson::DateTime>,
@@ -313,14 +238,6 @@ static REMOTE_TASK_CACHE: OnceLock<Mutex<Option<RemoteTaskCache>>> = OnceLock::n
 const REMOTE_TASK_CACHE_TTL: Duration = Duration::from_secs(10);
 /// 远程查询硬超时：隧道慢/挂时快速失败，避免每次操作被拖住（驱动默认 server selection 可达 30s）
 const REMOTE_TASK_TIMEOUT: Duration = Duration::from_secs(2);
-
-fn clear_remote_task_cache() {
-    if let Some(cache) = REMOTE_TASK_CACHE.get() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = None;
-        }
-    }
-}
 
 /// 从远程 mission.tasks 拉取任务列表（带 TTL 缓存 + 超时）。
 /// 远程不可达/超时时静默返回空，不影响本地任务展示。
@@ -380,55 +297,6 @@ async fn fetch_remote_tasks(clients: &Arc<MongoClients>, local_uri: &str, remote
     }
 }
 
-/// 删除 remote 端注册的任务（agent 在 mac-mini 直接生成的，仅存在于 remote mission.tasks）
-async fn delete_remote_registered_task(
-    clients: &Arc<MongoClients>,
-    obj_id: ObjectId,
-) -> Result<(), String> {
-    let remote_client = Arc::clone(&clients.remote);
-    let result = timeout(REMOTE_TASK_TIMEOUT, async move {
-        let tasks = remote_client.database("simulation_mission").collection::<Document>("tasks");
-
-        let task_doc = tasks
-            .find_one(doc! { "_id": obj_id }, None)
-            .await
-            .map_err(|e| format!("连接远程任务库失败: {}", e))?
-            .ok_or_else(|| "未找到指定的任务".to_string())?;
-
-        // 标记 deactive（软删）
-        tasks
-            .update_one(
-                doc! { "_id": obj_id },
-                doc! { "$set": { "status": "deactive" } },
-                None,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // 删除远程 simulation_db 中的同名 collection（尽力而为，失败不阻塞删除主流程）
-        let task_name = task_doc
-            .get_str("name")
-            .map_err(|_| "任务中缺少 name 字段".to_string())?
-            .to_string();
-        let sim_data_db = remote_client.database("simulation_db");
-        if let Ok(names) = sim_data_db.list_collection_names(None).await {
-            if names.contains(&task_name) {
-                let _ = sim_data_db.collection::<Document>(&task_name).drop(None).await;
-            }
-        }
-        Ok::<(), String>(())
-    })
-    .await;
-
-    match result {
-        Ok(res) => {
-            clear_remote_task_cache();
-            res
-        }
-        Err(_) => Err("连接远程任务库超时，请检查远程 MongoDB / 隧道是否可用".to_string()),
-    }
-}
-
 #[command]
 pub async fn get_all_tasks(
     clients: State<'_, Arc<MongoClients>>,
@@ -469,188 +337,79 @@ pub async fn get_all_tasks(
     Ok(tasks)
 }
 
-// Keep the existing delete button/lifecycle. Prepared research templates carry
-// an optional sidecar; archive through the same Python control interface before
-// making any destructive Mongo change. Legacy tasks need no new workflow.
-async fn archive_prepared_research(task: &Document, config: &AppConfig) -> Result<(), String> {
-    let template = task.get_str("templatefile").unwrap_or("");
-    if template.is_empty() { return Ok(()); }
-    let kind = task.get_str("taskType").unwrap_or("regular");
-    if kind == "priority" { return Ok(()); } // Priority has its own unchanged templates.
-    let root = PathBuf::from(&config.env.working_dir);
-    let result = run_template_catalog(&root, "binding", kind, Some(template), None).await
-        .map_err(|e| format!("研究绑定核验失败；任务记录保留：{e}"))?;
-    let binding = result.get("binding").ok_or("研究绑定查询缺少 binding；任务记录保留")?;
-    if !binding.is_null() && !binding.is_object() {
-        return Err("研究绑定类型应为对象或 null；任务记录保留".into());
-    }
-    // Refine descriptors are not dataset manifests. Keep the original binding's kind.
-    if binding.get("kind").and_then(|v| v.as_str()) != Some("dataset") { return Ok(()); }
-    if task.get_str("status").ok() == Some("running") {
-        return Err("当前研究任务正在运行；完成整任务暂停后可删除".into());
-    }
+#[command]
+pub async fn delete_task(id: String, expected_remote: Option<bool>, clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<(), String> {
+    required_task_id(Some(&id))?;
+    let core = control.get(&app_config, &clients).await?;
+    // No remote-only fallback and no name adoption. The common owner archives.
+    let task = core.task_by_id(&id).await?;
     let name = task.get_str("name").map_err(|e| e.to_string())?;
-    let id = task.get_object_id("_id").map_err(|e| e.to_string())?.to_hex();
-    let remote = if task.get_bool("isRemote").unwrap_or(false) { "true" } else { "false" };
-    let (stdout, stderr) = run_taskctl(&root,
-        &["archive-research", "--name", name, "--expected-task-id", &id, "--expected-remote", remote],
-        Duration::from_secs(90)).await
-        .map_err(|e| format!("研究统计归档失败；任务记录保留：{e}"))?;
-    let receipt: JsonValue = serde_json::from_str(&stdout)
-        .map_err(|e| format!("研究统计归档回执 JSON 解析失败；任务记录保留：{e}\nstdout: {stdout}\nstderr: {stderr}"))?;
-    if receipt.get("ok").and_then(|v| v.as_bool()) != Some(true)
-        || receipt.get("command").and_then(|v| v.as_str()) != Some("archive-research")
-        || receipt.get("task").and_then(|v| v.as_str()) != Some(name)
-        || receipt.get("archivePath").and_then(|v| v.as_str()).map_or(true, str::is_empty) {
-        return Err(format!("研究统计归档失败；任务记录保留：{receipt}\nstdout: {stdout}\nstderr: {stderr}"));
+    let remote = expected_remote.unwrap_or(task.get_bool("isRemote").unwrap_or(false));
+    let result = core.delete_bound(name, Some(&id), Some(remote), None, None).await;
+    core_receipt(&result, "delete", name)?;
+    let receipt = &result.value;
+    if receipt["controlHidden"] != true || receipt["localDeleted"] != true
+        || (remote && receipt["remoteDeleted"] != true)
+        || receipt["itemsPreserved"] != true || receipt["canonicalResultsDeleted"] != false {
+        return Err(format!("安全归档回执未完成；保留原任务核验：{receipt}"));
     }
     Ok(())
 }
 
-#[command]
-pub async fn delete_task(id: String, clients: State<'_, Arc<MongoClients>>,
-    app_config: State<'_, AppConfig>) -> Result<(), String> {
-    let client = &clients.local;
+fn start_request(task_name: &str, config: &str, remote: bool, task_id: &str, expected_remote: Option<bool>) -> Result<StartRequest, String> {
+    required_task_id(Some(task_id))?;
+    priority_config_document(config)?;
+    let mut request = StartRequest::new(task_name);
+    request.config_json = Some(config.into());
+    request.remote = Some(remote);
+    request.expected_remote = Some(expected_remote.unwrap_or(remote));
+    request.expected_task_id = Some(task_id.into());
+    request.notification.no_notify = true;
+    Ok(request)
+}
 
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    let obj_id = ObjectId::parse_str(&id).map_err(|e| e.to_string())?;
-
-    // 先在本地 mission.tasks 找；找不到则视为 remote 端注册的任务（agent 直接生成的），路由到远程删除
-    let probe = tasks
-        .find_one(doc! { "_id": obj_id }, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    if matches!(probe.as_ref().and_then(|d| d.get_str("status").ok()), Some("generating" | "generation_unknown")) {
-        return Err("当前处于候选生成阶段；完成生成核验后可删除".into());
+fn start_receipt(result: &TaskOutcome, request: &StartRequest) -> Result<(), String> {
+    core_receipt(result, "start", &request.name)?;
+    if result.value["taskId"].as_str() != request.expected_task_id.as_deref()
+        || result.value["remote"].as_bool() != request.remote {
+        return Err(format!("共享 TaskControl start 回执身份/执行端不匹配；未重试：{}", result.value));
     }
-    if probe.is_none() {
-        return delete_remote_registered_task(&clients, obj_id).await;
-    }
-    archive_prepared_research(probe.as_ref().unwrap(), &app_config).await?;
-
-    let mut delete_filter = doc! { "_id": obj_id };
-    for field in ["name", "status", "updatedAt", "isRemote", "templatefile", "taskType", "auth_profile"] {
-        match probe.as_ref().unwrap().get(field) {
-            Some(value) => { delete_filter.insert(field, value.clone()); },
-            None => { delete_filter.insert(field, doc! { "$exists": false }); },
-        }
-    }
-    let update_result = tasks
-        .update_one(
-            delete_filter,
-            doc! { "$set": { "status": "deactive" } },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if update_result.matched_count == 0 {
-        return Err("任务身份或状态已改变；任务记录保留".to_string());
-    }
-
-
-    // 找到该任务，获取 name 字段
-    let task_doc = tasks
-        .find_one(doc! { "_id": obj_id }, None)
-        .await
-        .map_err(|e| format!("查询任务失败: {}", e))?
-        .ok_or_else(|| "未找到指定的任务".to_string())?;
-    let task_name = task_doc
-        .get_str("name")
-        .map_err(|_| "任务中缺少 name 字段".to_string())?
-        .to_string();
-    // 删除 simulation_db 中的同名 collection（如果存在）
-    let sim_data_db = client.database("simulation_db");
-    if sim_data_db.list_collection_names(None).await
-        .map_err(|e| e.to_string())?
-        .contains(&task_name) 
-    {
-        sim_data_db
-            .collection::<Document>(&task_name)
-            .drop(None)
-            .await
-            .map_err(|e| format!("删除 simulation_db 中 collection 失败: {}", e))?;
-    }
-    // 如果是远程任务，尝试连接远程 Mongo 并删除同名 collection（尽力而为：超时/失败只告警，不阻塞删除主流程）
-    let is_remote = task_doc.get_bool("isRemote").unwrap_or(false);
-    if is_remote {
-        let remote_client = Arc::clone(&clients.remote);
-        let remote_task_name = task_name.clone();
-        let _ = timeout(REMOTE_TASK_TIMEOUT, async move {
-            let remote_db = remote_client.database("simulation_db");
-            if let Ok(names) = remote_db.list_collection_names(None).await {
-                if names.contains(&remote_task_name) {
-                    let _ = remote_db.collection::<Document>(&remote_task_name).drop(None).await;
-                }
-            }
-        })
-        .await;
-    }
-
     Ok(())
 }
 
-
-// Same local Python/root/PYTHONPATH transport previously used by archive-research.
-// taskctl owns remote transport, configuration, identity CAS and launch evidence.
-async fn run_taskctl(root: &Path, args: &[&str], budget: Duration) -> Result<(String, String), String> {
-    let mut command = tokio::process::Command::new(root.join(".venv/bin/python"));
-    command.current_dir(root).env("PYTHONPATH", root).kill_on_drop(true)
-        .arg(".agents/skills/manage-quantnight-frontend/scripts/taskctl.py").args(args);
-    run_process_observed(command, budget, false, None).await
-}
-
-async fn start_via_taskctl(
-    task_name: &str, config: &str, is_remote: bool, task_id: &str,
-    app_config: &AppConfig, budget: Duration,
-) -> Result<(), String> {
-    ObjectId::parse_str(task_id).map_err(|e| format!("启动任务身份无效：{e}"))?;
-    let value: JsonValue = serde_json::from_str(config)
-        .map_err(|e| format!("启动配置 JSON 无效：{e}"))?;
-    if !value.is_object() { return Err("启动配置必须是 JSON 对象".into()); }
-    let (stdout, stderr) = run_taskctl(Path::new(&app_config.env.working_dir),
-        &["start", "--name", task_name, "--config", config,
-          if is_remote { "--remote" } else { "--no-remote" },
-          "--expected-task-id", task_id, "--no-notify"], budget).await
-        .map_err(|e| format!("taskctl start 未获确认；未重试或写入 running，请核对原任务状态：{e}"))?;
-    let receipt: JsonValue = serde_json::from_str(&stdout)
-        .map_err(|e| format!("taskctl start 回执 JSON 无效；未重试：{e}\nstdout: {stdout}\nstderr: {stderr}"))?;
-    if receipt.get("schemaVersion").and_then(JsonValue::as_u64) != Some(1)
-        || receipt.get("command").and_then(JsonValue::as_str) != Some("start")
-        || receipt.get("task").and_then(JsonValue::as_str) != Some(task_name)
-        || receipt.get("ok").and_then(JsonValue::as_bool) != Some(true)
-        || receipt.get("taskId").and_then(JsonValue::as_str) != Some(task_id)
-        || receipt.get("remote").and_then(JsonValue::as_bool) != Some(is_remote) {
-        return Err(format!("taskctl start 失败或回执任务/执行端不匹配；未重试或写入 running\nstdout: {stdout}\nstderr: {stderr}"));
-    }
-    // Startup confirmation is not task completion or platform acceptance.
-    Ok(())
+async fn start_via_core(core: &TaskControl, request: &StartRequest) -> Result<(), String> {
+    // Transport intent is not host migration authorization. Shared core repeats
+    // authoritative identity/CAS checks under its original mission lock.
+    let task = core.task_by_id(required_task_id(request.expected_task_id.as_deref())?).await?;
+    operation_task_identity(&task, &request.name, request.expected_remote.ok_or("原始执行端缺失")?)?;
+    let result = timeout(Duration::from_secs(300), core.start(request, None)).await
+        .map_err(|_| "启动总预算300秒耗尽；结果待核验，未自动重试或写入running")?;
+    start_receipt(&result, request)
 }
 
 #[command]
-pub async fn start_task(
-    task_name: String, config: String, is_remote: bool, task_id: String,
-    app_config: State<'_, AppConfig>,
-) -> Result<(), String> {
-    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
+pub async fn start_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+    clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>) -> Result<(), String> {
+    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
 #[command]
-pub async fn start_super_task(
-    task_name: String, config: String, is_remote: bool, task_id: String,
-    app_config: State<'_, AppConfig>,
-) -> Result<(), String> {
-    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
+pub async fn start_super_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+    clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>) -> Result<(), String> {
+    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
 #[command]
-pub async fn start_priority_task(
-    task_name: String, config: String, is_remote: bool, task_id: String,
-    app_config: State<'_, AppConfig>,
-) -> Result<(), String> {
-    start_via_taskctl(&task_name, &config, is_remote, &task_id, &app_config, Duration::from_secs(300)).await
+pub async fn start_priority_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+    clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>) -> Result<(), String> {
+    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
 
@@ -989,6 +748,7 @@ fn dispatch_status_output(stdout: &str, dispatch: Option<DispatchState>) -> Stri
 
 const TASK_STAGE_PREFIX: &str = "QUANTNIGHT_TASK_STAGE ";
 const RUNTIME_BUDGET: Duration = Duration::from_secs(12);
+#[cfg(test)]
 const PAUSE_SCRIPT_BUDGET: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Deserialize)]
@@ -1097,6 +857,7 @@ async fn execute_task_script(progress: &TaskOperationProgress, config: &AppConfi
     budget: Duration) -> Result<(String, String), String> {
     let (key, diagnostic) = match progress.operation {
         "runtime" => ("check_task_status", true),
+        #[cfg(test)] // Original shell regression only; production pause uses TaskControl.
         "stop" => ("pause_task", false),
         _ => return Err(progress.failure("原生任务操作类型无效")),
     };
@@ -1197,51 +958,23 @@ pub async fn check_task_status(
 }
 
 #[command]
-pub async fn update_priority_task(
-    task_name: String,
-    config: String,
-    is_remote: bool,
-    clients: State<'_, Arc<MongoClients>>,
-    app_config: State<'_, AppConfig>,
-) -> Result<(), String> {
-    let set_doc = priority_config_update(&config, is_remote)?;
-
-    let client = &clients.local;
-    let db = client.database("simulation_mission");
-    let tasks = db.collection::<Document>("tasks");
-
-    let task_doc = tasks
-        .find_one(doc! { "name": &task_name, "status": { "$ne": "deactive" } }, None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "任务未找到".to_string())?;
-
-    let auth_profile = task_doc.get_str("auth_profile").unwrap_or("user1");
-    let is_remote_str = if is_remote { "true" } else { "false" };
-
-    let (_, _) = run_bash_script(
-        "update_priority_task",
-        &[
-            ("task_name", &task_name),
-            ("config", &config),
-            ("is_remote", is_remote_str),
-            ("auth_profile", auth_profile),
-        ],
-        is_remote,
-        &app_config,
-    )
-    .await?;
-
-    tasks
-        .update_one(
-            doc! { "name": &task_name, "status": { "$ne": "deactive" } },
-            doc! { "$set": set_doc },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+pub async fn update_priority_task(task_name: String, config: String, is_remote: bool,
+    task_id: Option<String>, clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>) -> Result<(), String> {
+    let id = required_task_id(task_id.as_deref())?;
+    priority_config_document(&config)?;
+    let request = quantnight_task_core::priority_update::UpdatePriorityRequest {
+        name: task_name.clone(), config_json: config, remote: Some(is_remote), expected_task_id: Some(id.into()),
+    };
+    let core = control.get(&app_config, &clients).await?;
+    let result = timeout(Duration::from_secs(300), core.update_priority(&request, None)).await
+        .map_err(|_| "Priority配置发布总预算300秒耗尽；结果未确认，未重试或写running")?;
+    core_receipt(&result, "priority-update", &task_name)?;
+    if result.value["taskId"].as_str() != Some(id) || result.value["configPublished"] != true
+        || result.value["adoptionVerified"] != false || result.value["remote"].as_bool() != Some(is_remote) {
+        return Err(format!("Priority配置发布回执身份/确认字段无效：{}", result.value));
+    }
+    Ok(()) // Configuration publication is NOT running/adoption evidence.
 }
 
 #[command]
@@ -1469,155 +1202,25 @@ fn get_script_description(script_key: &str) -> String {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExecutionStopProofV1 {
-    schema_version: u32,
-    task_name: String,
-    target_remote: bool,
-    session_absent: bool,
-    runners_exited: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionAbsentStopProofV2 {
-    schema_version: u32,
-    task_name: String,
-    target_remote: bool,
-    session_absent: bool,
-    // Unit requires an explicit JSON null, not an omitted Option or a bool.
-    runners_exited: (),
-    confirmation_basis: StopConfirmationBasis,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ExecutionStopProof {
-    Exited(ExecutionStopProofV1),
-    Absent(SessionAbsentStopProofV2),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StopConfirmationBasis {
-    RunnersExited,
-    SessionAbsent,
-}
-
-impl StopConfirmationBasis {
-    fn as_str(self) -> &'static str {
-        match self { Self::RunnersExited => "runners_exited", Self::SessionAbsent => "session_absent" }
-    }
-    fn description(self) -> &'static str {
-        match self {
-            Self::RunnersExited => "原会话与已捕获执行进程退出均已核验",
-            Self::SessionAbsent => "已确认目标主机上精确tmux会话缺失",
-        }
-    }
-}
-
-// Only the unique final receipt binds a stop basis. A runtime stage/event or
-// plain legacy absence line is NEVER pause/control-write authority.
-fn verified_stop_proof(stdout: &str, name: &str, remote: bool) -> Result<StopConfirmationBasis, String> {
-    let receipts: Vec<_> = stdout.lines().filter_map(|line|
-        line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")).collect();
-    if receipts.len() != 1 || stdout.lines().last().and_then(|line|
-        line.trim().strip_prefix("QUANTNIGHT_PAUSE_CONFIRMED ")) != receipts.first().copied() {
-        return Err(match receipts.len() {
-            0 => "暂停回执校验失败：缺少结构化暂停回执".into(),
-            1 => "暂停回执校验失败：结构化暂停回执后仍有输出，最终行应为暂停回执".into(),
-            count => format!("暂停回执校验失败：收到{count}条结构化暂停回执，要求唯一回执"),
-        });
-    }
-    if receipts[0].len() > 8192 { return Err("暂停回执校验失败：最终回执超出8192字节上限".into()); }
-    let proof: ExecutionStopProof = serde_json::from_str(receipts[0])
-        .map_err(|e| format!("暂停回执解析失败：{e}"))?;
-    match proof {
-        ExecutionStopProof::Exited(ExecutionStopProofV1 { schema_version: 1, task_name,
-            target_remote, session_absent: true, runners_exited: true })
-            if task_name == name && target_remote == remote => Ok(StopConfirmationBasis::RunnersExited),
-        ExecutionStopProof::Absent(SessionAbsentStopProofV2 { schema_version: 2, task_name,
-            target_remote, session_absent: true, runners_exited: (),
-            confirmation_basis: StopConfirmationBasis::SessionAbsent })
-            if task_name == name && target_remote == remote => Ok(StopConfirmationBasis::SessionAbsent),
-        proof => Err(format!("暂停回执校验失败：任务身份、执行主机或停止依据存在字段差异；期望 task_name={name:?}, target_remote={remote}, session_absent=true，V1 runners_exited=true 或 V2 runners_exited=null/confirmation_basis=session_absent；收到 {proof:?}")),
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfirmedTaskStop {
-    confirmed: bool,
-    task_id: String,
-    task_name: String,
-    is_remote: bool,
-    stop_confirmed_at: i64,
-    confirmation_basis: StopConfirmationBasis,
-}
-
-fn confirmed_pause_update(id: ObjectId, remote: bool, at: bson::DateTime,
-    basis: StopConfirmationBasis) -> Document {
-    doc! { "status": "paused", "pausedAt": at, "stopConfirmedAt": at, "updatedAt": at,
-        "stopConfirmedRemote": remote, "stopConfirmedTaskId": id.to_hex(),
-        "stopConfirmationBasis": basis.as_str() }
-}
-
-fn pause_control_write(id: ObjectId, name: &str, original: &Document,
-    remote: bool, at: bson::DateTime, basis: StopConfirmationBasis) -> (Document, Document) {
-    let mut filter = doc! { "_id": id, "name": name };
-    // Preserve the same task/host AND the captured control revision. This uses
-    // existing updatedAt/launch/evidence fields, not a new version mechanism.
-    for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "launchAttemptAt", "startedAt",
-        "generation", "startupBinding", "tmuxContext", "stopConfirmedAt", "stopConfirmedRemote",
-        "stopConfirmedTaskId", "stopConfirmationBasis"] {
-        filter.insert(key, original.get(key).cloned().unwrap_or_else(|| bson::Bson::Document(doc! { "$exists": false })));
-    }
-    (filter, doc! { "$set": confirmed_pause_update(id, remote, at, basis) })
-}
-
-fn validate_stop_output(progress: &TaskOperationProgress, stdout: &str, stderr: &str) -> Result<StopConfirmationBasis, String> {
-    progress.stage("receipt_validate", "验证唯一最终暂停回执、任务/执行端与V1进程退出或V2会话缺失依据");
-    verified_stop_proof(stdout, &progress.name, progress.remote)
-        .map_err(|e| progress.failure(format!("{e}；stderr: {stderr}；stdout: {stdout}")))
-}
-
-fn confirmed_stop_after_write(progress: &TaskOperationProgress, id: ObjectId, at: bson::DateTime,
-    basis: StopConfirmationBasis, matched_count: u64) -> Result<ConfirmedTaskStop, String> {
-    if matched_count != 1 {
-        return Err(progress.failure(format!("{}；暂停回写匹配失败：原任务身份/执行目标/控制版本已变化", basis.description())));
-    }
-    progress.stage("completed", &format!("{}；控制面CAS回写已确认", basis.description()));
-    Ok(ConfirmedTaskStop { confirmed: true, task_id: id.to_hex(), task_name: progress.name.clone(),
-        is_remote: progress.remote, stop_confirmed_at: at.timestamp_millis(), confirmation_basis: basis })
-}
-
 #[command]
 pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<String>,
-    request_id: Option<String>, app: AppHandle,
-    clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>) -> Result<ConfirmedTaskStop, String> {
-    let mut progress = TaskOperationProgress::new(app, "stop", task_id.as_deref(),
-        &task_name, is_remote, request_id);
-    progress.stage("initial", "暂停请求已接收；停止操作次数1次，脚本预算75秒");
-    progress.stage("identity", "核对本地控制面原任务与执行目标");
-    let task = operation_task(&clients, task_id.as_deref(), &task_name, Duration::from_secs(5)).await
-        .map_err(|e| progress.failure(e))?;
-    let id = operation_task_identity(&task, &task_name, is_remote).map_err(|e| progress.failure(e))?;
-    progress.task_id = id.to_hex();
-    progress.tmux_binding = Some(task_script_binding(&task, is_remote).map_err(|e| progress.failure(e))?);
-    if matches!(task.get_str("status").ok(), Some("generating" | "generation_unknown")) {
-        return Err(progress.failure("当前处于候选生成阶段；请先核验生成作业"));
-    }
-    let (stdout, stderr) = execute_task_script(&progress, &app_config, PAUSE_SCRIPT_BUDGET).await?;
-    let basis = validate_stop_output(&progress, &stdout, &stderr)?;
-    let at = bson::DateTime::now();
-    let (filter, update) = pause_control_write(id, &task_name, &task, is_remote, at, basis);
-    progress.stage("control_write", &format!("{}；按原任务ID/名称/执行目标/控制版本CAS回写暂停（5秒）", basis.description()));
-    let tasks = clients.local.database("simulation_mission").collection::<Document>("tasks");
-    let result = timeout(Duration::from_secs(5), tasks.update_one(filter, update, None)).await
-        .map_err(|_| progress.failure(format!("{}；控制记录回写超时（预算5秒）", basis.description())))?
-        .map_err(|e| progress.failure(format!("{}；控制记录回写失败：{e}", basis.description())))?;
-    confirmed_stop_after_write(&progress, id, at, basis, result.matched_count)
+    request_id: Option<String>, app: AppHandle, clients: State<'_, Arc<MongoClients>>,
+    app_config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<ConfirmedTaskStop, String> {
+    let id = required_task_id(task_id.as_deref())?;
+    let progress = TaskOperationProgress::new(app, "stop", Some(id), &task_name, is_remote, request_id);
+    progress.stage("initial", "暂停请求已接收；共享核心核验原任务，停止脚本预算75秒");
+    let core = control.get(&app_config, &clients).await.map_err(|e| progress.failure(e))?;
+    let stages = progress.clone();
+    let result = core.pause(&task_name, PauseOptions {
+        expected_task_id: Some(id), expected_remote: Some(is_remote),
+        observer: Some(Arc::new(move |event| {
+            if event.stage == "failed" { stages.failure(event.message); }
+            else { stages.stage(event.stage, &event.message); }
+        })),
+        ..Default::default()
+    }, StopBudget::Gui, Some(progress.observer())).await;
+    if result.exit_code != 0 { return Err(progress.failure(result.value)); }
+    result.confirmed_stop.ok_or_else(|| progress.failure("共享核心未返回已确认停止回执"))
 }
 
 #[command]
@@ -1627,6 +1230,20 @@ pub fn restart_app() -> Result<(), String> {
 }
 
 
+
+#[cfg(test)]
+use quantnight_task_core::pause::{verified_stop_proof, StopConfirmationBasis};
+#[cfg(test)]
+#[path = "task_control_tests.rs"]
+mod task_control_tests;
+#[cfg(test)]
+use task_control_tests::{pause_route, proof_line};
+#[cfg(test)]
+fn validate_stop_output(progress: &TaskOperationProgress, stdout: &str, stderr: &str) -> Result<StopConfirmationBasis, String> {
+    progress.stage("receipt_validate", "验证共享核心唯一最终V1/V2回执");
+    verified_stop_proof(stdout, &progress.name, progress.remote)
+        .map_err(|e| progress.failure(format!("{e}；stderr: {stderr}；stdout: {stdout}")))
+}
 
 #[cfg(test)]
 mod verified_pause_tests {
@@ -1687,18 +1304,16 @@ mod verified_pause_tests {
         }
         let error = verified_stop_proof("QUANTNIGHT_PAUSE_CONFIRMED {broken}", "pipeline__priority", true).unwrap_err();
         assert!(error.starts_with("暂停回执解析失败："));
-        assert_eq!(StopConfirmationBasis::SessionAbsent.description(), "已确认目标主机上精确tmux会话缺失");
-        assert_eq!(StopConfirmationBasis::RunnersExited.description(), "原会话与已捕获执行进程退出均已核验");
     }
 
-    #[test]
-    fn task_list_preserves_persisted_stop_evidence_for_remounts() {
+    #[tokio::test]
+    async fn task_list_preserves_persisted_stop_evidence_for_remounts() {
         let id = ObjectId::new();
-        let at = bson::DateTime::now();
-        let mut record = confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited);
-        record.insert("_id", id);
-        record.insert("name", "pipeline__priority");
-        record.insert("isRemote", true);
+        let original = doc! {"_id":id,"name":"pipeline__priority","status":"running","isRemote":true};
+        let route = pause_route(original.clone(), proof_line("pipeline__priority", true, StopConfirmationBasis::RunnersExited), 1).await;
+        assert_eq!(route.outcome.exit_code, 0);
+        let mut record = original;
+        record.extend(route.writes[0].1.get_document("$set").unwrap().clone());
         let task: Task = bson::from_document(record).unwrap();
         let wire = serde_json::to_value(task).unwrap();
         assert_eq!(wire["stopConfirmedTaskId"], id.to_hex());
@@ -1706,18 +1321,17 @@ mod verified_pause_tests {
         assert!(!wire["stopConfirmedAt"].is_null());
     }
 
-    #[test]
-    fn persisted_and_returned_stop_identity_are_fenced_and_explicit() {
+    #[tokio::test]
+    async fn persisted_and_returned_stop_identity_are_fenced_and_explicit() {
         let id = ObjectId::new();
-        let at = bson::DateTime::now();
-        let update = confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited);
+        let original = doc! {"_id":id,"name":"pipeline__priority","status":"running","isRemote":true};
+        let route = pause_route(original, proof_line("pipeline__priority", true, StopConfirmationBasis::RunnersExited), 1).await;
+        let update = route.writes[0].1.get_document("$set").unwrap();
         assert_eq!(update.get_str("status").unwrap(), "paused");
         assert_eq!(update.get_str("stopConfirmedTaskId").unwrap(), id.to_hex());
         assert!(update.get_bool("stopConfirmedRemote").unwrap());
-        assert_eq!(*update.get_datetime("stopConfirmedAt").unwrap(), at);
-        let response = serde_json::to_value(ConfirmedTaskStop { confirmed: true,
-            task_id: id.to_hex(), task_name: "pipeline__priority".into(), is_remote: true,
-            stop_confirmed_at: at.timestamp_millis(), confirmation_basis: StopConfirmationBasis::RunnersExited }).unwrap();
+        let at = update.get_datetime("stopConfirmedAt").unwrap();
+        let response = serde_json::to_value(route.outcome.confirmed_stop.unwrap()).unwrap();
         assert_eq!(response["taskId"], id.to_hex());
         assert_eq!(response["isRemote"], true);
         assert_eq!(response["confirmed"], true);
@@ -1757,19 +1371,19 @@ mod priority_config_tests {
     fn update_persists_exact_nested_object_and_explicit_empty_steps() {
         let value = json!({"refine_templates":[], "max_variants_per_alpha":40,
             "extension":{"preserve":true}});
-        let update = priority_config_update(&value.to_string(), false).unwrap();
-        assert_eq!(update.get_str("status").unwrap(), "running");
-        let saved = update.get_document("mission_config").unwrap();
+        let update = priority_config_document(&value.to_string()).unwrap();
+        assert!(!update.contains_key("status"));
+        let saved = &update;
         assert!(saved.get_array("refine_templates").unwrap().is_empty());
         assert_eq!(serde_json::to_value(saved).unwrap(), value);
-        let legacy = priority_config_update("{\"interval\":600}", false).unwrap();
-        assert!(!legacy.get_document("mission_config").unwrap().contains_key("refine_templates"));
+        let legacy = priority_config_document("{\"interval\":600}").unwrap();
+        assert!(!legacy.contains_key("refine_templates"));
     }
 
     #[test]
     fn invalid_top_level_config_is_rejected_before_script_execution() {
         for value in ["[]", "null", "false", "3", "broken"] {
-            assert!(priority_config_update(value, true).is_err());
+            assert!(priority_config_document(value).is_err());
         }
         assert!(mission_config_document(&json!([])).is_err());
     }
@@ -1780,10 +1394,9 @@ mod priority_config_tests {
             for remote in [true, false] {
                 let value = json!({"rounds":{"enabled":enabled}, "source_tasks":["remote-source"],
                     "extra":{"source_remote":!remote}});
-                let update = priority_config_update(&value.to_string(), remote).unwrap();
-                assert_eq!(update.get_bool("isRemote").unwrap(), remote);
-                assert_eq!(update.get_bool("targetRemote").unwrap(), remote);
-                assert_eq!(serde_json::to_value(update.get_document("mission_config").unwrap()).unwrap(), value);
+                let update = priority_config_document(&value.to_string()).unwrap();
+                assert!(!update.contains_key("isRemote") && !update.contains_key("targetRemote") && !update.contains_key("status"));
+                assert_eq!(serde_json::to_value(update).unwrap(), value);
             }
         }
     }
@@ -2066,11 +1679,18 @@ if [ "$1" = '-m' ]; then
   cat catalog.json
   exit "$(cat catalog.exit)"
 fi
-[ "$1" = '.agents/skills/manage-quantnight-frontend/scripts/taskctl.py' ] || exit 95
+[ "$1" = '-B' ] && [ "$2" = '-m' ] || exit 95
+if [ "$3" = 'backend.mongodb.mongo_config' ]; then
+  printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok":true}'
+  exit 0
+fi
+[ "$3" = 'util.dataset_mission' ] && [ "$4" = '--native-archive-statistics' ] || exit 96
+printf '%s' "$5" > archive-request.json
 cat archive.json
 exit "$(cat archive.exit)"
 "#).unwrap();
             fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(root.join("credentials.yaml"), "synthetic fixture only").unwrap();
             fs::write(root.join("catalog.exit"), "0").unwrap();
             fs::write(root.join("archive.exit"), "0").unwrap();
             Self(root)
@@ -2110,62 +1730,72 @@ exit "$(cat archive.exit)"
         assert!(latest_template_from_directory(&f.0, &folder, Some("super")).await.is_err());
     }
 
+    async fn original_archive(f: &Fixture, task: &Document) -> Result<JsonValue, String> {
+        use quantnight_task_core::{backend_binding::validate_backend_binding,
+            operations_runtime::OriginalOperationsRuntime, cleanup_sync::OperationsRuntime, task_store::Host};
+        let binding = validate_backend_binding(&f.config()).await?;
+        let runtime = OriginalOperationsRuntime { binding: &binding, observer: None };
+        runtime.archive_research(binding.root(), task, Host::Remote, task.get_str("name").unwrap()).await
+    }
+    fn archive_receipt(result: JsonValue) -> JsonValue {
+        json!({"schemaVersion":1,"command":"native-archive-statistics","ok":true,"result":result})
+    }
+
     #[tokio::test]
     async fn dataset_binding_archives_original_task_and_exact_target_before_delete() {
         let f = Fixture::new();
-        f.catalog(json!({"ok":true,"binding":{"kind":"dataset","loader":"frozen_research","extension":"kept"}}));
-        f.receipt(json!({"ok":true,"command":"archive-research","task":"task","archivePath":"/fake/archive.json"}));
+        f.receipt(archive_receipt(json!({"archivePath":"/fake/archive.json"})));
         let task = f.task();
-        archive_prepared_research(&task, &f.config()).await.unwrap();
+        assert_eq!(original_archive(&f, &task).await.unwrap()["archivePath"], "/fake/archive.json");
+        let request: JsonValue = serde_json::from_str(&fs::read_to_string(f.0.join("archive-request.json")).unwrap()).unwrap();
+        assert_eq!(request["task"]["_id"]["$oid"], task.get_object_id("_id").unwrap().to_hex());
+        assert_eq!(request["task"]["name"], "task");
+        assert_eq!(request["task"]["taskType"], "super");
+        assert_eq!(request["task"]["templatefile"], "same_name");
+        assert_eq!(request["remote"], true);
+        assert_eq!(request["evidenceCollection"], "task");
+        assert!(request["configurationBinding"].is_object());
         let calls = f.calls();
-        assert!(calls.contains("--kind\nsuper\n--name\nsame_name\n"));
-        assert!(calls.contains(&format!("archive-research\n--name\ntask\n--expected-task-id\n{}\n--expected-remote\ntrue\n", task.get_object_id("_id").unwrap().to_hex())));
-        assert!(calls.find("templates.catalog").unwrap() < calls.find("archive-research").unwrap());
+        assert!(calls.find("backend.mongodb.mongo_config").unwrap() < calls.find("util.dataset_mission").unwrap());
+        assert!(!calls.contains("taskctl.py"));
     }
 
     #[tokio::test]
     async fn archive_rejects_invalid_binding_collision_process_error_and_wrong_receipt() {
-        for binding in [json!({"ok":false,"error":"ambiguous template name collision"}),
-                        json!({"ok":true}), json!({"ok":true,"binding":false})] {
-            let f = Fixture::new(); f.catalog(binding);
-            assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
-            assert!(!f.calls().contains("archive-research"));
+        // Dataset catalog/binding now belongs to original dataset_mission, not
+        // GUI. Errors from that owner and bad native receipts remain fatal.
+        for receipt in [json!({"ok":false,"error":"ambiguous template name collision"}),
+            json!({"ok":true}), json!({"schemaVersion":1,"command":"native-archive-statistics","ok":false}),
+            json!({"schemaVersion":1,"command":"archive-research","ok":true,"result":null}),
+            json!({"schemaVersion":2,"command":"native-archive-statistics","ok":true,"result":null}),
+            json!({"schemaVersion":1,"command":"native-archive-statistics","ok":"true","result":null})] {
+            let f = Fixture::new(); f.receipt(receipt);
+            assert!(original_archive(&f, &f.task()).await.is_err());
         }
-        for receipt in [json!({"ok":false}),
-            json!({"ok":true,"command":"archive-research","task":"other","archivePath":"/fake"}),
-            json!({"ok":true,"command":"verify-registration","task":"task","archivePath":"/fake"}),
-            json!({"ok":true,"command":"archive-research","task":"task","archivePath":""})] {
-            let f = Fixture::new();
-            f.catalog(json!({"ok":true,"binding":{"kind":"dataset"}})); f.receipt(receipt);
-            assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
-        }
-        let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":null}));
-        fs::write(f.0.join("catalog.exit"), "1").unwrap();
-        assert!(archive_prepared_research(&f.task(), &f.config()).await.is_err());
+        let f = Fixture::new(); fs::write(f.0.join("archive.json"), "broken-json").unwrap();
+        assert!(original_archive(&f, &f.task()).await.is_err());
     }
 
     #[tokio::test]
     async fn missing_legacy_binding_refine_and_priority_do_not_archive_dataset() {
-        for binding in [JsonValue::Null, json!({"loader":"frozen_refine","schemaVersion":3})] {
-            let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":binding}));
-            archive_prepared_research(&f.task(), &f.config()).await.unwrap();
-            assert!(!f.calls().contains("archive-research"));
+        // Absence/refine/priority no-op is interpreted by the original owner;
+        // Rust forwards metadata and preserves its null result, not sidecars.
+        for kind in ["regular", "super", "priority"] {
+            let f = Fixture::new(); f.receipt(archive_receipt(JsonValue::Null));
+            let mut task = f.task(); task.insert("taskType", kind);
+            assert_eq!(original_archive(&f, &task).await.unwrap(), JsonValue::Null);
+            let request: JsonValue = serde_json::from_str(&fs::read_to_string(f.0.join("archive-request.json")).unwrap()).unwrap();
+            assert_eq!(request["task"]["taskType"], kind);
+            assert!(!f.calls().contains("templates.catalog"));
         }
-        let f = Fixture::new(); let mut task = f.task(); task.insert("taskType", "priority");
-        archive_prepared_research(&task, &f.config()).await.unwrap();
-        assert!(f.calls().is_empty());
     }
 
     #[tokio::test]
     async fn running_dataset_requires_pause_and_nonzero_archive_is_not_success() {
-        let f = Fixture::new(); f.catalog(json!({"ok":true,"binding":{"kind":"dataset"}}));
-        let mut task = f.task(); task.insert("status", "running");
-        assert!(archive_prepared_research(&task, &f.config()).await.is_err());
-        assert!(!f.calls().contains("archive-research"));
-        task.insert("status", "paused");
-        f.receipt(json!({"ok":true,"command":"archive-research","task":"task","archivePath":"/fake"}));
+        task_control_tests::assert_running_delete_refused().await;
+        let f = Fixture::new(); f.receipt(archive_receipt(json!({"archivePath":"/fake"})));
         fs::write(f.0.join("archive.exit"), "1").unwrap();
-        assert!(archive_prepared_research(&task, &f.config()).await.is_err());
+        assert!(original_archive(&f, &f.task()).await.is_err());
     }
     #[tokio::test]
     #[ignore = "set QUANTNIGHT_CATALOG_SOURCE and QUANTNIGHT_TEST_PYTHON for offline cross-repo CLI contract"]
@@ -2348,29 +1978,31 @@ mod task_stage_diagnostics_tests {
     #[tokio::test]
     async fn stop_receipt_final_and_control_write_builder_retains_cas() {
         let receipt = stop_receipt();
-        let script = shell_line(&stage("stop", "process_exit")) + &format!("printf '%s\\n' '{receipt}'");
+        let script = shell_line(&stage("stop", "process_exit")) + &format!("printf '%s\n' '{receipt}'");
         let fake = FakeBash::new(&script);
-        let (p, events) = progress("stop");
+        let (p, _) = progress("stop");
         let (out, err) = execute_task_script(&p, &fake.config, Duration::from_secs(1)).await.unwrap();
         validate_stop_output(&p, &out, &err).unwrap();
         assert_eq!(out.lines().last(), Some(receipt.as_str()));
         let id = ObjectId::parse_str(&p.task_id).unwrap();
-        let at = bson::DateTime::now();
-        let (filter, update) = pause_control_write(id, &p.name, &doc! {"isRemote":true, "status":"running"}, true, at, StopConfirmationBasis::RunnersExited);
-        assert_eq!(filter.get_object_id("_id").unwrap(), id);
-        assert_eq!(filter.get_str("name").unwrap(), "exact__priority");
-        assert_eq!(filter.get_str("status").unwrap(), "running");
-        assert_eq!(filter.get_bool("isRemote").unwrap(), true);
-        assert_eq!(filter.get_document("updatedAt").unwrap(), &doc! {"$exists":false});
-        assert_eq!(update, doc! {"$set": confirmed_pause_update(id, true, at, StopConfirmationBasis::RunnersExited)});
-        let (null_filter, _) = pause_control_write(id, &p.name, &doc! {"isRemote":bson::Bson::Null}, false, at, StopConfirmationBasis::RunnersExited);
-        assert_eq!(null_filter.get("isRemote"), Some(&bson::Bson::Null));
-        p.stage("control_write", "仅构造原CAS；本测试不连接数据库");
-        let error = p.failure("synthetic write rejected: original host changed");
-        assert!(error.contains("stage=control_write") && error.contains("host changed"));
-        assert_eq!(events.lock().unwrap().last().unwrap().stage, "control_write");
-        assert!(verified_stop_proof(&(out + "\n" + TASK_STAGE_PREFIX + &stage("stop", "complete").to_string()),
-            &p.name, true).is_err());
+        for host in [bson::Bson::Boolean(true), bson::Bson::Null] {
+            let remote = host == bson::Bson::Boolean(true);
+            let original = doc! {"_id":id,"name":&p.name,"isRemote":host.clone(),"status":"running"};
+            let route = pause_route(original, proof_line(&p.name, remote, StopConfirmationBasis::RunnersExited), 0).await;
+            let (filter, update) = &route.writes[0];
+            assert_eq!(filter.get_object_id("_id").unwrap(), id);
+            assert_eq!(filter.get_str("name").unwrap(), "exact__priority");
+            assert_eq!(filter.get_str("status").unwrap(), "running");
+            assert_eq!(filter.get("isRemote"), Some(&host));
+            assert_eq!(filter.get_document("updatedAt").unwrap(), &doc! {"$exists":false});
+            assert_eq!(filter.get_document("acceptedObservation").unwrap(), &doc! {"$exists":false});
+            assert_eq!(update.get_document("$set").unwrap().get_str("status").unwrap(), "paused");
+            assert!(route.outcome.value["error"].as_str().unwrap().contains("CAS failed"));
+            assert!(route.outcome.confirmed_stop.is_none());
+            assert!(route.stages.iter().any(|s| s == "control_write"));
+            assert!(!route.stages.iter().any(|s| s == "completed"));
+        }
+        assert!(verified_stop_proof(&(out + "\n" + TASK_STAGE_PREFIX + &stage("stop", "complete").to_string()), &p.name, true).is_err());
     }
 
     #[tokio::test]
@@ -2465,8 +2097,7 @@ mod session_absent_v2_tests {
         for remote in [false, true] {
             for (version, expected) in [(1, StopConfirmationBasis::RunnersExited), (2, StopConfirmationBasis::SessionAbsent)] {
                 let final_line = receipt(&proof(version, remote));
-                let script = print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("stop", remote, if version == 2 { "session_absent" } else { "receipt" })))
-                    + &print_line(&final_line);
+                let script = print_line(&format!("{TASK_STAGE_PREFIX}{}", stage("stop", remote, if version == 2 { "session_absent" } else { "receipt" }))) + &print_line(&final_line);
                 let fake = FakeBash::new(&script);
                 let (progress, events) = progress("stop", remote);
                 let (out, err) = execute_task_script(&progress, &fake.config, Duration::from_secs(2)).await.unwrap();
@@ -2475,36 +2106,31 @@ mod session_absent_v2_tests {
                 assert_eq!(out.lines().last(), Some(final_line.as_str()));
                 assert!(!events.lock().unwrap().iter().any(|e| e.stage == "control_write"));
                 let id = ObjectId::parse_str(&progress.task_id).unwrap();
-                let at = bson::DateTime::now();
-                let original = doc! {"_id":id, "name":&progress.name, "isRemote":remote, "status":"running",
-                    "updatedAt":"original-control-revision", "launchAttemptId":"original-launch"};
-                let (filter, update) = pause_control_write(id, &progress.name, &original, remote, at, basis);
-                assert_eq!(filter.get_str("updatedAt").unwrap(), "original-control-revision");
-                assert_eq!(filter.get_str("launchAttemptId").unwrap(), "original-launch");
-                assert_eq!(filter.get_bool("isRemote").unwrap(), remote);
-                let set = update.get_document("$set").unwrap();
-                assert_eq!(set.get_str("stopConfirmationBasis").unwrap(), basis.as_str());
-                assert!(!set.contains_key("runners_exited") && !set.contains_key("platformCancelled"));
-                let mut persisted = set.clone();
-                persisted.insert("_id", id); persisted.insert("name", &progress.name); persisted.insert("isRemote", remote);
-                let mapped: Task = bson::from_document(persisted).unwrap();
-                assert_eq!(serde_json::to_value(mapped).unwrap()["stopConfirmationBasis"], basis.as_str());
-                progress.stage("control_write", basis.description());
-                let rejected = confirmed_stop_after_write(&progress, id, at, basis, 0).unwrap_err();
-                assert!(rejected.contains("stage=control_write") && rejected.contains("控制版本已变化"));
-                assert!(rejected.contains(basis.description()) && rejected.contains("暂停回写匹配失败"));
-                assert!(!rejected.contains('不'));
-                assert!(!events.lock().unwrap().iter().any(|e| e.stage == "completed"));
-                // This is only the pure real-command gate, not a fake DB write.
-                let confirmed = confirmed_stop_after_write(&progress, id, at, basis, 1).unwrap();
-                let wire = serde_json::to_value(confirmed).unwrap();
-                assert_eq!(wire["confirmed"], true);
-                assert_eq!(wire["taskId"], id.to_hex());
-                assert_eq!(wire["isRemote"], remote);
-                assert_eq!(wire["confirmationBasis"], basis.as_str());
-                if version == 2 {
-                    assert_eq!(events.lock().unwrap().last().unwrap().message,
-                        "已确认目标主机上精确tmux会话缺失；控制面CAS回写已确认");
+                let original = doc! {"_id":id,"name":&progress.name,"isRemote":remote,"status":"running", "updatedAt":"original-control-revision","launchAttemptId":"original-launch"};
+                for matched in [0, 1] {
+                    let route = pause_route(original.clone(), out.clone(), matched).await;
+                    let (filter, update) = &route.writes[0];
+                    assert_eq!(filter.get_str("updatedAt").unwrap(), "original-control-revision");
+                    assert_eq!(filter.get_str("launchAttemptId").unwrap(), "original-launch");
+                    assert_eq!(filter.get_bool("isRemote").unwrap(), remote);
+                    let set = update.get_document("$set").unwrap();
+                    assert_eq!(set.get_str("stopConfirmationBasis").unwrap(), basis.as_str());
+                    assert!(!set.contains_key("runners_exited") && !set.contains_key("platformCancelled"));
+                    let mut persisted = original.clone(); persisted.extend(set.clone());
+                    let mapped: Task = bson::from_document(persisted).unwrap();
+                    assert_eq!(serde_json::to_value(mapped).unwrap()["stopConfirmationBasis"], basis.as_str());
+                    if matched == 0 {
+                        assert!(route.outcome.value["error"].as_str().unwrap().contains("CAS failed"));
+                        assert!(route.outcome.confirmed_stop.is_none());
+                        assert!(!route.stages.iter().any(|s| s == "completed"));
+                    } else {
+                        let wire = serde_json::to_value(route.outcome.confirmed_stop.unwrap()).unwrap();
+                        assert_eq!(wire["confirmed"], true);
+                        assert_eq!(wire["taskId"], id.to_hex());
+                        assert_eq!(wire["isRemote"], remote);
+                        assert_eq!(wire["confirmationBasis"], basis.as_str());
+                        assert_eq!(route.stages.last().unwrap(), "completed");
+                    }
                 }
             }
         }
@@ -2565,21 +2191,19 @@ mod session_absent_v2_tests {
         assert!(verified_stop_proof(&out, &progress.name, true).is_err());
     }
 
-    #[test]
-    fn control_cas_retains_original_status_revision_host_launch_and_absent_fields() {
-        let id = ObjectId::new(); let at = bson::DateTime::now();
-        let original = doc! {"status":"running", "isRemote":true, "updatedAt":17_i64,
-            "launchAttemptId":"launch-v1", "generation":{"id":"generation-v1"}, "stopConfirmedAt":bson::Bson::Null};
-        let (filter, set) = pause_control_write(id, "exact__priority", &original, true, at, StopConfirmationBasis::SessionAbsent);
-        for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "generation", "stopConfirmedAt"] {
-            assert_eq!(filter.get(key), original.get(key));
-        }
-        for key in ["startedAt", "stopConfirmationBasis", "stopConfirmedTaskId"] {
-            assert_eq!(filter.get_document(key).unwrap(), &doc! {"$exists":false});
-        }
-        assert_eq!(set.get_document("$set").unwrap().get_datetime("updatedAt").unwrap(), &at);
-        // Legacy records without basis still deserialize instead of inventing it.
-        let task: Task = bson::from_document(doc! {"_id":id, "name":"legacy", "status":"paused"}).unwrap();
+    #[tokio::test]
+    async fn control_cas_retains_original_status_revision_host_launch_and_absent_fields() {
+        let id = ObjectId::new();
+        let original = doc! {"_id":id,"name":"exact__priority","status":"running","isRemote":true,"updatedAt":17_i64,
+            "launchAttemptId":"launch-v1","generation":{"id":"generation-v1"},"stopConfirmedAt":bson::Bson::Null};
+        let route = pause_route(original.clone(), proof_line("exact__priority", true, StopConfirmationBasis::SessionAbsent), 1).await;
+        let (filter, update) = &route.writes[0];
+        for key in ["status", "isRemote", "updatedAt", "launchAttemptId", "generation", "stopConfirmedAt"] { assert_eq!(filter.get(key), original.get(key)); }
+        for key in ["startedAt", "stopConfirmationBasis", "stopConfirmedTaskId", "acceptedObservation"] { assert_eq!(filter.get_document(key).unwrap(), &doc! {"$exists":false}); }
+        let set = update.get_document("$set").unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(set.get_str("updatedAt").unwrap()).is_ok());
+        assert_eq!(set.get_datetime("stopConfirmedAt").unwrap().timestamp_millis(), route.outcome.confirmed_stop.unwrap().stop_confirmed_at);
+        let task: Task = bson::from_document(doc! {"_id":id,"name":"legacy","status":"paused"}).unwrap();
         assert!(serde_json::to_value(task).unwrap()["stopConfirmationBasis"].is_null());
     }
 }
@@ -2756,7 +2380,9 @@ else: raise AssertionError(a)
         let (out,err)=execute_task_script(&p,&fake.config,Duration::from_secs(5)).await.unwrap();
         let basis=validate_stop_output(&p,&out,&err).unwrap();
         assert!(matches!(basis,StopConfirmationBasis::SessionAbsent));
-        let (filter,_)=pause_control_write(id,"fixture",&task,false,bson::DateTime::now(),basis);
+        let route = pause_route(task.clone(), out, 1).await;
+        assert_eq!(route.outcome.exit_code, 0);
+        let filter = &route.writes[0].0;
         assert_eq!(filter.get_document("tmuxContext").unwrap(),task.get_document("tmuxContext").unwrap());
         assert!(!root.join("shim-called").exists(),"Pi PATH shim must never be invoked");
         assert!(!fs::read_to_string(root.join("native-calls")).unwrap().contains("kill-session"));
@@ -2765,95 +2391,66 @@ else: raise AssertionError(a)
 }
 
 #[cfg(all(test, unix))]
-mod taskctl_start_tests {
+mod shared_start_tests {
     use super::*;
-    use crate::config::bash_test_support::FakeBash;
+    use crate::config::{bash_test_support::FakeBash, run_process_observed};
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     const ID: &str = "0123456789abcdef01234567";
     const CONFIG: &str = r#"{"max_concurrent":3,"rounds":{"enabled":true},"marker":"space ' quote"}"#;
-
-    fn fixture(body: &str) -> FakeBash {
-        let mut f = FakeBash::new(":");
-        f.config.env.working_dir = Path::new(&f.config.env.working_dir).canonicalize().unwrap().to_string_lossy().into_owned();
-        let root = Path::new(&f.config.env.working_dir);
-        fs::create_dir_all(root.join(".venv/bin")).unwrap();
-        let path = root.join(".venv/bin/python");
-        fs::write(&path, format!(r#"#!/bin/sh
-[ "$PYTHONPATH" = "$PWD" ] || exit 94
-[ "$1" = '.agents/skills/manage-quantnight-frontend/scripts/taskctl.py' ] || exit 95
-printf '%s\n' "$@" >> calls
-{body}
-"#)).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(root.join("control.json"), r#"{"status":"paused"}"#).unwrap();
-        f
-    }
     fn success(remote: bool) -> JsonValue {
         json!({"schemaVersion":1,"command":"start","task":"fixture","ok":true,"taskId":ID,"remote":remote})
     }
-    fn output(value: &str) -> String {
-        format!("printf '%s\\n' '{}'", value.replace('\'', "'\\''"))
-    }
-    async fn start(f: &FakeBash, remote: bool, budget: Duration) -> Result<(), String> {
-        start_via_taskctl("fixture", CONFIG, remote, ID, &f.config, budget).await
-    }
-    fn assert_one_start_no_control_write(f: &FakeBash, remote: bool) {
-        let root = Path::new(&f.config.env.working_dir);
-        assert_eq!(fs::read_to_string(root.join("calls")).unwrap(), format!(
-            ".agents/skills/manage-quantnight-frontend/scripts/taskctl.py\nstart\n--name\nfixture\n--config\n{CONFIG}\n{}\n--expected-task-id\n{ID}\n--no-notify\n",
-            if remote {"--remote"} else {"--no-remote"}));
-        assert_eq!(fs::read_to_string(root.join("control.json")).unwrap(), r#"{"status":"paused"}"#);
-    }
-    #[tokio::test]
-    async fn real_local_cli_transport_preserves_full_config_id_host_and_disables_notification() {
+    #[test]
+    fn real_shared_request_preserves_full_config_id_host_and_disables_notification() {
         for remote in [false, true] {
-            let f = fixture(&output(&success(remote).to_string()));
-            start(&f, remote, Duration::from_secs(10)).await.unwrap();
-            assert_one_start_no_control_write(&f, remote);
+            let request = start_request("fixture", CONFIG, remote, ID, None).unwrap();
+            assert_eq!(request.config_json.as_deref(), Some(CONFIG));
+            assert_eq!(request.expected_task_id.as_deref(), Some(ID));
+            assert_eq!(request.remote, Some(remote));
+            assert_eq!(request.expected_remote, Some(remote));
+            assert!(request.notification.no_notify);
+            assert!(request.notification.target.is_none());
+            start_receipt(&TaskOutcome {value:success(remote),exit_code:0}, &request).unwrap();
         }
     }
-    #[tokio::test]
-    async fn false_wrong_identity_schema_and_invalid_json_never_retry_or_write_running() {
-        let mut receipts = vec!["not-json".into(), "{}".into()];
+    #[test]
+    fn false_wrong_identity_schema_and_invalid_json_never_retry_or_write_running() {
+        let request = start_request("fixture", CONFIG, false, ID, None).unwrap();
+        let mut receipts = vec![JsonValue::Null, json!({}), json!("not-json")];
         for change in [json!({"ok":false,"error":"execution_context_unverified: specific-host-error"}),
             json!({"taskId":"replacement-task"}), json!({"remote":true}), json!({"remote":"false"}),
-            json!({"task":"other"}), json!({"command":"status"}), json!({"schemaVersion":2}),
-            json!({"ok":"true"})] {
+            json!({"task":"other"}), json!({"command":"status"}), json!({"schemaVersion":2}), json!({"ok":"true"})] {
             let mut receipt = success(false);
             receipt.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
-            receipts.push(receipt.to_string());
+            receipts.push(receipt);
         }
         for receipt in receipts {
-            let f = fixture(&(output(&receipt) + "\necho precise-stderr >&2"));
-            let error = start(&f, false, Duration::from_secs(10)).await.unwrap_err();
-            assert!(error.contains(&receipt) && error.contains("precise-stderr"), "{error}");
-            assert_one_start_no_control_write(&f, false);
+            let result = TaskOutcome {value:receipt.clone(),exit_code:0};
+            assert!(start_receipt(&result, &request).unwrap_err().contains(&receipt.to_string()));
         }
+        assert!(start_receipt(&TaskOutcome {value:success(false),exit_code:1}, &request).is_err());
     }
     #[tokio::test]
     async fn nonzero_and_timeout_preserve_partial_diagnostics_and_do_not_retry() {
-        for (tail, expected, budget) in [
-            ("exit 17", "17", Duration::from_secs(10)),
-            ("exec /bin/sleep 30", "2000 ms", Duration::from_secs(2)),
-        ] {
-            let f = fixture(&(output(&success(false).to_string()) + "\necho host-binding-failure >&2\n" + tail));
-            let error = start(&f, false, budget).await.unwrap_err();
-            assert!(error.contains(expected) && error.contains("host-binding-failure") && error.contains("stdout"), "{error}");
-            assert_one_start_no_control_write(&f, false);
+        // Same shared process owner used by native start; no Python taskctl shim.
+        for (tail, expected, budget) in [("exit 17", "17", Duration::from_secs(10)),
+            ("exec /bin/sleep 30", "2000 ms", Duration::from_secs(2))] {
+            let f = FakeBash::new(&format!("echo called >> calls\necho partial-stdout\necho host-binding-failure >&2\n{tail}"));
+            let root = Path::new(&f.config.env.working_dir);
+            let mut command = tokio::process::Command::new("/bin/bash");
+            command.current_dir(root).arg("fake.sh");
+            let error = run_process_observed(command, budget, false, None).await.unwrap_err();
+            assert!(error.contains(expected) && error.contains("host-binding-failure") && error.contains("partial-stdout"), "{error}");
+            assert_eq!(fs::read_to_string(root.join("calls")).unwrap(), "called\n");
         }
     }
     #[tokio::test]
-    async fn malformed_id_config_and_missing_python_fail_without_launch() {
-        let f = fixture("exit 99");
+    async fn malformed_id_config_and_missing_process_fail_without_launch() {
         for (id, config) in [("", CONFIG), (ID, "bad-json"), (ID, "[]")] {
-            assert!(start_via_taskctl("fixture", config, false, id, &f.config, Duration::from_secs(1)).await.is_err());
+            assert!(start_request("fixture", config, false, id, None).is_err());
         }
-        let root = Path::new(&f.config.env.working_dir);
-        assert!(!root.join("calls").exists());
-        fs::remove_file(root.join(".venv/bin/python")).unwrap();
-        let error = start(&f, false, Duration::from_secs(1)).await.unwrap_err();
+        let command = tokio::process::Command::new("/no-such-quantnight-test-process");
+        let error = run_process_observed(command, Duration::from_secs(1), false, None).await.unwrap_err();
         assert!(error.contains("启动命令失败"), "{error}");
-        assert!(!root.join("calls").exists());
     }
 }

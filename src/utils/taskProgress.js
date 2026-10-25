@@ -22,7 +22,7 @@ export function createTaskFetcher({ load, replace, refresh, isActive, onError, o
 
 // Invalidate pre-mutation reads and reads started while the command was pending.
 // The final invalidation and local commit have no await gap between them.
-export async function mutateTaskSource({ fetch, update, commit }) {
+export async function mutateTaskSource({ fetch, update, commit = () => {} }) {
   fetch.invalidate()
   try {
     await update()
