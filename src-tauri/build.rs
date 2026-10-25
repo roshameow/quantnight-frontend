@@ -1,9 +1,17 @@
+#[path = "src/dev_link.rs"]
+mod dev_link;
 #[path = "../crates/source_identity.rs"]
 mod source_identity;
 #[path = "src/dev_identity_inputs.rs"]
 mod dev_identity_inputs;
 
 fn main() {
+    for argument in dev_link::link_args(
+        &std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+        &std::env::var("PROFILE").unwrap_or_default(),
+    ) {
+        println!("cargo:rustc-link-arg={argument}");
+    }
     println!("cargo:rerun-if-env-changed=QUANTNIGHT_DEV_BINDING");
     println!("cargo:rerun-if-env-changed=QUANTNIGHT_TASKCTL_BIN");
     let frontend = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())

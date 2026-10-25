@@ -6,6 +6,8 @@ mod source_identity;
 mod dev_identity_inputs;
 mod dev_image;
 mod dev_identity;
+#[cfg(test)]
+mod dev_link;
 mod config;
 mod watcher;
 mod datas;
