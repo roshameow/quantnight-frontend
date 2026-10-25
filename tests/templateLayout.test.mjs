@@ -32,8 +32,12 @@ test('descriptor IDs strip the entire suffix and reject paths/temporary names', 
 });
 
 test('both development and packaged defaults point at generated kind directories', async () => {
-  for (const path of ['../src/config.js', '../src-tauri/resources/default_config.js']) {
-    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+  // src/config.js is user-owned and untracked, not a versioned default. Exercise
+  // the actual store's empty-config path instead of requiring a private file.
+  const { store } = await configStore({});
+  const development = JSON.stringify({ paths: store.paths });
+  const packaged = await readFile(new URL('../src-tauri/resources/default_config.js', import.meta.url), 'utf8');
+  for (const source of [development, packaged]) {
     assert.match(source, /templates\/generated\/regular/);
     assert.match(source, /templates\/generated\/super/);
   }
