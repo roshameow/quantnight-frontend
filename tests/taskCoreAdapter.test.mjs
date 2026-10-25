@@ -20,12 +20,38 @@ test('all active task mutations call the shared facade and never Mongo writes, t
   assert.doesNotMatch(body('update_remote_status'), /MongoClients|TaskControl|update_one|isRemote.*\$set/);
 });
 
-test('one lazy app service reuses existing AppConfig and Mongo pools without a button client or parser', () => {
-  assert.equal((main.match(/manage\(commands::TaskControlState::default\(\)\)/g) || []).length, 1);
+test('one verified startup publishes shared AppConfig/pools/control before GUI reads, without button bootstrap', () => {
+  assert.equal((main.match(/TaskControl::bootstrap_gui\(config\)/g) || []).length, 1);
+  assert.equal((main.match(/manage\(commands::TaskControlState::from_verified\(control\)\)/g) || []).length, 1);
+  assert.ok(main.indexOf('load_config(&config_path)') < main.indexOf('TaskControl::bootstrap_gui(config)'));
+  assert.ok(main.indexOf('context.into_parts()') < main.indexOf('tauri::Builder'));
+  assert.ok(main.indexOf('dev_identity::verify_gui_root') < main.indexOf('TaskControl::bootstrap_gui(config)'));
+  assert.ok(main.indexOf('context.into_parts()') < main.indexOf('dev_identity::ready()'));
+  assert.match(main.split('Application unavailable:')[1].split('tauri::Builder')[0], /std::process::exit\(1\)/);
+  assert.doesNotMatch(main, /MongoClients::new|TaskControlState::default/);
+  assert.match(main, /Application unavailable/);
+  assert.match(main, /eprintln!\("MongoDB endpoint authority: backend MongoConfig[^"\n]+legacy TOML URI values are not used for transport[^"\n]+"\);/);
+  const notice = main.split('eprintln!("MongoDB endpoint authority:')[1].split('\n')[0];
+  assert.doesNotMatch(notice, /\{.*\}|mongodb:\/\/|mongodb\+srv:\/\//);
+  assert.match(main, /manage\(mongo_clients.clone\(\)\)/);
+  assert.match(main, /manage\(config\)/);
   const init = commands.slice(commands.indexOf('pub struct TaskControlState'), commands.indexOf('fn core_receipt'));
   assert.match(init, /OnceCell<Result<TaskControl, String>>/);
   assert.match(init, /TaskControl::with_existing_clients\(config, clients.clone\(\)\)/);
   assert.match(init, /get_or_init/);
+  assert.match(init, /OnceCell::new_with\(Some\(Ok\(control\)\)\)/);
+  assert.doesNotMatch(init, /get_or_try_init|bootstrap_gui|export_backend_config/);
+  const binding = read('../crates/task-core/src/backend_binding.rs');
+  assert.match(binding, /run_process_private\(command, Duration::from_secs\(8\)\)/);
+  assert.doesNotMatch(binding, /run_process_observed|normalize|directConnection/);
+  const cli = read('../crates/taskctl/src/bootstrap.rs');
+  assert.match(cli, /export_backend_config\(root\)/);
+  assert.doesNotMatch(cli, /process::Command|from_value|run_process_private/);
+  assert.match(facade, /MongoClients::new_with\(&config, build\)/);
+  assert.match(facade, /MongoTaskStore::new\(clients.clone\(\), &config\)/);
+  assert.match(facade, /binding.verify_current\(\)\?/);
+  const watcher = read('../src-tauri/src/watcher.rs');
+  assert.doesNotMatch(watcher.split('#[cfg(test)]')[0], /MongoClients::new|bootstrap_gui|export_backend_config/);
   assert.doesNotMatch(init, /MongoClients::new|load_config|credentials\.yaml/);
   assert.match(facade, /with_existing_clients/);
   assert.match(facade, /validate_backend_binding\(config\)/);

@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:macos": "bash ./scripts/build-macos.sh",
-    "demo": "vite --open /demo.html",
+    "demo": "vite --mode demo --open /demo.html",
     "build:demo": "vite build --mode demo",
     "check:version": "node scripts/check-version.mjs"
   },

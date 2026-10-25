@@ -1,6 +1,6 @@
 //! Task-control storage over the EXISTING MongoClients factory. No new client,
 //! resolver, fallback, retry owner or queue. Metadata reads never fetch payloads.
-use crate::{config::AppConfig, mongo_manager::{MongoClients, ScopedMongoClients}};
+use crate::{config::AppConfig, mongo_manager::{MongoClients, ClientSlots}};
 use async_trait::async_trait;
 use bson::{doc, Bson, Document};
 use futures_util::TryStreamExt;
@@ -244,22 +244,17 @@ async fn bounded<T>(
 }
 
 /// Immutable mappings supplied by the existing app config, never a new factory.
-pub struct MongoTaskStore {
-    clients: ScopedMongoClients,
+pub struct MongoTaskStore<T = mongodb::Client> {
+    clients: ClientSlots<T>,
     mission: String,
     simulation: String,
 }
-impl MongoTaskStore {
+impl<T> MongoTaskStore<T> {
     /// Original desktop injection: retain the exact existing pools.
-    pub fn new(clients: Arc<MongoClients>, config: &AppConfig) -> Result<Self, String> {
-        Self::with_clients(ScopedMongoClients::existing(&clients), config)
+    pub fn new(clients: Arc<MongoClients<T>>, config: &AppConfig) -> Result<Self, String> {
+        Self::with_clients(ClientSlots::existing(&clients), config)
     }
-    /// Native bootstrap does not create unused clients or parse unused URIs.
-    /// First access delegates to the original MongoClients connection owner.
-    pub fn from_config(config: &AppConfig) -> Result<Self, String> {
-        Self::with_clients(MongoClients::scoped(config), config)
-    }
-    fn with_clients(clients: ScopedMongoClients, config: &AppConfig) -> Result<Self, String> {
+    fn with_clients(clients: ClientSlots<T>, config: &AppConfig) -> Result<Self, String> {
         let mission = config.mongodb.databases.mission.clone();
         let simulation = config.mongodb.databases.simulation.clone();
         if mission.trim().is_empty() || simulation.trim().is_empty() {
@@ -270,6 +265,17 @@ impl MongoTaskStore {
             mission,
             simulation,
         })
+    }
+    #[cfg(test)]
+    pub(crate) async fn existing_client(&self, host: Host) -> &Arc<T> {
+        self.clients.client_with(host.is_remote(), |_| async { panic!("injected pool must never rebuild") }).await.unwrap()
+    }
+}
+impl MongoTaskStore {
+    /// Native bootstrap does not create unused clients or parse unused URIs.
+    /// First access delegates to the original MongoClients connection owner.
+    pub fn from_config(config: &AppConfig) -> Result<Self, String> {
+        Self::with_clients(MongoClients::scoped(config), config)
     }
     async fn client(&self, host: Host) -> Result<&mongodb::Client, String> {
         self.clients.client(host.is_remote()).await.map(Arc::as_ref)

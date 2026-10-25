@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import path from "path"; // ✅ 修复：导入 path 模块
 import fs from 'fs'
+import { devInputs, tauriInputIgnore } from "./scripts/dev-inputs.mjs";
 
 
 const host = process.env.TAURI_DEV_HOST;
@@ -13,7 +14,9 @@ export default defineConfig(async ({ mode }) => ({
     outDir: 'dist-demo',
     rollupOptions: { input: path.resolve(__dirname, 'demo.html') },
   } : {},
-  plugins: [vue(),
+  // The synthetic demo has no taskctl/backend. All other serve modes retain
+  // mandatory enrollment; only this plugin is omitted in explicit demo mode.
+  plugins: [vue(), ...(mode === 'demo' ? [] : [devInputs(__dirname)]),
   {
     name: 'ensure-config-js',
     apply: 'build', // 只在构建时运行
@@ -60,7 +63,7 @@ export default defineConfig(async ({ mode }) => ({
       : undefined,
     watch: {
       // 3. tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      ignored: [tauriInputIgnore(__dirname)],
     },
   },
 }));

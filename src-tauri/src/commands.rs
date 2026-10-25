@@ -21,12 +21,16 @@ use quantnight_task_core::{task_control::TaskControl, cleanup_sync::TaskOutcome,
 pub use quantnight_task_core::create_generate::GuiCreatedTask as CreatedTask;
 pub use quantnight_task_core::pause::ConfirmedTaskStop;
 
-/// One lazy bootstrap per app; reuse the existing parsed config and Mongo pools.
+/// Startup supplies verified control; legacy injection retains one cached bootstrap.
 /// A failed bootstrap is also cached, not retried for every button click.
 #[derive(Default)]
 pub struct TaskControlState(tokio::sync::OnceCell<Result<TaskControl, String>>);
 impl TaskControlState {
+    pub fn from_verified(control: TaskControl) -> Self {
+        Self(tokio::sync::OnceCell::new_with(Some(Ok(control))))
+    }
     async fn get(&self, config: &AppConfig, clients: &Arc<MongoClients>) -> Result<&TaskControl, String> {
+        crate::dev_identity::admit_gui()?;
         self.initialize(TaskControl::with_existing_clients(config, clients.clone())).await
     }
     async fn initialize(&self, init: impl std::future::Future<Output = Result<TaskControl, String>>) -> Result<&TaskControl, String> {

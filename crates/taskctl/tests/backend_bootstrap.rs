@@ -106,6 +106,25 @@ assert not violations
     let binding=quantnight_task_core::backend_binding::validate_backend_binding(&config).await.unwrap();
     assert!(binding.request()["remoteUriSha256"].is_null());
     binding.verify_current().unwrap();
+    // Explicit desktop TOML remains strict CLI input: it is never merged with
+    // the backend export just because the GUI now has startup authority.
+    let path = root.0.join("synthetic-app.toml");
+    std::fs::write(&path, format!(r#"
+[env]
+working_dir = {:?}
+[python.scripts]
+[bash.scripts]
+[mongodb]
+local_uri = "mongodb://synthetic:private-secret@127.0.0.1:27017/?directConnection=true"
+[mongodb.databases]
+mission = "simulation_mission"
+simulation = "simulation_db"
+alpha = "custom-ui-alpha"
+"#, root.0.to_string_lossy())).unwrap();
+    let explicit = bootstrap::load(Some(&path), None).await.unwrap();
+    assert_eq!(explicit.mongodb.local_uri, "mongodb://synthetic:private-secret@127.0.0.1:27017/?directConnection=true");
+    assert_eq!(explicit.mongodb.databases.alpha, "custom-ui-alpha");
+    assert!(quantnight_task_core::backend_binding::validate_backend_binding(&explicit).await.is_err());
 }
 
 #[cfg(feature = "backend-owner-tests")]

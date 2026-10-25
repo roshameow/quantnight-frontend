@@ -1191,6 +1191,7 @@ dependencies = [
  "quantnight-task-core",
  "quote",
  "serde_json",
+ "sha2",
  "syn 2.0.100",
  "tokio",
 ]

@@ -1,6 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+#[path = "../../crates/source_identity.rs"]
+mod source_identity;
+mod dev_identity_inputs;
+mod dev_image;
+mod dev_identity;
 mod config;
 mod watcher;
 mod datas;
@@ -11,30 +16,56 @@ mod metrics; // Add metrics module
 
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tauri::async_runtime;
 
-use mongo_manager::MongoClients;
+use quantnight_task_core::task_control::TaskControl;
 use crate::config::load_config;
 use crate::config::default_config_path;
 
 fn main() {
+    // Exact first OS argument only, before either GUI loop or any GUI I/O.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("taskctl")) {
+        std::process::exit(quantnight_taskctl::run_os_with_admission(args, dev_identity::admit_cli));
+    }
+    if let Err(error) = dev_identity::initialize_gui() {
+        eprintln!("dev GUI admission failed: {error}. Fix the cause and rerun `npm run tauri dev`.");
+        std::process::exit(1);
+    }
     let config_path = env::args().nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
     println!("加载配置路径: {:?}", config_path);
     let config = load_config(&config_path).expect("配置加载失败");
 
-    // 初始化 MongoClients 并用 Arc 包装
-    let mongo_clients = async_runtime::block_on(async {
-        Arc::new(MongoClients::new(&config).await.expect("MongoDB 初始化失败"))
-    });
+    if let Err(error) = dev_identity::verify_gui_root(std::path::Path::new(&config.env.working_dir)) {
+        eprintln!("dev backend binding mismatch: {error}. Fix the cause and rerun `npm run tauri dev`.");
+        std::process::exit(1);
+    }
+
+    // TOML selects backend root and UI settings. Backend MongoConfig is the
+    // sole endpoint authority for ALL shared reads/watchers and mutations.
+    // Refuse the entire GUI on failure: never show an old-URI task view as a
+    // controllable new context. Recovery is a normal user restart, not replay.
+    let (config, mongo_clients, control) = match async_runtime::block_on(
+        TaskControl::bootstrap_gui(config)
+    ).and_then(|context| context.into_parts()) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("Application unavailable: backend task configuration authority failed: {error}. Check configuration and restart normally; no task operation was retried.");
+            std::process::exit(1);
+        }
+    };
+
+    // Fixed, non-secret operator notice: never log endpoints or AppConfig.
+    eprintln!("MongoDB endpoint authority: backend MongoConfig supplies all shared GUI connections. TOML still selects the backend root, UI database/collection names and scripts; legacy TOML URI values are not used for transport. Changes require a normal restart, not a task retry.");
 
     tauri::Builder::default()
+        .setup(|_| { dev_identity::ready().map_err(|e| format!("{e}; fix and rerun `npm run tauri dev`"))?; Ok(()) })
         .plugin(tauri_plugin_dialog::init())
         .manage(mongo_clients.clone()) // 注册 Arc<MongoClients>
-        .manage(commands::TaskControlState::default()) // lazy, reuses config + pools
+        .manage(commands::TaskControlState::from_verified(control))
         .manage(config)
         .invoke_handler(tauri::generate_handler![
             commands::create_task,

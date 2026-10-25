@@ -6,25 +6,20 @@ use tokio::sync::OnceCell;
 
 /// Desktop callers retain their original full-pool fields and constructor.
 #[derive(Clone)]
-pub struct MongoClients {
-    pub local: Arc<Client>,
-    pub remote: Arc<Client>,
+pub struct MongoClients<T = Client> {
+    pub local: Arc<T>,
+    pub remote: Arc<T>,
 }
 
 impl MongoClients {
     pub async fn new(config: &AppConfig) -> Result<Self> {
-        // Full-pool callers explicitly request both roles. Check both before
-        // constructing either; absence is not a reason to substitute local.
-        let local = required_uri(&config.mongodb.local_uri, "local")?;
-        let remote = required_uri(&config.mongodb.remote_uri, "remote")?;
-        Ok(Self {
-            local: Self::build_client("local", local).await?,
-            remote: Self::build_client("remote", remote).await?,
-        })
+        Self::new_with(config, |role, uri| async move {
+            Self::build_client(&role, &uri).await.map_err(|error| error.to_string())
+        }).await.map_err(anyhow::Error::msg)
     }
 
     /// The sole Rust connection factory, shared by desktop and lazy task pools.
-    async fn build_client(role: &str, uri: &str) -> Result<Arc<Client>> {
+    pub(crate) async fn build_client(role: &str, uri: &str) -> Result<Arc<Client>> {
         #[cfg(feature = "test-support")]
         assert!(
             !local_config_test_support::construction_forbidden(),
@@ -44,6 +39,21 @@ impl MongoClients {
 
     pub(crate) fn scoped(config: &AppConfig) -> ScopedMongoClients {
         ClientSlots::from_config(config)
+    }
+}
+
+impl<T> MongoClients<T> {
+    /// Same full-pool role policy and construction sequence for production and
+    /// offline lowest-factory tests. No alternate success bootstrap path.
+    pub(crate) async fn new_with<F, Fut>(config: &AppConfig, mut build: F) -> Result<Self, String>
+    where F: FnMut(String, String) -> Fut,
+          Fut: Future<Output = Result<Arc<T>, String>> {
+        let local = required_uri(&config.mongodb.local_uri, "local").map_err(|e| e.to_string())?;
+        let remote = required_uri(&config.mongodb.remote_uri, "remote").map_err(|e| e.to_string())?;
+        Ok(Self {
+            local: build("local".into(), local.into()).await?,
+            remote: build("remote".into(), remote.into()).await?,
+        })
     }
 }
 
@@ -113,7 +123,7 @@ impl<T> ClientSlots<T> {
             remote: ClientSlot::existing(remote),
         }
     }
-    async fn client_with<F, Fut>(&self, remote: bool, build: F) -> Result<&Arc<T>, String>
+    pub(crate) async fn client_with<F, Fut>(&self, remote: bool, build: F) -> Result<&Arc<T>, String>
     where
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = Result<Arc<T>, String>>,
@@ -125,10 +135,12 @@ impl<T> ClientSlots<T> {
         }
     }
 }
-impl ScopedMongoClients {
-    pub(crate) fn existing(clients: &MongoClients) -> Self {
+impl<T> ClientSlots<T> {
+    pub(crate) fn existing(clients: &MongoClients<T>) -> Self {
         Self::from_existing(clients.local.clone(), clients.remote.clone())
     }
+}
+impl ScopedMongoClients {
     pub(crate) async fn client(&self, remote: bool) -> Result<&Arc<Client>, String> {
         self.client_with(remote, |uri| async move {
             MongoClients::build_client(if remote { "remote" } else { "local" }, &uri)

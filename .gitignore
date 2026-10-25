@@ -30,3 +30,14 @@ src-tauri/config.toml
 
 tmp
 dist-demo/
+
+# Vite dev-input trigger, not a source or readiness authority
+/src-tauri/src/dev-input.stamp
+
+# Explicit per-checkout locator and its interrupted same-parent publication temp.
+/.quantnight/taskctl-selection.json
+/.quantnight/taskctl-selection.json.[0-9]*.tmp
+# Keep the ONE canonical binding outside Git, or explicitly choose this ignored
+# in-checkout location (its canonical parent must already exist before planning).
+/.quantnight/taskctl-binding.json
+/.quantnight/taskctl-binding.json.[0-9]*.tmp

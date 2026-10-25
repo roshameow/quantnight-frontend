@@ -40,6 +40,26 @@ npm run tauri:dev
 
 源码构建还需要 Rust 和 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。先用演示检查界面，再配置完整桌面环境。
 
+## 桌面 MongoDB 配置权威（源码变更）
+
+GUI 启动时仍按原命令行参数或默认路径读取 TOML。TOML 负责选择
+`env.working_dir` 后端根目录，以及 UI 数据库/集合名称和 Python/bash 脚本映射；
+**实际共享 MongoDB 连接的本地/远程端点由该后端的原 `MongoConfig` 提供**。
+TOML 中旧 `mongodb.local_uri` / `remote_uri` 值不再用于选择 GUI 传输端点，
+即使设置编辑器仍可编辑它们；不会自动改写或保存这些字段。
+任务 mission/simulation 命名空间必须与后端一致，冲突时拒绝启动，不做隐式迁移。
+
+这一权威选择覆盖任务列表、watcher、任务控制及共用连接的数据页面（包括 alpha）；
+保留 UI 命名空间不代表新旧服务器是同一个物理数据库。驱动 URI 选项也采用后端值，
+不会暗中保留旧 TOML 的 `directConnection` 或超时覆盖；原外层操作预算不变。
+后端根目录、导出或绑定校验失败时，整个 GUI 不可用，不退回旧端点显示可操作的任务列表。
+GUI 仍要求本地和远程角色都已配置；原生 CLI 的可选远程/lazy 行为与显式
+`--app-config` 严格语义不变。
+
+配置修正后须由用户正常关闭并重新启动应用，保持原选择的 TOML 路径，重新核对任务列表；
+保存设置或刷新列表不会重绑定，旧任务选择和失败操作不会自动重试。现有应用内
+`restart_app` 仅退出，不保证自动重启。本文描述源码行为，不代表已发布或运行中的应用已采用。
+
 ## Priority 调度与暂停监控
 
 配合支持per-root调度的后端，任务卡的「调度优先级」是数值越大越优先的正数权重（默认1），不是阶段号或预算。同一个原任务消费者队列按 **任务权重 → R3/R2/R1 → 同阶段已开始root → 稳定顺序** 调度，不抢占已运行的模拟，也不保证不同消费者/机器之间的全账号严格排序。每root独立最多3阶段×60候选，来源和预算保持不变。
@@ -94,3 +114,27 @@ No automatic deployment or service restart is included. Remote generation still
 requires the original dependency/sync preflight; ignored runtime files are not
 proof that the executor has their manifests or loaders. See `tests/README.md` for
 offline checks; these are not native-app or real-task smoke tests.
+
+## 开发态 taskctl 一致性
+
+`npm run tauri dev` 仍是原入口。显式 dev binding 将后端薄壳指向同一 GUI debug
+可执行文件的早期 `taskctl` 分支；独立 taskctl/core 不依赖 Tauri/linfa，但 dev host
+确实由系统加载桌面框架。原 Vite watcher 只发输入 stamp，stock Tauri 负责 kill/wait/
+build/restart。没有第二 CLI 构建、后台 watcher、Cargo runner 或任务策略变更。
+
+逐 crate 编译身份和已加载 Mach-O UUID 只做准入时新鲜度检查，不承诺任意并发重写/ABA
+下的不可变编译快照，也不热升级 Python/tmux/MCP/远程消费者。启动/准入失败可能退出
+dev lifecycle：修复后重新运行 `npm run tauri dev`；不伪造编译错误或保活等待进程。
+绑定由 Main 从原 AppConfig `env.working_dir` 显式安装；测试不安装绑定、不采用实际 GUI。
+完整 schema、独立/开发选择与关闭 GUI 的合同见 [CLI README](crates/taskctl/README.md#explicit-desktop-development-taskctl-mode)。
+
+### 持久显式登记（v3 兼容性变化）
+
+原入口各自从已知根的 `.quantnight/taskctl-selection.json` 读取模式；dev 两端只指向同一个
+规范非秘密 binding 文档。登记后新终端/Pi 环境无需环境变量，仍用 `npm run tauri dev` 和原
+后端 shim。若提供环境选择，必须与登记一致。未登记/损坏不再自动执行已安装 `bin/taskctl`；
+独立模式须显式登记 standalone 或使用无 dev 冲突的 `QUANTNIGHT_TASKCTL_BIN`。这是明确的
+兼容性变化，不是静默回退。`scripts/register-dev-host.mjs` 默认只输出显式路径计划，Main
+另行授权后才用 `--write` 登记；从原 AppConfig 核对 backend root，启动仍在 clients 前验证。
+GUI Cargo.lock 的 watcher 例外仅允许该文件及父目录；权限 capability JSON/TOML/JSON5 源
+及成员变化由同一个 Rust owner 指纹覆盖，生成的 gen/schemas 不参与。

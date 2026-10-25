@@ -1,18 +1,60 @@
-//! Common application entry point. Desktop and CLI supply the SAME parsed
-//! AppConfig; neither adapter owns task mutation or a second client factory.
+//! Common application entry point. Desktop and CLI share the original task
+//! endpoint authority; desktop UI settings remain separate. Neither adapter
+//! owns task mutation or a second client factory.
 use std::sync::Arc;
 use bson::{doc, oid::ObjectId, Document};
 use serde_json::json;
-use crate::{backend_binding::{validate_backend_binding, BackendBinding},
+use crate::{backend_binding::{validate_backend_binding, resolve_gui_binding, BackendBinding},
     cleanup_sync::{self, TaskOutcome}, config::{AppConfig, BashScriptObserver},
     mongo_manager::MongoClients, operations_runtime::OriginalOperationsRuntime,
     task_store::{Host, MongoTaskStore, TaskStore}};
+
+/// Unpublished checked desktop context. No public constructor; consuming it
+/// rechecks source freshness immediately before the GUI registers shared state.
+/// The default type is the original Mongo client, not an alternate pool stack.
+pub struct GuiContext<T = mongodb::Client> {
+    config: AppConfig,
+    clients: Arc<MongoClients<T>>,
+    binding: BackendBinding,
+    store: MongoTaskStore<T>,
+}
+impl<T> GuiContext<T> {
+    fn checked_parts(self) -> Result<(AppConfig, Arc<MongoClients<T>>, BackendBinding, MongoTaskStore<T>), String> {
+        self.binding.verify_current()?;
+        Ok((self.config, self.clients, self.binding, self.store))
+    }
+}
+impl GuiContext {
+    pub fn into_parts(self) -> Result<(AppConfig, Arc<MongoClients>, TaskControl), String> {
+        let (config, clients, binding, store) = self.checked_parts()?;
+        Ok((config, clients, TaskControl { binding, store: Arc::new(store) }))
+    }
+}
+
+// One startup algorithm. The only injection point is the lowest client
+// factory; export, strict proof, merge, store wiring and freshness are real.
+async fn bootstrap_gui_with<T, F, Fut>(config: AppConfig, build: F) -> Result<GuiContext<T>, String>
+where F: FnMut(String, String) -> Fut,
+      Fut: std::future::Future<Output = Result<Arc<T>, String>> {
+    let (config, binding) = resolve_gui_binding(config).await?;
+    let clients = Arc::new(MongoClients::new_with(&config, build).await?);
+    let store = MongoTaskStore::new(clients.clone(), &config)?;
+    binding.verify_current()?;
+    Ok(GuiContext { config, clients, binding, store })
+}
 
 pub struct TaskControl {
     binding: BackendBinding,
     store: Arc<dyn TaskStore>,
 }
 impl TaskControl {
+    /// Original GUI startup authority, before all shared reads/watchers.
+    /// Endpoint options intentionally follow MongoConfig, not legacy TOML.
+    pub async fn bootstrap_gui(config: AppConfig) -> Result<GuiContext, String> {
+        bootstrap_gui_with(config, |role, uri| async move {
+            MongoClients::build_client(&role, &uri).await.map_err(|error| error.to_string())
+        }).await
+    }
     /// Headless CLI bootstrap. Configuration proof happens before client setup.
     pub async fn connect(config: &AppConfig) -> Result<Self, String> {
         let binding = validate_backend_binding(config).await?;
@@ -151,3 +193,7 @@ fn rejected(command: &str, name: &str, error: String) -> TaskOutcome {
         "task":name, "ok":false, "at":chrono::Utc::now().to_rfc3339(),
         "errorType":"RuntimeError", "error":error}) }
 }
+
+#[cfg(all(test, unix, feature = "test-support"))]
+#[path = "gui_bootstrap_tests.rs"]
+mod gui_bootstrap_tests;

@@ -431,3 +431,28 @@ fn creation_destination_and_captured_actual_host_are_distinct_shared_request_fie
     start_receipt(&receipt(true), &request).unwrap();
     // This adapter grants no pristine/history eligibility: core.start owns it.
 }
+
+#[tokio::test]
+async fn startup_failure_is_cached_for_concurrent_buttons_without_factory_or_replay() {
+    use quantnight_task_core::{config::bash_test_support::FakeBash,
+        mongo_manager::local_config_test_support::without_client_construction};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fake = FakeBash::new(":"); // no credentials: real startup must refuse
+    let service = TaskControlState::default();
+    let calls = AtomicUsize::new(0);
+    let init = || async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        TaskControl::bootstrap_gui(fake.config.clone()).await?
+            .into_parts().map(|(_, _, control)| control)
+    };
+    without_client_construction(async {
+        let (a, b) = tokio::join!(service.initialize(init()), service.initialize(init()));
+        let error = a.err().unwrap();
+        assert_eq!(Some(error.clone()), b.err());
+        assert_eq!(service.initialize(init()).await.err(), Some(error));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // No retry of the original operation, even if a new context is later
+        // explicitly constructed. Nothing in these failed futures reaches I/O.
+        assert!(!Path::new(&fake.config.env.working_dir).join(".quantnight").exists());
+    }).await;
+}
