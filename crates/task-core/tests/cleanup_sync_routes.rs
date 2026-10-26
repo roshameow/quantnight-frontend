@@ -2254,3 +2254,82 @@ async fn archive_preconditions_report_the_original_action_without_attempting_arc
         assert_eq!(out.value["controlHidden"], false);
     }
 }
+
+#[tokio::test]
+async fn legacy_super_missing_enhancements_can_archive_unresolved_receipts_after_original_stop_checks() {
+    for remote in [false, true] {
+        let root = Root::new();
+        let retained = vec![doc! {"_id":"accepted-unknown","status":"timeout_error","acceptance":"UNKNOWN",
+            "campaign_post_attempted":true,"superSlotId":"retain-original-slot","submissionAttempts":[{"acceptance":"UNKNOWN"}],
+            "payload":{"selection":"original"}},
+            doc! {"_id":"success","status":"success","alphaId":"old-alpha"}];
+        let store = MemoryStore::new("paused", remote, retained.clone());
+        if remote { store.remote(retained.clone()); }
+        { let mut d = store.0.lock().unwrap();
+          for tasks in d.tasks.values_mut() {
+              tasks[0].insert("taskType", "super");
+              for key in ["startupBinding","simulatorRuntime","tmuxContext"] { tasks[0].remove(key); }
+          }
+        }
+        let runtime = Runtime::default();
+        let out = delete(&store, &runtime, &root).await;
+        assert_eq!(out.exit_code, 0, "{}", out.value);
+        assert_eq!(out.value["itemsPreserved"], true);
+        assert_eq!(out.value["canonicalResultsDeleted"], false);
+        assert_eq!(store.collection(Host::Local, &archive()).unwrap(), retained);
+        if remote { assert_eq!(store.collection(Host::Remote, &archive()).unwrap(), retained); }
+        assert_eq!(store.control().get_str("status").unwrap(), "deactive");
+        assert!(runtime.calls.lock().unwrap().contains(&format!("absence:{}", if remote {"remote"} else {"local"})));
+        assert!(!store.control().contains_key("simulatorRuntime"), "archive cannot invent runner closure or platform terminal");
+    }
+}
+
+#[path = "support/original_professional_runtime.rs"]
+mod original_professional_runtime;
+
+#[tokio::test]
+async fn public_archive_missing_stop_automatically_uses_original_verify_only_without_signal() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
+    struct OriginalStopUnboundResearch<'a>(OriginalOperationsRuntime<'a>);
+    #[async_trait]
+    impl OperationsRuntime for OriginalStopUnboundResearch<'_> {
+        async fn assert_consumer_absent(&self,root:&Path,task:&Document,host:Host)->Result<(),String> {
+            self.0.assert_consumer_absent(root,task,host).await
+        }
+        async fn verify_stopped(&self,root:&Path,task:&Document,remaining:std::time::Duration)->Result<Option<quantnight_task_core::pause::StopOutput>,String> {
+            self.0.verify_stopped(root,task,remaining).await
+        }
+        async fn confirm_stopped_scope(&self,r:&Path,s:&dyn TaskStore,t:&Document,d:std::time::Duration)->Result<(),String>{
+            self.0.confirm_stopped_scope(r,s,t,d).await
+        }
+        async fn archive_research(&self,_:&Path,_:&Document,_:Host,_:&str)->Result<Value,String> {
+            // Independent unbound research leaf; original stop/check shell IO is NOT mocked.
+            Ok(Value::Null)
+        }
+    }
+    for remote in [false,true] {
+        let fake=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fake.config.env.working_dir);
+        let binding=validate_backend_binding(&fake.config).await.unwrap();
+        let runtime=OriginalStopUnboundResearch(OriginalOperationsRuntime{binding:&binding,observer:None});
+        let retained=vec![doc!{"_id":"unknown","status":"timeout_error","acceptance":"UNKNOWN","superSlotId":"original-token"}];
+        let store=MemoryStore::new("paused",remote,retained.clone());
+        if remote {store.remote(retained.clone());}
+        {let mut d=store.0.lock().unwrap();for tasks in d.tasks.values_mut(){
+            for key in ["stopConfirmedAt","stopConfirmedRemote","stopConfirmedTaskId","startupBinding","simulatorRuntime","tmuxContext"] {tasks[0].remove(key);}
+            tasks[0].insert("taskType","super");
+            tasks[0].insert("tmuxContext",doc!{"sessionId":"$4"});
+        }}
+        let out=cleanup_sync::delete(root,&store,&runtime,NAME,Some(ID)).await;
+        assert_eq!(out.exit_code,0,"{remote}: {}",out.value);
+        assert_eq!(out.value["itemsPreserved"],true);
+        assert_eq!(out.value["unresolvedItemCount"],1);
+        assert_eq!(store.collection(Host::Local,&archive()).unwrap(),retained);
+        if remote{assert_eq!(store.collection(Host::Remote,&archive()).unwrap(),retained);}
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert!(!trace.contains("if-shell")&&!trace.contains("new-session"));
+        let control=store.control();
+        assert_eq!(control.get_str("stopConfirmationBasis").unwrap(),"session_absent");
+        assert!(!control.contains_key("simulatorRuntime"));
+    }
+}

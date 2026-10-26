@@ -1,7 +1,7 @@
 // src/stores/taskStore.js
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { newTaskRequestId, failureKind, errorStage, validOperationStage } from '../utils/taskDiagnostics.js'
+import { newTaskRequestId, failureKind, errorStage, validOperationStage, taskLaunchMatches } from '../utils/taskDiagnostics.js'
 
 const emptyProgress = (task, previous) => ({
   success: 0, error: 0, total: 0,
@@ -22,7 +22,9 @@ const taskId = (task) => typeof task?._id === 'object' ? task._id?.$oid : task?.
 const sameStopTarget = (task, target) => !!task && !!target &&
   task.name === target.name && typeof taskId(task) === 'string' && !!taskId(task) &&
   taskId(task) === taskId(target) && typeof target.isRemote === 'boolean' &&
-  (task.isRemote === true) === target.isRemote
+  (task.isRemote === true) === target.isRemote && taskLaunchMatches(task, target) &&
+  (target.expectedTaskType === undefined || (task.taskType ?? 'regular') === target.expectedTaskType) &&
+  (target.expectedAuthProfile === undefined || (task.auth_profile ?? 'user1') === target.expectedAuthProfile)
 
 export function stopProofMillis(value) {
   if (value instanceof Date) value = value.getTime()
@@ -118,6 +120,11 @@ export const useTaskStore = defineStore('task', () => {
   const beginTaskStop = (target) => {
     if (!currentStopTask(target) || taskStopOperationMap.value[target.name]?.status === 'stopping') return null
     const operation = { _id: taskId(target), name: target.name, isRemote: target.isRemote,
+      ...(target.expectedLaunchAttemptId != null ? { expectedLaunchAttemptId: target.expectedLaunchAttemptId } : {}),
+      ...(target.expectedLaunchAbsent === true ? { expectedLaunchAbsent: true } : {}),
+      ...(target.expectedTaskType !== undefined ? { expectedTaskType: target.expectedTaskType, taskType: target.taskType } : {}),
+      ...(target.expectedAuthProfile !== undefined ? { expectedAuthProfile: target.expectedAuthProfile, auth_profile: target.auth_profile } : {}),
+      ...(Object.hasOwn(target, 'launchAttemptId') ? { launchAttemptId: target.launchAttemptId } : {}),
       status: 'stopping', generation: ++stopGeneration, startedAt: Date.now(),
       requestId: newTaskRequestId('stop'), stage: 'native_request',
       detail: '已发起原生停止调用，等待阶段回报和最终停止凭据', error: null }

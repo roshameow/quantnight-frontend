@@ -17,7 +17,7 @@ test('ordinary generation disables click immediately and across refreshed state'
 
 test('card and manager bind both in-flight and persisted generation state', () => {
   const card = readFileSync(new URL('../src/components/TaskCards/RegularTaskCard.vue', import.meta.url), 'utf8');
-  assert.match(card, /:disabled="!canGenerate\(task, generationBusy\)"/);
+  assert.match(card, /:disabled="!!taskMutationIssue\(task\) \|\| !canGenerate\(task, generationBusy\)"/);
   assert.match(card, /:loading="isGenerating\(task, generationBusy\)"/);
   const manager = readFileSync(new URL('../src/views/TaskManager.vue', import.meta.url), 'utf8');
   assert.match(manager, /generationRequests\.value\[key\] = true/);

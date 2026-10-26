@@ -30,6 +30,7 @@ pub async fn dispatch(control: &TaskControl, request: &Request) -> TaskOutcome {
                     PauseOptions {
                         expected_task_id: r.expected_task_id.as_deref(),
                         expected_launch_attempt_id: r.expected_launch_attempt_id.as_deref(),
+                        expected_launch_absent: false, remaining: None,
                         expected_remote: None,
                         observer: None,
                     },

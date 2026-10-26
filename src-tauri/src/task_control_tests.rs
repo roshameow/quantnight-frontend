@@ -12,9 +12,11 @@ pub(super) struct PauseRoute {
     pub outcome: pause::PauseOutcome,
     pub writes: Vec<(Document, Document)>,
     pub stages: Vec<String>,
+    pub stop_invocations: usize,
 }
 struct Store {
     task: Document,
+    execution: Option<Document>,
     matched: u64,
     writes: Mutex<Vec<(Document, Document)>>,
 }
@@ -30,18 +32,17 @@ impl TaskStore for Store {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            assert_eq!(host, Host::Local);
+            let task = match host {
+                Host::Local => &self.task,
+                Host::Remote => self.execution.as_ref().expect("unexpected remote registry access"),
+            };
             let matched = filter.iter().all(|(key, expected)| match expected {
-                bson::Bson::Document(op) if op.contains_key("$ne") => {
-                    self.task.get(key) != op.get("$ne")
-                }
-                bson::Bson::Document(op) if op.contains_key("$exists") => {
-                    self.task.contains_key(key) == op.get_bool("$exists").unwrap()
-                }
-                bson::Bson::Null => matches!(self.task.get(key), None | Some(bson::Bson::Null)),
-                _ => self.task.get(key) == Some(expected),
+                bson::Bson::Document(op) if op.contains_key("$ne") => task.get(key) != op.get("$ne"),
+                bson::Bson::Document(op) if op.contains_key("$exists") => task.contains_key(key) == op.get_bool("$exists").unwrap(),
+                bson::Bson::Null => matches!(task.get(key), None | Some(bson::Bson::Null)),
+                _ => task.get(key) == Some(expected),
             });
-            Ok(matched.then(|| self.task.clone()))
+            Ok(matched.then(|| task.clone()))
         })
     }
     fn update_task<'life0, 'async_trait>(
@@ -146,6 +147,9 @@ impl TaskStore for Store {
     }
 }
 pub(super) async fn pause_route(task: Document, stdout: String, matched: u64) -> PauseRoute {
+    pause_route_with_execution(task, stdout, matched, None).await
+}
+async fn pause_route_with_execution(task: Document, stdout: String, matched: u64, execution: Option<Document>) -> PauseRoute {
     use quantnight_task_core::{
         backend_binding::validate_backend_binding, config::bash_test_support::FakeBash,
     };
@@ -170,17 +174,32 @@ printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok"
     )
     .unwrap();
     fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        root.join("scripts/pause_task.sh"),
-        format!(
-            "printf '%s' \"$QUANTNIGHT_TMUX_BINDING\" > binding.json\nprintf '%s\\n' '{}'\n",
-            stdout.replace('\'', "'\"'\"'")
-        ),
-    )
-    .unwrap();
+    let name = task.get_str("name").unwrap();
+    let remote = task.get_bool("isRemote").unwrap_or(false);
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let still_active = format!("QUANTNIGHT_STOP_OBSERVED {}", serde_json::json!({
+        "schema_version":1,"task_name":name,"target_remote":remote,"session_absent":false}));
+    let stopped = proof_line(name, remote, pause::StopConfirmationBasis::SessionAbsent);
+    let raw_is_valid = pause::verified_stop_proof(&stdout, name, remote).is_ok();
+    fs::write(root.join("scripts/pause_task.sh"), format!(
+        "set -eu\n[ \"$1\" = {name} ] && [ \"$2\" = {host} ] || {{ echo wrong-stop-route >> VIOLATIONS; exit 97; }}\nprintf '%s' \"$QUANTNIGHT_TMUX_BINDING\" > binding.json\ncase \"${{3-}}\" in\n--verify-stopped) echo verify >> stop-calls; if [ -e stopped ]; then printf '%s\\n' {stopped}; else printf '%s\\n' {active}; fi ;;\n'') echo stop >> stop-calls; {transition}; printf '%s\\n' {raw} ;;\n*) echo unknown-stop-mode >> VIOLATIONS; exit 97 ;;\nesac\n",
+        name=quote(name),host=quote(if remote {"--remote"} else {"false"}),
+        stopped=quote(&stopped),active=quote(&still_active),raw=quote(&stdout),
+        transition=if raw_is_valid {"touch stopped"} else {":"})).unwrap();
+    let active = serde_json::json!({"schemaVersion":1,"taskName":name,"remote":remote,
+        "taskId":task.get_object_id("_id").unwrap().to_hex(),"launchAttemptId":task.get_str("launchAttemptId").ok(),
+        "state":"unverified","consumerRunning":true,"identityVerified":false,"ownedResidue":false,"explicitPauseVerified":true});
+    let absent = serde_json::json!({"schemaVersion":1,"taskName":name,"remote":remote,
+        "state":"session_absent","consumerRunning":false,"identityVerified":false,"ownedResidue":false});
+    fs::write(root.join("scripts/check_tmux_python.sh"), format!(
+        "set -eu\n[ \"$1\" = {name} ] && [ \"$2\" = {host} ] && [ \"$3\" = --inspect-execution ] && [ \"$4\" = --binding ] || {{ echo wrong-inspect-route >> VIOLATIONS; exit 97; }}\necho inspect >> stop-calls\nif [ -e stopped ]; then printf '%s\\n' {absent}; else printf '%s\\n' {active}; fi\n",
+        name=quote(name),host=quote(if remote {"true"} else {"false"}),
+        active=quote(&format!("QUANTNIGHT_EXECUTION_OBSERVED {active}")),
+        absent=quote(&format!("QUANTNIGHT_EXECUTION_OBSERVED {absent}")))).unwrap();
     let binding = validate_backend_binding(&fake.config).await.unwrap();
     let store = Arc::new(Store {
         task: task.clone(),
+        execution: execution.or_else(|| task.get_bool("isRemote").unwrap_or(false).then(|| task.clone())),
         matched,
         writes: Mutex::new(vec![]),
     });
@@ -228,11 +247,19 @@ printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok"
         fs::read_to_string(root.join("bootstrap-calls")).unwrap(),
         "bootstrap\n"
     );
+    assert!(!root.join("VIOLATIONS").exists(), "fixture route violation must not be swallowed");
+    let calls = fs::read_to_string(root.join("stop-calls")).unwrap();
+    let stop_invocations = calls.lines().filter(|line| *line == "stop").count();
+    assert!(stop_invocations <= 1, "read-only recovery must not repeat stop");
+    if outcome.exit_code == 0 || stages.lock().unwrap().iter().any(|s| s == "control_write") {
+        assert_eq!(stop_invocations, 1, "fixture initially-active stop cannot be replaced with verification success");
+    }
     let writes = store.writes.lock().unwrap().clone();
     PauseRoute {
         outcome,
         writes,
         stages: Arc::try_unwrap(stages).unwrap().into_inner().unwrap(),
+        stop_invocations,
     }
 }
 pub(super) fn proof_line(name: &str, remote: bool, basis: pause::StopConfirmationBasis) -> String {
@@ -311,6 +338,7 @@ pub(super) async fn assert_running_delete_refused() {
     fs::create_dir_all(&root).unwrap();
     let store = Store {
         task: doc! {"_id":id,"name":"dataset","status":"running","isRemote":false},
+        execution: None,
         matched: 1,
         writes: Mutex::new(vec![]),
     };
@@ -327,7 +355,7 @@ pub(super) async fn assert_running_delete_refused() {
         result.value["error"]
             .as_str()
             .unwrap()
-            .contains("pause/reconcile"),
+            .contains("current valid stop confirmation unavailable"),
         "{}",
         result.value
     );
@@ -419,7 +447,7 @@ fn void_projection_requires_version_command_name_boolean_success_and_zero_exit()
 #[test]
 fn creation_destination_and_captured_actual_host_are_distinct_shared_request_fields() {
     let id = "0123456789abcdef01234567";
-    let request = start_request("fixture", "{}", true, id, Some(false)).unwrap();
+    let request = start_request("fixture", Some("{}"), true, id, Some(false)).unwrap();
     assert_eq!(request.remote, Some(true));
     assert_eq!(request.expected_remote, Some(false));
     let receipt = |remote| TaskOutcome {
@@ -455,4 +483,25 @@ async fn startup_failure_is_cached_for_concurrent_buttons_without_factory_or_rep
         // explicitly constructed. Nothing in these failed futures reaches I/O.
         assert!(!Path::new(&fake.config.env.working_dir).join(".quantnight").exists());
     }).await;
+}
+
+#[tokio::test]
+async fn original_pause_registry_preserves_legacy_null_local_and_rejects_remote_conflicts() {
+    let id = ObjectId::new();
+    for host in [bson::Bson::Null, bson::Bson::Boolean(false)] {
+        let task = doc! {"_id":id,"name":"legacy","status":"running","isRemote":host};
+        let route = pause_route(task, proof_line("legacy",false,pause::StopConfirmationBasis::RunnersExited),1).await;
+        assert_eq!(route.outcome.exit_code,0,"{}",route.outcome.value);
+        assert_eq!(route.stop_invocations,1);
+        assert_eq!(route.writes.len(),1);
+    }
+    for host in [bson::Bson::Null,bson::Bson::Boolean(false),bson::Bson::String("true".into())] {
+        let task=doc! {"_id":id,"name":"legacy","status":"running","isRemote":true};
+        let mut execution=task.clone();execution.insert("isRemote",host);
+        let route=pause_route_with_execution(task,proof_line("legacy",true,pause::StopConfirmationBasis::RunnersExited),1,Some(execution)).await;
+        assert_eq!(route.outcome.exit_code,1);
+        assert!(route.outcome.value["error"].as_str().unwrap().contains("execution registry belongs"));
+        assert_eq!(route.stop_invocations,0);
+        assert!(route.writes.is_empty());
+    }
 }

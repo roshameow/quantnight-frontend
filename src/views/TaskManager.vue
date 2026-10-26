@@ -26,6 +26,7 @@
             :key="typeof task._id === 'object' ? task._id.$oid : task._id"
             style="margin-bottom: 20px"
           >
+            <n-text v-if="taskOperationDetail(task)" type="warning">{{ taskOperationDetail(task) }}</n-text>
             <PriorityTaskCard
               :task="task"
               :progress="taskProgressMap[task.name]"
@@ -34,6 +35,7 @@
               @update:is-remote="(val) => updateIsRemote(task._id, val)"
               @start="openStartModal(task)"
               @update="openUpdateModal(task)"
+              @view="viewTask(task._id)"
               @pause="pauseTask(task)"
               @delete="deleteTask(task._id)"
             />
@@ -58,9 +60,12 @@
             :key="typeof task._id === 'object' ? task._id.$oid : task._id"
             style="margin-bottom: 20px"
           >
+            <n-text v-if="taskOperationDetail(task)" type="warning">{{ taskOperationDetail(task) }}</n-text>
             <RegularTaskCard
               :task="task"
               :generation-busy="Boolean(generationRequests[getObjectId(task._id)])"
+              :operation-busy="taskOperationBusy(task)"
+              @check-runtime="checkTaskStatus(task)"
               :progress="taskProgressMap[task.name]"
               :task-runtime-status="taskRuntimeStatus[task.name]"
               :stop-operation="taskStopOperationMap[task.name]"
@@ -76,6 +81,14 @@
         </n-grid>
       </n-collapse-item>
     </n-collapse>
+
+    <n-modal :show="!!detailTaskId" preset="card" title="任务详情" style="max-width: 720px" @update:show="value => { if (!value) closeTaskDetails(); }">
+      <TaskDetailsPanel :task-id="detailTaskId" :task="detailTask"
+        :progress="detailTask ? taskProgressMap[detailTask.name] : undefined"
+        :runtime="detailTask ? taskRuntimeStatus[detailTask.name] : undefined"
+        :stop-operation="detailTask ? taskStopOperationMap[detailTask.name] : undefined"
+        @browse-alpha-library="router.push({ name: 'Data' })" />
+    </n-modal>
 
     <!-- Modals -->
     <AddTaskModal v-model:show="showAddModal" @add-task="handleAddTask" />
@@ -192,7 +205,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt, taskStopDisplayStatus } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, mutateTaskSource } from "../utils/taskProgress.js";
-import { newTaskRequestId, validOperationStage } from '../utils/taskDiagnostics.js';
+import { newTaskRequestId, validOperationStage, taskRuntimeTarget, sameRuntimeIdentity, taskStartBlockReason, isCompletedTask, taskMutationIssue, taskStartOutcome, taskStartFailure, taskStartJoinEvidence, taskMatchesJoinEvidence, taskLaunchValue, taskLaunchMatches } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
 import { useMessage, useDialog } from "naive-ui";
@@ -201,6 +214,7 @@ import { useMessage, useDialog } from "naive-ui";
 import TaskManagerToolbar from "../components/TaskCards/TaskManagerToolbar.vue";
 import PriorityTaskCard from "../components/TaskCards/PriorityTaskCard.vue";
 import RegularTaskCard from "../components/TaskCards/RegularTaskCard.vue";
+import TaskDetailsPanel from "../components/TaskCards/TaskDetailsPanel.vue";
 
 // Import moved modals
 import AddTaskModal from "../components/modals/AddTaskModal.vue";
@@ -235,11 +249,9 @@ const isPriorityForUpdate = ref(false);
 // Other reactive state
 const taskRuntimeStatus = ref({});
 const runtimeRequests = new Map();
-const runtimeTarget = (task) => ({ taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true, authProfile: task.auth_profile ?? "user1", launchAttemptId: task.launchAttemptId ?? null });
-const matchesRuntimeTarget = (task, target) => task?.status === 'running' &&
-  typeof target.taskId === 'string' && !!target.taskId && getObjectId(task._id) === target.taskId &&
-  task.name === target.name && (task.isRemote === true) === target.isRemote &&
-  (task.auth_profile ?? "user1") === target.authProfile && (task.launchAttemptId ?? null) === (target.launchAttemptId ?? null);
+const runtimeTarget = (task) => ({ ...taskRuntimeTarget(task), controlStatus: task.status });
+const matchesRuntimeTarget = (task, target) => sameRuntimeIdentity(task, target) &&
+  (task.status === target.controlStatus || isCompletedTask(task));
 const invalidateRuntime = (name) => {
   delete taskRuntimeStatus.value[name];
   runtimeRequests.get(name)?.cancelTimer?.();
@@ -295,15 +307,20 @@ const handleTaskOperationStage = (event) => {
 
 // --- Task Actions (invoking Rust backend) ---
 const getObjectId = (id) => (id && typeof id === "object" && "$oid" in id ? id.$oid : id);
+const allowTaskMutation = (task) => {
+  const issue = taskMutationIssue(task);
+  if (issue) { message.warning(issue); return false; }
+  return true; // Unknown/old DTO still relies on native exact local control ID.
+};
 
 const generationRequests = ref({});
 const generateList = async (id) => {
   const key = getObjectId(id);
   const task = tasks.value.find(item => getObjectId(item._id) === key);
-  if (!canGenerate(task, Boolean(generationRequests.value[key]))) return;
+  if (!allowTaskMutation(task) || !canGenerate(task, Boolean(generationRequests.value[key])) || taskOperationBusy(task)) return;
   generationRequests.value[key] = true; // disable immediately, before awaiting native
   try {
-    await invoke("generate_list", { id: key });
+    await oncePerTask(key, () => invoke("generate_list", { id: key }), { kind: 'generate' });
     if (!disposed) message.success("列表生成完成");
   } catch (err) {
     console.error("生成列表失败", err);
@@ -325,17 +342,57 @@ const setRemoteSource = (task, isRemote) => mutateTaskSource({
   }),
 });
 
-const mutationRequests = new Set();
-const oncePerTask = async (id, action) => {
-  if (disposed || mutationRequests.has(id)) return false;
-  mutationRequests.add(id);
-  try { return await action(); } finally { mutationRequests.delete(id); }
+// One operation owner per task, including the native start -> requested pause handoff.
+const mutationRequests = ref(new Map());
+const monotonicNow = () => performance.now();
+const pauseJoinBudget = Object.freeze({ ui: 120000, fresh: 8000, adapter: 8000, core: 75000, reply: 2000 });
+const pauseDispatchReserve = pauseJoinBudget.adapter + pauseJoinBudget.core + pauseJoinBudget.reply;
+const deferredOperation = () => {
+  let resolve, reject;
+  const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+};
+const startModalTarget = ref(null);
+const matchesStartModalTarget = (task, target) => !!task && !!target && task.status !== 'deactive' &&
+  getObjectId(task._id) === target.taskId && task.name === target.name &&
+  (task.isRemote === true) === target.isRemote && (task.auth_profile ?? 'user1') === target.authProfile &&
+  (task.taskType ?? 'regular') === target.taskType && (task.taskType !== 'priority' ||
+    (task.targetRemote ?? null) === target.targetRemote);
+const taskOperationBusy = (task) => mutationRequests.value.has(getObjectId(task._id)) ||
+  [...pendingStops.values()].some(entry => entry.target._id === getObjectId(task._id));
+const taskOperationDetail = (task) => {
+  const intent = mutationRequests.value.get(getObjectId(task._id))?.pauseIntent;
+  if (!intent || intent.completed) return '';
+  return intent.stopSent ? '暂停请求已发送，等待原停止核验与回执'
+    : intent.phase === 'fresh' ? '已请求暂停：正在核验本次启动身份，尚未发送停止'
+      : '已请求在本次启动结束后暂停：等待原启动回执，尚未发送停止';
+};
+const startBlockReason = (task) => taskStartBlockReason(task, {
+  busy: taskOperationBusy(task) || Boolean(generationRequests.value[getObjectId(task?._id)]),
+  stopping: taskStopDisplayStatus(task, taskStopOperationMap.value[task?.name]) === 'stopping',
+});
+
+const releaseMutation = (id, entry) => {
+  if (mutationRequests.value.get(id) === entry && entry.actionFinished &&
+      (!entry.pauseIntent || entry.pauseIntent.completed)) mutationRequests.value.delete(id);
+};
+const oncePerTask = async (id, action, { joinStop = false, kind = 'mutation', binding = null } = {}) => {
+  if (disposed || mutationRequests.value.has(id) || (!joinStop &&
+      [...pendingStops.values()].some(entry => entry.target._id === id))) return false;
+  mutationRequests.value.set(id, { kind, binding, operationId: newTaskRequestId(kind),
+    nativeSent: false, nativeOutcomePromise: null, actionDone: deferredOperation(), actionFinished: false,
+    pauseIntent: null, invalidated: false, seenLaunches: new Set(binding ? [binding.launchAttemptId] : []),
+    seenHosts: new Set(binding ? [binding.actualRemote] : []) });
+  const entry = mutationRequests.value.get(id);
+  try { return await action(entry); }
+  finally { entry.actionFinished = true; entry.actionDone.resolve(); releaseMutation(id, entry); }
 };
 
 const syncRemoteTask = async (taskName) => {
   try {
     const task = tasks.value.find((task) => task.name === taskName);
     if (!task) throw new Error("任务列表缺少所选任务记录");
+    if (!allowTaskMutation(task)) return;
     const target = { taskId: getObjectId(task._id), alphaMissionList: task.name, expectedRemote: task.isRemote === true };
     await oncePerTask(target.taskId, async () => {
       await mutateTaskSource({ fetch: fetchTasks,
@@ -354,18 +411,30 @@ const updateIsRemote = async (id, isRemote) => {
   try {
     const targetTask = tasks.value.find((task) => getObjectId(task._id) === getObjectId(id));
     if (!targetTask) throw new Error("任务列表缺少所选任务记录");
-    await setRemoteSource(targetTask, isRemote);
-    if (!disposed) message.success(`运行方式已更新为 ${isRemote ? "远程" : "本地"}`);
-    await fetchTasks();
+    if (!allowTaskMutation(targetTask)) return;
+    await oncePerTask(getObjectId(id), async () => {
+      await setRemoteSource(targetTask, isRemote);
+      if (!disposed) message.success(`运行方式已更新为 ${isRemote ? "远程" : "本地"}`);
+      await fetchTasks();
+    });
   } catch (err) {
     console.error("更新 isRemote 失败", err);
     if (!disposed) message.error("运行方式更新失败: " + err);
   }
 };
 
-const performPauseTask = async (task, { reportError = true, refreshAfter = true } = {}) => {
-  // Capture before awaiting: the current task/host may be replaced meanwhile.
-  const target = { _id: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true };
+const performPauseTask = async (task, { reportError = true, refreshAfter = true, joinDeadline = null,
+  expectedLaunchAttemptId, expectedLaunchAbsent, onDispatch } = {}) => {
+  // Capture before awaiting: the current task/host/launch may be replaced meanwhile.
+  const target = { _id: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true,
+    ...(expectedLaunchAttemptId != null ? { expectedLaunchAttemptId } : {}),
+    ...(expectedLaunchAbsent === true ? { expectedLaunchAbsent: true } : {}),
+    ...(joinDeadline !== null ? { expectedTaskType: task.taskType ?? 'regular', taskType: task.taskType ?? 'regular',
+      expectedAuthProfile: task.auth_profile ?? 'user1', auth_profile: task.auth_profile ?? 'user1' } : {}),
+    ...((expectedLaunchAttemptId != null || expectedLaunchAbsent === true) && Object.hasOwn(task, 'launchAttemptId')
+      ? { launchAttemptId: task.launchAttemptId } : {}) };
+  const remainingMs = joinDeadline === null ? null : Math.floor(joinDeadline - monotonicNow());
+  if (remainingMs !== null && (!Number.isSafeInteger(remainingMs) || remainingMs <= 0 || remainingMs > pauseJoinBudget.ui)) return false;
   if (disposed) return false;
   const operation = taskStore.beginTaskStop(target);
   if (!operation) return false; // missing/replaced task or an already pending stop
@@ -373,6 +442,7 @@ const performPauseTask = async (task, { reportError = true, refreshAfter = true 
   pendingStops.set(operation.generation, pending);
   let receipt;
   let timer;
+  let committed = false;
   try {
     // Reuse both invalidation barriers. A resolved void command or stdout text
     // is not proof: native must verify process exit AND commit control state.
@@ -381,13 +451,19 @@ const performPauseTask = async (task, { reportError = true, refreshAfter = true 
       update: async () => {
         try {
           receipt = await Promise.race([
-            invoke("pause_task", { taskName: target.name, taskId: target._id, isRemote: target.isRemote, requestId: operation.requestId }),
+            (() => {
+              onDispatch?.();
+              return invoke("pause_task", { taskName: target.name, taskId: target._id, isRemote: target.isRemote, requestId: operation.requestId,
+                ...(expectedLaunchAttemptId != null ? { expectedLaunchAttemptId } : {}),
+                ...(expectedLaunchAbsent === true ? { expectedLaunchAbsent: true } : {}),
+                ...(remainingMs !== null ? { remainingMs } : {}) });
+            })(),
             new Promise((_, reject) => {
               timer = setTimeout(() => {
                 pending.completed = true;
                 pending.failureSource = 'client_timeout';
                 reject(new Error("停止确认超时（120 秒）；最终暂停回执待核对"));
-              }, 120000);
+              }, remainingMs ?? 120000);
               pending.cancelTimer = () => clearTimeout(timer);
             }),
           ]);
@@ -397,7 +473,7 @@ const performPauseTask = async (task, { reportError = true, refreshAfter = true 
           throw new Error("暂停回执校验失败：回执字段、任务身份或执行主机有差异");
         }
       },
-      commit: () => { if (!disposed) taskStore.confirmTaskPaused(target, receipt, operation); },
+      commit: () => { if (!disposed) committed = taskStore.confirmTaskPaused(target, receipt, operation); },
     });
   } catch (error) {
     if (!disposed) {
@@ -407,17 +483,143 @@ const performPauseTask = async (task, { reportError = true, refreshAfter = true 
     throw error;
   } finally { pendingStops.delete(operation.generation); }
   if (!disposed && refreshAfter) await fetchTasks();
-  return true;
+  return joinDeadline === null ? true : committed;
 };
 
-// Reuse the original pause request, proof validation, timeout and state owner.
-const pauseTask = (task, options) => {
+// Original pause executor: public pause and an already-owned archive share
+// this path and pendingStops promise, never acquire a second mutation lock.
+const requestPauseTask = (task, options) => {
   const target = { taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true };
   const promise = performPauseTask(task, options);
   const pending = [...pendingStops.values()].find(entry => entry.target._id === target.taskId &&
     entry.target.name === target.name && entry.target.isRemote === target.isRemote);
   if (pending && !pending.promise) pending.promise = promise;
   return promise;
+};
+
+// Cancellation only withdraws an unsent continuation; it never cancels a sent stop.
+const cancelPauseIntent = (intent, reason) => {
+  if (!intent || intent.completed || intent.cancelled) return;
+  intent.cancelled = true; intent.reason = reason;
+  if (intent.phase === 'fresh') fetchTasks.invalidate();
+  intent.rejectWait?.(new Error(reason));
+};
+const rememberStartSnapshot = (entry, task) => {
+  const b = entry.binding;
+  if (!b || entry.kind !== 'start') return;
+  if (!task || task.status === 'deactive' || getObjectId(task._id) !== b.taskId || task.name !== b.name ||
+      (task.taskType ?? 'regular') !== b.taskType || (task.auth_profile ?? 'user1') !== b.authProfile || taskMutationIssue(task) ||
+      (![(b.actualRemote), b.remote].includes(task.isRemote === true)) || taskLaunchValue(task) === undefined) {
+    entry.invalidated = true;
+  } else {
+    entry.seenLaunches.add(taskLaunchValue(task)); entry.seenHosts.add(task.isRemote === true);
+    if (entry.seenLaunches.size > 2 || (entry.pauseIntent?.evidence &&
+        ([...entry.seenLaunches].some(launch => launch !== b.launchAttemptId && launch !== entry.pauseIntent.evidence.launchAttemptId) ||
+         [...entry.seenHosts].some(host => host !== b.actualRemote && host !== entry.pauseIntent.evidence.isRemote)))) entry.invalidated = true;
+    if (entry.pauseIntent?.phase === 'stopping' && !taskMatchesJoinEvidence(task, entry.pauseIntent.evidence)) entry.invalidated = true;
+  }
+  if (entry.invalidated) cancelPauseIntent(entry.pauseIntent, '任务身份/执行端/launch已变化，取消本次后续暂停');
+};
+const waitForPauseIntent = async (intent, promise, milliseconds, reason) => {
+  if (disposed || intent.cancelled || (milliseconds !== null && (!Number.isFinite(milliseconds) || milliseconds <= 0))) {
+    // The native/read promise may already have been created synchronously.
+    // Observe its late failure only to drain it; cancellation never authorizes a stop.
+    Promise.resolve(promise).catch(() => {});
+    throw new Error(intent.reason || reason);
+  }
+  let timer, rejectWait;
+  const aborted = new Promise((_, reject) => {
+    rejectWait = reject; intent.rejectWait = reject;
+    if (milliseconds !== null) timer = setTimeout(() => cancelPauseIntent(intent, reason), milliseconds);
+  });
+  try { return await Promise.race([promise, aborted]); }
+  finally { clearTimeout(timer); if (intent.rejectWait === rejectWait) intent.rejectWait = null; }
+};
+const joinOwnStartPause = (task, entry) => {
+  const b = entry.binding;
+  if (!b || getObjectId(task._id) !== b.taskId || task.name !== b.name ||
+      (task.taskType ?? 'regular') !== b.taskType || (task.auth_profile ?? 'user1') !== b.authProfile) {
+    message.warning('本次暂停与原启动身份不符，未发送停止'); return Promise.resolve(false);
+  }
+  if (entry.pauseIntent) return entry.pauseIntent.promise;
+  const completion = deferredOperation();
+  entry.pauseIntent = { phase: 'waiting_start', deadline: monotonicNow() + pauseJoinBudget.ui,
+    completed: false, cancelled: false, stopSent: false, reason: '', evidence: null,
+    rejectWait: null, promise: completion.promise };
+  const intent = entry.pauseIntent; // use the same reactive owner identity everywhere
+  rememberStartSnapshot(entry, tasks.value.find(item => getObjectId(item._id) === b.taskId));
+  const notice = message.loading('已请求在本次启动结束后暂停；等待启动回执，尚未发送停止…', { duration: 0 });
+  const owned = () => !disposed && !entry.invalidated && !intent.cancelled &&
+    mutationRequests.value.get(b.taskId) === entry && entry.pauseIntent === intent;
+  const run = async () => {
+    try {
+      const waitUntil = intent.deadline - pauseJoinBudget.fresh - pauseDispatchReserve;
+      let raw;
+      try {
+        raw = await waitForPauseIntent(intent, entry.nativeOutcomePromise,
+          waitUntil - monotonicNow(), '等待本次启动结果超时，停止未发送');
+      } catch (error) {
+        if (!owned()) throw error;
+        const partial = taskStartFailure(error, b);
+        if (!partial) throw error;
+        raw = partial;
+      }
+      intent.evidence = taskStartJoinEvidence(raw, b);
+      rememberStartSnapshot(entry, tasks.value.find(item => getObjectId(item._id) === b.taskId));
+      if (!owned()) throw new Error(intent.reason || '原操作已失效');
+      // Sequencing only: receipt above, not this UI barrier, supplies authority.
+      await waitForPauseIntent(intent, entry.actionDone.promise,
+        waitUntil - monotonicNow(), '启动本地收尾超时，停止未发送');
+      if (!owned()) throw new Error(intent.reason || '原操作已失效');
+      intent.phase = 'fresh';
+      const freshAllowance = Math.min(pauseJoinBudget.fresh, intent.deadline - monotonicNow() - pauseDispatchReserve);
+      if (freshAllowance <= 0) throw new Error('fresh核验剩余预算不足，停止未发送');
+      const refreshed = await waitForPauseIntent(intent, fetchTasks(), freshAllowance,
+        '本次启动后的控制记录核验超时，停止未发送');
+      const current = tasks.value.find(item => getObjectId(item._id) === b.taskId);
+      if (!refreshed || !owned() || !taskMatchesJoinEvidence(current, intent.evidence)) {
+        throw new Error(intent.reason || 'fresh任务与本次已确认launch不一致，停止未发送');
+      }
+      if (intent.deadline - monotonicNow() < pauseDispatchReserve) throw new Error('剩余预算不足以容纳原安全停止路径，停止未发送');
+      const launch = intent.evidence.launchAttemptId;
+      intent.phase = 'stopping';
+      const stopped = await waitForPauseIntent(intent, requestPauseTask(current, {
+        refreshAfter: false, joinDeadline: intent.deadline,
+        ...(launch === null ? { expectedLaunchAbsent: true } : { expectedLaunchAttemptId: launch }),
+        onDispatch: () => { intent.stopSent = true; },
+      }), null, '停止结果未确认'); // original performPauseTask owns the remaining UI timer
+      if (stopped !== true) throw new Error('停止回执未绑定当前任务；未认定当前任务已暂停');
+      if (!disposed) message.success('本次启动结束后暂停已确认（不代表平台请求取消）');
+      completion.resolve(true);
+    } catch (error) {
+      if (!intent.stopSent) {
+        if (!disposed) message.warning(`本次暂停未发送：${error instanceof Error ? error.message : String(error)}`);
+        completion.resolve(false);
+      } else if (intent.cancelled || disposed) {
+        if (!disposed) message.warning('停止请求已经发送，最终回执待核验；未宣称停止已撤销');
+        completion.resolve(false);
+      } else {
+        completion.reject(error); // keep original sent-stop failure semantics
+      }
+    } finally {
+      intent.completed = true; intent.rejectWait = null; notice.destroy(); releaseMutation(b.taskId, entry);
+    }
+  };
+  void run();
+  return intent.promise;
+};
+
+const pauseTask = (task, options) => {
+  if (disposed || !allowTaskMutation(task)) return Promise.resolve(false);
+  const entry = mutationRequests.value.get(getObjectId(task._id));
+  if (entry) {
+    if (options?.joinOwnedStart !== false && entry.kind === 'start' && entry.nativeSent && entry.nativeOutcomePromise) return joinOwnStartPause(task, entry);
+    message.warning(options?.joinOwnedStart === false
+      ? '原任务操作正在进行，自动暂停未发送；未建立新的延后用户意图'
+      : '原任务操作正在进行（非已发本次start），本次暂停未发送');
+    return Promise.resolve(false);
+  }
+  return requestPauseTask(task, options);
 };
 
 // This only chooses preparation; the native archive rechecks fresh stop/ID/host proof.
@@ -447,6 +649,7 @@ const deleteTask = (id) => {
   const taskId = getObjectId(id);
   const original = tasks.value.find(task => getObjectId(task._id) === taskId);
   if (!original) { message.error("任务身份缺失，请刷新列表后再归档。"); return; }
+  if (!allowTaskMutation(original)) return;
   const expectedRemote = original?.isRemote === true;
   const confirmation = dialog.warning({
     title: "确认暂停并归档",
@@ -458,13 +661,14 @@ const deleteTask = (id) => {
       confirmation.destroy();
       try {
         if (!original) throw new Error("任务身份缺失；请刷新列表后再归档");
+        if (!allowTaskMutation(tasks.value.find(task => getObjectId(task._id) === taskId))) return;
         await oncePerTask(taskId, async () => {
           const pending = message.loading("正在核验停止状态并归档任务…", { duration: 0 });
           try {
             if (needsArchivePause(original)) {
               const inFlight = [...pendingStops.values()].find(entry => entry.target._id === taskId &&
                 entry.target.name === original.name && entry.target.isRemote === expectedRemote);
-              const stopped = await (inFlight?.promise ?? pauseTask(original, { reportError: false, refreshAfter: false }));
+              const stopped = await (inFlight?.promise ?? requestPauseTask(original, { reportError: false, refreshAfter: false }));
               if (stopped !== true) throw new Error("停止尚未确认，未执行归档。");
             }
             if (disposed) return; // Do not start a second mutation after this view has gone away.
@@ -486,7 +690,7 @@ const deleteTask = (id) => {
               await fetchTasks();
             }
           } finally { pending.destroy(); }
-        });
+        }, { joinStop: true });
       } catch (e) {
         console.error("删除任务失败", e);
         if (!disposed) message.error("任务归档未完成：" + archiveErrorText(e));
@@ -496,6 +700,7 @@ const deleteTask = (id) => {
 };
 
 const checkTaskStatus = async (task) => {
+  if (taskMutationIssue(task)) return; // This native diagnostic also requires local control registration.
   const target = runtimeTarget(task); // primitives captured before any await
   if (disposed || !matchesRuntimeTarget(tasks.value.find(item => item.name === target.name), target) ||
       runtimeRequests.has(target.name)) return;
@@ -538,9 +743,19 @@ const checkTaskStatus = async (task) => {
   }
 };
 
-// Invalidate on removal, replacement, target switch or leaving running. This
+// Invalidate on removal, replacement, target switch or leaving an observed phase
+// (except terminal: retain evidence of the same still-live consumer). This
 // also prevents an away-and-back transition from reviving an old async result.
 const stopRuntimeWatch = watch(tasks, () => {
+  for (const [id, entry] of mutationRequests.value) {
+    if (entry.kind === 'start') rememberStartSnapshot(entry, tasks.value.find(task => getObjectId(task._id) === id));
+  }
+  const modal = startModalTarget.value;
+  if (modal && !matchesStartModalTarget(tasks.value.find(task => task.name === modal.name), modal)) {
+    startModalTarget.value = null;
+    showStartModal.value = false;
+    selectedTask.value = null;
+  }
   for (const [name, observation] of Object.entries(taskRuntimeStatus.value)) {
     if (!matchesRuntimeTarget(tasks.value.find(item => item.name === name), observation)) invalidateRuntime(name);
   }
@@ -586,26 +801,62 @@ const handleAddPriorityTask = async (task) => {
 const startTask = async (command, { taskName, config, isRemote }) => {
   const original = tasks.value.find((task) => task.name === taskName);
   const target = original && { _id: getObjectId(original._id), name: taskName, isRemote: original.isRemote === true };
+  let outcomeTarget;
   try {
     if (!target?._id) throw new Error("任务身份缺失；请刷新任务列表后再启动");
+    if (!allowTaskMutation(original)) return;
     if (isRemote !== target.isRemote) throw new Error("启动参数不能切换实际执行端；请使用原任务的安全同步/目标意向流程，已有任务不会自动迁移");
     // Forward saved creation intent, not a new checkbox migration. Only core
     // may approve pristine Priority destination or require initial sync; GUI
     // never interprets status/history/receipts to grant a host transition.
-    const requestedRemote = typeof original.targetRemote === "boolean" ? original.targetRemote : target.isRemote;
-    const args = { taskName, taskId: target._id, config: JSON.stringify(config), isRemote: requestedRemote, expectedRemote: target.isRemote };
-    await oncePerTask(target._id, async () => {
+    const modal = startModalTarget.value;
+    if (!modal || !matchesStartModalTarget(original, modal)) {
+      throw new Error("启动弹窗对应的任务身份/执行端/启动批次已变化，请重新核验原任务");
+    }
+    const blocked = startBlockReason(original);
+    if (blocked) throw new Error(blocked);
+    // REGULAR/SUPER always resume on their actual execution host. Only
+    // Priority retains the original saved first-destination intent contract.
+    const requestedRemote = original.taskType === "priority" && typeof original.targetRemote === "boolean"
+      ? original.targetRemote : target.isRemote;
+    outcomeTarget = { taskId: target._id, name: taskName, remote: requestedRemote, actualRemote: target.isRemote };
+    const args = { taskName, taskId: target._id, ...(config === undefined ? {} : { config: JSON.stringify(config) }),
+      isRemote: requestedRemote, expectedRemote: target.isRemote };
+    await oncePerTask(target._id, async (entry) => {
+      // Consume this modal intent before native launch; failure/unknown cannot
+      // be resubmitted from the stale modal without a new original check.
+      startModalTarget.value = null;
+      showStartModal.value = false;
       invalidateRuntime(taskName);
-      await mutateTaskSource({ fetch: fetchTasks, update: () => invoke(command, args) });
+      let outcome;
+      await mutateTaskSource({ fetch: fetchTasks, update: async () => {
+        entry.nativeOutcomePromise = Promise.resolve(invoke(command, args));
+        entry.nativeSent = true;
+        outcome = taskStartOutcome(await entry.nativeOutcomePromise, outcomeTarget);
+        // Defensive against a mismatched adapter resolving a failed TaskOutcome.
+        if (outcome?.ok === false) throw outcome;
+      } });
       if (!disposed) {
-        taskStore.clearTaskStop(target);
-        message.success("任务启动已确认（不代表平台完成）");
-        fetchTasks();
+        if (outcome?.outcome === 'already_running') {
+          message.success("原任务已运行，继续查看原任务；未新启动、未应用新配置");
+        } else {
+          if (!entry.invalidated) taskStore.clearTaskStop(target);
+          message.success("任务启动已确认（不代表平台完成）");
+        }
+        if (!entry.pauseIntent || entry.pauseIntent.completed) fetchTasks();
       }
-    });
+    }, { kind: 'start', binding: { ...outcomeTarget, taskType: original.taskType ?? 'regular',
+      authProfile: original.auth_profile ?? 'user1', launchAttemptId: taskLaunchValue(original) } });
   } catch (err) {
     console.error("启动任务失败", err);
-    if (!disposed) message.error(`任务启动失败：${err instanceof Error ? err.message : String(err)}`);
+    if (!disposed) {
+      const outcome = outcomeTarget && taskStartFailure(err, outcomeTarget);
+      if (outcome?.outcome === 'already_running' && outcome.consumerRunning === true) {
+        message.warning(`原消费者仍在运行，本次配置未应用（${outcome.configComparison === 'different' ? '配置不同' : '配置未核验'}）；继续查看原任务。${outcome.error || ''}`);
+      } else {
+        message.error(`任务启动失败：${outcome?.error || (err instanceof Error ? err.message : String(err))}`);
+      }
+    }
   }
 };
 const handleStartTask = (args) => startTask("start_task", args);
@@ -614,6 +865,8 @@ const handlePriorityStartTask = (args) => startTask("start_priority_task", args)
 
 const handleUpdateTask = async ({ task, config, isRemote }) => {
   try {
+    if (!allowTaskMutation(task) || !allowTaskMutation(tasks.value.find(item => getObjectId(item._id) === getObjectId(task._id)))) return;
+    await oncePerTask(getObjectId(task._id), async () => {
     await invoke("update_task", {
       id: getObjectId(task._id),
       updates: { config: JSON.stringify(config), is_remote: isRemote },
@@ -621,6 +874,7 @@ const handleUpdateTask = async ({ task, config, isRemote }) => {
     message.success("任务更新成功");
     showUpdateModal.value = false;
     fetchTasks();
+    }, { kind: 'update' });
   } catch (err) {
     console.error("更新任务失败", err);
     message.error("任务更新失败");
@@ -631,11 +885,14 @@ const handleUpdatePriorityTask = async ({ taskName, config, isRemote }) => {
   try {
     const task = tasks.value.find((task) => task.name === taskName);
     if (!task) throw new Error("任务身份缺失；请刷新任务列表");
+    if (!allowTaskMutation(task)) return;
     if (isRemote !== (task.isRemote === true)) throw new Error("配置更新不能迁移执行端");
+    await oncePerTask(getObjectId(task._id), async () => {
     await invoke("update_priority_task", { taskName, taskId: getObjectId(task._id), config: JSON.stringify(config), isRemote });
     message.success("Priority任务更新成功");
     showUpdateModal.value = false;
     fetchTasks();
+    }, { kind: 'update' });
   } catch (err) {
     console.error("更新 Priority 任务失败", err);
     message.error("Priority任务更新失败：" + String(err));
@@ -643,16 +900,30 @@ const handleUpdatePriorityTask = async ({ taskName, config, isRemote }) => {
 };
 
 // --- Helper Functions ---
-const viewTask = (id) => router.push(`/task/${getObjectId(id)}`);
+const detailTaskId = computed(() => typeof route.query?.taskId === 'string' ? route.query.taskId : '');
+const detailTask = computed(() => tasks.value.find(task => getObjectId(task._id) === detailTaskId.value) ?? null);
+const viewTask = (id) => router.push({ name: 'TaskManager', query: { ...route.query, taskId: getObjectId(id) } });
+const closeTaskDetails = () => {
+  const { taskId, ...query } = route.query ?? {};
+  return router.replace({ name: 'TaskManager', query });
+};
 const getIsSuper = (task) => task && task.taskType === "super";
 const getIsPriority = (task) => task && task.taskType === "priority";
 
 const openStartModal = (task) => {
-  selectedTask.value = task;
+  const current = tasks.value.find(item => getObjectId(item._id) === getObjectId(task._id));
+  const target = { taskId: getObjectId(task._id), name: task.name, isRemote: task.isRemote === true,
+    authProfile: task.auth_profile ?? 'user1', taskType: task.taskType ?? 'regular', targetRemote: task.targetRemote ?? null };
+  if (disposed || !matchesStartModalTarget(current, target)) return;
+  const blocked = startBlockReason(current);
+  if (blocked) { message.warning(blocked); return; }
+  startModalTarget.value = target;
+  selectedTask.value = { ...current };
   showStartModal.value = true;
 };
 
 const openUpdateModal = (task) => {
+  if (!allowTaskMutation(task)) return;
   selectedTaskForUpdate.value = task;
   isSuperForUpdate.value = getIsSuper(task);
   isPriorityForUpdate.value = getIsPriority(task);
@@ -660,20 +931,15 @@ const openUpdateModal = (task) => {
 };
 
 // --- Lifecycle Hooks ---
-const pollTaskStatus = () => {
-  if (disposed) return;
-  tasks.value.forEach((task) => {
-    if (task.status === "running") checkTaskStatus(task);
-  });
-};
-
+// No periodic process discovery. Explicit read-only diagnostics remain optional;
+// progress events/refresh and count-based automatic pause keep their original owner.
 const autoPause = createAutoPauseScheduler({
-  getTasks: () => tasks.value,
+  getTasks: () => tasks.value.filter(task => !taskMutationIssue(task)),
   getProgress: () => taskProgressMap.value,
   pause: (task) => {
     // Progress recovery must not blindly retry a failed/unconfirmed stop.
     if (taskStopOperationMap.value[task.name]) return;
-    return pauseTask(task);
+    return pauseTask(task, { joinOwnedStart: false }); // existing auto-pause never creates a new deferred user intent
   },
   onError: (error) => {
     console.error("自动暂停失败", error);
@@ -689,7 +955,6 @@ const progressLifecycle = createTaskProgressLifecycle({
   listen,
   ready: () => invoke("frontend_ready"),
   fetch: fetchTasks,
-  poll: pollTaskStatus,
   onProgress: handleTaskProgressUpdate,
   onError: handleTaskProgressError,
   onRefreshError: handleTaskProgressRefreshError,
@@ -721,6 +986,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true;
+  for (const entry of mutationRequests.value.values()) cancelPauseIntent(entry.pauseIntent, '页面已离开，不再派发后续停止');
+  mutationRequests.value.clear();
   operationUnlisten?.();
   operationUnlisten = undefined;
   registryUnlisten?.();

@@ -48,6 +48,19 @@ pub trait PauseRuntime: Send + Sync {
         task: &Document,
         verify_never_started: bool,
     ) -> Result<StopOutput, String>;
+    /// Original professional verify-only owner. None means no stopped proof,
+    /// never authoritative absence. Legacy injected ports retain original stop.
+    async fn verify_stopped(&self, _root: &Path, _task: &Document,
+        _remaining: Duration) -> Result<Option<StopOutput>, String> { Ok(None) }
+    async fn inspect_before_stop(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,_remaining:Duration)
+        -> Result<Option<Value>,String>{Ok(None)}
+    async fn confirm_stopped_scope(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,_remaining:Duration)
+        -> Result<(),String>{Ok(())}
+    async fn stop_bounded(&self, root: &Path, task: &Document, never: bool,
+        remaining: Duration) -> Result<StopOutput, String> {
+        tokio::time::timeout(remaining, self.stop(root, task, never)).await
+            .map_err(|_| "original stop allowance exhausted; not retried".to_string())?
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct PauseStage {
@@ -59,6 +72,8 @@ pub type PauseObserver = Arc<dyn Fn(PauseStage) + Send + Sync>;
 pub struct PauseOptions<'a> {
     pub expected_task_id: Option<&'a str>,
     pub expected_launch_attempt_id: Option<&'a str>,
+    pub expected_launch_absent: bool,
+    pub remaining: Option<Duration>,
     pub expected_remote: Option<bool>,
     pub observer: Option<PauseObserver>,
 }
@@ -119,6 +134,28 @@ impl StopConfirmationBasis {
             Self::SessionAbsent => "session_absent",
         }
     }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopObservation { schema_version: u32, task_name: String, target_remote: bool, session_absent: bool }
+/// Verify the original script's unique final read-only reply; no text inference.
+pub fn verified_stop_observation(stdout: &str, name: &str, remote: bool) -> Result<bool, String> {
+    if stdout.lines().any(|line| line.starts_with("QUANTNIGHT_PAUSE_CONFIRMED ")) {
+        if verified_stop_proof(stdout, name, remote)? != StopConfirmationBasis::SessionAbsent {
+            return Err("verify-only cannot manufacture V1 historical runner exit".into());
+        }
+        return Ok(true);
+    }
+    let prefix = "QUANTNIGHT_STOP_OBSERVED ";
+    let markers: Vec<_> = stdout.lines().filter(|line| line.starts_with(prefix)).collect();
+    if markers.len() != 1 || stdout.lines().last() != Some(markers[0]) {
+        return Err("original verify-only response lacks unique final observation".into());
+    }
+    let proof: StopObservation = serde_json::from_str(&markers[0][prefix.len()..]).map_err(|e| e.to_string())?;
+    if proof.schema_version != 1 || proof.task_name != name || proof.target_remote != remote || proof.session_absent {
+        return Err("original verify-only observation identity/schema mismatch".into());
+    }
+    Ok(false)
 }
 pub fn verified_stop_proof(
     stdout: &str,
@@ -249,6 +286,7 @@ pub fn never_started_history(task: &Document) -> Result<bool, String> {
     for key in [
         "launchAttemptId",
         "launchAttemptAt",
+        "launchSettledAttemptId",
         "startedAt",
         "completedAt",
         "pausedAt",
@@ -664,6 +702,7 @@ fn pause_filter(name: &str, task: &Document) -> Result<Document, String> {
         "updatedAt",
         "launchAttemptId",
         "launchAttemptAt",
+        "launchSettledAttemptId",
         "startedAt",
         "generation",
         "startupBinding",
@@ -683,33 +722,64 @@ fn pause_filter(name: &str, task: &Document) -> Result<Document, String> {
     }
     Ok(filter)
 }
-pub async fn pause(
-    root: &Path,
-    store: &dyn TaskStore,
-    runtime: &dyn PauseRuntime,
-    name: &str,
-    options: PauseOptions<'_>,
+fn remaining(deadline: tokio::time::Instant) -> Result<Duration, String> {
+    let value = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if value.is_zero() { Err("original operation deadline exhausted; no additional attempt".into()) }
+    else { Ok(value) }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum StopIntent { StopAllowed, VerifyOnly }
+fn early_failure(name: &str, observer: &Option<PauseObserver>, error: String) -> PauseOutcome {
+    stage(observer, "failed", error.clone());
+    let mut value = envelope(name, false);
+    value["reason"] = json!("pause_unconfirmed"); value["stopConfirmation"] = json!("unknown");
+    value["error"] = json!(error);
+    PauseOutcome { value, exit_code: 1, confirmed_stop: None }
+}
+pub async fn pause(root: &Path, store: &dyn TaskStore, runtime: &dyn PauseRuntime,
+    name: &str, options: PauseOptions<'_>) -> PauseOutcome {
+    let allowance=options.remaining.unwrap_or(runtime.script_budget().duration()).min(runtime.script_budget().duration());
+    pause_with_deadline(root,store,runtime,name,options,tokio::time::Instant::now()+allowance).await
+}
+pub(crate) async fn pause_with_deadline(root:&Path,store:&dyn TaskStore,runtime:&dyn PauseRuntime,
+    name:&str,options:PauseOptions<'_>,deadline:tokio::time::Instant)->PauseOutcome {
+    let budget = runtime.script_budget();
+    let deadline=deadline.min(tokio::time::Instant::now()+budget.duration());
+    stage(&options.observer, "initial", format!(
+        "收到请求，尚未取得生命周期锁/尚未执行停止; original stop budget{}s; one attempt", budget.seconds()));
+    if let Err(error) = policy::validate_name(name) { return early_failure(name, &options.observer, error); }
+    let guard = match MissionLocks::acquire(root, &[name], false) {
+        Ok(guard) => guard, Err(error) => return early_failure(name, &options.observer, error),
+    };
+    pause_locked(root, store, runtime, name, options, &guard, deadline, StopIntent::StopAllowed).await
+}
+/// Private composition requires an already-owned guard, not an external skip-lock flag.
+pub(crate) async fn pause_locked(
+    root: &Path, store: &dyn TaskStore, runtime: &dyn PauseRuntime, name: &str,
+    options: PauseOptions<'_>, _guard: &MissionLocks, deadline: tokio::time::Instant,
+    intent: StopIntent,
 ) -> PauseOutcome {
+    if let Err(error)=remaining(deadline){return early_failure(name,&options.observer,error);}
     let mut output: Option<StopOutput> = None;
     let observer = &options.observer;
-    let budget = runtime.script_budget();
-    stage(
-        observer,
-        "initial",
-        format!(
-            "pause accepted; original stop budget{}s; one attempt",
-            budget.seconds()
-        ),
-    );
-    let result: Result<ConfirmedTaskStop,String> = async {
+    let mut reconciled_reason: Option<String> = None;
+    let result: Result<(ConfirmedTaskStop,String),String> = tokio::time::timeout_at(deadline, async {
         policy::validate_name(name)?;
-        let _lock = MissionLocks::acquire(root,&[name],false)?;
         stage(observer,"identity","verify original control task and launch binding");
         let task = active_task(store,name).await?;
         let id = task.get_object_id("_id").map_err(|_| "original task ObjectId unavailable".to_string())?;
         if task.get_str("name").ok() != Some(name) { return Err("task name binding changed".into()); }
         if options.expected_task_id.is_some_and(|v| v != id.to_hex()) { return Err("task identity changed before mutation".into()); }
-        if options.expected_launch_attempt_id.is_some_and(|v| v != text(task.get("launchAttemptId")).unwrap_or("")) { return Err("launch identity changed before mutation".into()); }
+        if options.expected_launch_attempt_id.is_some_and(|v|v.trim().is_empty()) ||
+            (options.expected_launch_absent && options.expected_launch_attempt_id.is_some()) {
+            return Err("exact launch must be nonempty and mutually exclusive with absent expectation".into());
+        }
+        match task.get("launchAttemptId") {
+            None|Some(Bson::Null) if options.expected_launch_attempt_id.is_none()=>(),
+            Some(Bson::String(actual)) if !actual.trim().is_empty() && !options.expected_launch_absent &&
+                options.expected_launch_attempt_id.map_or(true,|expected|expected==actual)=>(),
+            _=>return Err("launch identity changed or malformed before mutation".into()),
+        }
         policy::assert_observation_closed(&task)?;
         let remote = match task.get("isRemote") { None | Some(Bson::Null | Bson::Boolean(false)) => false, Some(Bson::Boolean(true)) => true, _ => return Err("invalid task execution host".into()) };
         if options.expected_remote.is_some_and(|expected| expected != remote) { return Err("task execution host changed before pause".into()); }
@@ -718,12 +788,53 @@ pub async fn pause(
             stage(observer,"inventory","verify complete original never-started history and all actual item evidence");
             Some(never_started_inventory(store,&task).await?)
         } else { None };
-        stage(observer,"stop","invoke original bound pause script once");
-        output = Some(tokio::time::timeout(budget.duration(), runtime.stop(root,&task,inventory.is_some()))
-            .await.map_err(|_| format!("pause script timeout after {}s; stop unconfirmed; not retried",budget.seconds()))??);
+        stage(observer,"stop","read original stop facts; signal at most once within remaining allowance");
+        let observed = if inventory.is_some() && matches!(intent, StopIntent::StopAllowed) { None } else {
+            runtime.verify_stopped(root, &task, remaining(deadline)?.min(Duration::from_secs(12))).await?
+        };
+        let mut verification_task=task.clone();
+        verification_task.remove("observedExecutionBeforeStop");
+        output = if let Some(proof) = observed { Some(proof) } else {
+            if matches!(intent, StopIntent::VerifyOnly) {
+                return Err("original verify-only did not prove stopped; explicit stop intent required".into());
+            }
+            if inventory.is_none() {
+                if let Some(observation)=runtime.inspect_before_stop(root,store,&task,
+                        remaining(deadline)?.min(Duration::from_secs(12))).await? {
+                    let observed=crate::start::config_document(observation)?;
+                    if observed.get_bool("identityVerified").ok()==Some(true) || observed.get_bool("explicitPauseVerified").ok()==Some(true){
+                        if let Ok(context)=observed.get_document("tmuxContext"){verification_task.insert("tmuxContext",context.clone());}
+                    }
+                    verification_task.insert("observedExecutionBeforeStop",observed);
+                }
+            }
+            let attempt = runtime.stop_bounded(root, &verification_task, inventory.is_some(), remaining(deadline)?).await;
+            let attempt = attempt.and_then(|out| {
+                verified_stop_proof(&out.stdout, name, remote).map(|_| out)
+            });
+            match attempt {
+                Ok(out) => Some(out),
+                Err(first) => {
+                    // Explicit counter-evidence from the original captured tree
+                    // cannot be erased by a weaker session-only observation.
+                    if first.contains("known_original_runners_still_live") { return Err(first); }
+                    // Exactly one read-only recovery, never another stop signal.
+                    let proof = runtime.verify_stopped(root, &verification_task,
+                        remaining(deadline)?.min(Duration::from_secs(12))).await
+                        .map_err(|next| format!("{first}; original read-only recovery: {next}"))?
+                        .ok_or_else(|| format!("{first}; original read-only recovery did not confirm stop"))?;
+                    reconciled_reason = Some(first);
+                    Some(proof)
+                }
+            }
+        };
         let result = output.as_ref().unwrap();
         stage(observer,"receipt_validate","validate unique final V1/V2 receipt and exact task/host");
         let basis = verified_stop_proof(&result.stdout,name,remote)?;
+        // A fresh contradictory process observation cannot be overridden by
+        // either receipt version; never send a second stop to "fix" it.
+        runtime.confirm_stopped_scope(root,store,&verification_task,
+            remaining(deadline)?.min(Duration::from_secs(12))).await?;
         if let Some(before) = inventory {
             stage(observer,"inventory_recheck","re-read original task and all items after process verification");
             let current = active_task(store,name).await?;
@@ -736,24 +847,48 @@ pub async fn pause(
             StopConfirmationBasis::RunnersExited => doc! {"schema_version":1,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":true},
             StopConfirmationBasis::SessionAbsent => doc! {"schema_version":2,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":Bson::Null,"confirmation_basis":"session_absent"},
         };
-        let fields = doc! {"status":"paused","pausedAt":&now,"updatedAt":&now,"stopConfirmedAt":at,
+        let mut fields = doc! {"status":"paused","pausedAt":&now,"updatedAt":&now,"stopConfirmedAt":at,
             "stopConfirmedRemote":remote,"stopConfirmedTaskId":id.to_hex(),"stopConfirmationBasis":basis.as_str()};
+        if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
+            // V1/V2 stops do not settle an old launcher. Preserve the captured
+            // legacy unknown fact in this same task/launch CAS before changing
+            // its status; do not turn every marker-less legacy task into a hold.
+            fields.insert("launchSettledAttemptId",Bson::Null);
+        }
         let event = doc! {"id":ObjectId::new().to_hex(),"command":"pause","status":"paused","at":&now,"detail":proof};
         stage(observer,"control_write","CAS original task/launch/stop/observer snapshot; never name-only update");
-        let matched = store.update_task(Host::Local,pause_filter(name,&task)?,doc! {"$set":fields,"$push":{"events":event}}).await?;
-        if matched != 1 { return Err("pause control CAS failed: original task/host/launch/revision changed".into()); }
+        let filter = pause_filter(name,&task)?;
+        let write = store.update_task(Host::Local, filter.clone(),
+            doc! {"$set":fields.clone(),"$push":{"events":event.clone()}}).await;
+        if !matches!(write, Ok(1)) {
+            let first = write.err().unwrap_or_else(|| "pause control CAS failed: original task/host/launch/revision changed".into());
+            // Same generated event + exact committed fields; never re-issue CAS.
+            let mut committed = filter;
+            committed.extend(fields.clone()); committed.remove("events");
+            let row = store.find_task(Host::Local, committed, false).await?;
+            if !row.as_ref().and_then(|r| r.get_array("events").ok())
+                .is_some_and(|events| events.contains(&Bson::Document(event))) {
+                return Err(first);
+            }
+            reconciled_reason = Some(first);
+        }
         stage(observer,"completed","verified stop evidence and control CAS confirmed; not platform cancellation");
-        Ok(ConfirmedTaskStop {confirmed:true,task_id:id.to_hex(),task_name:name.into(),is_remote:remote,
-            stop_confirmed_at:at.timestamp_millis(),confirmation_basis:basis})
-    }.await;
+        Ok((ConfirmedTaskStop {confirmed:true,task_id:id.to_hex(),task_name:name.into(),is_remote:remote,
+            stop_confirmed_at:at.timestamp_millis(),confirmation_basis:basis},now))
+    }).await.unwrap_or_else(|_| Err("original pause total deadline exhausted; stop not repeated".into()));
     let mut value = envelope(name, result.is_ok());
+    if let Some(reason) = reconciled_reason {
+        value["reconciledFromObservation"] = json!(true);
+        value["originalError"] = json!(reason);
+    }
     let script_returned_success = output.is_some();
     if let Some(output) = output {
         value["stdout"] = json!(tail(&output.stdout));
         value["stderr"] = json!(tail(&output.stderr));
     }
     match result {
-        Ok(stop) => {
+        Ok((stop,control_revision)) => {
+            value["controlRevision"] = json!(control_revision);
             value["taskStatus"] = json!("paused");
             value["stopConfirmation"] = json!("confirmed");
             value["confirmationBasis"] = json!(stop.confirmation_basis.as_str());

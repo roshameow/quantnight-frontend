@@ -93,7 +93,10 @@ fn project(d: &Document, p: &Document) -> Document {
     result
 }
 #[derive(Default)]
+struct ReadGate { entered: tokio::sync::Notify, release: tokio::sync::Notify }
+#[derive(Default)]
 struct Data {
+    summary_gate: Option<Arc<ReadGate>>,
     controls: HashMap<Host, Vec<Document>>,
     items: HashMap<Host, Vec<Document>>,
     canonical: Vec<Document>,
@@ -145,6 +148,8 @@ impl TaskStore for Memory {
             &mut d,
             if newest {
                 "control-read"
+            } else if q.contains_key("acceptedObservation") {
+                "status-revalidate"
             } else {
                 "startup-read"
             },
@@ -194,6 +199,8 @@ impl TaskStore for Memory {
         Ok(1)
     }
     async fn summary(&self, h: Host, _: &str) -> Result<CollectionSummary, String> {
+        let gate = self.0.lock().unwrap().summary_gate.take();
+        if let Some(gate) = gate { gate.entered.notify_one(); gate.release.notified().await; }
         let mut d = self.0.lock().unwrap();
         call(&mut d, "summary")?;
         let Some(rows) = d.items.get(&h) else {
@@ -275,6 +282,10 @@ impl TaskStore for Memory {
             .map(|r| project(r, &p))
             .collect())
     }
+    async fn execution_receipt_assessment(&self,h:Host,_:&str)->Result<Document,String>{
+        let mut d=self.0.lock().unwrap();call(&mut d,"receipt-assessment")?;
+        Ok(task_store::assess_execution_receipts(d.items.get(&h).map(Vec::as_slice).unwrap_or(&[])))
+    }
     async fn rows(&self, _: Host, _: &str, _: Option<Document>) -> Result<Vec<Document>, String> {
         panic!("inspection only reads bounded projections except explicit collect API")
     }
@@ -296,6 +307,7 @@ impl TaskStore for Memory {
 }
 #[derive(Default)]
 struct Runtime {
+    priority_gate: Option<Arc<ReadGate>>,
     calls: Mutex<Vec<String>>,
     priority: Option<Value>,
     namespace_fail: bool,
@@ -320,6 +332,9 @@ impl OperationsRuntime for Runtime {
 }
 #[async_trait]
 impl InspectionRuntime for Runtime {
+    async fn inspect_execution(&self,_:&Path,_:&dyn TaskStore,_:&Document,_:Host)->Result<Option<Value>,String>{
+        self.calls.lock().unwrap().push("process-inspection".into());Ok(None)
+    }
     async fn canonical_namespace(
         &self,
         _: &Path,
@@ -345,6 +360,7 @@ impl InspectionRuntime for Runtime {
             .lock()
             .unwrap()
             .push(format!("priority:{h:?}:{inspect}"));
+        if let Some(gate) = &self.priority_gate { gate.entered.notify_one(); gate.release.notified().await; }
         Ok(self
             .priority
             .clone()
@@ -371,10 +387,12 @@ fn super_task(remote: bool) -> Document {
     let b = doc! {"taskId":ID,"name":NAME,"auth_profile":"fixture-profile","remote":remote,"consumer_run_id":"consumer-1","launchAttemptId":"launch-1"};
     let mut proof = b.clone();
     proof.extend(doc! {"phase":"complete","completedAt":"stamp"});
+    let mut closure = proof.clone();
+    closure.insert("schemaVersion", 1);
     t.insert("startupBinding", b);
     t.insert(
         "simulatorRuntime",
-        doc! {"consumer_run_id":"consumer-1","startupRecovery":proof},
+        doc! {"consumer_run_id":"consumer-1","startupRecovery":proof,"lifecycleClosure":closure},
     );
     t
 }
@@ -429,7 +447,7 @@ async fn regular_status_aggregates_execution_then_exact_terminal_cas() {
     let d = m.0.lock().unwrap();
     assert_eq!(
         d.calls,
-        vec!["control-read", "summary", "summary", "terminal-cas"]
+        vec!["control-read", "summary", "summary", "status-revalidate", "terminal-cas"]
     );
     let q = &d.writes[0].1;
     assert_eq!(q.get_str("launchAttemptId").unwrap(), "launch-1");
@@ -535,6 +553,7 @@ async fn super_local_runtime_proof_is_bound_in_final_cas() {
             "startup-read",
             "summary",
             "summary",
+            "status-revalidate",
             "terminal-cas"
         ]
     );
@@ -558,6 +577,7 @@ async fn super_remote_proof_reconfirmed_after_counts_before_local_cas() {
             "startup-read",
             "summary",
             "summary",
+            "status-revalidate",
             "startup-confirm",
             "terminal-cas"
         ]
@@ -661,7 +681,8 @@ async fn status_lock_and_store_errors_do_not_look_like_empty_success() {
     let lock = MissionLocks::acquire(&root.0, &[NAME], false).unwrap();
     let r = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
     assert_eq!(r.exit_code, 1);
-    assert!(m.0.lock().unwrap().calls.is_empty());
+    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "summary", "summary"]);
+    m.no_writes(); // Long reads are now allowed; the terminal EX must still fail.
     drop(lock);
     for fail in ["control-read", "summary", "terminal-cas"] {
         let m = Memory::new(task(false), success_rows());
@@ -698,7 +719,7 @@ async fn priority_uses_original_owner_override_inspect_and_preserves_invalid_exi
     assert_eq!(r.value["ok"], false);
     assert_eq!(r.value["reason"], "root_checkpoint_unavailable_or_invalid");
     assert_eq!(*rt.calls.lock().unwrap(), vec!["priority:Remote:true"]);
-    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read"]);
+    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "status-revalidate"]);
     m.no_writes();
 }
 #[tokio::test]
@@ -944,7 +965,16 @@ async fn original_python_status_and_startup_ast_oracle_228_cases() {
     let cases: Vec<Value> = serde_json::from_str(inspection_status_cases::CASES).unwrap();
     assert_eq!(cases.len(), 228);
     let root = Root::new();
-    for case in cases {
+    for mut case in cases {
+        // Evolve the legacy startup-complete fixture, not its 228 old oracles.
+        // New negative cases above exercise absent/stale closure independently.
+        for side in ["task", "runtime"] {
+            if let Some(proof) = case[side]["simulatorRuntime"]["startupRecovery"].as_object().cloned() {
+                let mut closure = proof;
+                closure.insert("schemaVersion".into(), json!(1));
+                case[side]["simulatorRuntime"]["lifecycleClosure"] = json!(closure);
+            }
+        }
         let mut t = bson::to_document(&case["task"]).unwrap();
         t.insert("_id", ObjectId::parse_str(ID).unwrap());
         let rows: Vec<Document> = case["rows"]
@@ -1104,4 +1134,389 @@ async fn super_malformed_unhashable_status_and_history_keep_original_type_failur
         assert_eq!(out.value["errorType"], "TypeError", "{}", out.value);
         m.no_writes();
     }
+}
+
+#[tokio::test]
+async fn final_closure_not_startup_gates_twelve_timeout_wave_and_same_run_continuation() {
+    for remote in [false, true] {
+        let root = Root::new();
+        let h = Host::from_remote(remote);
+        let mut t = super_task(remote);
+        let closure = t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure").unwrap();
+        let rows = (0..12).map(|id| doc! {"_id":id,"status":"timeout_error"}).collect();
+        let m = Memory::new(t.clone(), rows);
+        if remote { m.0.lock().unwrap().controls.insert(h, vec![t.clone()]); }
+        let first = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(first.value["terminal"], false, "{}", first.value);
+        assert_eq!(first.value["startupRecovery"]["ready"], true);
+        assert_eq!(first.value["lifecycleClosure"]["ready"], false);
+        assert_eq!(first.value["unfinished"], 0);
+        m.no_writes();
+        // Same owner can still release capacity noPOST rows after this snapshot.
+        { let mut d = m.0.lock().unwrap();
+          for row in d.items.get_mut(&h).unwrap() { row.insert("status", "pending"); }
+          d.items.get_mut(&h).unwrap()[0].insert("status", "processing"); }
+        let next = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(next.value["terminal"], false);
+        assert_eq!(next.value["unfinished"], 12);
+        assert_eq!(m.control().get_str("launchAttemptId").unwrap(), "launch-1");
+        m.no_writes();
+        // A genuinely closed timeout/error wave remains terminal, not excluded.
+        { let mut d = m.0.lock().unwrap();
+          for row in d.items.get_mut(&h).unwrap() { row.insert("status", "timeout_error"); }
+          set(&mut d.controls.get_mut(&h).unwrap()[0], "simulatorRuntime.lifecycleClosure", closure); }
+        let last = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(last.value["terminal"], true, "{}", last.value);
+        assert_eq!(last.value["taskStatus"], "completed_with_errors");
+    }
+}
+
+#[tokio::test]
+async fn final_closure_identity_and_schema_are_exact_on_both_hosts() {
+    for remote in [false, true] {
+        for (field, value) in [
+            ("schemaVersion", Bson::Int32(0)), ("schemaVersion", Bson::Boolean(true)),
+            ("phase", "recovering".into()), ("completedAt", Bson::Null),
+            ("taskId", "other".into()), ("name", "other".into()),
+            ("auth_profile", "other".into()), ("remote", (!remote).into()),
+            ("launchAttemptId", "old".into()), ("consumer_run_id", "old".into()),
+        ] {
+            let root = Root::new();
+            let mut t = super_task(remote);
+            set(&mut t, &format!("simulatorRuntime.lifecycleClosure.{field}"), value);
+            let m = Memory::new(t.clone(), success_rows());
+            if remote { m.0.lock().unwrap().controls.insert(Host::Remote, vec![t]); }
+            let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+            assert_eq!(out.value["terminal"], false, "{field}: {}", out.value);
+            assert_eq!(out.value["startupRecovery"]["ready"], true);
+            m.no_writes();
+        }
+    }
+}
+
+#[tokio::test]
+async fn historical_completed_unfinished_is_display_only_even_without_control_revision_change() {
+    for remote in [false, true] {
+        let root = Root::new();
+        let mut t = super_task(remote);
+        t.insert("status", "completed_with_errors");
+        t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure");
+        let m = Memory::new(t.clone(), vec![doc! {"_id":1,"status":"processing"}]);
+        if remote { m.0.lock().unwrap().controls.insert(Host::Remote, vec![t.clone()]); }
+        let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(out.value["terminal"], false);
+        assert_eq!(out.value["taskStatus"], "completed_with_errors");
+        assert_eq!(out.value["controlStatus"], "completed_with_errors");
+        assert_eq!(out.value["lifecycleDiagnostic"]["unfinished"], 1);
+        assert_eq!(m.control(), t);
+        m.no_writes();
+    }
+}
+
+#[tokio::test]
+async fn closure_cas_cannot_commit_across_pause_observation_or_successor() {
+    for patch in [
+        doc! {"status":"paused"}, doc! {"status":"deactive"},
+        doc! {"launchAttemptId":"successor"},
+        doc! {"acceptedObservation":{"id":"new-observer"}},
+        doc! {"simulatorRuntime":{"consumer_run_id":"consumer-1","lifecycleClosure":null}},
+    ] {
+        let root = Root::new();
+        let m = Memory::new(super_task(false), success_rows());
+        m.0.lock().unwrap().patch_before_write = Some((Host::Local, patch));
+        let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(out.exit_code, 1, "{}", out.value);
+        assert_ne!(m.control().get_str("status").unwrap(), "completed");
+    }
+}
+
+#[tokio::test]
+async fn remote_final_closure_cas_rejects_replacement_after_snapshot() {
+    let root = Root::new();
+    let t = super_task(true);
+    let m = Memory::new(t.clone(), success_rows());
+    { let mut d = m.0.lock().unwrap();
+      d.controls.insert(Host::Remote, vec![t]);
+      d.patch_before_write = Some((Host::Remote, doc! {
+          "simulatorRuntime":{"consumer_run_id":"consumer-1","lifecycleClosure":null}
+      })); }
+    let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(m.control().get_str("status").unwrap(), "running");
+    assert!(m.0.lock().unwrap().writes.iter().all(|(h, _, _)| *h == Host::Remote));
+}
+
+#[tokio::test]
+async fn common_task_control_status_facade_preserves_open_wave_then_closed_same_run() {
+    use quantnight_task_core::{
+        backend_binding::validate_backend_binding,
+        config::bash_test_support::FakeBash,
+        task_control::TaskControl,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    for remote in [false, true] {
+        // Reuse the original binding-owner fixture: only its external process
+        // response and TaskStore are fake. No inspection/facade success mock.
+        let fixture = FakeBash::new("exit 91 # non-priority status must not launch runtime scripts");
+        let root = Path::new(&fixture.config.env.working_dir);
+        std::fs::write(root.join("credentials.yaml"), "synthetic fixture only\n").unwrap();
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        let python = root.join(".venv/bin/python");
+        std::fs::write(&python, r#"#!/bin/sh
+[ "$1" = '-B' ] && [ "$2" = '-m' ] && [ "$3" = 'backend.mongodb.mongo_config' ] && [ "$4" = '--validate-task-control-binding' ] || exit 92
+printf 'binding-process\n' >> binding_calls
+printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok":true}'
+"#).unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = validate_backend_binding(&fixture.config).await.unwrap();
+        let h = Host::from_remote(remote);
+        let mut t = super_task(remote);
+        let proof = t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure").unwrap();
+        let m = Memory::new(t.clone(), (0..12).map(|id| doc! {"_id":id,"status":"timeout_error"}).collect());
+        if remote { m.0.lock().unwrap().controls.insert(h, vec![t]); }
+        let control = TaskControl::with_store(binding, Arc::new(m.clone()));
+        let request = StatusRequest::new(NAME);
+        let first = control.status(&request).await;
+        assert_eq!(first.exit_code, 0, "{}", first.value);
+        assert_eq!(first.value["terminal"], false, "{}", first.value);
+        assert_eq!(first.value["taskStatus"], "running");
+        assert_eq!(first.value["startupRecovery"]["ready"], true);
+        assert_eq!(first.value["lifecycleClosure"]["ready"], false);
+        m.no_writes();
+        { let mut d = m.0.lock().unwrap();
+          for row in d.items.get_mut(&h).unwrap() { row.insert("status", "pending"); }
+          d.items.get_mut(&h).unwrap()[0].insert("status", "processing"); }
+        let continued = control.status(&request).await;
+        assert_eq!(continued.value["unfinished"], 12);
+        assert_eq!(continued.value["terminal"], false);
+        m.no_writes();
+        { let mut d = m.0.lock().unwrap();
+          for row in d.items.get_mut(&h).unwrap() { row.insert("status", "success"); }
+          set(&mut d.controls.get_mut(&h).unwrap()[0], "simulatorRuntime.lifecycleClosure", proof); }
+        let closed = control.status(&request).await;
+        assert_eq!(closed.value["terminal"], true, "{}", closed.value);
+        assert_eq!(closed.value["taskStatus"], "completed");
+        let stored = m.control();
+        assert_eq!(stored.get_str("launchAttemptId").unwrap(), "launch-1");
+        assert_eq!(stored.get_array("events").unwrap().len(), 1);
+        assert_eq!(stored.get_array("events").unwrap()[0].as_document().unwrap().get_str("command").unwrap(), "status-terminal-reconcile");
+        // Bypassing the original public implementation loses its counted reads
+        // or CAS/event, and cannot satisfy this oracle. No runtime shell fallback.
+        let d = m.0.lock().unwrap();
+        assert_eq!(d.calls.iter().filter(|c| c.as_str() == "control-read").count(), 3);
+        assert_eq!(d.calls.iter().filter(|c| c.as_str() == "startup-read").count(), 3);
+        assert_eq!(d.writes.iter().filter(|(host, _, _)| *host == Host::Local).count(), 1);
+        assert_eq!(std::fs::read_to_string(root.join("binding_calls")).unwrap(), "binding-process\n");
+    }
+}
+
+
+#[async_trait]
+impl quantnight_task_core::pause::PauseRuntime for Runtime {
+    async fn stop(&self, _: &Path, task: &Document, never: bool) -> Result<quantnight_task_core::pause::StopOutput, String> {
+        assert!(!never);
+        assert_eq!(task.get_str("launchAttemptId").unwrap(), "launch-1");
+        self.calls.lock().unwrap().push("original-stop-once".into());
+        Ok(quantnight_task_core::pause::StopOutput {
+            stdout: format!("QUANTNIGHT_PAUSE_CONFIRMED {}", json!({"schema_version":1,"task_name":NAME,
+                "target_remote":task.get_bool("isRemote").unwrap(),"session_absent":true,"runners_exited":true})),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn long_status_reads_allow_real_pause_and_never_overwrite_its_new_state() {
+    use quantnight_task_core::pause::{pause, PauseOptions};
+    for kind in ["regular", "super", "priority"] {
+      for remote in [false, true] {
+        let root = Root::new();
+        let gate = Arc::new(ReadGate::default());
+        let mut t = if kind == "super" { super_task(remote) } else { task(remote) };
+        t.insert("taskType", kind);
+        let m = Memory::new(t.clone(), success_rows());
+        if remote { m.0.lock().unwrap().controls.insert(Host::Remote, vec![t]); }
+        let runtime = Arc::new(Runtime { priority_gate: (kind == "priority").then(|| gate.clone()), ..Default::default() });
+        if kind != "priority" { m.0.lock().unwrap().summary_gate = Some(gate.clone()); }
+        let (r, store, rt) = (root.0.clone(), m.clone(), runtime.clone());
+        let reading = tokio::spawn(async move { status(&r, &store, rt.as_ref(), &StatusRequest::new(NAME)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified()).await.unwrap();
+        let stopped = pause(&root.0, &m, runtime.as_ref(), NAME, PauseOptions::default()).await;
+        assert_eq!(stopped.exit_code, 0, "{kind}: {}", stopped.value);
+        assert!(stopped.confirmed_stop.is_some());
+        assert!(!reading.is_finished(), "status I/O must remain suspended, not faked complete");
+        let paused = m.control();
+        gate.release.notify_one();
+        let stale = tokio::time::timeout(std::time::Duration::from_secs(2), reading).await.unwrap().unwrap();
+        assert_eq!(stale.exit_code, 1, "stale {kind} read cannot report current completion: {}", stale.value);
+        assert_eq!(m.control(), paused);
+        assert_eq!(runtime.calls.lock().unwrap().iter().filter(|c| *c == "original-stop-once").count(), 1);
+        let d = m.0.lock().unwrap();
+        assert_eq!(d.writes.len(), 1, "only the real pause CAS may write");
+        assert_eq!(d.controls[&Host::Local][0].get_str("status").unwrap(), "paused");
+    }
+  }
+}
+
+#[tokio::test]
+async fn long_status_snapshot_must_revalidate_identity_before_terminal_lock_and_cas() {
+    for patch in [doc! {"launchAttemptId":"next"}, doc! {"isRemote":true},
+        doc! {"generation":{"id":"next"}}, doc! {"acceptedObservation":{"id":"new"}},
+        doc! {"updatedAt":"next"}, doc! {"runId":"next"}, doc! {"status":"deactive"},
+        doc! {"simulatorRuntime":{"consumer_run_id":"consumer-1","lifecycleClosure":null}}] {
+        let root = Root::new(); let gate = Arc::new(ReadGate::default());
+        let m = Memory::new(super_task(false), success_rows());
+        m.0.lock().unwrap().summary_gate = Some(gate.clone());
+        let (r, store) = (root.0.clone(), m.clone());
+        let reading = tokio::spawn(async move { status(&r, &store, &Runtime::default(), &StatusRequest::new(NAME)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified()).await.unwrap();
+        m.0.lock().unwrap().controls.get_mut(&Host::Local).unwrap()[0].extend(patch);
+        let changed = m.control(); gate.release.notify_one();
+        let out = reading.await.unwrap();
+        assert_eq!(out.exit_code, 1, "{}", out.value);
+        assert_eq!(m.control(), changed); m.no_writes();
+    }
+}
+
+#[tokio::test]
+async fn terminal_reconcile_conflicting_original_lock_never_reports_committed_success() {
+    let root = Root::new(); let gate = Arc::new(ReadGate::default());
+    let m = Memory::new(super_task(false), success_rows());
+    m.0.lock().unwrap().summary_gate = Some(gate.clone());
+    let (r, store) = (root.0.clone(), m.clone());
+    let reading = tokio::spawn(async move { status(&r, &store, &Runtime::default(), &StatusRequest::new(NAME)).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified()).await.unwrap();
+    let lock = MissionLocks::acquire(&root.0, &[NAME], false).expect("long read must not hold EX or SH");
+    gate.release.notify_one(); let out = reading.await.unwrap();
+    assert_eq!(out.exit_code, 1); assert_eq!(out.value["ok"], false);
+    assert!(out.value["error"].as_str().unwrap().contains("lifecycle mutator"));
+    m.no_writes(); drop(lock);
+}
+
+#[tokio::test]
+async fn legacy_missing_enhancements_do_not_block_status_results_or_original_pause() {
+    use quantnight_task_core::pause::{pause, PauseOptions};
+    for remote in [false, true] {
+        for missing in ["closure", "startup", "all"] {
+            let root = Root::new(); let mut t = super_task(remote);
+            t.remove("tmuxContext");
+            t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure");
+            if missing != "closure" { t.get_document_mut("simulatorRuntime").unwrap().remove("startupRecovery"); }
+            if missing == "all" { t.remove("startupBinding"); t.remove("simulatorRuntime"); }
+            let rows = vec![doc! {"_id":1,"status":"timeout_error","acceptance":"UNKNOWN","campaign_post_attempted":true,"superSlotId":"retain"},
+                doc! {"_id":2,"status":"success","alphaId":"old-alpha","acceptance":"ACCEPTED"}];
+            let m = Memory::new(t.clone(), rows.clone());
+            if remote { m.0.lock().unwrap().controls.insert(Host::Remote, vec![t.clone()]); }
+            let rt = Runtime::default();
+            let observed = status(&root.0, &m, &rt, &StatusRequest::new(NAME)).await;
+            assert_eq!(observed.exit_code, 0, "{missing}: {}", observed.value);
+            assert_eq!(observed.value["taskStatus"], "running");
+            assert_eq!(observed.value["terminal"], false);
+            let saved = results(&root.0, &m, &rt, &ResultsRequest::new(NAME)).await;
+            assert_eq!(saved.exit_code, 0, "{}", saved.value);
+            assert_eq!(saved.value["pageItems"], 2);
+            m.no_writes();
+            let stopped = pause(&root.0, &m, &rt, NAME, PauseOptions::default()).await;
+            assert_eq!(stopped.exit_code, 0, "{}", stopped.value);
+            assert!(stopped.confirmed_stop.is_some());
+            assert_eq!(rt.calls.lock().unwrap().iter().filter(|c| *c == "original-stop-once").count(), 1);
+            let d = m.0.lock().unwrap();
+            assert_eq!(d.items[&Host::from_remote(remote)], rows, "stop must retain unresolved platform receipts/slots/results");
+            assert!(!d.controls[&Host::Local][0].get_document("simulatorRuntime").map(|r| r.contains_key("lifecycleClosure")).unwrap_or(false));
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_status_retains_successful_facts_but_never_calls_them_current() {
+    let root=Root::new(); let gate=Arc::new(ReadGate::default());
+    let m=Memory::new(super_task(false),success_rows());
+    m.0.lock().unwrap().summary_gate=Some(gate.clone());
+    let (r,store)=(root.0.clone(),m.clone());
+    let reading=tokio::spawn(async move {status(&r,&store,&Runtime::default(),&StatusRequest::new(NAME)).await});
+    tokio::time::timeout(std::time::Duration::from_secs(2),gate.entered.notified()).await.unwrap();
+    m.0.lock().unwrap().controls.get_mut(&Host::Local).unwrap()[0].insert("status","paused");
+    gate.release.notify_one();let out=reading.await.unwrap();
+    assert_eq!(out.exit_code,1);assert_eq!(out.value["snapshotCurrent"],false);
+    assert_eq!(out.value["execution"]["total"],1);
+    assert_eq!(out.value["reconcileSkipped"],true);
+    assert_eq!(out.value["terminal"],false);
+    assert_eq!(out.value["capturedTaskStatus"],"running");
+    assert!(out.value.get("taskStatus").is_none());
+    assert_eq!(out.value["observationIdentity"]["launchAttemptId"],"launch-1");
+    m.no_writes();
+}
+
+#[path = "support/original_professional_runtime.rs"]
+mod original_professional_runtime;
+
+#[tokio::test]
+async fn original_legacy_status_separates_stop_platform_and_result_facts_without_forged_closure() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
+    for remote in [false,true] {for case in ["v1_complete","v2_only","unknown_receipt","result_pending","legacy_event","conflicting_stop"] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);
+        let mut t=task(remote);t.insert("taskType","super");t.insert("status","completed_with_errors");
+        t.insert("stopConfirmedAt",bson::DateTime::from_millis(2000));t.insert("stopConfirmedTaskId",ID);t.insert("stopConfirmedRemote",remote);
+        if case=="legacy_event" {
+            t.insert("events",vec![doc!{"command":"pause","status":"paused","at":"1970-01-01T00:00:02Z",
+                "detail":{"schema_version":1,"task_name":NAME,"target_remote":remote,"session_absent":true,"runners_exited":true}}]);
+        } else {t.insert("stopConfirmationBasis",if case=="v2_only"{"session_absent"}else{"runners_exited"});}
+        if case=="conflicting_stop"{t.insert("stopConfirmedTaskId","foreign");}
+        let mut row=doc!{"_id":1,"status":"success","alphaId":"old-alpha","detailsFetchedAt":"saved","resultMetrics":{"fitness":1.0,"sharpe":1.0,"turnover":0.1,"returns":0.1,"drawdown":0.1,"margin":0.01}};
+        if case=="unknown_receipt"{row.insert("acceptance","UNKNOWN");}
+        if case=="result_pending"{row.remove("detailsFetchedAt");row.remove("resultMetrics");}
+        let m=Memory::new(t.clone(),vec![row]);if remote{m.0.lock().unwrap().controls.insert(Host::Remote,vec![t.clone()]);}
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};
+        let out=status(root,&m,&runtime,&StatusRequest::new(NAME)).await;
+        assert_eq!(out.exit_code,0,"{remote}/{case}: {}",out.value);
+        let ready=matches!(case,"v1_complete"|"legacy_event");
+        assert_eq!(out.value["terminal"],ready);
+        if matches!(case,"v2_only"|"conflicting_stop") {
+            // Frozen narrowed scope: no PID query can promote V2/foreign proof.
+            // Preserve the old nonterminal/zero-write oracle and additionally
+            // forbid manufacturing current stopped facts from a persisted proof.
+            assert!(out.value.get("executionObservation").is_none());
+            assert!(out.value.get("completionVerification").is_none());
+            assert!(!root.join("trace").exists());
+        } else {
+            assert_eq!(out.value["executionObservation"]["consumerStopped"],true);
+            assert_eq!(out.value["executionObservation"]["naturalClosure"],false);
+            assert_eq!(out.value["completionVerification"]["ready"],ready,"{remote}/{case}: {}",out.value);
+            assert_eq!(out.value["completionVerification"]["runnerProofCreated"],false);
+            assert_eq!(out.value["receiptObservation"]["complete"],true);
+            if case=="unknown_receipt"{assert_eq!(out.value["receiptObservation"]["receiptUnresolvedItemCount"],1);}
+            if case=="result_pending"{assert_eq!(out.value["receiptObservation"]["resultPendingItemCount"],1);}
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("if-shell")&&!trace.contains("new-session"));
+        }
+        assert_eq!(m.control(),t);m.no_writes();
+    }}
+}
+
+#[test]
+fn legacy_assessment_preserves_unknown_even_with_success_and_all_result_fields() {
+    for unknown in ["UNKNOWN","unknown","Unknown"] {
+        let row=doc!{"_id":1,"status":"success","alphaId":"old-alpha","acceptance":unknown,"detailsFetchedAt":"saved",
+            "resultMetrics":{"fitness":Bson::Null,"sharpe":Bson::Null,"turnover":Bson::Null,"returns":Bson::Null,"drawdown":Bson::Null,"margin":Bson::Null}};
+        let assessed=task_store::assess_execution_receipts(&[row]);
+        assert_eq!(assessed.get_i64("unresolvedItemCount").unwrap(),1);
+        assert_eq!(assessed.get_i64("receiptUnresolvedItemCount").unwrap(),1);
+        assert_eq!(assessed.get_i64("resultPendingItemCount").unwrap(),0);
+    }
+}
+
+#[tokio::test]
+async fn completion_ordinary_status_missing_closure_does_not_query_processes() {
+    for remote in [false,true] {for state in ["processing","pending","timeout_error","success"] {
+        let root=Root::new();let mut t=super_task(remote);
+        t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure");
+        let m=Memory::new(t.clone(),vec![doc!{"_id":1,"status":state}]);
+        if remote{m.0.lock().unwrap().controls.insert(Host::Remote,vec![t]);}
+        let runtime=Runtime::default();
+        let out=status(&root.0,&m,&runtime,&StatusRequest::new(NAME)).await;
+        assert_eq!(out.exit_code,0,"{}",out.value);assert_eq!(out.value["terminal"],false);
+        assert_eq!(out.value["execution"]["total"],1);
+        assert!(!runtime.calls.lock().unwrap().iter().any(|c|c=="process-inspection"));m.no_writes();
+    }}
 }

@@ -849,3 +849,33 @@ test('new or missing pool and selected host/task identity changes cannot inherit
     assert.equal(store.taskProgressMap.alpha.priority_campaign, undefined);
   }
 });
+
+test('v6 optional joined-stop launch fence rejects late proof for a successor while old direct calls remain compatible', () => {
+  for (const launch of ['joined-launch', null]) {
+    const original = task({ launchAttemptId: launch });
+    const store = freshStore([original]);
+    const target = { ...original, ...(launch === null ? { expectedLaunchAbsent: true } : { expectedLaunchAttemptId: launch }) };
+    const operation = store.beginTaskStop(target); assert.ok(operation);
+    store.replaceTasks([task({ launchAttemptId: 'successor' })]);
+    assert.equal(store.taskStopOperationMap.alpha, undefined);
+    assert.equal(store.confirmTaskPaused(target, { confirmed: true, taskId: 'id-a', taskName: 'alpha', isRemote: false, stopConfirmedAt: Date.now() }, operation), false);
+    assert.equal(store.tasks[0].status, 'running');
+    assert.equal(store.tasks[0].launchAttemptId, 'successor');
+  }
+  const legacy = freshStore([task({ launchAttemptId: 'current' })]);
+  const target = { _id: 'id-a', name: 'alpha', isRemote: false };
+  const operation = legacy.beginTaskStop(target); assert.ok(operation);
+  assert.equal(legacy.confirmTaskPaused(target, { confirmed: true, taskId: 'id-a', taskName: 'alpha', isRemote: false, stopConfirmedAt: Date.now() }, operation), true);
+});
+
+test('v6 explicit absence stop target never interprets malformed launch as missing', () => {
+  for (const launch of [false, 0, '', ' ', {}, [], undefined]) {
+    const original = task({ launchAttemptId: launch });
+    const store = freshStore([original]);
+    assert.equal(store.beginTaskStop({ ...original, expectedLaunchAbsent: true }), null);
+  }
+  for (const original of [task(), task({ launchAttemptId: null })]) {
+    const store = freshStore([original]);
+    assert.ok(store.beginTaskStop({ ...original, expectedLaunchAbsent: true }));
+  }
+});

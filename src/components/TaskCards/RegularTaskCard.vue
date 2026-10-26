@@ -28,6 +28,9 @@
       <div v-if="diagnosticDetails" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ diagnosticDetails }}</div>
       <div v-if="dispatchDetails" style="overflow-wrap: anywhere"><n-text depth="3">{{ dispatchDetails }}</n-text></div>
     </details>
+    <div v-if="startBlockReason" style="font-size: 12px; margin-bottom: 4px">
+      <n-text type="warning">{{ startBlockReason }}</n-text>
+    </div>
     <div v-if="progress">
       <div style="font-size: 12px; margin-bottom: 4px">
         <n-text type="success" title="成功 (普通+插队)">
@@ -56,9 +59,11 @@
         </div>
       </template>
     </div>
+    <div style="font-size: 12px; margin: 4px 0"><n-text :type="taskMutationIssue(task) ? 'warning' : 'default'">{{ taskControlLabel(task) }}</n-text></div>
     <n-space align="center" style="margin-top: 2px">
       <n-switch
         :value="task.isRemote"
+        :disabled="!!taskMutationIssue(task)"
         @update:value="(val) => $emit('update:isRemote', val)"
         :checked-value="true"
         :unchecked-value="false"
@@ -80,7 +85,7 @@
         <n-button
           size="small"
           @click="$emit('generateList')"
-          :disabled="!canGenerate(task, generationBusy)"
+          :disabled="!!taskMutationIssue(task) || !canGenerate(task, generationBusy)"
           :loading="isGenerating(task, generationBusy)"
         >
           <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : task.status === 'generation_unknown' ? '生成状态待核验' : '生成list' }}
@@ -88,17 +93,18 @@
         <n-button
           size="small"
           @click="$emit('syncRemote')"
-          :disabled="task.status === 'running' || generationBusyOrUnknown(task, generationBusy)"
+          :disabled="!!taskMutationIssue(task) || task.status === 'running' || generationBusyOrUnknown(task, generationBusy)"
         >
           <template #icon>-></template>发送到远程
         </n-button>
-        <n-button size="small" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('start')">
+        <n-button size="small" :disabled="!!startBlockReason" :title="startBlockReason || undefined" @click="$emit('start')">
           <template #icon>>></template>启动
         </n-button>
-        <n-button size="small" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('pause')">
+        <n-button size="small" :disabled="taskRuntimeStatus?.state === 'checking' || operationBusy || !!taskMutationIssue(task)" @click="$emit('checkRuntime')">运行诊断（只读，可选）</n-button>
+        <n-button size="small" :disabled="!!taskMutationIssue(task) || generationBusyOrUnknown(task, generationBusy)" @click="$emit('pause')">
           <template #icon>| |</template>暂停
         </n-button>
-        <n-button size="small" type="error" :disabled="generationBusyOrUnknown(task, generationBusy)" @click="$emit('delete')">
+        <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || generationBusyOrUnknown(task, generationBusy)" @click="$emit('delete')">
           <template #icon>x</template>删除
         </n-button>
       </n-space>
@@ -113,12 +119,13 @@ export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR
 
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
-import { RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
+import { taskMutationIssue, taskControlLabel, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 import { isGenerating, canGenerate, generationBusyOrUnknown } from '../../utils/taskGeneration.js';
 
 const props = defineProps({
   generationBusy: { type: Boolean, default: false },
+  operationBusy: { type: Boolean, default: false },
   task: {
     type: Object,
     required: true,
@@ -137,7 +144,7 @@ const props = defineProps({
   },
 });
 
-defineEmits(['update:isRemote', 'view', 'generateList', 'syncRemote', 'start', 'pause', 'delete']);
+defineEmits(['update:isRemote', 'view', 'generateList', 'syncRemote', 'start', 'pause', 'delete', 'checkRuntime']);
 
 // A one-shot local expiry (not another native poll) invalidates Vue's cached
 // computed badge even when no props change after a positive observation.
@@ -158,6 +165,9 @@ const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpir
 onMounted(() => { mounted = true; refreshRuntimeExpiry(); });
 onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(); });
 const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
+const startBlockReason = computed(() => taskStartBlockReason(props.task, {
+  busy: props.operationBusy || props.generationBusy, stopping: stopStatus.value === 'stopping',
+}));
 const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
 const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
 const dispatchDetails = computed(() => {

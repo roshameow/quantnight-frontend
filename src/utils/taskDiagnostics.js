@@ -66,13 +66,45 @@ export function stopDiagnostic(task, operation, stopStatus, proofIssue = '') {
     : operation?.status === 'stopping' ? '正在等待原生停止核验及本次停止凭据。'
       : '本次停止操作缺少有效最终回执。'].filter(Boolean).join(' · ') }
 }
+// UI-only identity/gating. Native absence remains the final start authority.
+export function taskRuntimeTarget(task) {
+  return { taskId: typeof task?._id === 'object' ? task._id?.$oid : task?._id,
+    name: task?.name, isRemote: task?.isRemote === true,
+    authProfile: task?.auth_profile ?? 'user1', launchAttemptId: task?.launchAttemptId ?? null }
+}
+export function sameRuntimeIdentity(task, target) {
+  const current = taskRuntimeTarget(task)
+  return !!task && task.status !== 'deactive' && typeof current.taskId === 'string' && !!current.taskId &&
+    ['taskId', 'name', 'isRemote', 'authProfile', 'launchAttemptId'].every(key =>
+      current[key] === (key === 'launchAttemptId' ? target?.[key] ?? null : target?.[key]))
+}
+// Assigned by the original native list branch. Missing/unknown is NOT denial
+// for legacy clients; native exact-local-ID checks remain the authority.
+export const taskControlSource = task => ['local', 'remote_only'].includes(task?.controlSource)
+  ? task.controlSource : 'unknown'
+export const taskMutationIssue = task => taskControlSource(task) === 'remote_only'
+  ? '仅远端登记：当前本地控端无此任务控制权限，请由原 owner 管理；仍可查看任务详情' : ''
+export const taskControlLabel = task => taskControlSource(task) === 'local'
+  ? '本控端登记（执行端可为本地或远程）' : taskMutationIssue(task) || '登记来源未提供；操作仍由原 native 精确身份核验'
+
+export const isCompletedTask = task => ['completed', 'completed_with_errors'].includes(task?.status)
+// Only view-owned admission and known control registration belong here.
+// Runtime/PID snapshots and historical proof/status are never start authority.
+export function taskStartBlockReason(task, { busy = false, stopping = false } = {}) {
+  if (!task || !taskRuntimeTarget(task).taskId || task.status === 'deactive') return '任务身份缺失或已归档，请刷新列表'
+  if (taskMutationIssue(task)) return taskMutationIssue(task)
+  if (busy || stopping) return '本视图的原任务操作正在进行，请等待本次回执'
+  return ''
+}
+
 export function runtimeDiagnostic(task, observation, now = Date.now()) {
   if (!observation) return { status: '尚未执行运行检查', detail: '等待首次消费者检查。' }
   const id = typeof task?._id === 'object' ? task._id?.$oid : task?._id
   if (typeof id !== 'string' || !id || observation.taskId !== id || observation.name !== task.name ||
       observation.isRemote !== (task.isRemote === true) ||
-      (observation.authProfile !== undefined && observation.authProfile !== (task.auth_profile ?? 'user1'))) {
-    return { status: '运行检查身份校验失败', detail: `身份校验失败：检查结果的任务 ID、名称、执行主机或账号与当前任务存在差异；结果已拒绝。${stageDetails(observation)}` }
+      (observation.authProfile !== undefined && observation.authProfile !== (task.auth_profile ?? 'user1')) ||
+      (observation.launchAttemptId ?? null) !== (task.launchAttemptId ?? null)) {
+    return { status: '运行检查身份校验失败', detail: `身份校验失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异；结果已拒绝。${stageDetails(observation)}` }
   }
   if (!Number.isSafeInteger(observation.observedAt) || observation.observedAt <= 0 || observation.observedAt > now) {
     return { status: '运行检查时间无效', detail: `结果时间戳缺失、无效或位于未来。${stageDetails(observation)}` }
@@ -100,12 +132,19 @@ export function regularDispatchState(task, observation, now = Date.now()) {
   return d
 }
 export function regularDisplayStatus(task, observation, stopStatus, now = Date.now()) {
+  if (isCompletedTask(task) && (!stopStatus || stopStatus === 'paused') &&
+      runtimeDiagnostic(task, observation, now).status === '消费者存活') return '控制记录已完成，但原消费者仍存活'
   if (stopStatus === 'paused' && task.stopConfirmationBasis === 'session_absent') return '已暂停（tmux会话缺失）'
   if (stopStatus) return stopStatus === 'stopping' ? '停止执行中' : stopStatus
+  if (isCompletedTask(task) && observation) {
+    const diagnostic = runtimeDiagnostic(task, observation, now)
+    return diagnostic.status === '消费者存活' ? '控制记录已完成，但原消费者仍存活' : `${task.status} · ${diagnostic.status}`
+  }
   if (task.status !== 'running') {
     const historical = { unknown: '控制记录缺少执行阶段', generation_unknown: '生成结果核验缺少最终回执', launch_unknown: '启动结果核验缺少最终回执' }
     return historical[String(task.status).toLowerCase()] ?? task.status
   }
+  if (!observation) return task.status // business control state; not a liveness claim
   const diagnostic = runtimeDiagnostic(task, observation, now)
   if (diagnostic.status !== '消费者存活') return diagnostic.status
   const dispatch = regularDispatchState(task, observation, now)
@@ -117,14 +156,14 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
 export function taskDiagnosticDetails(task, observation, operation, stopStatus, now = Date.now(), proofIssue = '') {
   const stopped = stopDiagnostic(task, operation, stopStatus, proofIssue)
   if (stopped) return [stopped.detail, businessDiagnostic(task, observation, now)?.detail].filter(Boolean).join(' · ')
-  if (task.status !== 'running') return ''
+  if (!observation) return ''
   const diagnostic = runtimeDiagnostic(task, observation, now)
   const dispatch = regularDispatchState(task, observation, now)
   const dispatchReason = diagnostic.status === '消费者存活' && task.taskType !== 'super' && !dispatch
-    ? (observation.dispatch && now - observation.dispatch.heartbeatAt >= DISPATCH_MAX_AGE
+    ? (observation?.dispatch && now - observation.dispatch.heartbeatAt >= DISPATCH_MAX_AGE
       ? '派发快照已过期（120 秒）。'
       : '缺少身份、主机、账号和时效均有效的派发快照。') : ''
-  return [diagnostic.detail, dispatchReason, businessDiagnostic(task, observation, now)?.detail,
+  return [isCompletedTask(task) && diagnostic.status === '消费者存活' ? '控制记录与执行状态矛盾；继续查看原任务，不重复启动。' : '', diagnostic.detail, dispatchReason, businessDiagnostic(task, observation, now)?.detail,
     !observation?.businessDiagnostic && ['not_running', 'session_absent'].includes(observation?.state)
       ? '缺少可信的历史业务错误；检查完成仅表示进程检查结束，业务完成及平台终态仍需原回执核验。' : ''].filter(Boolean).join(' · ')
 }
@@ -193,4 +232,84 @@ export function taskDiagnosticSummary(task, observation, now = Date.now()) {
   if (runtime.status === '消费者存活' && dispatch?.submissionReason) return `派发限制：${safeDiagnosticText(dispatch.submissionReason)}`
   if (['not_running', 'session_absent'].includes(observation?.state)) return '缺少可归因的历史业务错误证据（不根据末条日志推断退出原因）'
   return ''
+}
+
+
+// Original TaskOutcome decoding only. Never extract IDs/launch from free text.
+// Null/undefined acknowledge an old void adapter but supply NO join/launch proof.
+export function taskStartOutcome(value, target) {
+  if (value == null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== 1 ||
+      value.command !== 'start' || value.task !== target.name || typeof value.ok !== 'boolean') {
+    throw new Error('启动回执格式/任务名称无效；未认定成功')
+  }
+  const matchedHost = value.remote === target.remote || (value.ok === false &&
+    value.requestSatisfied === false && value.remote === (target.actualRemote ?? target.remote))
+  const identityMatches = value.taskId === target.taskId && matchedHost
+  if ((value.taskId !== undefined && value.taskId !== target.taskId) ||
+      (value.remote !== undefined && !matchedHost) ||
+      ((value.ok || value.consumerRunning === true) && !identityMatches)) {
+    throw new Error('启动回执身份/执行端不符；未认定成功或消费者归属')
+  }
+  // Refusal before configuration comparison may omit that comparison. It is
+  // still a failure, never a positive consumer/launch attribution.
+  if (value.ok === false && value.outcome === 'refused' && value.consumerRunning !== true &&
+      value.startedNew === false && value.configApplied === false && value.requestSatisfied === false) return value
+  if (value.outcome !== undefined) {
+    if (!['started', 'already_running', 'refused'].includes(value.outcome) ||
+        typeof value.startedNew !== 'boolean' || typeof value.configApplied !== 'boolean' ||
+        typeof value.requestSatisfied !== 'boolean' ||
+        !['equal', 'different', 'unverified', 'not_requested'].includes(value.configComparison)) {
+      throw new Error('启动结构化回执字段无效；未认定成功')
+    }
+    if (value.ok && (!value.requestSatisfied || value.outcome === 'refused')) throw new Error('启动回执成功/意图结果矛盾')
+    if (value.outcome === 'already_running' &&
+        (value.startedNew || value.configApplied || value.consumerRunning !== true || !identityMatches ||
+         (value.ok && !['equal', 'not_requested'].includes(value.configComparison)))) {
+      throw new Error('已运行回执矛盾；未认定配置应用或消费者归属')
+    }
+    if (value.outcome === 'started' && value.ok && !value.startedNew) throw new Error('启动回执未确认新启动')
+  }
+  return value
+}
+export function taskStartFailure(error, target) {
+  let value = error
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) } catch { return null }
+  }
+  try {
+    const result = taskStartOutcome(value, target)
+    return result?.ok === false ? result : null
+  } catch { return null }
+}
+
+
+// Missing/null are a real absence expectation; other types are not absence.
+export function taskLaunchValue(task) {
+  if (!Object.hasOwn(task ?? {}, 'launchAttemptId') || task.launchAttemptId === null) return null
+  return typeof task.launchAttemptId === 'string' && task.launchAttemptId.trim() ? task.launchAttemptId : undefined
+}
+export function taskLaunchMatches(task, expected) {
+  if (expected?.expectedLaunchAbsent === true && expected.expectedLaunchAttemptId != null) return false
+  if (expected?.expectedLaunchAbsent === true) return taskLaunchValue(task) === null
+  if (expected?.expectedLaunchAttemptId != null) return typeof expected.expectedLaunchAttemptId === 'string' &&
+    !!expected.expectedLaunchAttemptId.trim() && taskLaunchValue(task) === expected.expectedLaunchAttemptId
+  return true // old direct caller: omission is NOT must-be-absent
+}
+export function taskStartJoinEvidence(value, binding) {
+  const outcome = taskStartOutcome(value, binding)
+  if (!outcome || outcome.operationSettled !== true || !['started', 'already_running', 'refused'].includes(outcome.outcome) ||
+      outcome.taskId !== binding.taskId || outcome.task !== binding.name ||
+      typeof outcome.remote !== 'boolean' || outcome.taskType !== binding.taskType || outcome.authProfile !== binding.authProfile ||
+      !Object.hasOwn(outcome, 'launchAttemptId') || taskLaunchValue(outcome) === undefined) {
+    throw new Error('原启动缺少已收敛的精确身份/launch回执；本次暂停未发送')
+  }
+  return { taskId: outcome.taskId, name: outcome.task, isRemote: outcome.remote,
+    taskType: outcome.taskType, authProfile: outcome.authProfile, launchAttemptId: outcome.launchAttemptId }
+}
+export function taskMatchesJoinEvidence(task, evidence) {
+  return !!task && task.status !== 'deactive' && !taskMutationIssue(task) &&
+    taskRuntimeTarget(task).taskId === evidence.taskId && task.name === evidence.name &&
+    (task.taskType ?? 'regular') === evidence.taskType && (task.auth_profile ?? 'user1') === evidence.authProfile &&
+    (task.isRemote === true) === evidence.isRemote && taskLaunchValue(task) === evidence.launchAttemptId
 }

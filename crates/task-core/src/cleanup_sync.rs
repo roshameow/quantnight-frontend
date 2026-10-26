@@ -29,6 +29,11 @@ pub trait OperationsRuntime: Send + Sync {
         task: &Document,
         host: Host,
     ) -> Result<(), String>;
+    /// Original stop owner's read-only reconciliation; never sends stop signals.
+    async fn verify_stopped(&self, _root: &Path, _task: &Document,
+        _remaining: std::time::Duration) -> Result<Option<crate::pause::StopOutput>, String> { Ok(None) }
+    async fn confirm_stopped_scope(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,
+        _remaining:std::time::Duration)->Result<(),String>{Ok(())}
     /// Invoke the original archive_statistics owner using the exact retained
     /// execution namespace. A null result denotes an unbound research task.
     async fn archive_research(
@@ -144,6 +149,7 @@ fn binding(name: &str, expected: &Document, command: &str) -> Result<Document, S
         "stopConfirmedTaskId",
         "stopConfirmationBasis",
         "launchAttemptAt",
+        "launchSettledAttemptId",
     ] {
         query.insert(
             field,
@@ -171,6 +177,7 @@ async fn bound(store: &dyn TaskStore, name: &str, expected: &Document) -> Result
         "stopConfirmedRemote",
         "stopConfirmedTaskId",
         "launchAttemptAt",
+        "launchSettledAttemptId",
     ] {
         if current.get(field) != expected.get(field) {
             return Err("task identity/state changed before mutation".into());
@@ -528,6 +535,21 @@ pub async fn delete(
     delete_with_expected_host(root, store, runtime, name, expected_task_id, None).await
 }
 
+struct ArchiveStopVerifier<'a>(&'a dyn OperationsRuntime);
+#[async_trait]
+impl crate::pause::PauseRuntime for ArchiveStopVerifier<'_> {
+    async fn stop(&self, _: &Path, _: &Document, _: bool) -> Result<crate::pause::StopOutput, String> {
+        Err("archive verify-only cannot send stop signals".into())
+    }
+    async fn confirm_stopped_scope(&self,root:&Path,store:&dyn TaskStore,task:&Document,remaining:std::time::Duration)->Result<(),String>{
+        self.0.confirm_stopped_scope(root,store,task,remaining).await
+    }
+    async fn verify_stopped(&self, root: &Path, task: &Document, remaining: std::time::Duration)
+        -> Result<Option<crate::pause::StopOutput>, String> {
+        self.0.verify_stopped(root, task, remaining).await
+    }
+}
+
 pub async fn delete_with_expected_host(
     root: &Path, store: &dyn TaskStore, runtime: &dyn OperationsRuntime,
     name: &str, expected_task_id: Option<&str>, expected_remote: Option<bool>,
@@ -544,7 +566,7 @@ pub async fn delete_with_expected_host(
         Ok(lock) => lock,
         Err(error) => return failure("delete", name, error),
     };
-    let original = match task(store, name, true).await {
+    let mut original = match task(store, name, true).await {
         Ok(Some(task)) => task,
         Ok(None) if expected_task_id.is_none() => {
             return outcome("delete", name, true, json!({"alreadyDeleted": true}))
@@ -568,6 +590,34 @@ pub async fn delete_with_expected_host(
     };
     if expected_remote.is_some_and(|expected| expected != host.is_remote()) {
         return failure("delete", name, "original execution host changed before locked cleanup");
+    }
+    if original.get_str("status").ok() != Some("deactive")
+        && !policy::stop_confirmation_valid(&original, host.is_remote())
+        && !matches!(original.get_str("status").ok(), Some("generating"|"generation_unknown"|"syncing"|"deleting")) {
+        let stopped = crate::pause::pause_locked(root, store, &ArchiveStopVerifier(runtime), name,
+            crate::pause::PauseOptions { expected_task_id, expected_remote: Some(host.is_remote()),
+                expected_launch_attempt_id: original.get_str("launchAttemptId").ok(), observer: None, ..Default::default() },
+            &_lock, tokio::time::Instant::now() + std::time::Duration::from_secs(12),
+            crate::pause::StopIntent::VerifyOnly).await;
+        if stopped.exit_code != 0 {
+            return outcome("delete", name, false, json!({"errorType":"RuntimeError",
+                "error":"current valid stop confirmation unavailable after original verify-only",
+                "stopReconciliation":stopped.value,"requiredAction":"inspect_original_stop_result"}));
+        }
+        let prior=original.clone();
+        original = match task(store, name, false).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return failure("delete", name, "task disappeared after stop verification"),
+            Err(error) => return failure("delete", name, error),
+        };
+        if ["_id","launchAttemptId","startupBinding","isRemote","taskType","auth_profile","generation","acceptedObservation","runId","startConfig","mission_config","config","templatefile"].iter()
+            .any(|key|original.get(*key)!=prior.get(*key))
+            || original.get_str("updatedAt").ok()!=stopped.value["controlRevision"].as_str()
+            || original.get_str("status").ok()!=Some("paused") {
+            return failure("delete",name,"original stop snapshot replaced before archive; successor not adopted");
+        }
+        if let Err(error) = validate_task(&original, name, expected_task_id) { return failure("delete", name, error); }
+        if task_host(&original).ok() != Some(host) { return failure("delete", name, "host changed after stop verification"); }
     }
     let path = receipt_path(root, name);
     let mut receipt = match new_receipt(name, &original, host.is_remote()) {
@@ -634,6 +684,10 @@ async fn delete_inner(
         return Err(
             "pause/reconcile generation or running/unconfirmed consumer before delete".into(),
         );
+    }
+    if crate::start::launch_attempt_unsettled(original) {
+        receipt["requiredAction"]=json!("reconcile_original_launcher");
+        return Err("original launcher remains unresolved after pause; preserve active items and attempt".into());
     }
     if !policy::stop_confirmation_valid(original, host.is_remote()) {
         receipt["requiredAction"] = json!("pause");

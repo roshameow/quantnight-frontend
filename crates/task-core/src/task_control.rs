@@ -83,6 +83,14 @@ impl TaskControl {
     }
     pub async fn pause(&self, name: &str, options: crate::pause::PauseOptions<'_>,
         budget: crate::pause::StopBudget, observer: Option<BashScriptObserver>) -> crate::pause::PauseOutcome {
+        let allowance=options.remaining.unwrap_or(budget.duration()).min(budget.duration());
+        let deadline=tokio::time::Instant::now()+allowance;
+        if allowance.is_zero() {
+            let mut failed=rejected("pause",name,"original caller pause deadline exhausted before binding".into());
+            failed.value["reason"]=json!("pause_unconfirmed");
+            return crate::pause::PauseOutcome{value:failed.value,exit_code:1,confirmed_stop:None};
+        }
+        match tokio::time::timeout_at(deadline,async {
         if let Err(error) = self.binding.refresh_if_changed().await {
             let mut failed = rejected("pause", name, error);
             failed.value["reason"] = json!("pause_unconfirmed");
@@ -91,7 +99,13 @@ impl TaskControl {
         }
         let runtime = crate::operations_runtime::OriginalPauseRuntime {
             common: OriginalOperationsRuntime { binding: &self.binding, observer }, budget };
-        crate::pause::pause(self.root(), self.store.as_ref(), &runtime, name, options).await
+        crate::pause::pause_with_deadline(self.root(), self.store.as_ref(), &runtime, name, options, deadline).await
+        }).await {
+            Ok(out)=>out,
+            Err(_)=>{let mut failed=rejected("pause",name,"original pause total deadline exhausted; stop not repeated".into());
+                failed.value["reason"]=json!("pause_unconfirmed");failed.value["stopConfirmation"]=json!("unknown");
+                crate::pause::PauseOutcome{value:failed.value,exit_code:1,confirmed_stop:None}}
+        }
     }
     pub async fn create(&self, request: &crate::create_generate::CreateRequest,
         observer: Option<BashScriptObserver>) -> TaskOutcome {
@@ -155,9 +169,12 @@ impl TaskControl {
     }
     pub async fn start(&self, request: &crate::start::StartRequest,
         observer: Option<BashScriptObserver>) -> TaskOutcome {
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(300);
+        match tokio::time::timeout_at(deadline,async {
         if let Err(error) = self.binding.refresh_if_changed().await { return rejected("start", &request.name, error); }
         let runtime = OriginalOperationsRuntime { binding: &self.binding, observer };
-        crate::start::start(self.root(), self.store.as_ref(), &runtime, request).await
+        crate::start::start_with_deadline(self.root(), self.store.as_ref(), &runtime, request, deadline).await
+        }).await {Ok(out)=>out,Err(_)=>rejected("start",&request.name,"original start total deadline exhausted; no additional launch".into())}
     }
     pub async fn resume(&self, request: &crate::resume::ResumeRequest,
         observer: Option<BashScriptObserver>) -> TaskOutcome {

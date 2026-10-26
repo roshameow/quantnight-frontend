@@ -45,6 +45,119 @@ impl OriginalOperationsRuntime<'_> {
                 "configurationBinding":self.binding.request()}), Duration::from_secs(30)).await?;
         crate::start::config_document(result)
     }
+    async fn execution_owner(&self, root: &Path, store: &dyn crate::task_store::TaskStore,
+        task: &Document, remote: bool, requested: Option<&Document>, allowance: Duration) -> Result<Value, String> {
+        let deadline = tokio::time::Instant::now() + allowance.min(Duration::from_secs(12));
+        tokio::time::timeout_at(deadline,async {
+        self.verify_root(root).await?;
+        let name = task.get_str("name").map_err(|_| "missing task name")?;
+        let profile = task.get_str("auth_profile").unwrap_or("");
+        let id = task.get_object_id("_id").map_err(|_| "missing original task ID")?;
+        let side = Host::from_remote(remote);
+        let registry = {
+            let row = store.find_task(side, bson::doc! {"name":name,"status":{"$ne":"deactive"}}, true).await?;
+            if row.as_ref().is_some_and(|r| r.get("_id") != task.get("_id") || (r.contains_key("auth_profile") && task.contains_key("auth_profile") && r.get("auth_profile") != task.get("auth_profile"))
+                || r.get("isRemote").is_some_and(|value| match value { Bson::Null => remote, Bson::Boolean(value) => *value != remote, _ => true })
+                || (r.contains_key("taskType") && r.get("taskType") != task.get("taskType"))
+                || (r.contains_key("launchAttemptId") && r.get("launchAttemptId") != task.get("launchAttemptId"))) { return Err("execution registry belongs to another task/profile/host/launch".into()); }
+            row
+        };
+        if registry.as_ref().is_some_and(|r|r.get("simulatorRuntime").is_some_and(|v| !matches!(v,Bson::Null|Bson::Document(_)))) {
+            return Err("original runtime registry evidence malformed; not missing legacy metadata".into());
+        }
+        let mut evidence = registry.as_ref().and_then(|r| r.get_document("simulatorRuntime").ok()).cloned().unwrap_or_default();
+        evidence=evidence.iter().filter(|(key,_)| ["pid","pidCreatedAt","heartbeatAt","consumer_run_id","configDigestVersion","effectiveConfigDigest","launchAttemptId","startupRecovery"].contains(&key.as_str())).map(|(key,value)|(key.clone(),value.clone())).collect();
+        if !evidence.is_empty() { evidence.insert("registryTaskId", id.to_hex()); }
+        if task.get_str("taskType").ok() == Some("regular") && !profile.is_empty() {
+            if let Some(capability) = store.consumer_runtime(side, name, profile).await? { evidence = capability; }
+        }
+        // Do not lose independently known runs when capability replaces registry
+        // evidence. The original checker must compare every available source.
+        let mut known_runs=Vec::new();
+        for row in [Some(task),registry.as_ref()].into_iter().flatten() {
+            for key in ["startupBinding","simulatorRuntime"] {
+                if let Ok(value)=row.get_document(key) {
+                    if let Some(run)=value.get("consumer_run_id") {known_runs.push(run.clone().into_relaxed_extjson());}
+                }
+            }
+            if let Some(run)=row.get("consumer_run_id") {known_runs.push(run.clone().into_relaxed_extjson());}
+        }
+        let binding = json!({"knownConsumerRuns":known_runs,"taskId":id.to_hex(),"remote":remote,"taskType":task.get_str("taskType").unwrap_or("regular"),
+            "auth_profile":profile,"launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "consumer_run_id":task.get_document("startupBinding").ok().and_then(|b| b.get_str("consumer_run_id").ok())
+                .or_else(||task.get_document("simulatorRuntime").ok().and_then(|b|b.get_str("consumer_run_id").ok()))
+                .or_else(||task.get_str("consumer_run_id").ok()),
+            "tmuxContext":task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "runtimeEvidence":Bson::Document(evidence).into_relaxed_extjson(),
+            "knownProcesses":task.get_document("observedExecutionBeforeStop").ok().and_then(|v|v.get_array("processes").ok())
+                .map(|v|Bson::Array(v.clone()).into_relaxed_extjson()),
+            "requestedConfig":requested.map(|c| crate::start::strict_json(&Bson::Document(c.clone()))).transpose()?});
+        let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {return Err("original execution observation deadline exhausted".into());}
+        let mut command=self.process("/bin/bash");
+        command.arg("scripts/check_tmux_python.sh").arg(name).arg(if remote {"true"} else {"false"})
+            .args(["--inspect-execution","--binding"]).arg(binding.to_string());
+        let (out,_)=run_process_observed(command,remaining,true,self.observer.clone()).await?;
+        let markers:Vec<_>=out.lines().filter_map(|line| line.strip_prefix("QUANTNIGHT_EXECUTION_OBSERVED ")).collect();
+        if markers.len()!=1 {return Err("original execution owner returned no unique structured observation".into());}
+        let observed:Value=serde_json::from_str(markers[0]).map_err(|_| "invalid original execution observation")?;
+        if observed["schemaVersion"]!=1 || observed["taskName"]!=name || observed["remote"]!=remote
+            || observed["identityVerified"].as_bool().is_none() || observed["consumerRunning"].as_bool().is_none()
+            || !matches!(observed["state"].as_str(),Some("live"|"owned_residue"|"session_absent"|"unverified")) {
+            return Err("original execution observation identity/schema mismatch".into());
+        }
+        let coherent=match observed["state"].as_str(){
+            Some("session_absent")=>observed["consumerRunning"]==false&&observed["identityVerified"]==false&&observed["ownedResidue"]==false&&observed.get("tmuxContext").map_or(true,Value::is_null),
+            Some("live")=>observed["consumerRunning"]==true&&observed["identityVerified"]==true&&observed["ownedResidue"]==false
+                &&observed["pid"].as_i64().is_some_and(|p|p>1)&&observed["pidCreatedAt"].as_f64().is_some_and(|v|v.is_finite()&&v>0.0),
+            Some("owned_residue")=>observed["consumerRunning"]==false&&observed["identityVerified"]==true&&observed["ownedResidue"]==true,
+            Some("unverified")=>observed["identityVerified"]==false&&observed["ownedResidue"]==false,
+            _=>false,
+        };
+        if !coherent{return Err("original execution observation contains contradictory facts".into());}
+        if observed["identityVerified"]==true && (observed["taskId"]!=id.to_hex()
+            || observed["launchAttemptId"]!=binding["launchAttemptId"]) {
+            return Err("independent execution identity disagrees with captured control".into());
+        }
+        Ok(observed)
+        }).await.map_err(|_|"original execution observation deadline exhausted".to_string())?
+    }
+    async fn pause_owner(&self, root: &Path, task: &Document, mode: Option<&str>,
+        allowance: Duration) -> Result<crate::pause::StopOutput, String> {
+        let deadline = tokio::time::Instant::now() + allowance;
+        self.verify_root(root).await?;
+        let name = task.get_str("name").map_err(|_| "missing exact task name")?;
+        validate_name(name)?;
+        let id = task.get_object_id("_id").map_err(|_| "missing original task ObjectId")?;
+        let remote = match task.get("isRemote") {
+            None | Some(Bson::Null | Bson::Boolean(false)) => false,
+            Some(Bson::Boolean(true)) => true, _ => return Err("invalid original task execution host".into()),
+        };
+        let binding = json!({"taskId":id.to_hex(), "remote":remote,
+            "launchAttemptId":task.get("launchAttemptId").filter(|v| **v!=Bson::Null).cloned()
+                .or_else(||task.get_document("tmuxContext").ok().and_then(|c|c.get("launchAttemptId")).cloned()).unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "tmuxContext":task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "executionObservation":task.get("observedExecutionBeforeStop").cloned().unwrap_or(Bson::Null).into_relaxed_extjson()});
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() { return Err("original stop allowance exhausted before process invocation".into()); }
+        let mut command = self.process("/bin/bash");
+        command.arg("scripts/pause_task.sh").arg(name).arg(if remote {"--remote"} else {"false"})
+            .env("QUANTNIGHT_TMUX_BINDING", binding.to_string())
+            .env("QUANTNIGHT_STOP_REMAINING_SECONDS", remaining.as_secs_f64().to_string())
+            .env("QUANTNIGHT_STOP_DEADLINE_EPOCH", (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map_err(|_|"invalid caller clock")?.as_secs_f64()
+                + remaining.as_secs_f64()).to_string());
+        if let Some(mode) = mode { command.arg(mode); }
+        let (stdout, stderr) = run_process_observed(command, remaining, false, self.observer.clone()).await?;
+        Ok(crate::pause::StopOutput { stdout, stderr })
+    }
+    async fn verify_stop_owner(&self, root: &Path, task: &Document, allowance: Duration)
+        -> Result<Option<crate::pause::StopOutput>, String> {
+        let out = self.pause_owner(root, task, Some("--verify-stopped"), allowance.min(Duration::from_secs(12))).await?;
+        let name = task.get_str("name").map_err(|_| "missing task name")?;
+        let remote = task.get_bool("isRemote").unwrap_or(false);
+        if crate::pause::verified_stop_observation(&out.stdout, name, remote)? { Ok(Some(out)) } else { Ok(None) }
+    }
     fn process(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command.current_dir(self.binding.root()).env("PYTHONPATH", self.binding.root())
@@ -86,6 +199,15 @@ impl OperationsRuntime for OriginalOperationsRuntime<'_> {
         require_exact_absence(&out, name, host.is_remote())
     }
 
+    async fn verify_stopped(&self, root: &Path, task: &Document, remaining: Duration)
+        -> Result<Option<crate::pause::StopOutput>, String> {
+        self.verify_stop_owner(root, task, remaining).await
+    }
+    async fn confirm_stopped_scope(&self,root:&Path,store:&dyn crate::task_store::TaskStore,task:&Document,remaining:Duration)->Result<(),String>{
+        let observed=self.execution_owner(root,store,task,task.get_bool("isRemote").unwrap_or(false),None,remaining).await?;
+        if observed["state"]!="session_absent"{return Err("original execution still live/unconfirmed after session-only stop proof".into());}
+        Ok(())
+    }
     async fn archive_research(&self, root: &Path, task: &Document, host: Host,
         evidence_collection: &str) -> Result<Value, String> {
         self.verify_root(root).await?;
@@ -126,6 +248,16 @@ fn start_task_metadata(task: &Document) -> Value {
 
 #[async_trait]
 impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
+    async fn inspect_execution(&self, root: &Path, store: &dyn crate::task_store::TaskStore, task: &Document,
+        remote: bool, requested: Option<&Document>, remaining: Duration) -> Result<Option<Value>, String> {
+        self.execution_owner(root, store, task, remote, requested, remaining).await.map(Some)
+    }
+    async fn verify_stopped(&self, root: &Path, task: &Document, remaining: Duration)
+        -> Result<Option<crate::pause::StopOutput>, String> { self.verify_stop_owner(root,task,remaining).await }
+    async fn stop_owned_residue(&self, root:&Path, task:&Document, remaining:Duration)
+        -> Result<crate::pause::StopOutput,String> {
+        self.pause_owner(root,task,Some("--stop-owned-residue"),remaining.min(Duration::from_secs(60))).await
+    }
     async fn priority_config(&self, root: &Path, task: &Document, selected: Option<Document>) -> Result<Document, String> {
         let selected = selected.map(|value| crate::start::strict_json(&Bson::Document(value))).transpose()?;
         let result = self.owner_result(root, "scripts.priority_task_config", "--native-config-preflight",
@@ -198,14 +330,16 @@ impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
         Ok(())
     }
     async fn launch(&self, root: &Path, specification: &crate::start::StartCommand) -> Result<crate::start::LaunchOutput, String> {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(specification.timeout_seconds.min(120));
         self.verify_root(root).await?;
-        if specification.timeout_seconds != 120 || specification.argv.first().map(String::as_str) != Some("bash")
+        if specification.timeout_seconds == 0 || specification.timeout_seconds > 120 || specification.argv.first().map(String::as_str) != Some("bash")
             || !matches!(specification.argv.get(1).map(String::as_str), Some("scripts/start_task.sh" | "scripts/start_super_task.sh" | "scripts/start_priority_task.sh")) {
             return Err("start must use one of the original launchers and its 120s budget".into());
         }
         let mut command = self.process("/bin/bash");
         command.args(&specification.argv[1..]).env("QUANTNIGHT_TMUX_BINDING", Bson::Document(specification.binding.clone()).into_relaxed_extjson().to_string());
-        let (stdout, stderr) = run_process_observed(command, Duration::from_secs(120), false, self.observer.clone()).await?;
+        let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
+        let (stdout, stderr) = run_process_observed(command, remaining, false, self.observer.clone()).await?;
         // This only extracts the original inspector's structured output; the
         // original execution_binding owner validates it in the coordinator.
         let observed_contexts = stdout.lines().filter_map(|line| line.strip_prefix("QUANTNIGHT_TMUX_CONTEXT "))
@@ -220,6 +354,8 @@ impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
 
 #[async_trait]
 impl crate::inspection::InspectionRuntime for OriginalOperationsRuntime<'_> {
+    async fn inspect_execution(&self, root: &Path, store: &dyn crate::task_store::TaskStore, task: &Document, host: Host)
+        -> Result<Option<Value>, String> { self.execution_owner(root,store,task,host.is_remote(),None,Duration::from_secs(12)).await.map(Some) }
     async fn canonical_namespace(&self, root: &Path, profile: &str) -> Result<crate::task_store::CanonicalNamespace, String> {
         let result = self.owner_result(root, "backend.mongodb.mongo_config", "--resolve-task-result-namespace",
             "resolve-task-result-namespace", json!({"authProfile":profile,"configurationBinding":self.binding.request()}),
@@ -332,28 +468,28 @@ pub struct OriginalPauseRuntime<'a> {
 #[async_trait]
 impl crate::pause::PauseRuntime for OriginalPauseRuntime<'_> {
     fn script_budget(&self) -> crate::pause::StopBudget { self.budget }
-    async fn stop(&self, root: &Path, task: &Document, verify_never_started: bool)
+    async fn stop(&self, root: &Path, task: &Document, never: bool) -> Result<crate::pause::StopOutput, String> {
+        self.stop_bounded(root, task, never, self.budget.duration()).await
+    }
+    async fn stop_bounded(&self, root: &Path, task: &Document, never: bool, remaining: Duration)
         -> Result<crate::pause::StopOutput, String> {
-        self.common.verify_root(root).await?;
-        let name = task.get_str("name").map_err(|_| "missing exact task name")?;
-        validate_name(name)?;
-        let id = task.get_object_id("_id").map_err(|_| "missing original task ObjectId")?;
-        let remote = match task.get("isRemote") {
-            None | Some(Bson::Null | Bson::Boolean(false)) => false,
-            Some(Bson::Boolean(true)) => true,
-            _ => return Err("invalid original task execution host".into()),
-        };
-        let binding = json!({"taskId":id.to_hex(), "remote":remote,
-            "launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "tmuxContext":task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson()});
-        let mut command = self.common.process("/bin/bash");
-        command.arg("scripts/pause_task.sh").arg(name)
-            .arg(if remote { "--remote" } else { "false" })
-            .env("QUANTNIGHT_TMUX_BINDING", binding.to_string());
-        if verify_never_started { command.arg("--verify-never-started"); }
-        let (stdout, stderr) = run_process_observed(command, self.budget.duration(), false,
-            self.common.observer.clone()).await?;
-        Ok(crate::pause::StopOutput { stdout, stderr })
+        self.common.pause_owner(root, task, if never {Some("--verify-never-started")}
+            else if task.get_document("observedExecutionBeforeStop").ok().and_then(|v|v.get_str("state").ok())==Some("owned_residue"){Some("--stop-owned-residue")} else {None},
+            remaining.min(self.budget.duration())).await
+    }
+    async fn inspect_before_stop(&self,root:&Path,store:&dyn crate::task_store::TaskStore,task:&Document,remaining:Duration)
+        ->Result<Option<Value>,String>{
+        let observed=self.common.execution_owner(root,store,task,task.get_bool("isRemote").unwrap_or(false),None,remaining).await?;
+        if observed["state"]=="session_absent" || observed["explicitPauseVerified"]==true || (observed["identityVerified"]==true
+            && matches!(observed["state"].as_str(),Some("live"|"owned_residue"))){Ok(Some(observed))}
+        else{Err("original execution identity unconfirmed; refusing a stop signal to a possibly foreign consumer".into())}
+    }
+    async fn confirm_stopped_scope(&self,root:&Path,store:&dyn crate::task_store::TaskStore,task:&Document,remaining:Duration)->Result<(),String>{
+        OperationsRuntime::confirm_stopped_scope(&self.common,root,store,task,remaining).await
+    }
+    async fn verify_stopped(&self, root: &Path, task: &Document, remaining: Duration)
+        -> Result<Option<crate::pause::StopOutput>, String> {
+        self.common.verify_stop_owner(root, task, remaining).await
     }
 }
 

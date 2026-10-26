@@ -50,8 +50,8 @@ function assertPreserved(html) {
   assert.match(text, /user1/);
 }
 
-test('real regular SFC SSR: initial running control is pending; fresh positive, bash-only and unknown are distinct', async () => {
-  for (const [runtime, label] of [[null, '尚未执行运行检查'], [observation(), '消费者存活（缺少有效派发快照）'],
+test('real regular SFC SSR: initial business running needs no PID observation; fresh positive, bash-only and unknown are distinct', async () => {
+  for (const [runtime, label] of [[null, 'running'], [observation(), '消费者存活（缺少有效派发快照）'],
     [observation({ state: 'not_running', raw: '❌ Pane 0 (pid=21733) is running: bash' }), '未检测到运行消费者'],
     [observation({ state: 'unknown' }), '运行检查输出校验失败'], [observation({ state: 'checking' }), '运行检查进行中'],
     [observation({ state: 'paused' }), '运行检查输出校验失败']]) {
@@ -62,7 +62,7 @@ test('real regular SFC SSR: initial running control is pending; fresh positive, 
     assertPreserved(html);
     assert.equal(JSON.stringify(input), before);
     if (label !== '消费者存活（缺少有效派发快照）') assert.doesNotMatch(plain(html), /glb_spread 消费者存活（缺少有效派发快照）/);
-    assert.doesNotMatch(plain(html), /glb_spread running/);
+    if (runtime) assert.doesNotMatch(plain(html), /glb_spread running/);
     assert.doesNotMatch(plain(html), /paused|任务完成|启动成功/);
   }
 });
@@ -140,7 +140,7 @@ test('mounted real card updates evidence/status without losing counters/config a
   const props = reactive({ task: task(), progress: { ...progress }, taskRuntimeStatus: null, stopOperation: null });
   const mounted = memoryMount(props);
   try {
-    assert.match(mounted.text(), /glb_spread 尚未执行运行检查/);
+    assert.match(mounted.text(), /glb_spread running/);
     for (const [runtime, label] of [[observation(), '消费者存活（缺少有效派发快照）'],
       [observation({ state: 'not_running' }), '未检测到运行消费者'],
       [observation({ state: 'unknown' }), '运行检查输出校验失败'], [observation(), '消费者存活（缺少有效派发快照）']]) {
@@ -182,7 +182,7 @@ test('actual TaskManager SFC SSR wires regular stop operation and pending runtim
     .replace(/import (\w+) from "[^"\n]+\.vue";/g, 'const $1 = { render: () => null };');
   const module = await import(`data:text/javascript;base64,${Buffer.from(manager).toString('base64')}`);
   const renderManager = () => renderToString(configure(createSSRApp(module.default)));
-  assert.match(plain(await renderManager()), /glb_spread 尚未执行运行检查/);
+  assert.match(plain(await renderManager()), /glb_spread running/);
   const operation = store.beginTaskStop(task());
   assert.match(plain(await renderManager()), /glb_spread 停止执行中/);
   store.markTaskStopUnconfirmed(task(), operation, 'native timeout');
@@ -211,7 +211,7 @@ test('mounted positive badge expires without any new props or native polling and
 test('actual Regular/Super SFC body shows full stage and failure reasons, not merely tooltip/toast or renamed unknown', async () => {
   for (const taskType of ['regular', 'super']) {
     for (const [runtime, label, cause] of [
-      [null, '尚未执行运行检查', '等待首次消费者检查'],
+      [null, 'running', '运行诊断（只读，可选）'],
       [observation({ state: 'checking', stage: 'ssh', detail: 'SSH 正在握手' }), '运行检查进行中', 'SSH 正在握手'],
       [observation({ state: 'unknown', stage: 'process', detail: '枚举后代进程', error: '[process] /proc/341/status Permission denied；退出码=13' }), '运行检查执行失败', '/proc/341/status Permission denied；退出码=13'],
       [observation({ state: 'unknown', stage: 'tmux', detail: '正在枚举精确会话', error: '15 秒检查超时：tmux 未返回；保留原回执' }), '运行检查超时', '15 秒检查超时：tmux 未返回；保留原回执'],
@@ -320,7 +320,7 @@ test('copy regression: local/remote checks preserve facts, raw failures, existin
       [snapshot({}), '消费者存活（缺少有效派发快照）', '已识别 Python/uv 消费者进程。', 'warning'],
       [snapshot({ state: 'session_absent' }), '已暂停（tmux会话缺失）', '已核验目标主机的精确 tmux 会话缺失。', 'warning'],
       [snapshot({ state: 'unknown', raw: '' }), '运行检查输出校验失败', '检查输出缺少可校验的 Python/uv 或 shell/sleep 进程行。', 'error'],
-      [snapshot({ authProfile: 'other' }), '运行检查身份校验失败', '身份校验失败：检查结果的任务 ID、名称、执行主机或账号与当前任务存在差异', 'error'],
+      [snapshot({ authProfile: 'other' }), '运行检查身份校验失败', '身份校验失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异', 'error'],
     ]) {
       const input = { task: current, taskRuntimeStatus: runtime, progress };
       const before = JSON.stringify(input);
@@ -337,5 +337,52 @@ test('copy regression: local/remote checks preserve facts, raw failures, existin
     assert.match(html, /class="runtime-badge" type="error"/);
     assert.match(plain(html), /glb_spread 运行检查执行失败/);
     assertPreserved(html);
+  }
+});
+
+test('actual Regular card (including SUPER reuse) guards only view-owned pending work; PID snapshots do not disable normal start', async () => {
+  async function buttons(props) {
+    const app = configure(createSSRApp({ render: () => h(card.default, props) }));
+    app.component('n-button', { props: ['disabled'], setup: (props, { slots }) => () =>
+      h('button', { disabled: props.disabled }, [slots.icon?.(), slots.default?.()]) });
+    const html = await renderToString(app);
+    const rows = [...html.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g)];
+    return { html, byLabel: label => rows.find(row => plain(row[2]).endsWith(label)) };
+  }
+  for (const taskType of ['regular', 'super']) {
+    for (const [status, runtime, busy, blocked] of [
+      ['running', null, false, false], ['launch_unknown', null, false, false],
+      ['paused', null, false, false], // historical proof is left to the original core operation
+      ['completed', observation(), false, false], ['completed_with_errors', observation(), false, false],
+      ['completed', observation({ state: 'unknown' }), false, false],
+      ['ready', observation({ state: 'session_absent' }), false, false],
+      ['ready', observation({ state: 'session_absent' }), true, true],
+    ]) {
+      const result = await buttons({ task: task({ status, taskType }), taskRuntimeStatus: runtime, operationBusy: busy });
+      assert.equal(result.byLabel('启动')[1].includes('disabled'), blocked, `${taskType}:${status}:${runtime?.state}`);
+      assert.ok(!result.byLabel('查看')[1].includes('disabled'));
+      assert.ok(!result.byLabel('暂停')[1].includes('disabled'), 'original explicit pause remains available');
+      assert.ok(result.byLabel('运行诊断（只读，可选）'));
+      if (status.startsWith('completed') && runtime?.state === 'running') {
+        assert.match(plain(result.html), /控制记录已完成，但原消费者仍存活/);
+        assert.match(plain(result.html), /继续查看原任务/);
+      }
+    }
+  }
+});
+
+test('v4 R3 real Regular/SUPER card keeps view but disables remote-only mutators, not local-controlled remote execution', async () => {
+  for (const controlSource of ['remote_only', 'local', undefined]) {
+    const app = configure(createSSRApp({ render: () => h(card.default, { task: task({ status: 'ready', isRemote: true, controlSource }) }) }));
+    app.component('n-button', { props: ['disabled'], setup: (props, { slots }) => () => h('button', { disabled: props.disabled }, [slots.icon?.(), slots.default?.()]) });
+    const html = await renderToString(app);
+    const buttons = [...html.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g)];
+    const byLabel = label => buttons.find(row => plain(row[2]).endsWith(label));
+    assert.equal(byLabel('查看')[1].includes('disabled'), false);
+    for (const label of ['生成list', '发送到远程', '启动', '暂停', '删除']) {
+      assert.equal(byLabel(label)[1].includes('disabled'), controlSource === 'remote_only', label);
+    }
+    if (controlSource === 'remote_only') assert.match(plain(html), /仅远端登记.*原 owner/);
+    if (controlSource === undefined) assert.match(plain(html), /登记来源未提供/);
   }
 });

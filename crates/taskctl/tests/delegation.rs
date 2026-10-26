@@ -48,6 +48,7 @@ fn expected() -> BTreeMap<String, String> {
         ("Pause", "{ let result = control.pause(&r.name, PauseOptions {
             expected_task_id: r.expected_task_id.as_deref(),
             expected_launch_attempt_id: r.expected_launch_attempt_id.as_deref(),
+                        expected_launch_absent: false, remaining: None,
             expected_remote: None, observer: None,
         }, StopBudget::Cli, None).await;
         TaskOutcome { value: result.value, exit_code: result.exit_code } }"),

@@ -60,7 +60,12 @@ test('one verified startup publishes shared AppConfig/pools/control before GUI r
 test('mutations require exact local ID, keep legacy DTO and preserve existing operation budgets', () => {
   assert.match(body('sync_remote_task'), /task_id: Option<String>/);
   assert.match(body('sync_remote_task'), /required_task_id\(task_id.as_deref\(\)\)/);
-  assert.match(body('pause_task'), /expected_task_id: Some\(id\), expected_remote: Some\(is_remote\)/);
+  const pauseOptions = commands.slice(commands.indexOf('fn gui_pause_options'), commands.indexOf('pub async fn pause_task'));
+  assert.match(pauseOptions, /expected_task_id: Some\(id\), expected_remote: Some\(remote\)/);
+  assert.match(pauseOptions, /expected_launch_attempt_id: exact, expected_launch_absent, remaining/);
+  assert.match(body('pause_task'), /gui_pause_options\(id, is_remote, expected_launch_attempt_id.as_deref\(\), expected_launch_absent/);
+  assert.match(body('pause_task'), /remaining_ms, started.elapsed\(\)/);
+  assert.match(body('pause_task'), /core.pause\(&task_name, options, StopBudget::Gui/);
   assert.match(body('pause_task'), /StopBudget::Gui/);
   assert.match(body('generate_list'), /timeout_seconds = 900/);
   assert.match(commands, /Duration::from_secs\(300\), core.start/);
@@ -73,7 +78,7 @@ test('mutations require exact local ID, keep legacy DTO and preserve existing op
 
 test('view/cache and runtime inspection retain read-only semantics, not state-reconciling core status', () => {
   assert.match(body('get_all_tasks'), /fetch_remote_tasks/);
-  assert.doesNotMatch(body('get_all_tasks'), /core.status|TaskControl|update_one/);
+  assert.doesNotMatch(body('get_all_tasks'), /core.status|\bTaskControl\b|update_one/);
   assert.match(body('check_task_status'), /execute_task_script/);
   assert.match(body('check_task_status'), /read_runtime_evidence/);
   assert.doesNotMatch(body('check_task_status'), /core.status|update_one|\.pause\(/);
@@ -106,4 +111,12 @@ test('sync and archive send captured host into shared lock, not merely a pre-rea
   assert.match(facade, /cleanup_sync::delete_with_expected_host/);
   assert.match(cleanup, /original execution host changed before locked sync/);
   assert.match(cleanup, /original execution host changed before locked cleanup/);
+});
+
+test('read-only dependency guard distinguishes source metadata enum from control facade', () => {
+  const forbidden = /core.status|\bTaskControl\b|update_one/;
+  assert.doesNotMatch('listed_task(document, TaskControlSource::Local)', forbidden);
+  for (const mutation of ['TaskControl::new()', 'core.status(request)', 'collection.update_one(query, update)']) {
+    assert.match(mutation, forbidden);
+  }
 });

@@ -358,6 +358,7 @@ async fn run_process_typed(
     observer: Option<BashScriptObserver>,
     private_output: bool,
 ) -> Result<(String, String), ProcessFailure> {
+    if budget.is_zero() {return Err(ProcessFailure::new(ProcessFailureKind::Timeout,"process budget exhausted before spawn".into()));}
     let observe = |event| { if !private_output { if let Some(callback) = &observer { callback(event); } } };
     observe(BashScriptEvent::Launch);
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())

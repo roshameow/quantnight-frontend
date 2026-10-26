@@ -55,5 +55,7 @@ ndarray = "0.15"
 disposable-admission-fixture = []
 
 [dev-dependencies]
+# Reuse the existing locked Tauri package; test=[] adds no production bootstrap.
+tauri = { version = "2", features = ["test"] }
 async-trait = "0.1"
 quantnight-task-core = { path = "../crates/task-core", features = ["test-support"] }

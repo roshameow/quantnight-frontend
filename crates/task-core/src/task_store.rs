@@ -63,6 +63,41 @@ pub fn receipt_projection() -> Document {
     .map(|key| (key.to_string(), Bson::Int32(1)))
     .collect()
 }
+/// Original receipt metadata plus task-result write evidence, never payload/PnL.
+pub fn execution_receipt_projection() -> Document {
+    let mut fields=receipt_projection();
+    fields.extend(doc! {"detailsFetchedAt":1,"resultMetrics":1,"postprocessError":1,"postprocessErrorClass":1});
+    fields
+}
+pub fn assess_execution_receipts(rows: &[Document]) -> Document {
+    let mut unresolved=0_i64;let mut receipt_unknown=0_i64;let mut malformed=0_i64;
+    let mut result_pending=0_i64;let mut result_errors=0_i64;let mut sample=Vec::<Bson>::new();
+    for row in rows {
+        let invalid=["status","acceptance","terminalStatus","errorClass"].iter().any(|k| !matches!(row.get(*k),None|Some(Bson::Null|Bson::String(_))));
+        let receipt=crate::lifecycle_policy::checked_unresolved_execution_row(row);
+        if invalid || receipt.is_err(){malformed+=1;}
+        if invalid || receipt.unwrap_or(true){receipt_unknown+=1;}
+        let state=row.get_str("status").unwrap_or("");
+        let unknown=["acceptance","terminalStatus"].iter().any(|key|row.get_str(*key).map(|s|s.eq_ignore_ascii_case("UNKNOWN")).unwrap_or(false));
+        let resolved=!invalid&&!unknown&&if state=="success"{
+            row.get_str("alphaId").map(|v|!v.is_empty()).unwrap_or(false)
+        }else{
+            ["permanent_error","timeout_error","cancelled","error"].contains(&state)
+                && matches!(row.get_str("terminalStatus").ok(),Some("COMPLETE"|"COMPLETED"|"WARNING"|"ERROR"|"FAIL"|"FAILED"|"CANCELLED"))
+        };
+        let recorded_error=row.get_str("postprocessError").map(|v|!v.is_empty()).unwrap_or(false)
+            ||row.get_str("postprocessErrorClass").map(|v|!v.is_empty()).unwrap_or(false);
+        let persisted=matches!(row.get("detailsFetchedAt"),Some(Bson::DateTime(_)))
+            ||row.get_str("detailsFetchedAt").map(|v|!v.is_empty()).unwrap_or(false);
+        let pending=state=="success"&&!(recorded_error||(persisted&&row.get_document("resultMetrics").map(|v|["sharpe","fitness","turnover","returns","drawdown","margin"].iter().all(|k|v.contains_key(*k))).unwrap_or(false)));
+        if recorded_error{result_errors+=1;} if pending{result_pending+=1;}
+        if !resolved || pending {unresolved+=1;if sample.len()<20{sample.push(row.get("_id").cloned().unwrap_or(Bson::Null));}}
+    }
+    doc! {"rowCount":rows.len() as i64,"unresolvedItemCount":unresolved,"receiptUnresolvedItemCount":receipt_unknown,
+        "assessmentUnknownCount":malformed,"resultPendingItemCount":result_pending,"resultErrorItemCount":result_errors,
+        "unresolvedItemSample":sample,"sampleLimit":20,"complete":true,"canonicalSync":"not_assessed",
+        "platformRequestsCancelled":false,"capacityReleased":false}
+}
 pub fn id_projection() -> Document {
     doc! {"_id": 1}
 }
@@ -198,6 +233,11 @@ pub trait TaskStore: Send + Sync {
     async fn consumer_capability_exists(&self, _host: Host, _name: &str) -> Result<bool, String> {
         Err("never-started consumer capability query unavailable".into())
     }
+    async fn execution_receipt_assessment(&self,_host:Host,_name:&str)->Result<Document,String>{
+        Err("original execution receipt assessment unavailable".into())
+    }
+    async fn consumer_runtime(&self, _host: Host, _name: &str, _profile: &str)
+        -> Result<Option<Document>, String> { Ok(None) }
     async fn find_task(
         &self,
         host: Host,
@@ -384,6 +424,23 @@ impl TaskStore for MongoTaskStore {
         let (filter, options) = consumer_capability_query(name);
         bounded("never-started consumer capability query", CONTROL_BUDGET,
             capabilities.find_one(filter, options)).await.map(|row| row.is_some())
+    }
+    async fn execution_receipt_assessment(&self,host:Host,name:&str)->Result<Document,String>{
+        let items=self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+        let options=FindOptions::builder().projection(execution_receipt_projection()).batch_size(100).max_time(QUERY_BUDGET).build();
+        let rows:Vec<Document>=bounded("original execution receipt metadata",QUERY_BUDGET,async{
+            items.find(doc!{},options).await?.try_collect().await
+        }).await?;
+        Ok(assess_execution_receipts(&rows))
+    }
+    async fn consumer_runtime(&self, host: Host, name: &str, profile: &str) -> Result<Option<Document>, String> {
+        let capabilities = self.client(host).await?.database(&self.mission)
+            .collection::<Document>("priority_consumer_capabilities");
+        let options = FindOneOptions::builder().max_time(CONTROL_BUDGET).projection(doc! {
+            "task":1,"auth_profile":1,"source_task_id":1,"source_remote":1,"consumer_run_id":1,
+            "pid":1,"pidCreatedAt":1,"heartbeatAt":1,"dist":1,"configDigestVersion":1,"effectiveConfigDigest":1}).build();
+        bounded("original consumer identity", CONTROL_BUDGET,
+            capabilities.find_one(doc! {"_id":format!("{profile}:{name}"),"task":name,"auth_profile":profile}, options)).await
     }
     async fn find_task(
         &self,

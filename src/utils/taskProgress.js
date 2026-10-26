@@ -63,8 +63,12 @@ export function createTaskProgressLifecycle({ listen, ready, fetch, poll, onProg
       if (disposed) return
       await fetch()
       if (disposed) return
-      poll()
-      interval = setIntervalFn(poll, 600000)
+      // Optional legacy consumer hook only. TaskManager deliberately supplies no
+      // process poll; task/progress subscriptions and refresh are independent.
+      if (typeof poll === 'function') {
+        poll()
+        interval = setIntervalFn(poll, 600000)
+      }
     } catch (error) {
       stop()
       throw error

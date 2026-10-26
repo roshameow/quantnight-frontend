@@ -56,6 +56,13 @@ pub struct LaunchOutput {
 }
 #[async_trait]
 pub trait StartRuntime: Send + Sync {
+    async fn inspect_execution(&self, _root:&Path, _store:&dyn crate::task_store::TaskStore,
+        _task:&Document, _remote:bool, _requested:Option<&Document>, _remaining:std::time::Duration)
+        -> Result<Option<serde_json::Value>,String> { Ok(None) }
+    async fn verify_stopped(&self,_root:&Path,_task:&Document,_remaining:std::time::Duration)
+        -> Result<Option<crate::pause::StopOutput>,String> {Ok(None)}
+    async fn stop_owned_residue(&self,_root:&Path,_task:&Document,_remaining:std::time::Duration)
+        -> Result<crate::pause::StopOutput,String> {Err("original owned-residue stop owner unavailable".into())}
     async fn priority_config(
         &self,
         root: &Path,
@@ -381,6 +388,7 @@ fn control_filter(task: &Document, command: &str) -> Result<Document, String> {
         "stopConfirmedTaskId",
         "stopConfirmationBasis",
         "launchAttemptAt",
+        "launchSettledAttemptId",
     ] {
         query.insert(
             key,
@@ -776,12 +784,58 @@ fn pristine_priority_target(task: &Document, remote: bool) -> Result<bool, Strin
     Ok(true)
 }
 
+async fn resolve_priority_start_config(root:&Path,runtime:&dyn StartRuntime,task:&Document,explicit:Option<&str>)->Result<Document,String>{
+    let selected=priority_config_input(task,explicit)?;
+    let validated=normalize_config(&runtime.priority_config(root,task,selected.clone()).await?)?;
+    if let Some(selected)=&selected{preserves(selected,&validated)?;}
+    if validated.get_str("auth_profile")!=Ok(profile(task)?){return Err("Priority validator returned conflicting auth profile".into());}
+    Ok(validated)
+}
+
+// Missing/null is explicit observed absence; malformed evidence is not legacy.
+fn observed_launch(task:&Document)->Result<Value,String> {
+    match task.get("launchAttemptId") {
+        None|Some(Bson::Null)=>Ok(Value::Null),
+        Some(Bson::String(value)) if !value.trim().is_empty()=>Ok(json!(value)),
+        _=>Err("original launch identity malformed".into()),
+    }
+}
+
+// Known pending launch state survives explicit pause; missing optional evidence
+// on other legacy tasks is NOT a global new admission requirement.
+pub(crate) fn launch_attempt_unsettled(task:&Document)->bool {
+    (task.get_str("status").ok()==Some("launch_unknown") || task.contains_key("launchSettledAttemptId")) &&
+        (task.get_str("launchAttemptId").map_or(true,|v|v.trim().is_empty()) || task.get("launchSettledAttemptId")!=task.get("launchAttemptId"))
+}
+
+struct OwnedResidueStop<'a>{runtime:&'a dyn StartRuntime,observation:&'a Value}
+#[async_trait]
+impl crate::pause::PauseRuntime for OwnedResidueStop<'_> {
+    async fn inspect_before_stop(&self,_:&Path,_:&dyn TaskStore,_:&Document,_:std::time::Duration)->Result<Option<Value>,String>{Ok(Some(self.observation.clone()))}
+    async fn confirm_stopped_scope(&self,root:&Path,store:&dyn TaskStore,task:&Document,remaining:std::time::Duration)->Result<(),String>{
+        let proof=self.runtime.inspect_execution(root,store,task,task.get_bool("isRemote").unwrap_or(false),None,remaining).await?;
+        if proof.as_ref().and_then(|p|p["state"].as_str())!=Some("session_absent"){return Err("original residue processes remain live/unconfirmed after stop".into());}
+        Ok(())
+    }
+    async fn stop(&self,_:&Path,_:&Document,_:bool)->Result<crate::pause::StopOutput,String>{Err("residue stop requires remaining original deadline".into())}
+    async fn stop_bounded(&self,root:&Path,task:&Document,_:bool,remaining:std::time::Duration)->Result<crate::pause::StopOutput,String>{
+        self.runtime.stop_owned_residue(root,task,remaining).await
+    }
+    async fn verify_stopped(&self,root:&Path,task:&Document,remaining:std::time::Duration)->Result<Option<crate::pause::StopOutput>,String>{
+        self.runtime.verify_stopped(root,task,remaining).await
+    }
+}
 pub async fn start(
     root: &Path,
     store: &dyn TaskStore,
     runtime: &dyn StartRuntime,
     request: &StartRequest,
 ) -> TaskOutcome {
+    start_with_deadline(root,store,runtime,request,tokio::time::Instant::now()+std::time::Duration::from_secs(300)).await
+}
+pub(crate) async fn start_with_deadline(root:&Path,store:&dyn TaskStore,runtime:&dyn StartRuntime,
+    request:&StartRequest,deadline:tokio::time::Instant)->TaskOutcome {
+    if deadline<=tokio::time::Instant::now(){return failure("start",&request.name,"original start deadline exhausted before mutation");}
     if let Err(e) = lifecycle_policy::validate_name(&request.name) {
         return failure("start", &request.name, e);
     }
@@ -789,9 +843,10 @@ pub async fn start(
         Ok(v) => v,
         Err(e) => return failure("start", &request.name, e),
     };
-    match start_locked(root, store, runtime, request).await {
-        Ok(result) => result,
-        Err(error) => failure("start", &request.name, error),
+    match tokio::time::timeout_at(deadline,start_locked(root, store, runtime, request, &_lock, deadline)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => failure("start", &request.name, error),
+        Err(_) => failure("start", &request.name, "original start total deadline exhausted; no retry or additional launch"),
     }
 }
 async fn start_locked(
@@ -799,25 +854,29 @@ async fn start_locked(
     store: &dyn TaskStore,
     runtime: &dyn StartRuntime,
     request: &StartRequest,
+    guard: &MissionLocks,
+    deadline: tokio::time::Instant,
 ) -> Result<TaskOutcome, String> {
-    let task = active(store, &request.name)
+    let mut task = active(store, &request.name)
         .await?
         .ok_or("task not found")?;
     identity(&task, request)?;
     if matches!(
         task.get_str("status").ok(),
-        Some("generating" | "generation_unknown" | "launch_unknown" | "syncing" | "deleting")
+        Some("generating" | "generation_unknown" | "syncing" | "deleting")
     ) {
         return Err(
             "generation/launch is in progress or unconfirmed; reconcile before start".into(),
         );
     }
-    let kind = kind(&task)?;
-    let profile = profile(&task)?;
+    observed_launch(&task)?;
+    let launch_unresolved = launch_attempt_unsettled(&task);
+    let original_kind = kind(&task)?.to_string();
+    profile(&task)?; // Existing business profile requirement; no login/config guess.
     let remote = match request.remote {
         Some(v) => v,
         None => {
-            boolean(&task, "isRemote")? || (kind == "priority" && boolean(&task, "targetRemote")?)
+            boolean(&task, "isRemote")? || (original_kind == "priority" && boolean(&task, "targetRemote")?)
         }
     };
     let actual_remote = boolean(&task, "isRemote")?;
@@ -825,29 +884,87 @@ async fn start_locked(
         return Err("original execution host changed before locked start".into());
     }
     if remote != actual_remote {
-        if kind != "priority" || !pristine_priority_target(&task, remote)? {
+        if original_kind != "priority" || !pristine_priority_target(&task, remote)? {
             return Err("start cannot migrate execution host or discard prior receipt ownership; use the original initial sync or resume on the recorded host".into());
         }
         // A creation-time producer destination is not permission to leave an
         // old same-name controller running on the other host.
         runtime.assert_consumer_absent(root, &task, actual_remote).await?;
     }
+    let requested = if request.config_json.is_some() {
+        if original_kind == "priority" { Some(resolve_priority_start_config(root,runtime,&task,request.config_json.as_deref()).await?) }
+        else { Some(saved_start_config(&task,request.config_json.as_deref())?) }
+    } else { None };
+    if let Some(config)=&requested {
+        for (key,expected) in [
+            ("mission_tag",Bson::String(request.name.clone())),
+            ("dist",Bson::String(if remote{"remote"}else{"local"}.into())),
+            ("auth_profile",Bson::String(profile(&task)?.into())),
+            ("source_task_id",Bson::String(task_id(&task)?.to_hex())),
+            ("source_remote",Bson::Boolean(remote)),
+        ] {
+            if config.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original source/task identity config conflicts: {key}"));}
+        }
+        if let Some(Bson::Document(binding))=config.get("startup_binding"){
+            for (key,expected) in [("taskId",Bson::String(task_id(&task)?.to_hex())),("remote",Bson::Boolean(remote)),("auth_profile",Bson::String(profile(&task)?.into()))]{
+                if binding.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original startup identity config conflicts: {key}"));}
+            }
+        }
+    }
+    let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero(){return Err("start deadline exhausted before original execution observation".into());}
+    let observation=runtime.inspect_execution(root,store,&task,remote,requested.as_ref(),remaining).await?;
+    if let Some(observed)=observation {
+        unchanged(store,&task).await?;
+        match observed.get("state").and_then(Value::as_str) {
+            Some("live") if observed["identityVerified"]==true && observed["consumerRunning"]==true => {
+                let comparison=if request.config_json.is_none(){"not_requested"}else{observed["configComparison"].as_str().unwrap_or("unverified")};
+                let satisfied=request.config_json.is_none()||comparison=="equal";
+                return Ok(outcome("start",&request.name,satisfied,json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
+                    "launchAttemptId":observed_launch(&task)?,"taskType":original_kind,"authProfile":profile(&task)?,"operationSettled":!launch_unresolved,"outcome":"already_running",
+                    "startedNew":false,"consumerRunning":true,"configApplied":false,"configComparison":comparison,
+                    "requestSatisfied":satisfied,"executionObservation":observed,"controlStatus":task.get_str("status").unwrap_or(""),
+                    "controlReconciled":false,"error":if satisfied {Value::Null}else{json!("original consumer remains running; requested config not applied")}})));
+            }
+            Some("owned_residue") if observed["identityVerified"]==true && observed["ownedResidue"]==true => {
+                if launch_unresolved {return Err("original launcher still unresolved; no automatic residue cleanup".into());}
+                let stopped=crate::pause::pause_locked(root,store,&OwnedResidueStop{runtime,observation:&observed},&request.name,
+                    crate::pause::PauseOptions{expected_task_id:Some(&task_id(&task)?.to_hex()),
+                        expected_launch_attempt_id:task.get_str("launchAttemptId").ok(),expected_remote:Some(remote),observer:None,..Default::default()},
+                    guard,deadline.min(tokio::time::Instant::now()+std::time::Duration::from_secs(60)),crate::pause::StopIntent::StopAllowed).await;
+                if stopped.exit_code!=0 {return Err(format!("owned residue stop unconfirmed: {}",stopped.value));}
+                let prior=task.clone();
+                task=active(store,&request.name).await?.ok_or("task disappeared after original residue stop")?;
+                if ["_id","launchAttemptId","startupBinding","isRemote","taskType","auth_profile","generation","acceptedObservation","runId","startConfig","mission_config","config","templatefile"].iter()
+                    .any(|key|task.get(*key)!=prior.get(*key))
+                    ||task.get_str("updatedAt").ok()!=stopped.value["controlRevision"].as_str()
+                    ||task.get_str("status").ok()!=Some("paused"){
+                    return Err("original residue stop snapshot replaced before launch; successor not adopted".into());
+                }
+                identity(&task,request)?;
+                let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
+                let verified=runtime.inspect_execution(root,store,&task,remote,None,remaining).await?;
+                if verified.as_ref().and_then(|v|v["state"].as_str())!=Some("session_absent"){
+                    return Err("owned residue cleanup did not leave verified original execution absence".into());
+                }
+            }
+            Some("session_absent") => {
+                if launch_unresolved {
+                    return Err("original launch attempt is unresolved; session absence does not prove launcher settlement".into());
+                }
+            },
+            _=>return Ok(outcome("start",&request.name,false,json!({"outcome":"refused","startedNew":false,"configApplied":false,
+                "requestSatisfied":false,"executionObservation":observed,"error":"original execution identity unresolved; existing read/stop remain available"}))),
+        }
+    } else if launch_unresolved {
+        return Err("generation/launch is in progress or unconfirmed; original execution observation required".into());
+    }
+    let kind=kind(&task)?;
+    let profile=profile(&task)?;
     let mut counts: Option<CollectionSummary> = None;
     let mut preflight = Document::new();
     let mut config = if kind == "priority" {
-        let selected = priority_config_input(&task, request.config_json.as_deref())?;
-        let validated = normalize_config(
-            &runtime
-                .priority_config(root, &task, selected.clone())
-                .await?,
-        )?;
-        if let Some(selected) = &selected {
-            preserves(selected, &validated)?;
-        }
-        if validated.get_str("auth_profile") != Ok(profile) {
-            return Err("Priority validator returned conflicting auth profile".into());
-        }
-        validated
+        match requested.clone(){Some(config)=>config,None=>resolve_priority_start_config(root,runtime,&task,None).await?}
     } else {
         let execution = store
             .summary(Host::from_remote(remote), &request.name)
@@ -914,7 +1031,8 @@ async fn start_locked(
     // Every read-only specialist may await external IO; recheck identity/config
     // before the one launch claim. No specialist owns a control-plane write.
     unchanged(store, &task).await?;
-    let mut launch = doc! {"status":"launch_unknown","launchAttemptId":nonce(),"launchAttemptAt":bson::DateTime::now(),"isRemote":remote,
+    if deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()==0 {return Err("start deadline exhausted before launch claim".into());}
+    let mut launch = doc! {"launchSettledAttemptId":Bson::Null,"status":"launch_unknown","launchAttemptId":nonce(),"launchAttemptAt":bson::DateTime::now(),"isRemote":remote,
     "stopConfirmedAt":Bson::Null,"stopConfirmedRemote":Bson::Null,"stopConfirmedTaskId":Bson::Null,"stopConfirmationBasis":Bson::Null,"tmuxContext":Bson::Null};
     if kind == "super" {
         let binding = doc! {"taskId":task_id(&task)?.to_hex(),"name":&request.name,"auth_profile":profile,"remote":remote,
@@ -925,6 +1043,10 @@ async fn start_locked(
     // Strict conversion happens before side effects; never serialize NaN to null.
     let config_json = strict_json(&Bson::Document(config.clone()))?.to_string();
     let claimed = update(store, &task, "start", launch, Document::new()).await?;
+    // This block contains no launcher invocation. A returned preparation error
+    // is independently known no-dispatch; cancellation of the whole future is
+    // not caught here and cannot manufacture settlement.
+    let prepared:Result<(Document,StartCommand),String> = async {
     let mut claimed = reread_claim(store, &claimed).await?;
     if kind == "super" {
         register_super_runtime(store, &claimed, remote).await?;
@@ -953,8 +1075,28 @@ async fn start_locked(
             },
             profile.into(),
         ],
-        timeout_seconds: 120,
+        timeout_seconds: deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs().min(120),
         binding,
+    };
+    if command.timeout_seconds==0 {return Err("start deadline exhausted before launcher; original attempt retained".into());}
+    Ok((claimed,command))
+    }.await;
+    let (mut claimed,command)=match prepared {
+        Ok(value)=>value,
+        Err(error)=>{
+            let settlement:Result<(),String> = async {
+                if deadline<=tokio::time::Instant::now(){return Err("original remaining budget exhausted".into());}
+                let current=reread_claim(store,&claimed).await?;
+                update(store,&current,"start-not-dispatched",
+                    doc!{"launchSettledAttemptId":current.get_str("launchAttemptId").map_err(|_|"missing original launch")?},
+                    doc!{"launcherInvoked":false,"basis":"not_dispatched"}).await?;
+                Ok(())
+            }.await;
+            return Err(match settlement {
+                Ok(())=>format!("{error}; original attempt settled without invoking launcher; this start failed and was not retried"),
+                Err(persist)=>format!("{error}; original no-dispatch settlement not confirmed: {persist}; retain original attempt"),
+            });
+        }
     };
     let output = runtime.launch(root, &command).await?;
     if output.observed_contexts.len() != 1 {
@@ -974,6 +1116,11 @@ async fn start_locked(
     runtime
         .validate_execution_binding(root, &observed_binding, remote)
         .await?;
+    // Only a successful return from the original synchronous launcher settles
+    // its launch action. Timeout/transport rejection never writes this fence.
+    // Persist against this exact attempt, before later validation/control ACKs.
+    claimed = update(store, &claimed, "start-settled",
+        doc! {"launchSettledAttemptId":claimed.get_str("launchAttemptId").map_err(|_|"missing claimed launch")?}, Document::new()).await?;
     let mut fields = doc! {"status":"running","isRemote":remote,"startedAt":now(),"startConfig":&config,"mission_config":&config,"tmuxContext":observed};
     if kind == "priority" {
         fields.insert("targetRemote", remote);
@@ -1019,13 +1166,15 @@ async fn start_locked(
                     &request.name,
                     false,
                     json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
-                    "consumerStarted":true,"notificationAttached":false,"error":error,"notificationMetadataError":metadata_error,
+                    "taskType":kind,"authProfile":profile,"launchAttemptId":observed_launch(&running)?,"operationSettled":true,
+                    "consumerStarted":true,"outcome":"started","startedNew":true,"consumerRunning":true,"configApplied":true,
+                    "configComparison":"not_requested","requestSatisfied":false,"notificationAttached":false,"error":error,"notificationMetadataError":metadata_error,
                     "nextAction":"use taskctl watch; do not restart or resimulate accepted work"}),
                 ));
             }
         }
     }
-    let mut fields = json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,"counts":counts.as_ref().map(summary_value),
+    let mut fields = json!({"taskType":kind,"authProfile":profile,"launchAttemptId":observed_launch(&running)?,"operationSettled":true,"outcome":"started","startedNew":true,"consumerRunning":true,"configApplied":true,"configComparison":"not_requested","requestSatisfied":true,"taskId":task_id(&task)?.to_hex(),"remote":remote,"counts":counts.as_ref().map(summary_value),
         "notification":notification.as_document().map(wire_document),"tmuxContext":wire_document(observed),
         "stdout":tail(&output.stdout,16000),"stderr":tail(&output.stderr,4000)});
     if !preflight.is_empty() {

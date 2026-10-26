@@ -69,6 +69,7 @@ struct State {
     fail_before: BTreeSet<String>,
     fail_after: BTreeSet<String>,
     mutate_before: BTreeMap<String, Document>,
+    mutate_after: BTreeMap<String, Document>,
     id_growth: bool,
     insert_ack_lost: bool,
 }
@@ -171,6 +172,10 @@ impl TaskStore for Store {
             return Ok(0);
         };
         rows[i] = apply(&rows[i], &update)?;
+        if let Some(change)=s.mutate_after.remove(&label){
+            let rows=if host==Host::Local{&mut s.local}else{&mut s.remote};
+            rows.last_mut().unwrap().extend(change);
+        }
         if s.fail_after.remove(&label) {
             return Err(format!("response lost after {label}"));
         }
@@ -415,7 +420,7 @@ impl StartRuntime for Runtime {
         ] {
             assert_eq!(task.get(key), Some(&Bson::Null));
         }
-        assert_eq!(command.timeout_seconds, 120);
+        assert!(command.timeout_seconds > 0 && command.timeout_seconds <= 120, "child launch must stay within120 and remaining original outer budget");
         assert_eq!(command.argv[0], "bash");
         self.live.store(true, Ordering::SeqCst);
         let remote = command.binding.get_bool("remote").unwrap();
@@ -1122,4 +1127,332 @@ async fn actual_shared_create_then_first_priority_remote_start_preserves_intent_
     for (key, value) in &config { assert_eq!(actual.get(key), Some(value)); }
     assert!(store.0.lock().unwrap().local_rows.is_empty());
     assert!(store.0.lock().unwrap().remote_rows.is_empty());
+}
+
+#[path = "support/original_professional_runtime.rs"]
+mod original_professional_runtime;
+
+#[tokio::test]
+async fn public_start_original_checker_recognizes_same_run_without_claim_launch_or_config_lie() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
+    use serde_json::json;
+    for remote in [false,true] {
+        for case in ["ensure","equal","different","unverified","legacy_inline","legacy_absent","caller_echo_only"] {
+            let fixture=original_professional_runtime::original_professional_fixture(false);
+            let root=Path::new(&fixture.config.env.working_dir);
+            std::fs::write(root.join("state"),"active").unwrap();
+            let (_old_root,store,_fake,mut req)=setup("super",remote);
+            req.name="fixture".into();req.notification.no_notify=true;
+            let id=store.task().get_object_id("_id").unwrap().to_hex();
+            let input=json!({"max_concurrent":1,"opaque":[1,2]});
+            let loaded=json!({"max_concurrent":1,"opaque":[1,2],"startup_binding":{
+                "taskId":id,"name":"fixture","remote":remote,"launchAttemptId":"old-launch","consumer_run_id":"same-run","auth_profile":"user1"}});
+            let config=if matches!(case,"unverified"|"legacy_absent"|"caller_echo_only"){"/mutable/old.json".into()}else{loaded.to_string()};
+            let argv=vec!["python".to_string(),"-m".into(),"scripts.super_alpha_simulate_param".into(),"--task".into(),"fixture".into(),
+                "--dist".into(),if remote{"remote".into()}else{"local".into()},"--auth_profile".into(),"user1".into(),"--config".into(),config];
+            std::fs::write(root.join("psutil.py"),format!(r#"STATUS_ZOMBIE='zombie'
+ARGV={argv}
+class NoSuchProcess(Exception): pass
+class Process:
+ def __init__(self,pid):
+  self.pid=pid
+  if pid not in (1001,1002): raise NoSuchProcess(pid)
+ def create_time(self): return 1700000010.0 if self.pid==1002 else 1700000000.0
+ def cmdline(self): return ARGV if self.pid==1002 else ['bash']
+ def is_running(self): return True
+ def status(self): return 'running'
+"#,argv=serde_json::to_string(&argv).unwrap())).unwrap();
+            {let mut d=store.0.lock().unwrap();let t=d.local.last_mut().unwrap();
+             t.insert("name","fixture");t.remove("tmuxContext");
+             t.insert("status",if case=="legacy_inline"{"launch_unknown"}else if case=="ensure"{"completed_with_errors"}else{"running"});
+             t.insert("startConfig",doc!{"mutable_saved_value":"not_loaded_proof"});
+             if !matches!(case,"legacy_inline"|"caller_echo_only") {
+                 t.insert("simulatorRuntime",doc!{"pid":1002,"pidCreatedAt":1700000010.0,"consumer_run_id":"same-run",
+                    "startupRecovery":{"taskId":&id,"remote":remote,"consumer_run_id":"same-run","launchAttemptId":"old-launch"}});
+             }
+             if case=="legacy_absent" {
+                 t.remove("launchAttemptId");
+                 t.get_document_mut("simulatorRuntime").unwrap().get_document_mut("startupRecovery").unwrap().remove("launchAttemptId");
+             }
+             if remote {let task=t.clone();d.remote.push(task);}
+            }
+            req.config_json=if matches!(case,"ensure"|"legacy_inline"|"legacy_absent"|"caller_echo_only"){None}
+                else if case=="different"{Some(json!({"max_concurrent":2,"opaque":[1,2]}).to_string())}else{Some(input.to_string())};
+            let before=store.task();let binding=validate_backend_binding(&fixture.config).await.unwrap();
+            let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};
+            let out=core::start(root,store.as_ref(),&runtime,&req).await;
+            let satisfied=matches!(case,"ensure"|"equal"|"legacy_inline"|"legacy_absent");
+            assert_eq!(out.exit_code,if satisfied{0}else{1},"{remote}/{case}: {}",out.value);
+            assert_eq!(out.value["startedNew"],false);
+            assert_eq!(out.value["configApplied"],false);
+            if case!="caller_echo_only" {
+                assert_eq!(out.value["outcome"],"already_running");assert_eq!(out.value["consumerRunning"],true);
+                assert_eq!(out.value["operationSettled"],case!="legacy_inline");assert_eq!(out.value["taskType"],"super");assert_eq!(out.value["authProfile"],"user1");
+                assert!(out.value.get("launchAttemptId").is_some());
+                if case=="legacy_absent" {assert!(out.value["launchAttemptId"].is_null());}
+                assert_eq!(out.value["configComparison"],if case=="equal"{"equal"}else if case=="different"{"different"}else if case=="unverified"{"unverified"}else{"not_requested"});
+            }else{assert_eq!(out.value["outcome"],"refused");}
+            assert_eq!(store.task(),before,"never overwrite original launch/runtime/config");
+            let d=store.0.lock().unwrap();assert!(!d.calls.iter().any(|c|c.contains("runtime-register")||c.starts_with("start:")));
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+            assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn owned_residue_uses_original_stop_under_same_lock_then_one_original_launch() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
+    use serde_json::Value;
+    struct Professional<'a>{ original:OriginalOperationsRuntime<'a>, config_fixture:Runtime }
+    #[async_trait]
+    impl StartRuntime for Professional<'_> {
+        async fn inspect_execution(&self,r:&Path,s:&dyn TaskStore,t:&Document,h:bool,c:Option<&Document>,d:std::time::Duration)->Result<Option<Value>,String>{StartRuntime::inspect_execution(&self.original,r,s,t,h,c,d).await}
+        async fn verify_stopped(&self,r:&Path,t:&Document,d:std::time::Duration)->Result<Option<quantnight_task_core::pause::StopOutput>,String>{StartRuntime::verify_stopped(&self.original,r,t,d).await}
+        async fn stop_owned_residue(&self,r:&Path,t:&Document,d:std::time::Duration)->Result<quantnight_task_core::pause::StopOutput,String>{self.original.stop_owned_residue(r,t,d).await}
+        async fn priority_config(&self,r:&Path,t:&Document,c:Option<Document>)->Result<Document,String>{self.config_fixture.priority_config(r,t,c).await}
+        async fn validate_super_config(&self,r:&Path,c:&Document)->Result<(),String>{self.config_fixture.validate_super_config(r,c).await}
+        async fn bind_regular_source(&self,r:&Path,t:&Document,c:&Document)->Result<Document,String>{self.config_fixture.bind_regular_source(r,t,c).await}
+        async fn verify_priority_extension(&self,r:&Path,t:&Document,l:u64,n:u64)->Result<Document,String>{self.config_fixture.verify_priority_extension(r,t,l,n).await}
+        async fn continuation(&self,r:&Path,t:&Document,h:bool)->Result<Option<Document>,String>{self.config_fixture.continuation(r,t,h).await}
+        async fn preflight_notification(&self,r:&Path,s:&Document)->Result<(),String>{self.config_fixture.preflight_notification(r,s).await}
+        async fn assert_consumer_absent(&self,r:&Path,t:&Document,h:bool)->Result<(),String>{StartRuntime::assert_consumer_absent(&self.original,r,t,h).await}
+        async fn validate_execution_binding(&self,r:&Path,b:&Document,h:bool)->Result<(),String>{self.original.validate_execution_binding(r,b,h).await}
+        async fn launch(&self,r:&Path,c:&StartCommand)->Result<LaunchOutput,String>{self.original.launch(r,c).await}
+        async fn attach_watcher(&self,r:&Path,t:&Document,h:bool,s:&Document)->Result<Document,String>{StartRuntime::attach_watcher(&self.original,r,t,h,s).await}
+    }
+    for remote in [false,true] { for dead in [false,true] { for successor in [false,true] {
+        if dead && successor {continue;}
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);
+        std::fs::write(root.join("state"),if dead{"dead-residue"}else{"residue"}).unwrap();
+        let native=root.join("native-tmux");let source=std::fs::read_to_string(&native).unwrap();
+        let source=source.lines().map(|line|if line.starts_with("elif a[0]=='list-panes':") {
+            "elif a[0]=='list-panes':\n dead=state.read_text()=='dead-residue'\n if a[-1]=='#{session_id}|#{pane_pid}|#{pane_dead}': print('$4|1001|'+str(int(dead)))\n elif a[-1]=='#{session_id}|#{pane_pid}': print('$4|1001')\n else: print('$4|0|0|1001|bash|'+str(int(dead)))"
+        }else{line}).collect::<Vec<_>>().join("\n");std::fs::write(&native,source).unwrap();
+        let ps=root.join("bin/ps");let source=std::fs::read_to_string(&ps).unwrap()
+            .replace("if [[ -f \"$STATE\" ]]; then", "if [[ -f \"$STATE\" && $(cat \"$STATE\") != dead-residue ]]; then")
+            .replace("echo \"1002 1001 python\"", "if [[ $(cat \"$STATE\") == active ]]; then echo '1002 1001 python'; else echo '1002 1001 sleep'; fi");
+        std::fs::write(ps,source).unwrap();
+        std::fs::write(root.join("psutil.py"),r#"import os
+from pathlib import Path
+STATUS_ZOMBIE='zombie'
+class NoSuchProcess(Exception): pass
+class Process:
+ def __init__(self,pid):
+  self.pid=pid
+  if not Path(os.environ['STATE']).exists(): raise NoSuchProcess(pid)
+ def create_time(self): return 1700000001.0
+ def cmdline(self): return ['bash'] if self.pid==1001 else ['sleep','9999999']
+ def is_running(self): return Path(os.environ['STATE']).exists()
+ def status(self): return 'running'
+"#).unwrap();
+        let (_unused,store,config_fixture,mut req)=setup("super",remote);
+        req.name="fixture".into();req.notification.no_notify=true;
+        let id=store.task().get_object_id("_id").unwrap().to_hex();
+        store.mutate(doc!{"name":"fixture","status":"completed_with_errors","startConfig":{"max_concurrent":1},
+            "tmuxContext":{"schemaVersion":1,"backend":"tmux","socketName":"default","binary":native.canonicalize().unwrap().to_string_lossy().as_ref(),
+                "sessionId":"$4","sessionCreatedAt":1700000000000_i64,"taskId":&id,"launchAttemptId":"old-launch","remote":remote}});
+        if remote {let t=store.task();store.0.lock().unwrap().remote.push(t);}
+        if successor {store.0.lock().unwrap().mutate_after.insert("pause:paused".into(),doc!{"runId":"successor-mission"});}
+        let rows=store.0.lock().unwrap().local_rows.clone();
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let runtime=Professional{original:OriginalOperationsRuntime{binding:&binding,observer:None},config_fixture};
+        let out=core::start(root,store.as_ref(),&runtime,&req).await;
+        if successor {
+            assert_eq!(out.exit_code,1,"{}",out.value);
+            assert_eq!(store.task().get_str("runId").unwrap(),"successor-mission");
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+            assert!(!trace.contains("new-session"));
+            assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),1);
+            assert!(!store.0.lock().unwrap().calls.iter().any(|c|c=="start:launch_unknown"));
+            continue;
+        }
+        assert_eq!(out.exit_code,0,"remote={remote} dead={dead}: {}",out.value);
+        assert_eq!(out.value["startedNew"],true);
+        assert_ne!(store.task().get_str("launchAttemptId").unwrap(),"old-launch");
+        assert_eq!(store.0.lock().unwrap().local_rows,rows,"no accepted receipt reset/rePOST permission");
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
+        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),1);
+        if dead {assert!(!trace.contains("send-keys"));}
+        let d=store.0.lock().unwrap();
+        assert_eq!(d.calls.iter().filter(|c|*c=="pause:paused").count(),1);
+        assert_eq!(d.calls.iter().filter(|c|*c=="start:launch_unknown").count(),1);
+    }}}
+}
+
+
+fn completion_original_super_preflight(root:&Path) {
+    // Lowest process fixture for the unrelated config-owner response; lifecycle,
+    // binding, launch/check shell, and all task/launch CAS remain original.
+    let p=root.join(".venv/bin/python");let source=std::fs::read_to_string(&p).unwrap();
+    std::fs::write(p,source.replace("set -euo pipefail",r#"set -euo pipefail
+if [[ "${3:-}" == util.super_capacity ]]; then
+ echo '{"schemaVersion":1,"command":"native-config-preflight","ok":true,"result":{}}'; exit 0
+fi"#)).unwrap();
+}
+
+#[tokio::test]
+async fn completion_public_facade_unknown_launch_blocks_late_original_ssh_helper() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    use std::os::unix::net::UnixDatagram;
+    let fixture=original_professional_runtime::original_professional_fixture(false);
+    let root=Path::new(&fixture.config.env.working_dir);
+    completion_original_super_preflight(root);
+    let notify=UnixDatagram::bind(root.join("done.sock")).unwrap();
+    notify.set_read_timeout(Some(std::time::Duration::from_secs(12))).unwrap();
+    let ssh=root.join("bin/ssh");let old=std::fs::read_to_string(&ssh).unwrap();
+    let delayed=r#"
+if sys.argv[-2:]==['bash','-se']:
+ from pathlib import Path
+ root=Path(os.environ['STATE']).parent
+ payload=sys.stdin.buffer.read()
+ (root/'late-payload').write_bytes(payload)
+ os.mkfifo(root/'release')
+ child=r'''import os,sys,selectors,subprocess,socket
+from pathlib import Path
+root=Path(sys.argv[1]);fd=os.open(root/'release',os.O_RDONLY|os.O_NONBLOCK)
+s=selectors.DefaultSelector();s.register(fd,selectors.EVENT_READ)
+print('ready',flush=True)
+ready=s.select(8)
+if ready:
+ os.read(fd,1)
+ result=subprocess.run(['/bin/bash','-se'],input=(root/'late-payload').read_bytes(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6).returncode
+else: result=98
+sock=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);sock.sendto(str(result).encode(),str(root/'done.sock'))
+'''
+ p=subprocess.Popen([sys.executable,'-B','-c',child,str(root)],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+ assert p.stdout.readline()==b'ready\n'
+ (root/'late-helper.pid').write_text(str(p.pid))
+ sys.exit(255)
+"#;
+    std::fs::write(&ssh,old.replace("if os.environ.get(\"SSH_FAIL\")",&format!("{delayed}\nif os.environ.get(\"SSH_FAIL\")"))).unwrap();
+    let (_unused,store,_runtime,mut request)=setup("super",true);
+    request.name="fixture".into();request.notification.no_notify=true;
+    store.mutate(doc!{"name":"fixture"});
+    let binding=validate_backend_binding(&fixture.config).await.unwrap();
+    let control=TaskControl::with_store(binding,store.clone());
+    let first=control.start(&request,None).await;failed(&first);
+    let before=store.task();assert_eq!(before.get_str("status"),Ok("launch_unknown"));
+    assert!(root.join("late-helper.pid").exists(),"{}",first.value);
+    assert!(!root.join("state").exists());
+    let second=control.start(&request,None).await;failed(&second);
+    assert!(second.value.to_string().contains("settlement"),"{}",second.value);
+    assert_eq!(store.task(),before,"unresolved old attempt must not be overwritten");
+    assert_eq!(store.0.lock().unwrap().calls.iter().filter(|c|*c=="start:launch_unknown").count(),1);
+    // Release the ORIGINAL SSH child only. It may still launch; this test proves
+    // that no successor was admitted while its outcome was unknown.
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).open(root.join("release")).unwrap().write_all(b"x").unwrap();
+    let mut msg=[0;16];let count=notify.recv(&mut msg).unwrap();assert_eq!(&msg[..count],b"0");
+    assert_eq!(store.task(),before);
+    let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+    assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
+    assert!(!trace.contains("if-shell"));
+}
+
+#[tokio::test]
+async fn completion_public_facade_settled_original_launcher_can_recover_absence() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    for remote in [false,true] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);completion_original_super_preflight(root);
+        let (_unused,store,_runtime,mut request)=setup("super",remote);
+        request.name="fixture".into();request.notification.no_notify=true;store.mutate(doc!{"name":"fixture"});
+        store.0.lock().unwrap().fail_before.insert("start:running".into());
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
+        let first=control.start(&request,None).await;failed(&first);
+        let task=store.task();assert_eq!(task.get_str("status"),Ok("launch_unknown"));
+        assert_eq!(task.get("launchSettledAttemptId"),task.get("launchAttemptId"),"{}",first.value);
+        std::fs::remove_file(root.join("state")).unwrap();
+        store.0.lock().unwrap().fail_before.remove("start:running");
+        let recovered=control.start(&request,None).await;success(&recovered);
+        for key in ["task","taskId","remote","taskType","authProfile","launchAttemptId","operationSettled"] {
+            assert!(recovered.value.get(key).is_some(),"missing {key}: {}",recovered.value);
+        }
+        assert_eq!(recovered.value["operationSettled"],true);
+        assert_eq!(recovered.value["taskType"],"super");assert_eq!(recovered.value["authProfile"],"user1");
+        assert_ne!(store.task().get("launchAttemptId"),task.get("launchAttemptId"));
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),2);
+    }
+}
+
+#[tokio::test]
+async fn completion_original_start_preserves_launcher120_without_total120() {
+    let (root,store,runtime,request)=setup("regular",false);
+    let out=core::start(&root.0,store.as_ref(),&runtime,&request).await;success(&out);
+    assert_eq!(runtime.commands.lock().unwrap()[0].timeout_seconds,120);
+    assert_eq!(out.value["operationSettled"],true);assert_eq!(out.value["taskType"],"regular");
+    assert_eq!(out.value["authProfile"],"user1");
+    assert_eq!(out.value["launchAttemptId"].as_str(),store.task().get_str("launchAttemptId").ok());
+}
+
+#[tokio::test]
+async fn completion_legacy_unknown_pause_v2_preserves_pending_launcher_fence() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,pause::{PauseOptions,StopBudget}};
+    for remote in [false,true] {for case in ["legacy_unknown","legacy_normal","settled_unknown"] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);completion_original_super_preflight(root);
+        let (_unused,store,_runtime,mut request)=setup("super",remote);
+        request.name="fixture".into();request.notification.no_notify=true;
+        {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
+         task.insert("name","fixture");task.remove("tmuxContext");
+         task.insert("status",if case=="legacy_normal"{"running"}else{"launch_unknown"});
+         if case=="settled_unknown" {task.insert("launchSettledAttemptId","old-launch");}}
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
+        let out=control.pause("fixture",PauseOptions::default(),StopBudget::Cli,None).await;
+        assert_eq!(out.exit_code,0,"{remote}/{case}: {}",out.value);
+        assert_eq!(out.value["confirmationBasis"],"session_absent");
+        let paused=store.task();assert_eq!(paused.get_str("status"),Ok("paused"));
+        if case=="legacy_unknown" {assert_eq!(paused.get("launchSettledAttemptId"),Some(&Bson::Null));}
+        if case=="legacy_normal" {assert!(!paused.contains_key("launchSettledAttemptId"));}
+        let result=control.start(&request,None).await;
+        if case=="legacy_unknown" {
+            failed(&result);assert_eq!(store.task(),paused);
+            assert!(!store.0.lock().unwrap().calls.iter().any(|c|c=="start:launch_unknown"));
+            let archive=control.delete("fixture",None,None,None).await;failed(&archive);
+            assert!(archive.value.to_string().contains("launcher remains unresolved"),"{}",archive.value);
+            assert_eq!(store.task(),paused);
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
+        } else {success(&result);assert_eq!(result.value["startedNew"],true);}
+    }}
+}
+
+#[tokio::test]
+async fn completion_original_facade_claimed_but_not_dispatched_can_settle_without_retry() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    for remote in [false,true] {for case in ["persisted","persist_failure","replacement"] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);completion_original_super_preflight(root);
+        let refuse=root.join("refuse-validation");std::fs::write(&refuse,"true").unwrap();
+        let p=root.join(".venv/bin/python");let source=std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p,source.replace("set -euo pipefail",&format!(r#"set -euo pipefail
+if [[ "${{3:-}}" == scripts.script_config && -f '{refuse}' ]]; then
+ echo '{{"schemaVersion":1,"command":"validate-execution-binding","ok":false}}'; exit 0
+fi"#,refuse=refuse.display()))).unwrap();
+        let (_unused,store,_runtime,mut request)=setup("super",remote);
+        request.name="fixture".into();request.notification.no_notify=true;store.mutate(doc!{"name":"fixture"});
+        request.expected_task_id=Some(store.task().get_object_id("_id").unwrap().to_hex());
+        if case=="persist_failure" {store.0.lock().unwrap().fail_before.insert("start-not-dispatched:ok".into());}
+        if case=="replacement" {store.0.lock().unwrap().mutate_before.insert("start-not-dispatched:ok".into(),doc!{"_id":ObjectId::new(),"launchAttemptId":"successor"});}
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
+        let first=control.start(&request,None).await;failed(&first);
+        assert_ne!(first.value["operationSettled"],true,"failed response must not fabricate join proof");
+        let saved=store.task();assert_eq!(saved.get_str("status"),Ok("launch_unknown"));
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
+        assert_eq!(store.0.lock().unwrap().calls.iter().filter(|c|*c=="start:launch_unknown").count(),1);
+        if case=="persisted" {
+            assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
+            assert!(saved.get_array("events").unwrap().iter().any(|e|e.as_document().is_some_and(|d|d.get_str("command")==Ok("start-not-dispatched") && d.get_document("detail").unwrap().get_bool("launcherInvoked")==Ok(false))));
+        } else {assert_eq!(saved.get("launchSettledAttemptId"),Some(&Bson::Null));}
+        std::fs::remove_file(&refuse).unwrap();
+        store.0.lock().unwrap().fail_before.remove("start-not-dispatched:ok");
+        let next=control.start(&request,None).await;
+        if case=="persisted" {success(&next);assert_eq!(next.value["startedNew"],true);assert_ne!(store.task().get("launchAttemptId"),saved.get("launchAttemptId"));}
+        else {failed(&next);assert_eq!(store.task(),saved);}
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),usize::from(case=="persisted"));
+    }}
 }

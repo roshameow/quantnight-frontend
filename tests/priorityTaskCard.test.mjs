@@ -719,7 +719,7 @@ test('actual Priority SFC receives structured consumer diagnostics and displays 
   const current = { ...task, status: 'running' };
   const observation = extra => ({ taskId: 'id-a', name: task.name, isRemote: true, observedAt: Date.now(),
     state: 'unknown', stage: 'process', detail: '核验所有 pane 及消费者进程树', ...extra });
-  for (const [runtime, expected, reason] of [[null, '尚未执行运行检查', '等待首次消费者检查'],
+  for (const [runtime, expected, reason] of [[null, 'running', '未主动查询进程'],
     [observation({ state: 'checking' }), '运行检查进行中', '核验所有 pane 及消费者进程树'],
     [observation({ error: '[process] Permission denied: /proc/99/stat；exit=13，未发送停止命令' }), '运行检查执行失败', 'Permission denied: /proc/99/stat；exit=13，未发送停止命令'],
     [observation({ error: 'SSH 检查超时（15秒）；等待原连接返回，不重启任务' }), '运行检查超时', 'SSH 检查超时（15秒）；等待原连接返回，不重启任务'],
@@ -729,7 +729,7 @@ test('actual Priority SFC receives structured consumer diagnostics and displays 
     const html = await render({ task: current, taskRuntimeStatus: runtime,
       progress: { stale: false, priority_campaign: groupedEvent() } });
     const { main } = sections(html); const text = plainText(main);
-    assert.ok(text.includes(`消费者检查：${expected}`)); assert.ok(text.includes(reason));
+    assert.ok(text.includes(`${runtime ? '消费者检查' : '业务控制状态'}：${expected}`)); assert.ok(text.includes(reason));
     if (runtime?.stage) assert.ok(text.includes(`[${runtime.stage}]`));
     assert.match(text, /研究状态：active/);
     assert.match(text, /✓ 50.*✗ 0.*Σ 240/);
@@ -809,5 +809,21 @@ test('copy regression: Priority local/remote waiting, failed refresh and existin
       assert.equal(state.progressStale.value, true);
       assert.equal(state.progressError.value, error);
     } finally { hooks.unmount(); }
+  }
+});
+
+test('v4 R3 actual Priority card retains details but fences known remote-only mutators', async () => {
+  for (const controlSource of ['remote_only', 'local', undefined]) {
+    const app = createSSRApp({ render: () => h(card.default, { task: { ...task, taskType: 'priority', status: 'pending', controlSource } }) });
+    app.config.warnHandler = () => {};
+    for (const name of ['n-card', 'n-tag', 'n-text', 'n-space', 'n-switch']) app.component(name,
+      { setup: (_, { slots }) => () => h('div', [slots.header?.(), slots.default?.()]) });
+    app.component('n-button', { props: ['disabled'], setup: (props, { slots }) => () =>
+      h('button', { disabled: props.disabled }, [slots.icon?.(), slots.default?.()]) });
+    const html = await renderToString(app);
+    const buttons = [...html.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g)];
+    const byLabel = label => buttons.find(row => row[2].replace(/<[^>]*>/g, '').trim().endsWith(label));
+    assert.equal(byLabel('查看任务详情')[1].includes('disabled'), false);
+    for (const label of ['启动', '更新', '停止', '删除']) assert.equal(byLabel(label)[1].includes('disabled'), controlSource === 'remote_only');
   }
 });

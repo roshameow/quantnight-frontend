@@ -114,6 +114,7 @@ struct Data {
     fail: Option<String>,
     cas_zero: bool,
     write_timeout: bool,
+    readback_error: bool,
     control_patch: HashMap<Host, Document>,
 }
 #[derive(Clone, Default)]
@@ -167,6 +168,7 @@ impl TaskStore for Memory {
     ) -> Result<Option<Document>, String> {
         let mut d = self.0.lock().unwrap();
         call(&mut d, format!("task:{}", label(h)))?;
+        if d.readback_error && !d.writes.is_empty() { return Err("exact readback unavailable; stop not repeated".into()); }
         let mut rows = d.tasks.get(&h).cloned().unwrap_or_default();
         if newest {
             rows.sort_by_key(|v| {
@@ -528,6 +530,7 @@ async fn normal_stop_preserves_cli_gui_fields_stage_hook_and_native_cas_fences()
                 expected_launch_attempt_id: Some("launch-1"),
                 expected_remote: Some(false),
                 observer: Some(Arc::new(move |e| recorded.lock().unwrap().push(e.stage))),
+                ..Default::default()
             },
         )
         .await;
@@ -661,7 +664,7 @@ async fn script_receipt_and_cas_errors_never_confirm_or_retry() {
             "script" => r.fail = true,
             "receipt" => r.stdout = "QUANTNIGHT_TASK_STAGE {\"stage\":\"complete\"}".into(),
             "cas" => s.0.lock().unwrap().cas_zero = true,
-            "write-timeout" => s.0.lock().unwrap().write_timeout = true,
+            "write-timeout" => { let mut d=s.0.lock().unwrap(); d.write_timeout = true; d.readback_error = true; },
             _ => r.mutate = Some(fault),
         }
         let out = run(&s, &r, &Root::new()).await;
@@ -1132,4 +1135,239 @@ async fn added_write_apis_fail_closed_for_unrelated_existing_store_fakes() {
         .contains("unavailable"));
     store.no_write();
     assert!(store.0.lock().unwrap().calls.is_empty());
+}
+
+
+#[tokio::test]
+async fn initial_pause_message_is_request_only_before_lock_and_stop() {
+    for budget in [StopBudget::Cli, StopBudget::Gui] {
+        let root = Root::new();
+        let store = Memory::new(normal(), Some(vec![]));
+        let mut runtime = Runtime::new(&store, false); runtime.budget = budget;
+        let messages = Arc::new(Mutex::new(vec![])); let saved = messages.clone();
+        let lock = mission_lock::MissionLocks::acquire(&root.0, &[NAME], false).unwrap();
+        let out = pause::pause(&root.0, &store, &runtime, NAME, PauseOptions {
+            observer: Some(Arc::new(move |stage| saved.lock().unwrap().push(stage))),
+            ..Default::default()
+        }).await;
+        assert_eq!(out.exit_code, 1);
+        assert!(runtime.calls.lock().unwrap().is_empty());
+        let stages = messages.lock().unwrap();
+        assert_eq!(stages[0].stage, "initial");
+        assert!(stages[0].message.contains("尚未取得生命周期锁"));
+        assert!(stages[0].message.contains("尚未执行停止"));
+        assert!(!stages[0].message.contains("accepted"));
+        assert!(stages[0].message.contains(&format!("budget{}s", budget.seconds())));
+        assert!(stages[0].message.contains("one attempt"));
+        assert_eq!(stages.last().unwrap().stage, "failed");
+        drop(lock);
+    }
+}
+
+#[tokio::test]
+async fn committed_pause_lost_ack_is_confirmed_by_exact_readback_without_second_stop() {
+    let s = Memory::new(normal(), None);
+    s.0.lock().unwrap().write_timeout = true;
+    let r = Runtime::new(&s, false);
+    let out = run(&s, &r, &Root::new()).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert!(out.confirmed_stop.is_some());
+    assert_eq!(r.calls.lock().unwrap().len(), 1);
+    let d = s.0.lock().unwrap();
+    assert_eq!(d.writes.len(), 1);
+    assert_eq!(d.tasks[&Host::Local][0].get_array("events").unwrap().len(), 1);
+}
+
+#[path = "support/original_professional_runtime.rs"]
+mod original_professional_runtime;
+use original_professional_runtime::original_professional_fixture;
+
+#[tokio::test]
+async fn public_pause_original_runtime_and_shell_recover_missing_proof_and_lost_stop_receipt() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,
+        operations_runtime::{OriginalOperationsRuntime, OriginalPauseRuntime}};
+    for remote in [false, true] {
+        for lose_receipt in [false, true] {
+            let fake = original_professional_fixture(lose_receipt);
+            let root = Path::new(&fake.config.env.working_dir);
+            if lose_receipt { std::fs::write(root.join("state"), "active").unwrap(); }
+            let binding = validate_backend_binding(&fake.config).await.unwrap();
+            let runtime = OriginalPauseRuntime { common: OriginalOperationsRuntime { binding:&binding, observer:None }, budget:StopBudget::Cli };
+            let mut t=normal(); t.insert("isRemote",remote); t.remove("tmuxContext");t.remove("startupBinding");
+            t.insert("taskType","super");t.insert("auth_profile","user1");
+            original_professional_runtime::install_original_super_process(root,ID,NAME,remote,"launch-1");
+            if lose_receipt {t.insert("tmuxContext",doc!{"sessionId":"$4"});}
+            let evidence=vec![doc! {"_id":"unresolved","acceptance":"UNKNOWN","superSlotId":"kept","status":"timeout_error"}];
+            let store=Memory::new(t, Some(evidence.clone()));
+            let out=pause::pause(root,&store,&runtime,NAME,PauseOptions::default()).await;
+            assert_eq!(out.exit_code,0,"remote={remote} lost={lose_receipt}: {}",out.value);
+            assert_eq!(out.value["confirmationBasis"],"session_absent");
+            assert_eq!(out.value["stopConfirmation"],"confirmed");
+            if lose_receipt { assert_eq!(out.value["reconciledFromObservation"],true); }
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+            let signals=trace.lines().filter(|line| line.contains("if-shell")).count();
+            assert_eq!(signals,usize::from(lose_receipt),"verify-only must not signal; stop at most once");
+            let d=store.0.lock().unwrap();assert_eq!(d.writes.len(),1);
+            assert_eq!(d.items[&Host::from_remote(remote)],evidence);
+            assert_eq!(d.tasks[&Host::Local][0].get_array("events").unwrap().len(),1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn original_pause_never_signals_foreign_identity_or_confirms_known_live_orphan() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::{OriginalOperationsRuntime,OriginalPauseRuntime}};
+    for case in ["foreign_task","wrong_birth","known_live_after_stop"] {
+        let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+        std::fs::write(root.join("state"),"active").unwrap();
+        original_professional_runtime::install_original_super_process(root,if case=="foreign_task"{"ffffffffffffffffffffffff"}else{ID},NAME,false,"launch-1");
+        if case=="known_live_after_stop" {
+            let p=root.join("psutil.py");let s=std::fs::read_to_string(&p).unwrap()
+                .replace(" or not Path(os.environ['STATE']).exists()", "")
+                .replace("def is_running(self): return Path(os.environ['STATE']).exists()", "def is_running(self): return self.pid==1002 or Path(os.environ['STATE']).exists()");
+            std::fs::write(p,s).unwrap();
+        }
+        let mut t=normal();t.remove("tmuxContext");t.remove("startupBinding");t.insert("taskType","super");t.insert("auth_profile","user1");
+        if case=="wrong_birth" {t.insert("simulatorRuntime",doc!{"pid":1002,"pidCreatedAt":1700000999.0,"consumer_run_id":"original-run"});}
+        let store=Memory::new(t.clone(),Some(items()));
+        let binding=validate_backend_binding(&fake.config).await.unwrap();
+        let runtime=OriginalPauseRuntime{common:OriginalOperationsRuntime{binding:&binding,observer:None},budget:StopBudget::Cli};
+        let out=pause::pause(root,&store,&runtime,NAME,PauseOptions::default()).await;
+        assert_eq!(out.exit_code,1,"{case}: {}",out.value);
+        assert!(out.confirmed_stop.is_none());store.no_write();assert_eq!(store.task(),t);
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),usize::from(case=="known_live_after_stop"));
+        assert!(!trace.contains("new-session"));
+    }
+}
+
+#[tokio::test]
+async fn original_stop_adapter_zero_remaining_never_restarts_a_budget_or_process() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::{OriginalOperationsRuntime,OriginalPauseRuntime}};
+    for budget in [StopBudget::Cli,StopBudget::Gui] {
+        let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+        let binding=validate_backend_binding(&fake.config).await.unwrap();
+        let runtime=OriginalPauseRuntime{common:OriginalOperationsRuntime{binding:&binding,observer:None},budget};
+        assert!(runtime.stop_bounded(root,&normal(),false,std::time::Duration::ZERO).await.is_err());
+        assert!(runtime.verify_stopped(root,&normal(),std::time::Duration::ZERO).await.is_err());
+        assert!(!root.join("trace").exists(),"no original stop/check process after zero allowance");
+    }
+}
+
+#[tokio::test]
+async fn completion_frozen_pause_absent_exact_and_remaining_are_locked_guards() {
+    for case in ["missing","null","present","malformed","empty","both","empty_exact","zero","exact","omitted"] {
+        let root=Root::new(); let mut task=normal();
+        match case {"missing"|"omitted"=>{task.remove("launchAttemptId");},"null"=>{task.insert("launchAttemptId",Bson::Null);},
+            "malformed"=>{task.insert("launchAttemptId",17);},"empty"=>{task.insert("launchAttemptId","");},_=>()};
+        let store=Memory::new(task,None); let runtime=Runtime::new(&store,false);
+        let out=pause::pause(&root.0,&store,&runtime,NAME,PauseOptions{
+            expected_launch_absent:!matches!(case,"exact"|"omitted"|"empty_exact"|"zero"),
+            expected_launch_attempt_id:if matches!(case,"exact"|"both"){Some("launch-1")}else if case=="empty_exact"{Some("")}else{None},
+            remaining:if case=="zero"{Some(std::time::Duration::ZERO)}else{None},..Default::default()
+        }).await;
+        let accepted=matches!(case,"missing"|"null"|"exact"|"omitted");
+        assert_eq!(out.exit_code,if accepted{0}else{1},"{case}: {}",out.value);
+        assert_eq!(runtime.calls.lock().unwrap().len(),usize::from(accepted),"{case}");
+        if !accepted {store.no_write();}
+    }
+}
+
+#[tokio::test]
+async fn completion_original_explicit_legacy_file_argv_pauses_without_optional_proofs() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::{OriginalOperationsRuntime,OriginalPauseRuntime}};
+    for remote in [false,true] {for kind in ["regular","super","priority"] {
+        let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+        std::fs::write(root.join("state"),"active").unwrap();
+        original_professional_runtime::install_original_super_process(root,ID,NAME,remote,"launch-1");
+        let p=root.join("psutil.py");let source=std::fs::read_to_string(&p).unwrap();
+        let mut lines=Vec::new();
+        for line in source.lines() {
+            if let Some(raw)=line.strip_prefix("ARGV=") {
+                let mut argv:Vec<String>=serde_json::from_str(raw).unwrap();
+                argv[2]=format!("scripts.{}_simulate_param",if kind=="regular"{"alpha"}else if kind=="super"{"super_alpha"}else{"refine"});
+                *argv.last_mut().unwrap()="/original/tmp/tmp_config_fixture.json".into();
+                lines.push(format!("ARGV={}",serde_json::to_string(&argv).unwrap()));
+            } else {lines.push(line.into());}
+        }
+        std::fs::write(p,lines.join("\n")).unwrap();
+        let mut task=normal();task.remove("startupBinding");task.remove("tmuxContext");task.remove("launchAttemptId");
+        task.insert("taskType",kind);task.insert("auth_profile","user1");task.insert("isRemote",remote);
+        let evidence=items(); let store=Memory::new(task,Some(evidence.clone()));
+        let binding=validate_backend_binding(&fake.config).await.unwrap();
+        let runtime=OriginalPauseRuntime{common:OriginalOperationsRuntime{binding:&binding,observer:None},budget:StopBudget::Cli};
+        let out=pause::pause(root,&store,&runtime,NAME,PauseOptions::default()).await;
+        assert_eq!(out.exit_code,0,"{kind}/{remote}: {}",out.value);
+        assert_eq!(out.value["confirmationBasis"],"runners_exited");
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),1);
+        assert!(!trace.contains("new-session"));
+        assert_eq!(store.0.lock().unwrap().items[&Host::from_remote(remote)],evidence);
+    }}
+}
+
+#[tokio::test]
+async fn completion_zero_process_budget_and_facade_remaining_never_spawn() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,config::run_process_observed};
+    let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+    let mut command=tokio::process::Command::new("/bin/bash");
+    command.arg("-c").arg("echo escaped > zero-spawn").current_dir(root);
+    assert!(run_process_observed(command,std::time::Duration::ZERO,false,None).await.is_err());
+    assert!(!root.join("zero-spawn").exists());
+    let binding=validate_backend_binding(&fake.config).await.unwrap();
+    let store=Arc::new(Memory::new(normal(),None));
+    let control=TaskControl::with_store(binding,store.clone());
+    // Force an original binding refresh if wrongly admitted at zero budget.
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(root.join("credentials.yaml")).unwrap().write_all(b"\n#changed\n").unwrap();
+    let p=root.join(".venv/bin/python");let source=std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p,source.replace("set -euo pipefail",&format!("set -euo pipefail\necho spawned > '{}'",root.join("binding-spawn").display()))).unwrap();
+    for budget in [StopBudget::Cli,StopBudget::Gui] {
+        let out=control.pause(NAME,PauseOptions{remaining:Some(std::time::Duration::ZERO),..Default::default()},budget,None).await;
+        assert_eq!(out.exit_code,1);assert!(!root.join("binding-spawn").exists());assert!(!root.join("trace").exists());
+    }
+    store.no_write();
+}
+
+#[tokio::test]
+async fn completion_caller_remaining_includes_original_facade_binding_refresh() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+    let binding=validate_backend_binding(&fake.config).await.unwrap();
+    let store=Arc::new(Memory::new(normal(),None));let control=TaskControl::with_store(binding,store.clone());
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(root.join("credentials.yaml")).unwrap().write_all(b"\n#new fingerprint\n").unwrap();
+    let p=root.join(".venv/bin/python");let source=std::fs::read_to_string(&p).unwrap();
+    std::fs::write(p,source.replace("set -euo pipefail","set -euo pipefail\n/bin/sleep 0.1")).unwrap();
+    let out=control.pause(NAME,PauseOptions{remaining:Some(std::time::Duration::from_millis(10)),..Default::default()},StopBudget::Gui,None).await;
+    assert_eq!(out.exit_code,1);assert!(out.confirmed_stop.is_none());
+    assert!(!root.join("trace").exists(),"no stop/check after caller remaining was consumed by binding");
+    assert_ne!(out.value["operationSettled"],true);store.no_write();
+}
+
+#[tokio::test]
+async fn fc_p1_1_public_pause_grace_root_replacement_never_confirms_or_cas() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    for remote in [false,true] {
+        let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
+        let backend=std::env::var("QUANTNIGHT_BACKEND_SOURCE").unwrap();
+        let python=std::env::var("QUANTNIGHT_TEST_PYTHON").unwrap();
+        let code="import sys\nfrom test_system_tmux_context import install_grace_pane_replacement\ninstall_grace_pane_replacement(sys.argv[1],sys.argv[2],name='fixture',remote=sys.argv[3]=='true',launch='launch-1')";
+        let setup=std::process::Command::new(python).args(["-B","-c",code]).arg(root).arg(ID).arg(if remote{"true"}else{"false"})
+            .env("PYTHONPATH",format!("{backend}:{backend}/tests")).env("PYTHONDONTWRITEBYTECODE","1").output().unwrap();
+        assert!(setup.status.success(),"{}",String::from_utf8_lossy(&setup.stderr));
+        let mut task=normal();task.remove("tmuxContext");task.remove("startupBinding");
+        task.insert("isRemote",remote);task.insert("taskType","super");task.insert("auth_profile","user1");
+        let store=Arc::new(Memory::new(task.clone(),Some(items())));
+        let binding=validate_backend_binding(&fake.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
+        let out=control.pause(NAME,PauseOptions::default(),StopBudget::Cli,None).await;
+        assert_eq!(out.exit_code,1,"remote={remote} successorKilled={}: {}",root.join("successor-killed").exists(),out.value);
+        assert!(out.confirmed_stop.is_none());store.no_write();assert_eq!(store.task(),task);
+        assert!(root.join("grace-replaced").exists());
+        assert_eq!(std::fs::read_to_string(root.join("state")).unwrap(),"respawned");
+        assert!(!root.join("successor-killed").exists());
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),1);
+        assert!(!trace.contains("kill-session")&&!trace.contains("new-session"));
+    }
 }

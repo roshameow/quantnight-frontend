@@ -21,7 +21,8 @@
     <details class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
       <summary style="cursor: pointer">运行 / 停止详情</summary>
       <div style="white-space: pre-wrap; overflow-wrap: anywhere">
-        <div>消费者检查：{{ consumerStatus }}</div>
+        <div v-if="taskRuntimeStatus">消费者检查：{{ consumerStatus }}（只读快照）</div>
+        <div v-else>业务控制状态：{{ task.status }}（未主动查询进程）</div>
         <div v-if="diagnosticDetails">{{ diagnosticDetails }}</div>
       </div>
     </details>
@@ -99,9 +100,11 @@
       <span :title="PRIORITY_SCHEDULING_HINT">调度优先级 {{ priorityConfig?.priority ?? 1 }}</span>
     </div>
 
+    <div style="font-size: 12px; margin: 4px 0"><n-text :type="taskMutationIssue(task) ? 'warning' : 'default'">{{ taskControlLabel(task) }}</n-text></div>
     <n-space align="center" style="margin-top: 2px">
       <n-switch
         :value="task.isRemote"
+        :disabled="!!taskMutationIssue(task)"
         @update:value="(val) => $emit('update:isRemote', val)"
         :checked-value="true"
         :unchecked-value="false"
@@ -117,16 +120,17 @@
       </n-tag>
     </n-space>
     <n-space style="margin-top: 10px" justify="center">
-      <n-button size="small" type="success" @click="$emit('start')">
+      <n-button size="small" @click="$emit('view')">查看任务详情</n-button>
+      <n-button size="small" type="success" :disabled="!!taskMutationIssue(task)" @click="$emit('start')">
         <template #icon>>></template>启动
       </n-button>
-      <n-button size="small" @click="$emit('update')">
+      <n-button size="small" :disabled="!!taskMutationIssue(task)" @click="$emit('update')">
         <template #icon>↻</template>更新
       </n-button>
-      <n-button size="small" type="warning" @click="$emit('pause')">
+      <n-button size="small" type="warning" :disabled="!!taskMutationIssue(task)" @click="$emit('pause')">
         <template #icon>■</template>停止
       </n-button>
-      <n-button size="small" type="error" @click="$emit('delete')">
+      <n-button size="small" type="error" :disabled="!!taskMutationIssue(task)" @click="$emit('delete')">
         <template #icon>x</template>删除
       </n-button>
     </n-space>
@@ -226,7 +230,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
-import { RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
+import { taskMutationIssue, taskControlLabel, RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 
 const props = defineProps({
@@ -248,7 +252,7 @@ const props = defineProps({
   },
 });
 
-defineEmits(['update:isRemote', 'start', 'update', 'pause', 'delete']);
+defineEmits(['view', 'update:isRemote', 'start', 'update', 'pause', 'delete']);
 
 const runtime = ref(null);
 watch(() => JSON.stringify([typeof props.task._id === 'object' ? props.task._id?.$oid : props.task._id,

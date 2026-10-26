@@ -193,11 +193,17 @@ pub async fn sync_remote_task(alpha_mission_list: String, task_id: Option<String
     core_receipt(&result, "sync", &alpha_mission_list)
 }
 
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskControlSource { Local, RemoteOnly }
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
     #[serde(rename = "_id")]
     pub id: ObjectId, // 用 id 显得更自然一些，但必须 rename "_id"
     pub name: String,
+    #[serde(default, skip_deserializing, rename = "controlSource")]
+    pub control_source: Option<TaskControlSource>,
     #[serde(default)]
     pub template: String,
     #[serde(default)]
@@ -226,6 +232,13 @@ pub struct Task {
     #[serde(default, rename = "stopConfirmationBasis")]
     pub stop_confirmation_basis: Option<String>,
 
+}
+
+// This source is a property of the original read branch, never of stored data.
+fn listed_task(document: Document, source: TaskControlSource) -> Result<Task, bson::de::Error> {
+    let mut task = bson::from_document::<Task>(document)?;
+    task.control_source = Some(source);
+    Ok(task)
 }
 
 /// 远程任务列表缓存：短 TTL，避免每次本地操作都穿透 SSH 隧道查远程库。
@@ -274,7 +287,7 @@ async fn fetch_remote_tasks(clients: &Arc<MongoClients>, local_uri: &str, remote
         while let Some(mut document) = remote_cursor.try_next().await.map_err(|e| e.to_string())? {
             // 远程来源统一标记 isRemote = true
             document.insert("isRemote", true);
-            if let Ok(task) = bson::from_document::<Task>(document) {
+            if let Ok(task) = listed_task(document, TaskControlSource::RemoteOnly) {
                 remote_tasks.push(task);
             }
         }
@@ -321,7 +334,7 @@ pub async fn get_all_tasks(
     // 遍历 cursor，获取每一个 Document
     while let Some(document) = cursor.try_next().await.map_err(|e| e.to_string())? {
         // 假设你有一个 `Task` 类型，使用 `from_document` 方法将 Document 转换为 Task
-        if let Ok(task) = bson::from_document::<Task>(document) {
+        if let Ok(task) = listed_task(document, TaskControlSource::Local) {
             seen_names.insert(task.name.clone());
             tasks.push(task);
         }
@@ -384,11 +397,12 @@ pub async fn delete_task(id: String, expected_remote: Option<bool>, clients: Sta
     }))
 }
 
-fn start_request(task_name: &str, config: &str, remote: bool, task_id: &str, expected_remote: Option<bool>) -> Result<StartRequest, String> {
+fn start_request(task_name: &str, config: Option<&str>, remote: bool, task_id: &str, expected_remote: Option<bool>) -> Result<StartRequest, String> {
     required_task_id(Some(task_id))?;
-    priority_config_document(config)?;
+    if let Some(config) = config { priority_config_document(config)?; }
     let mut request = StartRequest::new(task_name);
-    request.config_json = Some(config.into());
+    // None is the original core's saved-config selection, never {} or JSON null.
+    request.config_json = config.map(str::to_owned);
     request.remote = Some(remote);
     request.expected_remote = Some(expected_remote.unwrap_or(remote));
     request.expected_task_id = Some(task_id.into());
@@ -405,37 +419,49 @@ fn start_receipt(result: &TaskOutcome, request: &StartRequest) -> Result<(), Str
     Ok(())
 }
 
-async fn start_via_core(core: &TaskControl, request: &StartRequest) -> Result<(), String> {
+// A failed business outcome remains a rejected command for old void callers.
+// Encode the ORIGINAL versioned object as complete JSON, not text fragments.
+fn gui_start_outcome(result: TaskOutcome, request: &StartRequest) -> Result<JsonValue, String> {
+    start_receipt(&result, request).map_err(|error| {
+        if result.value["schemaVersion"] == 1 && result.value["command"] == "start"
+            && result.value["task"].as_str() == Some(request.name.as_str()) && result.value["ok"] == false {
+            result.value.to_string()
+        } else { error }
+    })?;
+    Ok(result.value)
+}
+
+async fn start_via_core(core: &TaskControl, request: &StartRequest) -> Result<JsonValue, String> {
     // Transport intent is not host migration authorization. Shared core repeats
     // authoritative identity/CAS checks under its original mission lock.
     let task = core.task_by_id(required_task_id(request.expected_task_id.as_deref())?).await?;
     operation_task_identity(&task, &request.name, request.expected_remote.ok_or("原始执行端缺失")?)?;
     let result = timeout(Duration::from_secs(300), core.start(request, None)).await
         .map_err(|_| "启动总预算300秒耗尽；结果待核验，未自动重试或写入running")?;
-    start_receipt(&result, request)
+    gui_start_outcome(result, request)
 }
 
 #[command]
-pub async fn start_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+pub async fn start_task(task_name: String, config: Option<String>, is_remote: bool, task_id: String, expected_remote: Option<bool>,
     clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
-    control: State<'_, TaskControlState>) -> Result<(), String> {
-    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    control: State<'_, TaskControlState>) -> Result<JsonValue, String> {
+    let request = start_request(&task_name, config.as_deref(), is_remote, &task_id, expected_remote)?;
     start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
 #[command]
-pub async fn start_super_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+pub async fn start_super_task(task_name: String, config: Option<String>, is_remote: bool, task_id: String, expected_remote: Option<bool>,
     clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
-    control: State<'_, TaskControlState>) -> Result<(), String> {
-    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    control: State<'_, TaskControlState>) -> Result<JsonValue, String> {
+    let request = start_request(&task_name, config.as_deref(), is_remote, &task_id, expected_remote)?;
     start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
 #[command]
-pub async fn start_priority_task(task_name: String, config: String, is_remote: bool, task_id: String, expected_remote: Option<bool>,
+pub async fn start_priority_task(task_name: String, config: Option<String>, is_remote: bool, task_id: String, expected_remote: Option<bool>,
     clients: State<'_, Arc<MongoClients>>, app_config: State<'_, AppConfig>,
-    control: State<'_, TaskControlState>) -> Result<(), String> {
-    let request = start_request(&task_name, &config, is_remote, &task_id, expected_remote)?;
+    control: State<'_, TaskControlState>) -> Result<JsonValue, String> {
+    let request = start_request(&task_name, config.as_deref(), is_remote, &task_id, expected_remote)?;
     start_via_core(control.get(&app_config, &clients).await?, &request).await
 }
 
@@ -1229,23 +1255,54 @@ fn get_script_description(script_key: &str) -> String {
     }
 }
 
+// Optional frozen join fields. Omitted launch check preserves old direct callers.
+fn gui_pause_options<'a>(id: &'a str, remote: bool, exact: Option<&'a str>, absent: Option<bool>,
+    remaining_ms: Option<u64>, elapsed: Duration) -> Result<PauseOptions<'a>, String> {
+    required_task_id(Some(id))?;
+    if exact.is_some_and(|value| value.trim().is_empty()) { return Err("expectedLaunchAttemptId must be nonempty".into()); }
+    let expected_launch_absent = absent.unwrap_or(false);
+    if expected_launch_absent && exact.is_some() { return Err("exact launch and expectedLaunchAbsent are mutually exclusive".into()); }
+    let remaining = match remaining_ms {
+        Some(ms) if ms > 120_000 => return Err("remainingMs exceeds original pause UI120s".into()),
+        Some(ms) => {
+            let left = Duration::from_millis(ms).saturating_sub(elapsed);
+            if left.is_zero() { return Err("pause caller deadline expired; stop not sent".into()); }
+            Some(left)
+        }
+        None => None,
+    };
+    Ok(PauseOptions { expected_task_id: Some(id), expected_remote: Some(remote),
+        expected_launch_attempt_id: exact, expected_launch_absent, remaining, ..Default::default() })
+}
+
 #[command]
 pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<String>,
-    request_id: Option<String>, app: AppHandle, clients: State<'_, Arc<MongoClients>>,
+    request_id: Option<String>, expected_launch_attempt_id: Option<String>, expected_launch_absent: Option<bool>,
+    remaining_ms: Option<u64>, app: AppHandle, clients: State<'_, Arc<MongoClients>>,
     app_config: State<'_, AppConfig>, control: State<'_, TaskControlState>) -> Result<ConfirmedTaskStop, String> {
+    let started = Instant::now();
     let id = required_task_id(task_id.as_deref())?;
+    let admission = gui_pause_options(id, is_remote, expected_launch_attempt_id.as_deref(), expected_launch_absent, remaining_ms, Duration::ZERO)?;
     let progress = TaskOperationProgress::new(app, "stop", Some(id), &task_name, is_remote, request_id);
-    progress.stage("initial", "暂停请求已接收；共享核心核验原任务，停止脚本预算75秒");
-    let core = control.get(&app_config, &clients).await.map_err(|e| progress.failure(e))?;
+    progress.stage("initial", "暂停请求已接收；尚未获得原任务锁/尚未执行停止；原停止路径上限75秒");
+    let core = if let Some(left) = admission.remaining {
+        // Original binding owner uses an 8s cap; keep it inside caller remaining.
+        timeout(left.min(Duration::from_secs(8)), control.get(&app_config, &clients)).await
+            .map_err(|_| progress.failure("控端绑定获取超时；停止未发送"))?
+            .map_err(|error| progress.failure(error))?
+    } else { control.get(&app_config, &clients).await.map_err(|error| progress.failure(error))? };
+    let mut options = gui_pause_options(id, is_remote, expected_launch_attempt_id.as_deref(), expected_launch_absent,
+        remaining_ms, started.elapsed()).map_err(|error| progress.failure(error))?;
+    let left = options.remaining;
     let stages = progress.clone();
-    let result = core.pause(&task_name, PauseOptions {
-        expected_task_id: Some(id), expected_remote: Some(is_remote),
-        observer: Some(Arc::new(move |event| {
-            if event.stage == "failed" { stages.failure(event.message); }
-            else { stages.stage(event.stage, &event.message); }
-        })),
-        ..Default::default()
-    }, StopBudget::Gui, Some(progress.observer())).await;
+    options.observer = Some(Arc::new(move |event| {
+        if event.stage == "failed" { stages.failure(event.message); }
+        else { stages.stage(event.stage, &event.message); }
+    }));
+    let operation = core.pause(&task_name, options, StopBudget::Gui, Some(progress.observer()));
+    let result = if let Some(left) = left {
+        timeout(left, operation).await.map_err(|_| progress.failure("本次暂停剩余预算耗尽；最终停止回执待核验，未重发"))?
+    } else { operation.await };
     if result.exit_code != 0 { return Err(progress.failure(result.value)); }
     result.confirmed_stop.ok_or_else(|| progress.failure("共享核心未返回已确认停止回执"))
 }
@@ -2395,7 +2452,8 @@ else: raise AssertionError(a)
             last:Arc::new(Mutex::new(("initial".into(),"original runner".into()))),sink:Arc::new(move|e|copy.lock().unwrap().push(e))};
         let (out,err)=execute_task_script(&p,&fake.config,Duration::from_secs(3)).await.unwrap();
         assert!(err.is_empty());
-        let d=validated_history_diagnostic(&out,&task,id,"fixture",false,bson::DateTime::now().timestamp_millis()).unwrap();
+        let observed_at=bson::DateTime::now().timestamp_millis();
+        let d=validated_history_diagnostic(&out,&task,id,"fixture",false,observed_at).unwrap();
         let wire=business_diagnostic_output(&runtime_process_output(&out,&err).unwrap(),Some(d));
         assert!(wire.contains("simulation_recovery_phase_timeout") && wire.contains("300"));
         assert!(!wire.contains("private") && !wire.contains("EOFError") && !wire.contains("fake paused"));
@@ -2413,6 +2471,14 @@ else: raise AssertionError(a)
         assert_eq!(filter.get_document("tmuxContext").unwrap(),task.get_document("tmuxContext").unwrap());
         assert!(!root.join("shim-called").exists(),"Pi PATH shim must never be invoked");
         assert!(!fs::read_to_string(root.join("native-calls")).unwrap().contains("kill-session"));
+        // Exact output of the original script/native route above; the Node
+        // SFC/Pinia test consumes this only after this native test has passed.
+        println!("\nNATIVE_DIAGNOSTIC_TEST_WIRE {}", serde_json::json!({
+            "taskId":id.to_hex(), "name":"fixture", "isRemote":false,
+            "authProfile":task.get_str("auth_profile").unwrap_or("user1"),
+            "launchAttemptId":task.get_str("launchAttemptId").unwrap(),
+            "observedAt":observed_at, "output":wire
+        }));
     }
 
 }
@@ -2430,7 +2496,7 @@ mod shared_start_tests {
     #[test]
     fn real_shared_request_preserves_full_config_id_host_and_disables_notification() {
         for remote in [false, true] {
-            let request = start_request("fixture", CONFIG, remote, ID, None).unwrap();
+            let request = start_request("fixture", Some(CONFIG), remote, ID, None).unwrap();
             assert_eq!(request.config_json.as_deref(), Some(CONFIG));
             assert_eq!(request.expected_task_id.as_deref(), Some(ID));
             assert_eq!(request.remote, Some(remote));
@@ -2441,8 +2507,93 @@ mod shared_start_tests {
         }
     }
     #[test]
+    fn typed_start_success_returns_original_value_and_business_failure_still_rejects() {
+        let request = start_request("fixture", None, false, ID, Some(false)).unwrap();
+        let already = json!({"schemaVersion":1,"command":"start","task":"fixture","ok":true,
+            "taskId":ID,"remote":false,"launchAttemptId":"original-launch","outcome":"already_running",
+            "startedNew":false,"consumerRunning":true,"configApplied":false,"configComparison":"not_requested","requestSatisfied":true});
+        assert_eq!(gui_start_outcome(TaskOutcome { value:already.clone(), exit_code:0 }, &request).unwrap(), already);
+        for comparison in ["different", "unverified"] {
+            let mut failure = already.clone();
+            failure["ok"] = json!(false); failure["requestSatisfied"] = json!(false);
+            failure["configComparison"] = json!(comparison); failure["error"] = json!("explicit configuration was not applied");
+            // Even ok=false/exit=0 cannot resolve as legacy void success.
+            let rejected = gui_start_outcome(TaskOutcome { value:failure.clone(), exit_code:0 }, &request).unwrap_err();
+            assert_eq!(serde_json::from_str::<JsonValue>(&rejected).unwrap(), failure);
+        }
+        let mut foreign = already.clone(); foreign["taskId"] = json!("foreign-task");
+        assert!(gui_start_outcome(TaskOutcome { value:foreign, exit_code:0 }, &request).is_err());
+        assert!(gui_start_outcome(TaskOutcome { value:already, exit_code:1 }, &request).is_err());
+    }
+
+    #[test]
+    fn optional_gui_config_reaches_same_original_selectors_as_cli_none_using_raw_task_fixture() {
+        // Same JSON input table as actual StartTaskModal -> TaskManager tests.
+        // Raw task fields represent DB shape, not the lossy list Task DTO.
+        let table: JsonValue = serde_json::from_str(include_str!("../../tests/fixtures/startConfigParity.json")).unwrap();
+        fn literal(value: &JsonValue) -> bson::Bson {
+            // Fixture storage only: do not interpret opaque business $oid/$numberInt.
+            match value {
+                JsonValue::Null => bson::Bson::Null,
+                JsonValue::Bool(v) => bson::Bson::Boolean(*v),
+                JsonValue::String(v) => bson::Bson::String(v.clone()),
+                JsonValue::Number(v) => v.as_i64().map(bson::Bson::Int64).unwrap_or_else(|| bson::Bson::Double(v.as_f64().unwrap())),
+                JsonValue::Array(v) => bson::Bson::Array(v.iter().map(literal).collect()),
+                JsonValue::Object(v) => bson::Bson::Document(v.iter().map(|(k, v)| (k.clone(), literal(v))).collect()),
+            }
+        }
+        fn plain(value: &bson::Bson) -> JsonValue {
+            match value {
+                bson::Bson::Document(d) => JsonValue::Object(d.iter().map(|(k, v)| (k.clone(), plain(v))).collect()),
+                bson::Bson::Array(v) => JsonValue::Array(v.iter().map(plain).collect()),
+                bson::Bson::String(v) => json!(v), bson::Bson::Boolean(v) => json!(v),
+                bson::Bson::Int32(v) => json!(v), bson::Bson::Int64(v) => json!(v),
+                bson::Bson::Double(v) => json!(v), bson::Bson::Null => JsonValue::Null,
+                other => panic!("unexpected business fixture value: {other:?}"),
+            }
+        }
+        fn assert_selected(selected: &Document, row: &JsonValue) {
+            let expected = row.get("edit").unwrap_or(&row["expectedCore"]["value"]);
+            assert_eq!(&plain(&bson::Bson::Document(selected.clone())), expected, "{}", row["id"]);
+        }
+        for row in table["rows"].as_array().unwrap() {
+            let kind = row["kind"].as_str().unwrap();
+            let mut task = literal(&row["rawTask"]).as_document().unwrap().clone();
+            task.insert("name", "priority-a"); task.insert("taskType", kind);
+            let explicit = row.get("edit").map(JsonValue::to_string);
+            let gui = start_request("priority-a", explicit.as_deref(), false, ID, Some(false)).unwrap();
+            let mut cli = StartRequest::new("priority-a");
+            cli.config_json = explicit.clone();
+            assert_eq!(gui.config_json, cli.config_json, "{}", row["id"]);
+            if kind == "priority" {
+                let gui_selected = quantnight_task_core::start::priority_config_input(&task, gui.config_json.as_deref());
+                let cli_selected = quantnight_task_core::start::priority_config_input(&task, cli.config_json.as_deref());
+                assert_eq!(gui_selected, cli_selected, "{}", row["id"]);
+                if row["expectedCore"]["selection"] == "original_owner_default" { assert!(gui_selected.unwrap().is_none()); }
+                else { assert_selected(&gui_selected.unwrap().unwrap(), row); }
+            } else {
+                let gui_selected = quantnight_task_core::start::saved_start_config(&task, gui.config_json.as_deref());
+                let cli_selected = quantnight_task_core::start::saved_start_config(&task, cli.config_json.as_deref());
+                assert_eq!(gui_selected, cli_selected, "{}", row["id"]);
+                if row["expectedCore"]["selection"] == "reject" { assert!(gui_selected.is_err()); }
+                else { assert_selected(&gui_selected.unwrap(), row); }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_gui_config_keeps_explicit_null_array_and_invalid_json_errors() {
+        assert!(start_request("fixture", None, false, ID, Some(false)).unwrap().config_json.is_none());
+        for value in ["null", "[]", "false", "broken", "", "\"null\""] {
+            assert!(start_request("fixture", Some(value), false, ID, Some(false)).is_err(), "{value}");
+        }
+        let opaque = r#"{"opaque":{"$oid":"business","$numberInt":"01","array":[null,true,1]}}"#;
+        assert_eq!(start_request("fixture", Some(opaque), true, ID, Some(true)).unwrap().config_json.as_deref(), Some(opaque));
+    }
+
+    #[test]
     fn false_wrong_identity_schema_and_invalid_json_never_retry_or_write_running() {
-        let request = start_request("fixture", CONFIG, false, ID, None).unwrap();
+        let request = start_request("fixture", Some(CONFIG), false, ID, None).unwrap();
         let mut receipts = vec![JsonValue::Null, json!({}), json!("not-json")];
         for change in [json!({"ok":false,"error":"execution_context_unverified: specific-host-error"}),
             json!({"taskId":"replacement-task"}), json!({"remote":true}), json!({"remote":"false"}),
@@ -2474,10 +2625,153 @@ mod shared_start_tests {
     #[tokio::test]
     async fn malformed_id_config_and_missing_process_fail_without_launch() {
         for (id, config) in [("", CONFIG), (ID, "bad-json"), (ID, "[]")] {
-            assert!(start_request("fixture", config, false, id, None).is_err());
+            assert!(start_request("fixture", Some(config), false, id, None).is_err());
         }
         let command = tokio::process::Command::new("/no-such-quantnight-test-process");
         let error = run_process_observed(command, Duration::from_secs(1), false, None).await.unwrap_err();
         assert!(error.contains("启动命令失败"), "{error}");
+    }
+}
+
+
+#[cfg(test)]
+mod task_control_source_tests {
+    use super::*;
+    #[test]
+    fn list_source_is_assigned_by_original_read_branch_not_db_self_claim() {
+        for forged in [bson::Bson::String("local".into()), bson::Bson::String("remote_only".into()),
+            bson::Bson::Boolean(true), bson::Bson::Document(doc! {"local": true})] {
+            let row = doc! {"_id": ObjectId::new(), "name":"source-fixture", "status":"ready", "isRemote":true,
+                "controlSource":forged};
+            let local = listed_task(row.clone(), TaskControlSource::Local).unwrap();
+            assert_eq!(local.control_source, Some(TaskControlSource::Local));
+            assert_eq!(local.is_remote, Some(true)); // remote execution is still locally controllable
+            let remote = listed_task(row.clone(), TaskControlSource::RemoteOnly).unwrap();
+            assert_eq!(remote.control_source, Some(TaskControlSource::RemoteOnly));
+            assert_eq!(serde_json::to_value(remote).unwrap()["controlSource"], "remote_only");
+            let unclassified: Task = bson::from_document(row).unwrap();
+            assert!(unclassified.control_source.is_none());
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod gui_pause_join_tests {
+    use super::*;
+    const ID: &str = "0123456789abcdef01234567";
+    #[test]
+    fn exact_absent_and_legacy_options_remain_distinct_and_remaining_is_consumed() {
+        let legacy = gui_pause_options(ID, false, None, None, None, Duration::from_secs(1)).unwrap();
+        assert!(!legacy.expected_launch_absent); assert!(legacy.expected_launch_attempt_id.is_none()); assert!(legacy.remaining.is_none());
+        let exact = gui_pause_options(ID, true, Some("launch-original"), Some(false), Some(120000), Duration::from_millis(9000)).unwrap();
+        assert_eq!(exact.expected_launch_attempt_id, Some("launch-original")); assert!(!exact.expected_launch_absent);
+        assert_eq!(exact.remaining, Some(Duration::from_millis(111000)));
+        let absent = gui_pause_options(ID, true, None, Some(true), Some(85000), Duration::from_secs(8)).unwrap();
+        assert!(absent.expected_launch_absent); assert!(absent.expected_launch_attempt_id.is_none());
+        assert_eq!(absent.remaining, Some(Duration::from_secs(77)));
+        for (exact, absent, remaining, elapsed) in [
+            (Some(""), None, None, 0), (Some("  "), None, None, 0),
+            (Some("launch"), Some(true), None, 0), (None, None, Some(120001), 0),
+            (None, None, Some(0), 0), (None, Some(true), Some(80), 80), (None, None, Some(80), 90),
+        ] { assert!(gui_pause_options(ID, false, exact, absent, remaining, Duration::from_millis(elapsed)).is_err()); }
+        assert_eq!(StopBudget::Gui.seconds(), 75); assert_eq!(StopBudget::Cli.seconds(), 60);
+    }
+    #[test]
+    fn frozen_gui_optional_argument_types_reject_malformed_values_not_convert_to_absence() {
+        #[derive(Deserialize)]
+        #[serde(rename_all="camelCase")]
+        struct Arguments { expected_launch_attempt_id: Option<String>, expected_launch_absent: Option<bool>, remaining_ms: Option<u64> }
+        for raw in [r#"{"expectedLaunchAttemptId":false}"#, r#"{"expectedLaunchAttemptId":{}}"#,
+            r#"{"expectedLaunchAbsent":"true"}"#, r#"{"remainingMs":-1}"#,
+            r#"{"remainingMs":1.5}"#, r#"{"remainingMs":"10"}"#, r#"{"remainingMs":true}"#] {
+            assert!(serde_json::from_str::<Arguments>(raw).is_err(), "{raw}");
+        }
+        let args: Arguments = serde_json::from_str(r#"{"expectedLaunchAbsent":true,"remainingMs":100000}"#).unwrap();
+        let options = gui_pause_options(ID, false, args.expected_launch_attempt_id.as_deref(), args.expected_launch_absent, args.remaining_ms, Duration::ZERO).unwrap();
+        assert!(options.expected_launch_absent); assert!(options.expected_launch_attempt_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod generated_start_ipc_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rejected_by_real_handler(command: &str, body: JsonValue) -> JsonValue {
+        // Register the ORIGINAL three generated wrappers. No copied test command,
+        // no production bootstrap, and deliberately no managed MongoClients state.
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                crate::commands::start_task,
+                crate::commands::start_super_task,
+                crate::commands::start_priority_task,
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build Tauri MockRuntime application only");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build().expect("build mock webview only");
+        let response = tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd: command.into(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else { "tauri://localhost" }.parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        });
+        match response {
+            Err(error) => error,
+            Ok(_) => panic!("command must not succeed or reach business work without clients state"),
+        }
+    }
+    fn scalar_arguments() -> JsonValue {
+        json!({"taskName":"ipc-config-fixture", "taskId":"0123456789abcdef01234567", "isRemote":false})
+    }
+    fn assert_unmanaged_clients(command: &str, body: JsonValue) {
+        let error = rejected_by_real_handler(command, body);
+        let expected = format!("state not managed for field `clients` on command `{command}`. You must call `.manage()` before using this command");
+        assert_eq!(error.as_str(), Some(expected.as_str()),
+            "must reach original State extraction, not stop at config decoding: {error}");
+    }
+
+    #[test]
+    fn generated_start_handlers_decode_omitted_null_and_explicit_config_before_unmanaged_state() {
+        for command in ["start_task", "start_super_task", "start_priority_task"] {
+            assert_unmanaged_clients(command, scalar_arguments()); // config key is really omitted
+            let mut null = scalar_arguments(); null["config"] = JsonValue::Null;
+            assert_unmanaged_clients(command, null); // nullable Option is None, not JSON text "null"
+            let mut explicit = scalar_arguments();
+            explicit["config"] = json!(r#"{"max_concurrent":3,"opaque":{"$oid":"literal","values":[true,null]}}"#);
+            explicit["expectedRemote"] = json!(false);
+            assert_unmanaged_clients(command, explicit);
+            // String DTO decoding is not business JSON validation. The command
+            // body cannot run here; original start_request(Some(...)) tests own
+            // rejection of these contents after managed-state extraction.
+            for text in ["null", "[]", "broken-json"] {
+                let mut body = scalar_arguments(); body["config"] = json!(text);
+                assert_unmanaged_clients(command, body);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_start_handlers_reject_wrong_config_types_before_state_or_business_entry() {
+        for command in ["start_task", "start_super_task", "start_priority_task"] {
+            for invalid in [json!({}), json!([]), json!(false), json!(17)] {
+                let mut body = scalar_arguments(); body["config"] = invalid;
+                let error = rejected_by_real_handler(command, body);
+                let text = error.as_str().expect("original macro rejection string");
+                assert!(text.contains("invalid args `config`") && text.contains(command), "{text}");
+                assert!(!text.contains("state not managed"), "config must fail before State extraction");
+            }
+            let mut missing = scalar_arguments(); missing.as_object_mut().unwrap().remove("taskName");
+            let error = rejected_by_real_handler(command, missing);
+            let text = error.as_str().unwrap();
+            assert!(text.contains("missing required key taskName"), "required scalar still required: {text}");
+            assert!(!text.contains("state not managed"));
+        }
     }
 }

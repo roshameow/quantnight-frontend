@@ -10,7 +10,7 @@ import { useTaskStore, taskStopDisplayStatus, validStopReceipt, stopProofMillis 
 // Execute the actual TaskManager setup, with real Pinia/Vue/coordinator code.
 // Only component imports and native/router/UI boundaries are replaced. No app,
 // DB, network, SSH or real timers are required to test the pause command path.
-const source = await readFile(new URL('../src/views/TaskManager.vue', import.meta.url), 'utf8');
+const source = await readFile(process.env.QUANTNIGHT_TEST_MANAGER_SOURCE ?? new URL('../src/views/TaskManager.vue', import.meta.url), 'utf8');
 const { descriptor } = parse(source);
 const require = createRequire(import.meta.url);
 const vueModule = pathToFileURL(require.resolve('vue/dist/vue.runtime.esm-bundler.js')).href;
@@ -25,13 +25,15 @@ const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); 
 const task = (extra = {}) => ({ _id: { $oid: 'id-a' }, name: 'priority-a', taskType: 'priority',
   isRemote: true, status: 'running', mission_config: { rounds: { enabled: true } }, ...extra });
 
-async function harness(initial = task()) {
+async function harness(initial = task(), options = {}) {
   setActivePinia(createPinia());
   const store = useTaskStore();
   store.replaceTasks([initial]);
   const compiled = compileScript(descriptor, { id: `pause-${instance++}` }).content;
   const code = compiled
     .replace('createAutoPauseScheduler,', 'createAutoPauseScheduler as realAutoPauseScheduler,')
+    .replace('createTaskProgressLifecycle,', 'createTaskProgressLifecycle as realTaskProgressLifecycle,')
+    .replaceAll('performance.now()', 'hooks.now')
     .replace('ref, onMounted, onUnmounted, watch, computed', 'ref, watch, computed')
     .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`)
     .replaceAll('from "pinia"', `from ${JSON.stringify(piniaModule)}`)
@@ -42,13 +44,16 @@ async function harness(initial = task()) {
     .replace(/import \{ invoke \} from "@tauri-apps\/api\/core";/, 'const invoke = (...args) => hooks.invoke(...args);')
     .replace(/import \{ listen \} from "@tauri-apps\/api\/event";/, 'const listen = (...args) => hooks.listen(...args);')
     .replace(/import \{ useRoute, useRouter \} from "vue-router";/,
-      'const useRoute = () => ({ fullPath: "/tasks" }); const useRouter = () => ({ push() {} });')
+      'const useRoute = () => hooks.route; const useRouter = () => hooks.router;')
     .replace(/import \{ useMessage, useDialog \} from "naive-ui";/,
       'const useMessage = () => ({ error: (...args) => hooks.errors.push(args), success: text => hooks.notices.push({ type: "success", text }), warning: text => hooks.notices.push({ type: "warning", text }), loading: (text, options) => { const entry = { text, options, destroyed: false }; hooks.messages.push(entry); return { destroy: () => { entry.destroyed = true; } }; } }); const useDialog = () => ({ warning: options => { hooks.dialog = options; hooks.dialogClosed = false; return { destroy: () => { hooks.dialogClosed = true; } }; } });')
     .replace(/import (\w+) from "[^"\n]+\.vue";/g, 'const $1 = {};');
-  const hooksCode = `export const hooks = { errors: [], messages: [], notices: [], invoke: null, unmount: null, timers: new Map(), nextTimer: 0 };
-    const setTimeout = (callback, delay) => { const id = ++hooks.nextTimer; hooks.timers.set(id, { callback, delay }); return id; };
+  const hooksCode = `export const hooks = { errors: [], messages: [], notices: [], invoke: null, unmount: null, timers: new Map(), nextTimer: 0, now: 0, intervals: new Map(), nextInterval: 0 };
+    const setTimeout = (callback, delay) => { const id = ++hooks.nextTimer; hooks.timers.set(id, { callback, delay, at: hooks.now + delay }); return id; };
     const clearTimeout = (id) => { hooks.timers.delete(id); };
+    const createTaskProgressLifecycle = (options) => realTaskProgressLifecycle({ ...options,
+      setIntervalFn: (callback, delay) => { const id = ++hooks.nextInterval; hooks.intervals.set(id, { callback, delay }); return id; },
+      clearIntervalFn: id => hooks.intervals.delete(id) });
     const createAutoPauseScheduler = (options) => realAutoPauseScheduler({ ...options, setTimeoutFn: setTimeout, clearTimeoutFn: clearTimeout });
     const onMounted = (fn) => { hooks.mount = fn; };
     const onUnmounted = (fn) => { hooks.unmount = fn; };
@@ -70,6 +75,8 @@ async function harness(initial = task()) {
     if (name === 'refresh_task_progress') return backgroundError ? Promise.reject(backgroundError) : Promise.resolve();
     assert.fail(`unexpected native command: ${name}`);
   };
+  module.hooks.route = options.route ?? { fullPath: '/tasks', query: {} };
+  module.hooks.router = options.router ?? { push() {}, replace() {} };
   const state = module.default.setup({}, { expose() {} });
   return { store, state, hooks: module.hooks, command, lists, probes, calls, stop: () => module.hooks.unmount(),
     failBackground: () => { backgroundError = new Error('background progress timeout'); } };
@@ -344,6 +351,7 @@ test('actual successful start handler clears previous verified pause so stale ac
     h.store.confirmTaskPaused(target, receipt(), operation);
     const originalInvoke = h.hooks.invoke;
     h.hooks.invoke = (name, args) => name === 'start_priority_task' ? Promise.resolve() : originalInvoke(name, args);
+    await h.state.openStartModal(h.store.tasks[0]);
     await h.state.handlePriorityStartTask({ taskName: 'priority-a', config: {}, isRemote: true });
     assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
     assert.equal(stopStatus(h), '暂停标记无有效停止凭据');
@@ -358,30 +366,7 @@ const regularTask = (extra = {}) => task({ taskType: 'regular', mission_config: 
 const positivePane = '✅ Pane 0 (pid=21733) is running: python3.12';
 const bashPane = '❌ Pane 0 (pid=21733) is running: bash';
 
-test('existing manager poll includes regular, super and priority running tasks, never ready/paused; no DB mutation', async () => {
-  const h = await harness(regularTask());
-  try {
-    h.store.replaceTasks([regularTask(), task({ _id: 'id-p', name: 'priority-p' }),
-      regularTask({ _id: 'id-s', name: 'super-s', taskType: 'super' }),
-      regularTask({ _id: 'id-r', name: 'ready-r', status: 'ready' }),
-      regularTask({ _id: 'id-z', name: 'paused-z', status: 'paused' })]);
-    const before = JSON.stringify(h.store.tasks);
-    h.state.pollTaskStatus();
-    h.state.pollTaskStatus(); // one in-flight request per target
-    assert.deepEqual(h.calls.map(call => call.args.taskName), ['priority-a', 'priority-p', 'super-s']);
-    assert.ok(h.calls.every(call => call.name === 'check_task_status'));
-    assert.equal(h.hooks.timers.size, 3);
-    h.probes.forEach(probe => probe.resolve(bashPane));
-    await tick();
-    assert.equal(h.hooks.timers.size, 0);
-    const observation = h.state.taskRuntimeStatus.value['priority-a'];
-    assert.equal(observation.taskId, 'id-a');
-    assert.equal(observation.isRemote, true);
-    assert.equal(observation.state, 'not_running');
-    assert.ok(Number.isSafeInteger(observation.observedAt));
-    assert.equal(JSON.stringify(h.store.tasks), before);
-  } finally { h.stop(); }
-});
+
 
 test('native stdout contract only confirms recognized Python/uv, shell-only is missing consumer, errors remain unknown', async () => {
   const h = await harness(regularTask());
@@ -705,16 +690,28 @@ test('launch changes fence late native business errors through original request 
 });
 
 
+// Start regression fixtures now traverse open-modal and the same original
+// native diagnostic at submit; valid pause evidence is explicit, not inferred.
+const startableTask = (extra = {}) => task({ status: 'paused', stopConfirmedAt: proofAt,
+  stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true, ...extra });
+const absentPane = "❌ Session 'priority-a' 不存在 (remote)";
+async function openForStart(h) {
+  await h.state.openStartModal(h.store.tasks[0]);
+  assert.equal(h.state.showStartModal.value, true);
+}
+
 for (const [handler, native, taskType] of [
   ['handleStartTask', 'start_task', 'regular'],
   ['handleStartSuperTask', 'start_super_task', 'super'],
   ['handlePriorityStartTask', 'start_priority_task', 'priority'],
 ]) {
   test(`actual ${handler} binds captured ID/full config/target; failure is specific and never retries`, async () => {
-    const h = await harness(task({ taskType, status: 'paused' }));
+    const h = await harness(startableTask({ taskType }));
     try {
-      const calls = [];
+      await openForStart(h);
+      const calls = [], checks = [];
       h.hooks.invoke = async (name, args) => {
+        if (name === 'check_task_status') { checks.push(args); return absentPane; }
         calls.push({ name, args });
         throw 'taskctl start: wrong taskId/host; stdout=receipt stderr=execution_context_unverified';
       };
@@ -722,6 +719,7 @@ for (const [handler, native, taskType] of [
       await h.state[handler]({ taskName: 'priority-a', config, isRemote: true });
       assert.deepEqual(calls, [{ name: native, args: { taskName: 'priority-a', taskId: 'id-a',
         config: JSON.stringify(config), isRemote: true, expectedRemote: true } }]);
+      assert.equal(checks.length, 0);
       assert.equal(h.store.tasks[0].status, 'paused');
       assert.equal(h.lists.length, 0);
       assert.match(h.hooks.errors[0][0], /wrong taskId\/host.*stdout=receipt stderr=execution_context_unverified/);
@@ -745,17 +743,22 @@ test('all native GUI start entrypoints delegate once without a second launch or 
   assert.equal((body.match(/core.start\(/g) || []).length, 1);
   assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
   const request = rust.slice(rust.indexOf('fn start_request('), rust.indexOf('async fn start_via_core('));
-  for (const arg of ['expected_task_id', 'notification.no_notify = true', 'request.remote = Some(remote)', 'request.config_json = Some(config.into())']) assert.ok(request.includes(arg));
+  for (const arg of ['expected_task_id', 'notification.no_notify = true', 'request.remote = Some(remote)', 'request.config_json = config.map(str::to_owned)']) assert.ok(request.includes(arg));
   assert.match(rust, /use quantnight_task_core::/);
   assert.match(body, /operation_task_identity/);
 });
 
 for (const handler of ['handleStartTask', 'handleStartSuperTask', 'handlePriorityStartTask']) {
   test(`${handler} rejects checkbox host migration and duplicate in-flight launches without losing original stop evidence`, async () => {
-    const h = await harness(task({ status: 'paused' }));
+    const taskType = handler === 'handleStartSuperTask' ? 'super' : handler === 'handleStartTask' ? 'regular' : 'priority';
+    const h = await harness(startableTask({ taskType }));
     try {
+      await openForStart(h);
       const calls = [], pending = deferred();
-      h.hooks.invoke = (name, args) => { calls.push({ name, args }); return pending.promise; };
+      h.hooks.invoke = (name, args) => {
+        if (name === 'check_task_status') return Promise.resolve(absentPane);
+        calls.push({ name, args }); return pending.promise;
+      };
       const args = { taskName: 'priority-a', config: { full: { keep: true } }, isRemote: false };
       await h.state[handler](args);
       assert.equal(calls.length, 0);
@@ -820,6 +823,7 @@ test('start forwards persisted creation destination separately from captured act
   try {
     const calls = [];
     h.hooks.invoke = async (name, args) => { calls.push({ name, args }); throw new Error('core decides pristine destination eligibility'); };
+    await h.state.openStartModal(h.store.tasks[0]);
     await h.state.handlePriorityStartTask({ taskName: 'priority-a', config: { exact: [] }, isRemote: false });
     assert.deepEqual(calls, [{ name: 'start_priority_task', args: { taskName: 'priority-a', taskId: 'id-a',
       config: '{"exact":[]}', isRemote: true, expectedRemote: false } }]);
@@ -1011,5 +1015,1033 @@ test('backend remains authoritative when stop state changed after opening confir
     assert.equal(h.store.tasks.length, 1);
     assert.match(h.hooks.errors[0][0], /停止状态仍未确认.*归档未执行/);
     assert.doesNotMatch(h.hooks.errors[0][0], /ignoredLargeBody/);
+  } finally { h.stop(); }
+});
+
+for (const taskType of ['regular', 'super']) {
+  const handler = taskType === 'super' ? 'handleStartSuperTask' : 'handleStartTask';
+
+
+
+
+  test(`${taskType}: normal action reaches core once without PID preflight; callback cannot reuse consumed modal`, async () => {
+    const h = await harness(regularTask({ taskType, status: 'ready' }));
+    try {
+      const calls = [], launch = deferred();
+      h.hooks.invoke = (name, args) => {
+        calls.push({ name, args });
+        if (name === 'check_task_status') return Promise.resolve(absentPane);
+        if (name.startsWith('start_')) return launch.promise;
+        if (name === 'get_all_tasks') return Promise.resolve([regularTask({ taskType, status: 'running', launchAttemptId: 'new-launch' })]);
+        if (name === 'refresh_task_progress') return Promise.resolve();
+        assert.fail(name);
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      assert.equal(h.state.showStartModal.value, true);
+      const args = { taskName: 'priority-a', config: { max_concurrent: 3 }, isRemote: true };
+      const first = h.state[handler](args); await tick();
+      await h.state[handler](args);
+      assert.equal(calls.filter(call => call.name.startsWith('start_')).length, 1);
+      launch.resolve(); await first; await tick();
+      assert.equal(h.state.startModalTarget.value, null);
+      assert.equal(h.state.showStartModal.value, false);
+      assert.equal(calls.filter(call => call.name === 'check_task_status').length, 0);
+      assert.equal(h.hooks.notices.filter(notice => notice.type === 'success').length, 1);
+      await h.state[handler](args);
+      assert.equal(calls.filter(call => call.name.startsWith('start_')).length, 1);
+    } finally { h.stop(); }
+  });
+
+
+}
+
+
+
+
+
+
+
+// v2 follow-up: exercise the actual setup -> invoke boundary, not button text.
+for (const taskType of ['regular', 'super']) for (const actual of [false, true]) {
+  test(`followup v2 ${taskType} actual=${actual}: stale targetRemote never overrides actual execution host`, async () => {
+    const initial = regularTask({ taskType, status: 'ready', isRemote: actual, targetRemote: !actual });
+    const h = await harness(initial);
+    try {
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'check_task_status') return `❌ Session 'priority-a' 不存在 (${actual ? 'remote' : 'local'})`;
+        if (name.startsWith('start_')) return;
+        if (name === 'get_all_tasks') return [{ ...initial, status: 'running', launchAttemptId: 'new' }];
+        if (name === 'refresh_task_progress') return;
+        assert.fail(name);
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      assert.equal(h.state.showStartModal.value, true);
+      await h.state[taskType === 'super' ? 'handleStartSuperTask' : 'handleStartTask']({ taskName: initial.name, config: { max_concurrent: 3 }, isRemote: actual });
+      await tick();
+      const starts = calls.filter(call => call.name.startsWith('start_'));
+      assert.equal(starts.length, 1);
+      assert.equal(starts[0].args.isRemote, actual, 'stale creation intent is not actual host');
+      assert.equal(starts[0].args.expectedRemote, actual);
+      assert.deepEqual(calls.filter(call => call.name === 'check_task_status'), []);
+    } finally { h.stop(); }
+  });
+}
+
+test('followup v2 Priority initial remote target preserves actual-local fence without unrelated local runtime preflight', async () => {
+  for (const runtime of [null, 'unknown']) {
+    const initial = task({ status: 'pending', isRemote: false, targetRemote: true, launchAttemptId: null });
+    const h = await harness(initial);
+    try {
+      if (runtime) h.state.taskRuntimeStatus.value[initial.name] = {
+        ...h.state.runtimeTarget(initial), state: runtime, observedAt: Date.now(), diagnostic: 'actual-local observation, not target-remote authority',
+      };
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'start_priority_task') return;
+        if (name === 'get_all_tasks') return [{ ...initial, status: 'running', isRemote: true, launchAttemptId: 'first-remote-launch' }];
+        if (name === 'refresh_task_progress') return;
+        assert.fail(`unexpected actual-local preflight: ${name}`);
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      assert.equal(h.state.showStartModal.value, true, `local ${runtime} must not decide pristine remote destination`);
+      await h.state.handlePriorityStartTask({ taskName: initial.name, config: { rounds: { enabled: true } }, isRemote: false });
+      await tick();
+      const starts = calls.filter(call => call.name === 'start_priority_task');
+      assert.equal(starts.length, 1);
+      assert.equal(starts[0].args.isRemote, true);
+      assert.equal(starts[0].args.expectedRemote, false);
+      assert.equal(calls.filter(call => call.name === 'check_task_status').length, 0);
+    } finally { h.stop(); }
+  }
+});
+
+test('v6 legacy own-start result supplies no join proof: no conflicting pause and no later retry', async () => {
+  const initial = regularTask({ status: 'ready', isRemote: true });
+  const h = await harness(initial);
+  const launch = deferred();
+  try {
+    const calls = [];
+    h.hooks.invoke = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'check_task_status') return Promise.resolve(absentPane);
+      if (name === 'start_task') return launch.promise;
+      if (name === 'pause_task') return Promise.resolve(receipt()); // bad v1 route must fail assertions, not hang
+      if (name === 'get_all_tasks') return Promise.resolve([{ ...initial, status: 'running', launchAttemptId: 'claimed-launch' }]);
+      if (name === 'refresh_task_progress') return Promise.resolve();
+      assert.fail(name);
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    const starting = h.state.handleStartTask({ taskName: initial.name, config: {}, isRemote: true });
+    await tick();
+    assert.equal(calls.filter(call => call.name === 'start_task').length, 1);
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    launch.resolve(); await starting; await tick();
+    assert.equal(await pausing, false);
+    assert.equal(calls.filter(call => call.name === 'pause_task').length, 0);
+    assert.equal(h.store.taskStopOperationMap[initial.name], undefined);
+    assert.ok(h.hooks.notices.some(notice => notice.type === 'warning' && /未发送.*暂停|暂停.*未发送/.test(notice.text)));
+    assert.equal(h.hooks.notices.filter(notice => notice.type === 'success').length, 1, 'only actual start may succeed');
+    await tick();
+    assert.equal(calls.filter(call => call.name === 'pause_task').length, 0, 'no hidden retry after start ends');
+  } finally { launch.resolve(); h.stop(); }
+});
+
+test('followup v2 pending public pause blocks start/sync/host mutations but one-confirm archive joins that same pause', async () => {
+  const initial = regularTask();
+  const h = await harness(initial);
+  const paused = deferred();
+  try {
+    const calls = []; let archived = false;
+    h.hooks.invoke = (name, args) => {
+      calls.push({ name, args });
+      if (name === 'pause_task') return paused.promise;
+      if (name === 'delete_task') { archived = true; return Promise.resolve({ unresolvedItemCount: 2 }); }
+      if (name === 'get_all_tasks') return Promise.resolve(archived ? [] : [{ ...initial, status: 'paused', stopConfirmedAt: proofAt, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true }]);
+      if (name === 'refresh_task_progress' || name === 'sync_remote_task' || name === 'update_remote_status') return Promise.resolve();
+      assert.fail(name);
+    };
+    const stopping = h.state.pauseTask(h.store.tasks[0]);
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handleStartTask({ taskName: initial.name, config: {}, isRemote: true });
+    await h.state.syncRemoteTask(initial.name);
+    await h.state.updateIsRemote(initial._id, false);
+    const conflicts = calls.filter(call => ['sync_remote_task', 'update_remote_status', 'start_task'].includes(call.name));
+    h.state.deleteTask(initial._id);
+    const archiving = h.hooks.dialog.onPositiveClick();
+    assert.equal(h.hooks.dialogClosed, true);
+    assert.equal(calls.filter(call => call.name === 'pause_task').length, 1);
+    paused.resolve(receipt()); await Promise.all([stopping, archiving]);
+    assert.deepEqual(conflicts, []);
+    assert.equal(calls.filter(call => call.name === 'delete_task').length, 1);
+    assert.equal(h.store.tasks.length, 0);
+    assert.equal(h.hooks.notices.filter(notice => notice.type === 'success').length, 0, 'only archive warning about retained receipts, no fake sync/source success');
+  } finally { paused.resolve(receipt()); h.stop(); }
+});
+
+for (const taskType of ['regular', 'super']) test(`followup v2 ${taskType} legal start -> pause -> start -> one-confirm pause/archive preserves original lifecycle`, async () => {
+  const initial = regularTask({ taskType, status: 'ready', targetRemote: false, isRemote: true });
+  const h = await harness(initial);
+  try {
+    let control = { ...initial }; let live = false; let launches = 0; let archived = false;
+    const calls = [];
+    h.hooks.invoke = async (name, args) => {
+      calls.push({ name, args });
+      if (name === 'check_task_status') return live ? positivePane : absentPane;
+      if (name === (taskType === 'super' ? 'start_super_task' : 'start_task')) {
+        assert.equal(args.isRemote, true); assert.equal(args.expectedRemote, true);
+        live = true; control = { ...control, status: 'running', launchAttemptId: `launch-${++launches}`,
+          stopConfirmedAt: null, stopConfirmedTaskId: null, stopConfirmedRemote: null }; return;
+      }
+      if (name === 'pause_task') {
+        assert.equal(args.isRemote, true); live = false;
+        control = { ...control, status: 'paused', stopConfirmedAt: proofAt, stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true };
+        return receipt();
+      }
+      if (name === 'delete_task') { assert.equal(live, false); archived = true; return { unresolvedItemCount: 0 }; }
+      if (name === 'get_all_tasks') return archived ? [] : [{ ...control }];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(name);
+    };
+    const start = async () => {
+      await h.state.openStartModal(h.store.tasks[0]);
+      assert.equal(h.state.showStartModal.value, true);
+      await h.state[taskType === 'super' ? 'handleStartSuperTask' : 'handleStartTask']({ taskName: initial.name, config: { max_concurrent: 3 }, isRemote: true });
+      await tick(); assert.equal(h.store.tasks[0].status, 'running');
+    };
+    await start();
+    assert.equal(await h.state.pauseTask(h.store.tasks[0]), true);
+    assert.equal(h.store.tasks[0].status, 'paused');
+    assert.equal(stopStatus(h), 'paused');
+    await start();
+    assert.equal(h.store.taskStopOperationMap[initial.name], undefined);
+    h.state.deleteTask(initial._id);
+    await h.hooks.dialog.onPositiveClick();
+    assert.equal(h.hooks.dialogClosed, true);
+    assert.equal(h.store.tasks.length, 0);
+    assert.equal(h.hooks.errors.length, 0);
+    assert.deepEqual(calls.filter(call => /^(start_task|start_super_task|pause_task|delete_task)$/.test(call.name)).map(call => call.name),
+      [taskType === 'super' ? 'start_super_task' : 'start_task', 'pause_task', taskType === 'super' ? 'start_super_task' : 'start_task', 'pause_task', 'delete_task']);
+  } finally { h.stop(); }
+});
+
+test('followup v2 native mutator lock rejection is not pause success, not archived and not automatically retried', async () => {
+  const h = await harness(regularTask());
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => { calls.push({ name, args }); throw new Error('task mutator lock busy; launch claimed by another client'); };
+    await assert.rejects(h.state.pauseTask(h.store.tasks[0]), /mutator lock busy/);
+    assert.deepEqual(calls.map(call => call.name), ['pause_task']);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
+    assert.equal(h.hooks.notices.filter(notice => notice.type === 'success').length, 0);
+    assert.match(h.hooks.errors[0][0], /mutator lock busy/);
+    await tick(); assert.equal(calls.length, 1);
+  } finally { h.stop(); }
+});
+
+test('followup v2 Priority modal fences replacement identity and changed saved destination including away-and-back', async () => {
+  for (const patch of [{ _id: 'new-id' }, { isRemote: true }, { auth_profile: 'other' }, { targetRemote: false }]) {
+    const initial = task({ status: 'pending', isRemote: false, targetRemote: true, launchAttemptId: null });
+    const h = await harness(initial);
+    try {
+      const calls = [];
+      h.hooks.invoke = async (name, args) => { calls.push({ name, args }); throw new Error('no native action should be sent for stale modal'); };
+      await h.state.openStartModal(h.store.tasks[0]);
+      assert.equal(h.state.showStartModal.value, true);
+      h.store.replaceTasks([{ ...initial, ...patch }]);
+      h.store.replaceTasks([initial]);
+      await h.state.handlePriorityStartTask({ taskName: initial.name, config: {}, isRemote: false });
+      assert.deepEqual(calls, [], 'stale Priority modal is not authority for a replacement task/destination');
+      assert.equal(h.state.showStartModal.value, false);
+    } finally { h.stop(); }
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+// Frozen R1 UX: default emits no override; explicit edits emit the complete JSON.
+// Original raw DB selector parity is exercised by commands.rs native tests.
+const parityTable = JSON.parse(await readFile(new URL('./fixtures/startConfigParity.json', import.meta.url), 'utf8'));
+for (const row of parityTable.rows) test(`v4 R1 GUI adapter: actual StartTaskModal -> TaskManager -> invoke ${row.id}`, async () => {
+  // Current Task Option<JsonValue> wire represents both absent and null as null.
+  const wire = Object.fromEntries(['mission_config', 'startConfig', 'config'].map(key => [key, row.rawTask[key] ?? null]));
+  const initial = task({ ...wire, taskType: row.kind, templatefile: 'pipeline', status: 'ready' });
+  const h = await harness(initial);
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => {
+      calls.push({ name, args });
+      if (name === 'check_task_status') return absentPane;
+      if (name.startsWith('start_')) return;
+      if (name === 'get_all_tasks') return [{ ...initial, status: 'running' }];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(name);
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    const originalModal = await readFile(new URL('../src/components/modals/StartTaskModal.vue', import.meta.url), 'utf8');
+    const compiled = compileScript(parse(originalModal).descriptor, { id: `parity-${row.id}` }).content
+      .replace(/import \{ useMessage \} from "naive-ui";/, 'const useMessage = () => ({ error: text => { throw new Error(text); } });')
+      .replaceAll('"@/utils/taskConfig"', JSON.stringify(new URL('../src/utils/taskConfig.js', import.meta.url).href))
+      .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`);
+    const modal = (await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)).default;
+    const emitted = [], pending = [];
+    const handlers = { 'start-task': h.state.handleStartTask, 'start-super-task': h.state.handleStartSuperTask, 'start-priority-task': h.state.handlePriorityStartTask };
+    const form = modal.setup({ show: true, task: h.state.selectedTask.value, isSuper: row.kind === 'super', isPriority: row.kind === 'priority' }, {
+      expose() {}, emit(name, args) { emitted.push({ name, args }); if (handlers[name]) pending.push(handlers[name](args)); },
+    });
+    assert.equal(form.editConfig.value, false);
+    assert.equal(form.form.value.config, '', 'no inferred effective JSON is displayed');
+    if (row.edit) { form.setConfigMode(true); form.form.value.config = JSON.stringify(row.edit); }
+    form.onConfirm(); await Promise.all(pending); await tick();
+    const native = calls.find(call => call.name.startsWith('start_'));
+    assert.ok(native, 'actual emitted modal config must reach native boundary');
+    assert.equal(emitted.filter(event => event.name.startsWith('start-')).length, 1);
+    if (row.edit) {
+      assert.deepEqual(JSON.parse(native.args.config), row.edit, 'explicit preview equals complete submitted JSON');
+    } else {
+      assert.equal(Object.hasOwn(native.args, 'config'), false, 'default delegates to original core None');
+      assert.equal(Object.hasOwn(emitted.find(event => event.name.startsWith('start-')).args, 'config'), false);
+    }
+  } finally { h.stop(); }
+});
+
+test('v4 R3 confirmed remote-only blocks actual handlers, retains exact-ID details, while old/local remote tasks still start', async () => {
+  for (const taskType of ['regular', 'super', 'priority']) {
+    const original = task({ taskType, status: 'ready', isRemote: true, controlSource: 'remote_only' });
+    const h = await harness(original);
+    try {
+      const pushed = []; h.hooks.router.push = target => pushed.push(target);
+      await h.state.generateList(original._id);
+      await h.state.syncRemoteTask(original.name);
+      await h.state.updateIsRemote(original._id, false);
+      await h.state.openStartModal(original);
+      await h.state.handleStartTask({ taskName: original.name, config: {}, isRemote: true });
+      await h.state.handleStartSuperTask({ taskName: original.name, config: {}, isRemote: true });
+      await h.state.handlePriorityStartTask({ taskName: original.name, config: {}, isRemote: true });
+      assert.equal(await h.state.pauseTask(original), false);
+      h.state.deleteTask(original._id); h.state.openUpdateModal(original);
+      await h.state.handleUpdateTask({ task: original, config: {}, isRemote: true });
+      await h.state.handleUpdatePriorityTask({ taskName: original.name, config: {}, isRemote: true });
+      assert.deepEqual(h.calls, [], 'no unsupported native mutator/probe calls for known remote-only');
+      assert.equal(h.hooks.dialog, undefined);
+      assert.equal(h.hooks.notices.filter(n => n.type === 'success').length, 0);
+      h.state.viewTask(original._id);
+      assert.deepEqual(pushed, [{ name: 'TaskManager', query: { taskId: 'id-a' } }]);
+    } finally { h.stop(); }
+  }
+  for (const controlSource of [undefined, null, 'local', 'unknown', true]) {
+    const initial = regularTask({ status: 'ready', isRemote: true, controlSource });
+    const h = await harness(initial);
+    try {
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'check_task_status') return absentPane;
+        if (name === 'start_task') return;
+        if (name === 'get_all_tasks') return [{ ...initial, status: 'running' }];
+        if (name === 'refresh_task_progress') return;
+        assert.fail(name);
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartTask({ taskName: initial.name, isRemote: true }); await tick();
+      assert.equal(calls.filter(c => c.name === 'start_task').length, 1, 'legacy/unknown source is not a global denial');
+      assert.equal(calls.find(c => c.name === 'start_task').args.expectedRemote, true);
+    } finally { h.stop(); }
+  }
+});
+
+test('v4 R2 actual router.resolve + original view handler renders exact-ID task details, not a fake results route', async () => {
+  const routerModule = import.meta.resolve('vue-router');
+  const routerSource = (await readFile(new URL('../src/router/index.js', import.meta.url), 'utf8'))
+    .replaceAll('createWebHistory', 'createMemoryHistory')
+    .replace("from 'vue-router'", `from ${JSON.stringify(routerModule)}`)
+    .replace(/import (\w+) from '[^'\n]+\.vue';/g, 'const $1 = { render() { return null; } };');
+  const router = (await import(`data:text/javascript;base64,${Buffer.from(routerSource).toString('base64')}`)).default;
+  await router.push('/task'); await router.isReady();
+  const route = new Proxy({}, { get: (_, key) => router.currentRoute.value[key] });
+  const original = regularTask({ status: 'completed_with_errors', controlSource: 'remote_only' });
+  const h = await harness(original, { router, route });
+  try {
+    h.hooks.invoke = async (name) => {
+      if (name === 'get_all_tasks') return h.store.tasks;
+      if (name === 'refresh_task_progress') return;
+      assert.fail(`view must not invent a task-results backend: ${name}`);
+    };
+    await h.state.viewTask(original._id); await tick();
+    const resolved = router.resolve(router.currentRoute.value.fullPath);
+    assert.equal(resolved.name, 'TaskManager'); assert.equal(resolved.matched.length, 1);
+    assert.equal(resolved.path, '/task'); assert.equal(resolved.query.taskId, 'id-a');
+    assert.equal(h.state.detailTask.value.name, original.name);
+    const detailSource = await readFile(new URL('../src/components/TaskCards/TaskDetailsPanel.vue', import.meta.url), 'utf8');
+    const compiled = compileScript(parse(detailSource).descriptor, { id: 'real-details', inlineTemplate: true }).content
+      .replaceAll("'../../utils/taskDiagnostics.js'", JSON.stringify(new URL('../src/utils/taskDiagnostics.js', import.meta.url).href))
+      .replaceAll("'../../stores/taskStore.js'", JSON.stringify(new URL('../src/stores/taskStore.js', import.meta.url).href))
+      .replaceAll('from "vue"', `from ${JSON.stringify(vueModule)}`).replaceAll("from 'vue'", `from ${JSON.stringify(vueModule)}`);
+    const panel = (await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)).default;
+    const { createSSRApp, h: renderH } = await import('vue');
+    const { renderToString } = await import('@vue/server-renderer');
+    const renderDetails = () => renderToString(createSSRApp({ render: () => renderH(panel, {
+      taskId: h.state.detailTaskId.value, task: h.state.detailTask.value,
+      progress: h.state.detailTask.value && h.store.taskProgressMap[h.state.detailTask.value.name],
+    }) }));
+    let html = await renderDetails();
+    assert.match(html, /任务详情/); assert.match(html, /仅远端登记/);
+    assert.match(html, /未决.*已接受回执明细/); assert.match(html, /不是本任务完整结果/);
+    assert.match(html, /taskctl results/);
+    h.store.replaceTasks([{ ...original, _id: 'new-id' }]);
+    assert.equal(h.state.detailTask.value, null);
+    html = await renderDetails(); assert.match(html, /未找到当前活动记录/); assert.match(html, /不.*按同名任务认领/);
+    h.store.replaceTasks([{ ...original, status: 'deactive' }]);
+    html = await renderDetails(); assert.match(html, /该记录已归档/);
+    await h.state.closeTaskDetails(); await tick(); assert.equal(router.currentRoute.value.query.taskId, undefined);
+    assert.equal(h.state.detailTaskId.value, '');
+    // Real handler is wired from BOTH cards and detail panel in actual SFC.
+    assert.equal((source.match(/@view="viewTask\(task\._id\)"/g) || []).length, 2);
+    assert.match(source, /<TaskDetailsPanel :task-id="detailTaskId" :task="detailTask"/);
+  } finally { h.stop(); }
+});
+
+const typedStart = (extra = {}) => ({ schemaVersion: 1, command: 'start', task: 'priority-a', ok: true,
+  taskId: 'id-a', remote: true, launchAttemptId: 'original-launch', outcome: 'already_running',
+  startedNew: false, consumerRunning: true, configApplied: false, configComparison: 'not_requested', requestSatisfied: true, ...extra });
+
+test('v5 typed start: actual handler distinguishes started and existing consumer, does not clear existing stop evidence as new launch', async () => {
+  for (const existing of [true, false]) {
+    const h = await harness(startableTask({ taskType: 'super' }));
+    try {
+      const snapshot = { ...h.store.tasks[0] };
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'check_task_status') return absentPane;
+        if (name === 'start_super_task') return typedStart(existing ? {} : { outcome: 'started', startedNew: true, configApplied: true });
+        if (name === 'get_all_tasks') return [snapshot];
+        if (name === 'refresh_task_progress') return;
+        assert.fail(name);
+      };
+      const clear = h.store.clearTaskStop; let clears = 0;
+      h.store.clearTaskStop = (...args) => { clears++; return clear(...args); };
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartSuperTask({ taskName: snapshot.name, isRemote: true }); await tick();
+      assert.equal(calls.filter(c => c.name === 'start_super_task').length, 1);
+      assert.equal(clears, existing ? 0 : 1);
+      assert.equal(h.hooks.errors.length, 0);
+      assert.match(h.hooks.notices.at(-1).text, existing ? /原任务已运行.*未新启动.*未应用新配置/ : /任务启动已确认/);
+    } finally { h.stop(); }
+  }
+});
+
+test('v5 typed failure: rejected or incorrectly resolved ok=false preserves live facts without claiming success or applying config', async () => {
+  for (const comparison of ['different', 'unverified']) for (const reject of [true, false]) {
+    const h = await harness(startableTask({ taskType: 'super' }));
+    try {
+      const outcome = typedStart({ ok: false, requestSatisfied: false, configComparison: comparison, error: 'original consumer continues' });
+      const before = JSON.stringify(h.store.tasks);
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'check_task_status') return absentPane;
+        assert.equal(name, 'start_super_task');
+        if (reject) throw JSON.stringify(outcome);
+        return outcome;
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartSuperTask({ taskName: 'priority-a', isRemote: true, config: { requested: 'changed' } });
+      assert.equal(h.hooks.notices.filter(n => n.type === 'success').length, 0);
+      assert.match(h.hooks.notices.at(-1).text, /原消费者仍在运行.*本次配置未应用.*继续查看原任务/);
+      assert.equal(JSON.stringify(h.store.tasks), before, 'no false local proof/config state change');
+      assert.deepEqual(calls.map(c => c.name), ['start_super_task']);
+    } finally { h.stop(); }
+  }
+});
+
+test('v5 typed failure is never inferred from free text, foreign identity/host or contradictory flags', async () => {
+  for (const error of [
+    `prefix ${JSON.stringify(typedStart({ ok: false, requestSatisfied: false, configComparison: 'different' }))}`,
+    JSON.stringify(typedStart({ ok: false, taskId: 'another', requestSatisfied: false, configComparison: 'different' })),
+    JSON.stringify(typedStart({ ok: false, remote: false, requestSatisfied: false, configComparison: 'different' })),
+    JSON.stringify(typedStart({ ok: false, startedNew: true, requestSatisfied: false, configComparison: 'different' })),
+  ]) {
+    const h = await harness(startableTask({ taskType: 'super' }));
+    try {
+      h.hooks.invoke = async name => { if (name === 'check_task_status') return absentPane; throw error; };
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartSuperTask({ taskName: 'priority-a', isRemote: true });
+      assert.equal(h.hooks.notices.length, 0, 'no unverified live/idempotent claim');
+      assert.match(h.hooks.errors.at(-1)[0], /任务启动失败/);
+    } finally { h.stop(); }
+  }
+});
+
+test('v5 malformed success receipt cannot become a GUI success', async () => {
+  for (const output of [{}, typedStart({ taskId: 'foreign' }), typedStart({ requestSatisfied: false }), typedStart({ configApplied: true })]) {
+    const h = await harness(startableTask({ taskType: 'super' }));
+    try {
+      h.hooks.invoke = async name => name === 'check_task_status' ? absentPane : output;
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartSuperTask({ taskName: 'priority-a', isRemote: true });
+      assert.equal(h.hooks.notices.filter(n => n.type === 'success').length, 0);
+      assert.equal(h.hooks.errors.length, 1);
+    } finally { h.stop(); }
+  }
+});
+
+test('v5 typed Priority refusal may preserve the original actual-host consumer without granting a requested host migration', async () => {
+  const initial = task({ status: 'pending', isRemote: false, targetRemote: true });
+  const h = await harness(initial);
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => {
+      calls.push({ name, args }); assert.equal(name, 'start_priority_task');
+      throw JSON.stringify(typedStart({ ok: false, remote: false, requestSatisfied: false, configComparison: 'unverified', error: 'original local consumer remains' }));
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handlePriorityStartTask({ taskName: initial.name, isRemote: false, config: {} });
+    assert.equal(calls[0].args.isRemote, true); assert.equal(calls[0].args.expectedRemote, false);
+    assert.equal(h.store.tasks[0].isRemote, false);
+    assert.equal(h.hooks.notices.filter(n => n.type === 'success').length, 0);
+    assert.match(h.hooks.notices.at(-1).text, /原消费者仍在运行.*本次配置未应用/);
+    assert.equal(calls.length, 1);
+  } finally { h.stop(); }
+});
+
+test('v5 typed early refusal keeps concrete original error without inventing consumer identity', async () => {
+  const h = await harness(startableTask({ taskType: 'super' }));
+  try {
+    const refusal = { schemaVersion: 1, command: 'start', task: 'priority-a', ok: false, outcome: 'refused',
+      startedNew: false, configApplied: false, requestSatisfied: false, error: 'original execution identity unresolved' };
+    h.hooks.invoke = async name => { if (name === 'check_task_status') return absentPane; throw JSON.stringify(refusal); };
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handleStartSuperTask({ taskName: 'priority-a', isRemote: true });
+    assert.equal(h.hooks.notices.length, 0);
+    assert.equal(h.hooks.errors.at(-1)[0], '任务启动失败：original execution identity unresolved');
+  } finally { h.stop(); }
+});
+
+test('v5 legacy void null remains usable but is never upgraded to an already-running or exact-launch receipt', async () => {
+  const h = await harness(startableTask({ taskType: 'super' }));
+  try {
+    const initial = { ...h.store.tasks[0] }; const calls = [];
+    h.hooks.invoke = async name => {
+      calls.push(name);
+      if (name === 'check_task_status') return absentPane;
+      if (name === 'start_super_task') return null; // serde unit/old Tauri command
+      if (name === 'get_all_tasks') return [initial];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(name);
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handleStartSuperTask({ taskName: initial.name, isRemote: true }); await tick();
+    assert.equal(h.hooks.errors.length, 0);
+    assert.match(h.hooks.notices.at(-1).text, /任务启动已确认/);
+    assert.doesNotMatch(h.hooks.notices.at(-1).text, /原任务已运行|配置已应用/);
+    assert.equal(calls.filter(name => name === 'pause_task').length, 0);
+  } finally { h.stop(); }
+});
+
+const settledStart = (extra = {}) => typedStart({ outcome: 'started', startedNew: true, configApplied: true,
+  taskType: 'super', authProfile: 'user1', launchAttemptId: 'launch-owned', operationSettled: true, ...extra });
+async function ownStartHarness(extra = {}) {
+  const initial = task({ taskType: 'super', status: 'ready', launchAttemptId: 'launch-before', ...extra });
+  const h = await harness(initial);
+  const native = deferred(), fresh = deferred(), stop = deferred(), calls = [];
+  const latest = { ...initial, status: 'running', launchAttemptId: 'launch-owned' };
+  h.hooks.invoke = (name, args) => {
+    calls.push({ name, args });
+    if (name === 'check_task_status') return Promise.resolve(`❌ Session '${initial.name}' 不存在 (${initial.isRemote ? 'remote' : 'local'})`);
+    if (name.startsWith('start_')) return native.promise;
+    if (name === 'get_all_tasks') return fresh.promise;
+    if (name === 'refresh_task_progress') return Promise.resolve();
+    if (name === 'pause_task') return stop.promise;
+    assert.fail(name);
+  };
+  await h.state.openStartModal(h.store.tasks[0]);
+  const start = h.state[initial.taskType === 'priority' ? 'handlePriorityStartTask' : initial.taskType === 'regular' ? 'handleStartTask' : 'handleStartSuperTask']({ taskName: initial.name, isRemote: initial.isRemote });
+  await tick();
+  assert.equal(calls.filter(c => c.name.startsWith('start_')).length, 1);
+  return { ...h, native, fresh, stopReply: stop, ownCalls: calls, starting: start, latest };
+}
+const advanceJoinTime = async (h, ms) => {
+  h.hooks.now += ms;
+  for (const [id, timer] of [...h.hooks.timers].sort((a, b) => a[1].at - b[1].at)) {
+    if (timer.at <= h.hooks.now && h.hooks.timers.has(id)) { h.hooks.timers.delete(id); timer.callback(); }
+  }
+  await tick();
+};
+
+test('v6 join positive: one owned start -> one clicked pause succeeds through original stop, with one promise/reservation', async () => {
+  const h = await ownStartHarness();
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    assert.equal(h.state.pauseTask(h.store.tasks[0]), pausing, 'duplicate intent shares the same Promise');
+    assert.match(h.state.taskOperationDetail(h.store.tasks[0]), /尚未发送停止/);
+    assert.equal(h.store.taskStopOperationMap['priority-a'], undefined, 'waiting intent is not a sent stop');
+    h.native.resolve(settledStart()); await h.starting; await tick();
+    assert.equal(h.state.mutationRequests.value.has('id-a'), true, 'start finally must not release reservation');
+    assert.equal(h.ownCalls.filter(c => c.name === 'get_all_tasks').length, 1, 'fresh read is not duplicate start UI refresh');
+    await h.state.syncRemoteTask('priority-a');
+    await h.state.generateList('id-a');
+    await h.state.updateIsRemote('id-a', false);
+    h.state.deleteTask('id-a'); await h.hooks.dialog.onPositiveClick();
+    assert.equal(h.ownCalls.some(c => ['sync_remote_task', 'generate_list', 'update_remote_status', 'delete_task'].includes(c.name)), false);
+    h.fresh.resolve([h.latest]); await tick(); await tick();
+    const pauses = h.ownCalls.filter(c => c.name === 'pause_task');
+    assert.equal(pauses.length, 1);
+    assert.equal(pauses[0].args.expectedLaunchAttemptId, 'launch-owned');
+    assert.equal(Object.hasOwn(pauses[0].args, 'expectedLaunchAbsent'), false);
+    assert.equal(pauses[0].args.remainingMs, 120000);
+    assert.equal(h.state.mutationRequests.value.has('id-a'), true);
+    h.stopReply.resolve(receipt());
+    assert.equal(await pausing, true);
+    assert.equal(h.store.tasks[0].status, 'paused');
+    assert.equal(h.state.mutationRequests.value.has('id-a'), false);
+    assert.equal(h.hooks.timers.size, 0);
+    assert.equal(h.hooks.messages.filter(m => /尚未发送停止/.test(m.text)).every(m => m.destroyed), true);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join explicit observed null uses must-be-absent, never a guessed latest launch', async () => {
+  const h = await ownStartHarness({ launchAttemptId: null });
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    h.native.resolve(settledStart({ launchAttemptId: null })); await h.starting; await tick();
+    h.fresh.resolve([{ ...h.latest, launchAttemptId: null }]); await tick(); await tick();
+    const call = h.ownCalls.find(c => c.name === 'pause_task');
+    assert.ok(call); assert.equal(call.args.expectedLaunchAbsent, true);
+    assert.equal(Object.hasOwn(call.args, 'expectedLaunchAttemptId'), false);
+    h.stopReply.resolve(receipt({ confirmationBasis: 'session_absent' }));
+    assert.equal(await pausing, true);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join settled partial remains a failed config request but permits the independent same-click pause', async () => {
+  const h = await ownStartHarness();
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    h.native.reject(JSON.stringify(settledStart({ ok: false, outcome: 'already_running', startedNew: false,
+      configApplied: false, requestSatisfied: false, configComparison: 'different', launchAttemptId: 'launch-before', error: 'config not applied' })));
+    await h.starting; await tick();
+    h.fresh.resolve([{ ...h.latest, launchAttemptId: 'launch-before' }]); await tick(); await tick();
+    const call = h.ownCalls.find(c => c.name === 'pause_task'); assert.ok(call);
+    assert.equal(call.args.expectedLaunchAttemptId, 'launch-before');
+    h.stopReply.resolve(receipt()); assert.equal(await pausing, true);
+    assert.ok(h.hooks.notices.some(n => n.type === 'warning' && /本次配置未应用/.test(n.text)));
+    assert.equal(h.ownCalls.filter(c => c.name.startsWith('start_')).length, 1);
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join Priority follows only this settled native-approved actual host, never saved target intent alone', async () => {
+  const h = await ownStartHarness({ taskType: 'priority', status: 'pending', isRemote: false, targetRemote: true, launchAttemptId: null });
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    h.native.resolve(settledStart({ taskType: 'priority', remote: true })); await h.starting; await tick();
+    h.fresh.resolve([{ ...h.latest, isRemote: true }]); await tick(); await tick();
+    const call = h.ownCalls.find(c => c.name === 'pause_task');
+    assert.ok(call); assert.equal(call.args.isRemote, true); assert.equal(call.args.expectedLaunchAttemptId, 'launch-owned');
+    h.stopReply.resolve(receipt()); assert.equal(await pausing, true);
+    assert.equal(h.store.tasks[0].isRemote, true); assert.equal(h.store.tasks[0].status, 'paused');
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join missing/malformed identity or settlement, old void and arbitrary errors never become a pause authorization', async () => {
+  const omittedLaunch = settledStart(); delete omittedLaunch.launchAttemptId;
+  const cases = [omittedLaunch, settledStart({ launchAttemptId: '' }), settledStart({ launchAttemptId: false }),
+    settledStart({ launchAttemptId: {} }), settledStart({ operationSettled: false }), settledStart({ operationSettled: undefined }),
+    settledStart({ taskType: 'regular' }), settledStart({ authProfile: 'other' }), settledStart({ taskId: 'foreign' }),
+    settledStart({ remote: false }), null, undefined,
+    { rejection: 'timeout with guessed launchAttemptId=launch-owned' },
+    { rejection: JSON.stringify(settledStart({ ok: false, outcome: 'already_running', startedNew: false, configApplied: false,
+      configComparison: 'unverified', requestSatisfied: false, operationSettled: false })) }];
+  for (const outcome of cases) {
+    const h = await ownStartHarness();
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      if (outcome?.rejection) h.native.reject(outcome.rejection); else h.native.resolve(outcome);
+      await h.starting; await tick();
+      assert.equal(await pausing, false);
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+      assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 join fresh identity/host/type/profile/launch/source conflicts stop before native pause; no same-name adoption', async () => {
+  for (const patch of [{ _id: 'successor-id' }, { name: 'other-name' }, { taskType: 'regular' }, { auth_profile: 'other' },
+    { isRemote: false }, { launchAttemptId: 'successor-launch' }, { launchAttemptId: false },
+    { status: 'deactive' }, { controlSource: 'remote_only' }]) {
+    const h = await ownStartHarness();
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      h.native.resolve(settledStart()); await h.starting; await tick();
+      h.fresh.resolve([{ ...h.latest, ...patch }]); await tick();
+      assert.equal(await pausing, false, JSON.stringify(patch));
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 join identity away-and-back or intervening foreign launch cannot revive an old intent', async () => {
+  for (const patch of [{ _id: 'other-id' }, { auth_profile: 'other' }, { launchAttemptId: 'foreign-then-returned' }]) {
+    const h = await ownStartHarness();
+    try {
+      const before = { ...h.store.tasks[0] };
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      h.store.replaceTasks([{ ...before, ...patch }]); h.store.replaceTasks([before]);
+      h.native.resolve(settledStart()); await h.starting; await tick();
+      h.fresh.resolve([h.latest]);
+      assert.equal(await pausing, false);
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 join reserves actual bounded path budgets, shares original 120s deadline, and never resets remaining at dispatch', async () => {
+  const h = await ownStartHarness();
+  try {
+    const budget = h.state.pauseJoinBudget;
+    const wait = budget.ui - budget.fresh - budget.adapter - budget.core - budget.reply;
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    assert.equal([...h.hooks.timers.values()][0].delay, wait);
+    await advanceJoinTime(h, 20000);
+    h.native.resolve(settledStart()); await h.starting; await tick();
+    assert.equal([...h.hooks.timers.values()][0].delay, budget.fresh);
+    await advanceJoinTime(h, 6000);
+    h.fresh.resolve([h.latest]); await tick(); await tick();
+    const call = h.ownCalls.find(c => c.name === 'pause_task'); assert.ok(call);
+    assert.equal(call.args.remainingMs, budget.ui - 26000);
+    assert.ok(call.args.remainingMs >= budget.adapter + budget.core + budget.reply);
+    assert.equal(h.hooks.timers.size, 1, 'original pause owns the only stop wait timer');
+    assert.equal([...h.hooks.timers.values()][0].at, budget.ui);
+    h.stopReply.resolve(receipt()); assert.equal(await pausing, true);
+    assert.equal(h.hooks.timers.size, 0);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join wait deadline/unmount cancels unsent continuation; late native completion cannot issue pause', async () => {
+  for (const cause of ['deadline', 'unmount']) {
+    const h = await ownStartHarness();
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      if (cause === 'deadline') {
+        const b = h.state.pauseJoinBudget;
+        await advanceJoinTime(h, b.ui - b.fresh - b.adapter - b.core - b.reply);
+      } else h.stop();
+      assert.equal(await pausing, false);
+      h.native.resolve(settledStart()); await h.starting; await tick(); h.fresh.resolve([h.latest]); await tick();
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 join bounded fresh failure/timeout invalidates late results and cannot defer a stop', async () => {
+  for (const cause of ['timeout', 'read-error']) {
+    const h = await ownStartHarness();
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      h.native.resolve(settledStart()); await h.starting; await tick();
+      if (cause === 'timeout') await advanceJoinTime(h, h.state.pauseJoinBudget.fresh);
+      else h.fresh.reject(new Error('fresh original list unavailable'));
+      assert.equal(await pausing, false);
+      h.fresh.resolve([h.latest]); await tick();
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 joined stop passes exact fence for native lock recheck; successor rejection is not retried or reported paused', async () => {
+  const h = await ownStartHarness();
+  try {
+    let signals = 0;
+    const invoke = h.hooks.invoke;
+    h.hooks.invoke = (name, args) => {
+      if (name !== 'pause_task') return invoke(name, args);
+      h.ownCalls.push({ name, args });
+      // Boundary fixture models a successor appearing AFTER the fresh read.
+      // Actual lock/stop-runtime rejection is a core-writer native test, not a JS proof.
+      assert.equal(args.expectedLaunchAttemptId, 'launch-owned');
+      h.store.replaceTasks([{ ...h.latest, launchAttemptId: 'successor' }]);
+      if (args.expectedLaunchAttemptId !== 'successor') return Promise.reject(new Error('native exact launch conflict before stop'));
+      signals++; return Promise.resolve(receipt());
+    };
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    h.native.resolve(settledStart()); await h.starting; await tick();
+    h.fresh.resolve([h.latest]);
+    assert.equal(await pausing, false);
+    assert.equal(signals, 0);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.tasks[0].launchAttemptId, 'successor');
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 sent stop unmount/late receipt cannot falsely cancel stop or overwrite a successor launch', async () => {
+  for (const cause of ['unmount', 'successor', 'profile', 'type']) {
+    const h = await ownStartHarness();
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      h.native.resolve(settledStart()); await h.starting; await tick();
+      h.fresh.resolve([h.latest]); await tick(); await tick();
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+      if (cause === 'unmount') h.stop();
+      else h.store.replaceTasks([{ ...h.latest, ...(cause === 'profile' ? { auth_profile: 'other' } : cause === 'type' ? { taskType: 'regular' } : { launchAttemptId: 'newer-run' }) }]);
+      assert.equal(await pausing, false);
+      h.stopReply.resolve(receipt()); await tick(); await tick();
+      assert.equal(h.store.tasks[0].status, 'running');
+      if (cause !== 'unmount') assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
+      else assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
+      assert.equal(h.hooks.timers.size, 0);
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 join confirmed pause releases owner for a legal next start on the same task without stale stop proof', async () => {
+  const h = await ownStartHarness();
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    h.native.resolve(settledStart()); await h.starting; await tick();
+    h.fresh.resolve([h.latest]); await tick(); await tick();
+    h.stopReply.resolve(receipt()); assert.equal(await pausing, true);
+    assert.equal(h.store.tasks[0].status, 'paused');
+    const after = { ...h.latest, status: 'running', launchAttemptId: 'next-legitimate-launch' };
+    h.hooks.invoke = async (name, args) => {
+      h.ownCalls.push({ name, args });
+      if (name === 'check_task_status') return absentPane;
+      if (name === 'start_super_task') return settledStart({ launchAttemptId: after.launchAttemptId });
+      if (name === 'get_all_tasks') return [after];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(name);
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handleStartSuperTask({ taskName: 'priority-a', isRemote: true }); await tick();
+    assert.equal(h.ownCalls.filter(c => c.name === 'start_super_task').length, 2);
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.equal(h.store.tasks[0].launchAttemptId, after.launchAttemptId);
+    assert.equal(h.store.taskStopOperationMap['priority-a'], undefined);
+    assert.equal(h.state.mutationRequests.value.size, 0);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 join already-sent stop deadline preserves unconfirmed state and late receipt never becomes a second action', async () => {
+  const h = await ownStartHarness();
+  try {
+    const pausing = h.state.pauseTask(h.store.tasks[0]);
+    const rejected = assert.rejects(pausing, /停止确认超时/);
+    h.native.resolve(settledStart()); await h.starting; await tick();
+    h.fresh.resolve([h.latest]); await tick(); await tick();
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+    await advanceJoinTime(h, h.state.pauseJoinBudget.ui);
+    await rejected;
+    assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
+    assert.equal(h.store.tasks[0].status, 'running');
+    h.stopReply.resolve(receipt()); await tick();
+    assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(h.hooks.timers.size, 0);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v6 regular successful start and positively settled preflight refusal both honor the same single pause intent', async () => {
+  for (const refused of [false, true]) {
+    const h = await ownStartHarness({ taskType: 'regular' });
+    try {
+      const pausing = h.state.pauseTask(h.store.tasks[0]);
+      if (refused) h.native.reject(JSON.stringify({ schemaVersion: 1, command: 'start', task: 'priority-a', taskId: 'id-a', remote: true,
+        taskType: 'regular', authProfile: 'user1', launchAttemptId: 'launch-before', operationSettled: true,
+        ok: false, outcome: 'refused', startedNew: false, configApplied: false, requestSatisfied: false, error: 'settled preflight refusal' }));
+      else h.native.resolve(settledStart({ taskType: 'regular' }));
+      await h.starting; await tick();
+      const launch = refused ? 'launch-before' : 'launch-owned';
+      h.fresh.resolve([{ ...h.latest, launchAttemptId: launch }]); await tick(); await tick();
+      const call = h.ownCalls.find(c => c.name === 'pause_task'); assert.ok(call);
+      assert.equal(call.args.expectedLaunchAttemptId, launch);
+      h.stopReply.resolve(receipt()); assert.equal(await pausing, true);
+      assert.equal(h.ownCalls.filter(c => c.name === 'start_task').length, 1);
+      assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 1);
+      if (refused) assert.ok(h.hooks.errors.some(([message]) => /settled preflight refusal/.test(message)));
+    } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+  }
+});
+
+test('v6 original automatic-pause admission does not create a deferred user join intent', async () => {
+  const h = await ownStartHarness();
+  try {
+    assert.equal(await h.state.pauseTask(h.store.tasks[0], { joinOwnedStart: false }), false);
+    assert.equal(h.state.mutationRequests.value.get('id-a').pauseIntent, null);
+    h.native.resolve(settledStart()); await h.starting; h.fresh.resolve([h.latest]); await tick();
+    assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
+    assert.match(source, /return pauseTask\(task, \{ joinOwnedStart: false \}\)/);
+  } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
+});
+
+test('v8 normal open is local-only and one submit reaches core without PID/proof preflight across control states and all task types', async () => {
+  for (const taskType of ['regular', 'super', 'priority']) {
+    for (const status of ['ready', 'running', 'launch_unknown', 'completed', 'completed_with_errors', 'paused', 'generation_unknown', 'unknown']) {
+      const initial = task({ taskType, status });
+      const h = await harness(initial);
+      try {
+        const calls = [];
+        h.hooks.invoke = async (name, args) => {
+          calls.push({ name, args });
+          if (name.startsWith('start_')) {
+            if (status === 'generation_unknown') throw JSON.stringify({ schemaVersion: 1, command: 'start', task: initial.name,
+              ok: false, outcome: 'refused', startedNew: false, configApplied: false, requestSatisfied: false, error: 'original generation owner must reconcile' });
+            return settledStart({ taskType, outcome: 'already_running', startedNew: false, configApplied: false });
+          }
+          if (name === 'get_all_tasks') return [initial];
+          if (name === 'refresh_task_progress') return;
+          assert.fail(`normal action must not inspect processes: ${name}`);
+        };
+        await h.state.openStartModal(h.store.tasks[0]);
+        assert.equal(h.state.showStartModal.value, true, `${taskType}:${status}`);
+        assert.deepEqual(calls, [], 'open must not query native');
+        await h.state[taskType === 'priority' ? 'handlePriorityStartTask' : taskType === 'super' ? 'handleStartSuperTask' : 'handleStartTask']({ taskName: initial.name, isRemote: true });
+        await tick();
+        const starts = calls.filter(c => c.name.startsWith('start_'));
+        assert.equal(starts.length, 1, `${taskType}:${status}`);
+        assert.deepEqual(starts[0].args, { taskName: initial.name, taskId: 'id-a', isRemote: true, expectedRemote: true });
+        assert.equal(calls.filter(c => c.name === 'check_task_status').length, 0);
+        if (status === 'generation_unknown') assert.match(h.hooks.errors.at(-1)[0], /original generation owner must reconcile/);
+        else assert.match(h.hooks.notices.at(-1).text, /原任务已运行/);
+      } finally { h.stop(); }
+    }
+  }
+});
+
+test('v8 cached PID/absence/unknown/stale/wrong-identity observations cannot grant or block core start authority', async () => {
+  for (const observation of [null, { state: 'running' }, { state: 'not_running' }, { state: 'unknown', error: 'PID query failed' },
+    { state: 'session_absent' }, { state: 'running', taskId: 'foreign', observedAt: 1 }]) {
+    const initial = regularTask({ taskType: 'super', status: 'completed_with_errors' });
+    const h = await harness(initial);
+    try {
+      if (observation) h.state.taskRuntimeStatus.value[initial.name] = { ...h.state.runtimeTarget(initial), observedAt: Date.now(), ...observation };
+      const calls = [];
+      h.hooks.invoke = async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'start_super_task') throw JSON.stringify(settledStart({ ok: false, outcome: 'already_running', startedNew: false,
+          configApplied: false, requestSatisfied: false, configComparison: 'unverified', error: 'core retained original consumer' }));
+        assert.fail(`unexpected query/mutation: ${name}`);
+      };
+      await h.state.openStartModal(h.store.tasks[0]);
+      await h.state.handleStartSuperTask({ taskName: initial.name, isRemote: true, config: { changed: true } });
+      assert.deepEqual(calls.map(c => c.name), ['start_super_task']);
+      assert.equal(h.hooks.notices.filter(n => n.type === 'success').length, 0);
+      assert.match(h.hooks.notices.at(-1).text, /原消费者仍在运行.*配置未应用/);
+      assert.equal(h.store.tasks[0].status, 'completed_with_errors', 'UI does not write process/control truth');
+    } finally { h.stop(); }
+  }
+});
+
+test('v8 only view-owned in-flight work blocks start; a returned unconfirmed stop leaves reconciliation to core', async () => {
+  for (const busy of ['mutation', 'generation', 'stopping', 'returned-unconfirmed']) {
+    const initial = regularTask({ status: 'paused' });
+    const h = await harness(initial);
+    try {
+      if (busy === 'mutation') h.state.mutationRequests.value.set('id-a', { kind: 'mutation' });
+      if (busy === 'generation') h.state.generationRequests.value['id-a'] = true;
+      if (busy === 'stopping' || busy === 'returned-unconfirmed') {
+        const operation = h.store.beginTaskStop(initial);
+        if (busy === 'returned-unconfirmed') h.store.markTaskStopUnconfirmed(initial, operation, 'old response uncertain', 'client_timeout');
+      }
+      const calls = [];
+      h.hooks.invoke = async name => { calls.push(name); throw new Error('core refuses unresolved stop; no optimistic success'); };
+      await h.state.openStartModal(h.store.tasks[0]);
+      if (busy !== 'returned-unconfirmed') {
+        assert.equal(h.state.showStartModal.value, false); assert.deepEqual(calls, []);
+      } else {
+        assert.equal(h.state.showStartModal.value, true);
+        await h.state.handleStartTask({ taskName: initial.name, isRemote: true });
+        assert.deepEqual(calls, ['start_task']);
+        assert.match(h.hooks.errors.at(-1)[0], /core refuses unresolved stop/);
+        assert.equal(h.store.taskStopOperationMap[initial.name].status, 'stop_unconfirmed');
+      }
+    } finally { h.stop(); }
+  }
+});
+
+test('v8 modal fences task/source/type/profile replacement but a same-task launch epoch is decided by core, not cached PID metadata', async () => {
+  for (const patch of [{ _id: 'replacement' }, { isRemote: false }, { auth_profile: 'other' }, { taskType: 'priority' }, { launchAttemptId: 'later-run' }]) {
+    const initial = regularTask({ status: 'ready', launchAttemptId: 'before' });
+    const h = await harness(initial);
+    try {
+      const calls = [];
+      h.hooks.invoke = async name => { calls.push(name); throw new Error('original core decision'); };
+      await h.state.openStartModal(h.store.tasks[0]);
+      h.store.replaceTasks([{ ...initial, ...patch }]);
+      await h.state.handleStartTask({ taskName: initial.name, isRemote: true });
+      assert.equal(calls.length, Object.hasOwn(patch, 'launchAttemptId') ? 1 : 0);
+      assert.ok(calls.every(name => name === 'start_task'));
+    } finally { h.stop(); }
+  }
+});
+
+test('v8 mount/history adds no process queries or interval; original progress refresh and count-based autoPause remain operational', async () => {
+  const active = regularTask({ _id: 'active-id', name: 'business-progress' });
+  let rows = [active, ...Array.from({ length: 1453 }, (_, i) => regularTask({ _id: `old-${i}`, name: `history-${i}`,
+    status: 'completed_with_errors', launchAttemptId: `old-launch-${i}` }))];
+  const h = await harness(active);
+  try {
+    const calls = [];
+    h.hooks.invoke = async (name, args) => {
+      calls.push({ name, args });
+      if (name === 'frontend_ready' || name === 'refresh_task_progress') return;
+      if (name === 'get_all_tasks') return rows;
+      if (name === 'pause_task') {
+        rows = [{ ...active, status: 'paused', stopConfirmedAt: proofAt, stopConfirmedTaskId: 'active-id', stopConfirmedRemote: true }, ...rows.slice(1)];
+        return receipt({ taskId: 'active-id', taskName: active.name });
+      }
+      assert.fail(`background PID query is not an authorized progress dependency: ${name}`);
+    };
+    await h.hooks.mount(); await tick();
+    assert.deepEqual(calls.map(c => c.name), ['frontend_ready', 'get_all_tasks', 'refresh_task_progress']);
+    assert.equal(h.store.tasks.length, 1454);
+    assert.equal(h.hooks.intervals.size, 0);
+    assert.deepEqual(Object.keys(h.state.taskRuntimeStatus.value), []);
+    assert.equal(h.state.pollTaskStatus, undefined);
+    const emitProgress = success => h.hooks.handlers.get('task-progress-update')({ payload: {
+      collection: active.name, task_id: 'active-id', is_remote: true, updated_at: 1000 + success,
+      success, total: 2, error: 0, priority_success: 0, priority_error: 0, priority_total: 0,
+    } });
+    emitProgress(1); await tick();
+    assert.equal(h.store.taskProgressMap[active.name].success, 1);
+    assert.equal(h.hooks.timers.size, 0);
+    emitProgress(2); await tick();
+    assert.equal(h.hooks.timers.size, 1);
+    assert.equal([...h.hooks.timers.values()][0].delay, 300000, 'original business auto-pause timer, not PID poll');
+    await advanceJoinTime(h, 300000); await tick(); await tick();
+    assert.equal(calls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(calls.filter(c => c.name === 'check_task_status').length, 0);
+    assert.equal(h.store.tasks[0].status, 'paused');
+    assert.ok(calls.filter(c => c.name === 'refresh_task_progress').length >= 2);
+  } finally { h.stop(); }
+});
+
+test('v8 explicit optional diagnostic is read-only and does not cause pause, status writes or prerequisite state', async () => {
+  const initial = regularTask(); const h = await harness(initial);
+  try {
+    const before = JSON.stringify(h.store.tasks);
+    const check = h.state.checkTaskStatus(h.store.tasks[0]);
+    h.probes[0].resolve(absentPane); await check;
+    assert.deepEqual(h.calls.map(c => c.name), ['check_task_status']);
+    assert.equal(JSON.stringify(h.store.tasks), before);
+    assert.deepEqual(h.store.taskStopOperationMap, {});
+    assert.equal(h.state.taskRuntimeStatus.value[initial.name].state, 'session_absent');
+    assert.equal(h.state.startBlockReason(h.store.tasks[0]), '');
   } finally { h.stop(); }
 });

@@ -1,4 +1,5 @@
-//! Shared inspection/evidence coordinators. Status is a mutator, not a read.
+//! Shared inspection/evidence coordinators. Long observations are unlocked;
+//! only exact terminal reconciliation owns the original lifecycle EX lock.
 //! Python retains professional Priority/dataset algorithms; no taskctl callback.
 use crate::{
     cleanup_sync::{outcome, OperationsRuntime, TaskOutcome},
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 #[async_trait]
 pub trait InspectionRuntime: OperationsRuntime {
+    async fn inspect_execution(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,_host:Host)
+        -> Result<Option<Value>,String>{Ok(None)}
     /// Original MongoConfig profile mapping; no client/URI/GUI guess/fallback.
     async fn canonical_namespace(
         &self,
@@ -395,8 +398,9 @@ async fn startup_gate(
                 && b.get("name") == task.get("name")
                 && b.get("auth_profile") == task.get("auth_profile")
                 && b.get_bool("remote").ok() == Some(host(task).is_remote())
-                && truthy(b.get("consumer_run_id"))
-                && truthy(b.get("launchAttemptId"))
+                && b.get_str("auth_profile").map(|v|!v.is_empty()).unwrap_or(false)
+                && b.get_str("consumer_run_id").map(|v|!v.is_empty()).unwrap_or(false)
+                && b.get_str("launchAttemptId").map(|v|!v.is_empty()).unwrap_or(false)
                 && b.get("launchAttemptId") == task.get("launchAttemptId")
         })
         .unwrap_or(false);
@@ -429,8 +433,23 @@ async fn startup_gate(
         return Ok((pending, doc! {}));
     }
     let proof = proof.unwrap().clone();
+    let closure_proof = evidence.and_then(|r| r.get_document("lifecycleClosure").ok());
+    let closed = closure_proof.map(|p| {
+        matches!(p.get("schemaVersion"), Some(Bson::Int32(1) | Bson::Int64(1)))
+            && p.get_str("phase").ok() == Some("complete")
+            && truthy(p.get("completedAt"))
+            && binding.iter().all(|(k, v)| p.get(k) == Some(v))
+    }).unwrap_or(false);
+    let closure = if closed {
+        doc! {"required":true,"ready":true,"proof":closure_proof.unwrap().clone()}
+    } else {
+        doc! {"required":true,"ready":false,"reason":"lifecycle_closure_unconfirmed"}
+    };
     let mut fence = doc! {"startupBinding":binding.clone(),"taskType":"super","auth_profile":binding.get("auth_profile").cloned().unwrap_or(Bson::Null)};
     if !host(task).is_remote() {
+        if closed {
+            fence.insert("simulatorRuntime.lifecycleClosure", closure_proof.unwrap().clone());
+        }
         fence.insert("simulatorRuntime.startupRecovery", proof.clone());
         fence.insert(
             "simulatorRuntime.consumer_run_id",
@@ -440,13 +459,64 @@ async fn startup_gate(
                 .unwrap_or(Bson::Null),
         );
     }
-    Ok((doc! {"ready":true,"required":true,"proof":proof}, fence))
+    Ok((doc! {"ready":true,"required":true,"proof":proof,"lifecycleClosure":closure}, fence))
 }
 fn startup_query(task: &Document, binding: &Document) -> Document {
     doc! {"_id":task.get("_id").cloned().unwrap_or(Bson::Null),"name":task.get("name").cloned().unwrap_or(Bson::Null),
     "taskType":"super","auth_profile":binding.get("auth_profile").cloned().unwrap_or(Bson::Null),
     "isRemote":binding.get("remote").cloned().unwrap_or(Bson::Null),"launchAttemptId":binding.get("launchAttemptId").cloned().unwrap_or(Bson::Null),
     "startupBinding":binding.clone(),"status":{"$ne":"deactive"}}
+}
+/// Reuse the original control CAS identity for both unlocked read freshness
+/// and the short locked reconciliation. Optional proof absence is not invented.
+fn original_v1_stop(task:&Document, remote:bool)->bool{
+    if !policy::stop_confirmation_valid(task,remote){return false;}
+    match task.get("stopConfirmationBasis"){
+        Some(Bson::String(basis))=>return basis=="runners_exited",
+        None|Some(Bson::Null)=>(),_=>return false,
+    }
+    let stamp=task.get_datetime("stopConfirmedAt").unwrap().timestamp_millis();
+    task.get_array("events").map(|events|events.iter().rev().any(|event|{
+        let Some(e)=event.as_document() else{return false;};
+        let Ok(detail)=e.get_document("detail") else{return false;};
+        e.get_str("command").ok()==Some("pause")&&e.get_str("status").ok()==Some("paused")
+            &&e.get_str("at").ok().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).map(|v|v.timestamp_millis())==Some(stamp)
+            &&detail.get_i32("schema_version").ok()==Some(1)&&detail.get_str("task_name").ok()==task.get_str("name").ok()
+            &&detail.get_bool("target_remote").ok()==Some(remote)&&detail.get_bool("session_absent").ok()==Some(true)
+            &&detail.get_bool("runners_exited").ok()==Some(true)
+    })).unwrap_or(false)
+}
+fn status_snapshot_query(task: &Document, fence: &Document) -> Result<Document, Error> {
+    let name = task.get_str("name").map_err(|e| e.to_string())?;
+    let mut query = policy::task_binding_query(name, task, "status-terminal-reconcile")?;
+    for key in ["acceptedObservation", "runId", "launchAttemptAt", "startedAt"] {
+        query.insert(key, task.get(key).cloned()
+            .unwrap_or_else(|| Bson::Document(doc! {"$exists":false})));
+    }
+    query.extend(fence.clone());
+    Ok(query)
+}
+async fn confirm_status_snapshot(store: &dyn TaskStore, query: &Document) -> Result<(), Error> {
+    if store.find_task(Host::Local, query.clone(), false).await?.is_none() {
+        return Err("status snapshot changed during observation; no reconciliation performed; refresh original task".into());
+    }
+    Ok(())
+}
+fn failed_observation(task: &Document, mut facts: Value, observed_at: &str, error: Error) -> TaskOutcome {
+    facts.as_object_mut().unwrap().remove("taskStatus");
+    facts["capturedTaskStatus"] = wire(task.get("status"));
+    let identity: Document = ["_id", "name", "taskType", "isRemote", "launchAttemptId", "runId", "updatedAt"]
+        .iter().filter_map(|key| task.get(*key).map(|value| ((*key).into(), value.clone()))).collect();
+    facts["observationIdentity"] = wire_document(&identity);
+    facts["observedAt"] = json!(observed_at);
+    facts["snapshotCurrent"] = json!(false);
+    facts["reconcileSkipped"] = json!(true);
+    facts["reconcileError"] = json!(error.message);
+    facts["errorType"] = json!(error.kind);
+    facts["error"] = facts["reconcileError"].clone();
+    facts["observedTerminal"] = facts["terminal"].clone();
+    facts["terminal"] = json!(false);
+    outcome("status", task.get_str("name").unwrap_or(""), false, facts)
 }
 async fn status_inner(
     root: &Path,
@@ -455,8 +525,8 @@ async fn status_inner(
     request: &StatusRequest,
 ) -> Result<TaskOutcome, Error> {
     policy::validate_name(&request.name).map_err(invalid)?;
-    let _lock = MissionLocks::acquire(root, &[&request.name], false)?;
     let task = task(store, &request.name, true).await?;
+    let observed_at = now();
     let execution_host = host(&task);
     if task.get_str("taskType").ok() == Some("priority") {
         let value = runtime
@@ -470,6 +540,9 @@ async fn status_inner(
                 request.inspect_items,
             )
             .await?;
+        if let Err(error) = confirm_status_snapshot(store, &status_snapshot_query(&task, &doc! {})?).await {
+            return Ok(failed_observation(&task, value, &observed_at, error));
+        }
         let ok = value
             .get("ok")
             .and_then(Value::as_bool)
@@ -478,9 +551,39 @@ async fn status_inner(
         result.exit_code = 0;
         return Ok(result);
     }
-    let (startup, fence) = startup_gate(store, &task).await?;
-    let local = store.summary(Host::Local, &request.name).await?;
-    let execution = store.summary(execution_host, &request.name).await?;
+    let mut startup_read_error=None;
+    let (mut startup, mut fence)=match startup_gate(store,&task).await {
+        Ok(value)=>value,
+        Err(error) if error.kind=="TypeError"=>return Err(error),
+        Err(error)=>{
+            startup_read_error=Some(error.message.clone());
+            (doc!{"ready":false,"required":true,"reason":"startup_evidence_read_error","error":error.message},doc!{})
+        }
+    };
+    let closure = startup.get_document("lifecycleClosure").cloned().unwrap_or_else(|_| {
+        if startup.get_bool("required").unwrap_or(false) {
+            doc! {"required":true,"ready":false,"reason":"lifecycle_closure_unconfirmed"}
+        } else {
+            doc! {"required":false,"ready":true}
+        }
+    });
+    startup.remove("lifecycleClosure");
+    let mut execution_observation=Value::Null;
+    let mut receipt_observation=Value::Null;
+    let mut legacy_ready=false;
+    let local_read = store.summary(Host::Local, &request.name).await;
+    let execution_read = store.summary(execution_host, &request.name).await;
+    if local_read.is_err() || execution_read.is_err() {
+        let facts = json!({"remote":execution_host.is_remote(),
+            "local":local_read.as_ref().map(summary_value).unwrap_or(Value::Null),
+            "execution":execution_read.as_ref().map(summary_value).unwrap_or(Value::Null),
+            "readErrors":{"local":local_read.as_ref().err(),"execution":execution_read.as_ref().err()},
+            "startupRecovery":wire_document(&startup),"lifecycleClosure":wire_document(&closure)});
+        let error = local_read.as_ref().err().or(execution_read.as_ref().err()).unwrap().clone();
+        return Ok(failed_observation(&task, facts, &observed_at, error.into()));
+    }
+    let local = local_read.unwrap();
+    let execution = execution_read.unwrap();
     let terminal_states = [
         "success",
         "permanent_error",
@@ -494,11 +597,55 @@ async fn status_inner(
         .filter(|(k, _)| !terminal_states.contains(&k.as_str()))
         .map(|(_, v)| *v)
         .sum();
-    let terminal =
-        startup.get_bool("ready").unwrap_or(false) && execution.total > 0 && unfinished == 0;
+    if task.get_str("taskType").ok()==Some("super") && startup.get_bool("required").unwrap_or(false)
+        && !closure.get_bool("ready").unwrap_or(false) && startup_read_error.is_none()
+        && execution.total>0 && unfinished==0 && original_v1_stop(&task,execution_host.is_remote()) {
+        match runtime.inspect_execution(root,store,&task,execution_host).await {
+            Ok(Some(observation))=>{
+                let absent=observation["state"]=="session_absent";
+                execution_observation=observation;
+                execution_observation["naturalClosure"]=json!(false);
+                execution_observation["consumerStopped"]=json!(absent);
+                execution_observation["runnersExited"]=if absent&&original_v1_stop(&task,execution_host.is_remote()){json!(true)}else{Value::Null};
+                match store.execution_receipt_assessment(execution_host,&request.name).await {
+                    Ok(assessment)=>{
+                        legacy_ready=absent&&original_v1_stop(&task,execution_host.is_remote())&&policy::assert_observation_closed(&task).is_ok()
+                            &&assessment.get_i64("rowCount").unwrap_or(0)>0&&assessment.get_i64("unresolvedItemCount").ok()==Some(0)
+                            &&assessment.get_i64("receiptUnresolvedItemCount").ok()==Some(0)
+                            &&assessment.get_i64("assessmentUnknownCount").ok()==Some(0)&&assessment.get_bool("complete").ok()==Some(true);
+                        receipt_observation=wire_document(&assessment);
+                    },
+                    Err(error)=>receipt_observation=json!({"complete":false,"error":error}),
+                }
+            },
+            Ok(None)=>execution_observation=json!({"state":"unconfirmed","reason":"original execution observer unavailable"}),
+            Err(error)=>execution_observation=json!({"state":"unconfirmed","error":error}),
+        }
+        for key in ["stopConfirmedAt","stopConfirmedTaskId","stopConfirmedRemote","stopConfirmationBasis","events"]{
+            fence.insert(key,task.get(key).cloned().unwrap_or_else(||Bson::Document(doc!{"$exists":false})));
+        }
+    }
+    legacy_ready=legacy_ready&&receipt_observation["rowCount"].as_u64()==Some(execution.total)&&unfinished==0;
+    let terminal = ((startup.get_bool("ready").unwrap_or(false) && closure.get_bool("ready").unwrap_or(false))||legacy_ready)
+            && execution.total > 0 && unfinished == 0;
     let mut status = task.get("status").cloned().unwrap_or(Bson::Null);
     let old_status = task.get_str("status").unwrap_or("");
-    if terminal
+    let query = status_snapshot_query(&task, &fence)?;
+    let mut captured = json!({"taskStatus":wire(Some(&status)),"remote":execution_host.is_remote(),
+        "local":summary_value(&local),"execution":summary_value(&execution),"terminal":terminal,
+        "unfinished":unfinished,"startupRecovery":wire_document(&startup),"lifecycleClosure":wire_document(&closure)});
+    captured["observedAt"] = json!(&observed_at);
+    if let Some(error)=startup_read_error {
+        captured["readErrors"]=json!({"startupRecovery":error});
+        return Ok(failed_observation(&task,captured,&observed_at,error.into()));
+    }
+    if !execution_observation.is_null(){
+        captured["executionObservation"]=execution_observation;
+        captured["receiptObservation"]=receipt_observation;
+        captured["completionVerification"]=json!({"ready":legacy_ready,"basis":if legacy_ready{"legacy_revalidated"}else{"legacy_insufficient"},
+            "naturalClosure":false,"runnerProofCreated":false,"taskId":text_id(task.get("_id")),"remote":execution_host.is_remote()});
+    }
+    if terminal && !legacy_ready
         && !(old_status == "paused" && truthy(task.get("acceptedObservation")))
         && !checked_token(
             task.get("status"),
@@ -514,6 +661,12 @@ async fn status_inner(
             ],
         )?
     {
+        let reconciliation: Result<(), Error> = async {
+        // Never hold EX/SH across item summaries or the Priority snapshot.
+        // Acquiring EX alone is insufficient: a pause/new launch may have
+        // completed while this exact original snapshot was being read.
+        let _lock = MissionLocks::acquire(root, &[&request.name], false)?;
+        confirm_status_snapshot(store, &query).await?;
         policy::assert_observation_closed(&task)?;
         let failures: u64 = ["permanent_error", "timeout_error", "cancelled", "error"]
             .iter()
@@ -534,6 +687,8 @@ async fn status_inner(
             let proof = startup.get_document("proof").map_err(|e| e.to_string())?;
             let mut query = startup_query(&task, binding);
             query.insert("simulatorRuntime.startupRecovery", proof.clone());
+            query.insert("simulatorRuntime.lifecycleClosure",
+                closure.get_document("proof").map_err(|e| e.to_string())?.clone());
             query.insert(
                 "simulatorRuntime.consumer_run_id",
                 binding
@@ -554,23 +709,27 @@ async fn status_inner(
             }
         }
         let command = "status-terminal-reconcile";
-        let mut query = policy::task_binding_query(&request.name, &task, command)?;
-        // Observation is checked AND bound: a concurrent observation claim
-        // cannot be erased by a terminal reconciliation.
-        query.insert(
-            "acceptedObservation",
-            task.get("acceptedObservation")
-                .cloned()
-                .unwrap_or_else(|| Bson::Document(doc! {"$exists":false})),
-        );
-        query.extend(fence);
         let stamp = now();
         let event = doc! {"id":ObjectId::new().to_hex(),"command":command,"status":status.clone(),"at":&stamp,"detail":summary_document(&execution)?};
         if store.update_task(Host::Local,query,doc! {"$set":{"status":status.clone(),"completedAt":&stamp,"updatedAt":&stamp},"$push":{"events":event}}).await? != 1 {
             return Err(format!("active task not found: {}",request.name).into());
         }
+        Ok(())
+        }.await;
+        if let Err(error) = reconciliation { return Ok(failed_observation(&task, captured, &observed_at, error)); }
+    } else if let Err(error) = confirm_status_snapshot(store, &query).await {
+        return Ok(failed_observation(&task, captured, &observed_at, error));
     }
-    let mut value = json!({"taskStatus":wire(Some(&status)),"remote":execution_host.is_remote(),"local":summary_value(&local),"execution":summary_value(&execution),"terminal":terminal,"unfinished":unfinished,"startupRecovery":wire_document(&startup)});
+    let mut value = captured;
+    value["taskStatus"] = wire(Some(&status));
+    value["snapshotCurrent"] = json!(true);
+    if ["completed", "completed_with_errors"].contains(&old_status) && !terminal {
+        value["controlStatus"] = json!(old_status);
+        value["lifecycleDiagnostic"] = json!({
+            "reason":"control_terminal_execution_unconfirmed", "controlStatus":old_status,
+            "unfinished":unfinished,
+            "action":"inspect original run; no automatic restart or status rewrite"});
+    }
     if status.as_str() == Some("paused") {
         let confirmed = policy::stop_confirmation_valid(&task, execution_host.is_remote());
         value["stopConfirmation"] = json!(if confirmed { "confirmed" } else { "unknown" });

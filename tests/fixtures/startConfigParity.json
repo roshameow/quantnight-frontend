@@ -1,0 +1,534 @@
+{
+  "status": "v4_shared_raw_inputs_GUI_default_none_verified_native_execution_pending",
+  "core_sources": [
+    "start.rs::saved_start_config",
+    "start.rs::priority_config_input"
+  ],
+  "core_named_tests": [
+    "regular_local_preserves_full_config_and_original_rows",
+    "explicit_priority_config_and_source_scope_are_not_merged_or_replaced",
+    "invalid_configs_busy_observation_and_expected_id_fail_without_launcher"
+  ],
+  "rows": [
+    {
+      "id": "regular-conflict",
+      "kind": "regular",
+      "rawTask": {
+        "startConfig": {
+          "max_concurrent": 3,
+          "opaque": {
+            "$numberInt": "literal"
+          }
+        },
+        "mission_config": {
+          "max_concurrent": 2
+        },
+        "config": {
+          "older": true
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "max_concurrent": 3,
+          "opaque": {
+            "$numberInt": "literal"
+          }
+        }
+      },
+      "observedGui": {
+        "max_concurrent": 2
+      },
+      "drift": true
+    },
+    {
+      "id": "regular-missing-vs-null-a",
+      "kind": "regular",
+      "rawTask": {
+        "mission_config": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "observedGui": {
+        "opaque": {
+          "$oid": "business"
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "regular-missing-vs-null-b",
+      "kind": "regular",
+      "rawTask": {
+        "startConfig": null,
+        "mission_config": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "expectedCore": {
+        "selection": "reject"
+      },
+      "observedGui": {
+        "opaque": {
+          "$oid": "business"
+        }
+      },
+      "drift": true
+    },
+    {
+      "id": "regular-legacy",
+      "kind": "regular",
+      "rawTask": {
+        "config": "{\"opaque\":{\"$numberInt\":\"literal\"},\"max_concurrent\":3}"
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "opaque": {
+            "$numberInt": "literal"
+          },
+          "max_concurrent": 3
+        }
+      },
+      "observedGui": {
+        "opaque": {
+          "$numberInt": "literal"
+        },
+        "max_concurrent": 3
+      },
+      "drift": false
+    },
+    {
+      "id": "super-conflict",
+      "kind": "super",
+      "rawTask": {
+        "startConfig": {
+          "max_concurrent": 3,
+          "opaque": {
+            "$numberInt": "literal"
+          }
+        },
+        "mission_config": {
+          "max_concurrent": 2
+        },
+        "config": {
+          "older": true
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "max_concurrent": 3,
+          "opaque": {
+            "$numberInt": "literal"
+          }
+        }
+      },
+      "observedGui": {
+        "max_concurrent": 2
+      },
+      "drift": true
+    },
+    {
+      "id": "super-missing-vs-null-a",
+      "kind": "super",
+      "rawTask": {
+        "mission_config": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "observedGui": {
+        "opaque": {
+          "$oid": "business"
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "super-missing-vs-null-b",
+      "kind": "super",
+      "rawTask": {
+        "startConfig": null,
+        "mission_config": {
+          "opaque": {
+            "$oid": "business"
+          }
+        }
+      },
+      "expectedCore": {
+        "selection": "reject"
+      },
+      "observedGui": {
+        "opaque": {
+          "$oid": "business"
+        }
+      },
+      "drift": true
+    },
+    {
+      "id": "super-legacy",
+      "kind": "super",
+      "rawTask": {
+        "config": "{\"opaque\":{\"$numberInt\":\"literal\"},\"max_concurrent\":3}"
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "opaque": {
+            "$numberInt": "literal"
+          },
+          "max_concurrent": 3
+        }
+      },
+      "observedGui": {
+        "opaque": {
+          "$numberInt": "literal"
+        },
+        "max_concurrent": 3
+      },
+      "drift": false
+    },
+    {
+      "id": "priority-conflict",
+      "kind": "priority",
+      "rawTask": {
+        "mission_config": {
+          "priority": 4,
+          "extension": {
+            "$oid": "opaque"
+          }
+        },
+        "startConfig": {
+          "priority": 2
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "priority": 4,
+          "extension": {
+            "$oid": "opaque"
+          }
+        }
+      },
+      "observedGui": {
+        "priority": 4,
+        "extension": {
+          "$oid": "opaque"
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "priority-null-skip",
+      "kind": "priority",
+      "rawTask": {
+        "mission_config": null,
+        "startConfig": {
+          "priority": 2
+        }
+      },
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "priority": 2
+        }
+      },
+      "observedGui": {
+        "priority": 2
+      },
+      "drift": false
+    },
+    {
+      "id": "priority-legacy",
+      "kind": "priority",
+      "rawTask": {
+        "config": {
+          "priority": 7,
+          "extension": {
+            "keep": true
+          }
+        }
+      },
+      "expectedCore": {
+        "selection": "original_owner_default"
+      },
+      "observedGui": {
+        "priority": 7,
+        "extension": {
+          "keep": true
+        }
+      },
+      "drift": true
+    },
+    {
+      "id": "regular-explicit-edit",
+      "kind": "regular",
+      "rawTask": {
+        "startConfig": {
+          "max_concurrent": 1
+        },
+        "mission_config": {
+          "max_concurrent": 2
+        }
+      },
+      "edit": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "expectedCore": {
+        "selection": "explicit"
+      },
+      "observedGui": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "super-explicit-edit",
+      "kind": "super",
+      "rawTask": {
+        "startConfig": {
+          "max_concurrent": 1
+        },
+        "mission_config": {
+          "max_concurrent": 2
+        }
+      },
+      "edit": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "expectedCore": {
+        "selection": "explicit"
+      },
+      "observedGui": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "priority-explicit-edit",
+      "kind": "priority",
+      "rawTask": {
+        "startConfig": {
+          "max_concurrent": 1
+        },
+        "mission_config": {
+          "max_concurrent": 2
+        }
+      },
+      "edit": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "expectedCore": {
+        "selection": "explicit"
+      },
+      "observedGui": {
+        "max_concurrent": 3,
+        "opaque": {
+          "$oid": "literal",
+          "$numberInt": "01",
+          "nested": [
+            true,
+            null,
+            "x"
+          ]
+        }
+      },
+      "drift": false
+    },
+    {
+      "id": "regular-all-absent",
+      "kind": "regular",
+      "rawTask": {},
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "max_concurrent": 8,
+          "max_multi_simulation_children": 10,
+          "tag": {
+            "name": "priority-a",
+            "tags": [
+              "priority-a"
+            ],
+            "regular": {
+              "description": "research campaign"
+            }
+          }
+        }
+      },
+      "observedGui": {
+        "max_concurrent": 8,
+        "max_multi_simulation_children": 10,
+        "tag": {
+          "name": "priority-a",
+          "tags": [
+            "priority-a"
+          ],
+          "regular": {
+            "description": "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8"
+          }
+        },
+        "adaptive": {
+          "enabled": false,
+          "train_interval": 500,
+          "sample_size": 50000,
+          "min_train": 100,
+          "cand_batch": 10000,
+          "explore_ratio": 0.2,
+          "sat_power": 0.5,
+          "max_same_df": 5,
+          "good_th": [
+            1.25,
+            0.8
+          ],
+          "grade_bounds": [
+            0.5,
+            1.25,
+            2.0
+          ]
+        }
+      },
+      "drift": true
+    },
+    {
+      "id": "super-all-absent",
+      "kind": "super",
+      "rawTask": {},
+      "expectedCore": {
+        "selection": "value",
+        "value": {
+          "max_concurrent": 3,
+          "max_multi_simulation_children": 1,
+          "tag": {
+            "name": "priority-a",
+            "tags": [
+              "priority-a"
+            ],
+            "selection": {
+              "description": "research campaign"
+            },
+            "combo": {
+              "description": "research campaign"
+            }
+          }
+        }
+      },
+      "observedGui": {
+        "max_concurrent": 3,
+        "max_multi_simulation_children": 1,
+        "tag": {
+          "name": "priority-a",
+          "tags": [
+            "priority-a"
+          ],
+          "selection": {
+            "description": "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8"
+          },
+          "combo": {
+            "description": "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8"
+          }
+        }
+      },
+      "drift": true
+    },
+    {
+      "id": "priority-all-absent",
+      "kind": "priority",
+      "rawTask": {},
+      "expectedCore": {
+        "selection": "original_owner_default"
+      },
+      "observedGui": {
+        "interval": 600,
+        "priority": 1,
+        "filter_params": {
+          "sharpe_th": 1.2,
+          "fitness_th": 0.8,
+          "usage": "check"
+        },
+        "source_scope": "active",
+        "mission_tag": "pipeline",
+        "refine_templates": "auto",
+        "max_variants_per_alpha": 40,
+        "rounds": {
+          "enabled": true,
+          "max_rounds": 3,
+          "max_simulations_per_round": 60,
+          "promote_top_k": 5,
+          "exploration_fraction": 0.2,
+          "wait_timeout": 7200,
+          "poll_interval": 30
+        }
+      },
+      "drift": true
+    }
+  ],
+  "observedGui_note": "observedGui/drift fields preserve v3 historical output; v4 unedited emits no config. Native commands.rs tests use rawTask and expectedCore."
+}
