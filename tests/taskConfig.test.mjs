@@ -211,7 +211,7 @@ for (const [name, handler, event] of [
   test(`${name} round-trips explicit advanced JSON and [] without defaults`, async () => {
     const saved = { refine_templates: [{ name: 'group_op_add', enabled: true, params: { num_variants: 2 }, max_variants: 4 }, { name: 'event_op_add', params: { open_events: ['volume > adv20'], exit_events: ['-1'], num_variants: 6, max_attempts: 60, include_regional: false }, max_variants: 3 }], max_variants_per_alpha: 9, extra: { keep: true } };
     const { state, events, props } = await modal(name, { task: { name: 'custom__priority', isRemote: false, mission_config: saved } });
-    if (name === 'StartTaskModal') { assert.equal(state.form.value.config, ''); state.setConfigMode(true); state.form.value.config = JSON.stringify(saved); }
+
     assert.deepEqual(JSON.parse(state.form.value.config), saved);
     state[handler]();
     assert.deepEqual(events.find(([key]) => key === event)[1].config, saved);
@@ -220,27 +220,25 @@ for (const [name, handler, event] of [
     props.task = { name: 'custom__priority', startConfig: { refine_templates: [] } };
     props.show = true;
     await nextTick();
-    if (name === 'StartTaskModal') { assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, ''); state.setConfigMode(true); state.form.value.config = '{"refine_templates":[]}'; }
+
     assert.deepEqual(JSON.parse(state.form.value.config), { refine_templates: [] });
   });
 
   test(`${name} preserves legacy unconfigured single-template task`, async () => {
     const { state } = await modal(name, { task: { name: 'sign_flip__priority', templatefile: 'sign_flip' } });
-    if (name === 'StartTaskModal') { assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, ''); }
-    else assert.equal(Object.hasOwn(JSON.parse(state.form.value.config), 'refine_templates'), false);
+    assert.equal(Object.hasOwn(JSON.parse(state.form.value.config), 'refine_templates'), false);
   });
 
   test(`${name} retains saved legacy filters without injecting auto templates`, async () => {
     const saved = { interval: 30, filter_params: { sharpe_th: 1.8 } };
     const { state } = await modal(name, { task: { name: 'sign_flip__priority', mission_config: saved } });
-    if (name === 'StartTaskModal') { assert.equal(state.form.value.config, ''); state.setConfigMode(true); state.form.value.config = JSON.stringify(saved); }
+
     assert.deepEqual(JSON.parse(state.form.value.config), saved);
   });
 
   test(`${name} rejects invalid config without emitting a start/update command`, async () => {
     const { state, events } = await modal(name, { task: { name: 'pipeline__priority', templatefile: 'pipeline' } });
     for (const config of ['[]', '{"refine_templates":[{"name":"event_op_add","params":{"num_variants":0}}]}', '{"refine_templates":[{"name":"event_op_add","params":{"max_attempts":-1}}]}']) {
-      if (name === 'StartTaskModal') state.setConfigMode(true);
       state.form.value.config = config;
       state[handler]();
       assert.equal(events.some(([key]) => key === event), false);
@@ -303,24 +301,22 @@ for (const [name, handler, event] of [
   ['StartTaskModal', 'onConfirm', 'start-priority-task'],
   ['UpdateTaskModal', 'onConfirm', 'update-priority-task'],
 ]) {
-  test(`${name} round-trips explicit round configs; Start default defers, Update keeps original default`, async () => {
+  test(`${name} round-trips saved round configs and displays the original default when unconfigured`, async () => {
     for (const saved of [{ rounds: { ...roundDefaults, enabled: false }, refine_templates: [] },
       { rounds: { enabled: true, max_rounds: 2 }, refine_templates: ['ablation'] }]) {
       const { state, events } = await modal(name, { task: { name: 'wholepriority', templatefile: 'pipeline', mission_config: saved } });
-      if (name === 'StartTaskModal') { assert.equal(state.form.value.config, ''); state.setConfigMode(true); state.form.value.config = JSON.stringify(saved); }
+
     assert.deepEqual(JSON.parse(state.form.value.config), saved);
       state[handler]();
       assert.deepEqual(events.find(([key]) => key === event)[1].config, saved);
     }
     const { state } = await modal(name, { task: { name: 'wholepriority', templatefile: 'pipeline' } });
-    if (name === 'StartTaskModal') { assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, ''); }
-    else assert.deepEqual(JSON.parse(state.form.value.config).rounds, roundDefaults);
+    assert.deepEqual(JSON.parse(state.form.value.config).rounds, roundDefaults);
   });
 
   test(`${name} rejects rounds before emitting, including disabled schema and early-return legacy config`, async () => {
     const { state, events } = await modal(name, { task: { name: 'wholepriority', templatefile: 'pipeline' } });
     for (const rounds of [{ max_rounds: 4 }, { max_simulations_per_round: 61 }, { enabled: false, exploration_fraction: 2 }, { order: [] }]) {
-      if (name === 'StartTaskModal') state.setConfigMode(true);
       state.form.value.config = JSON.stringify({ rounds });
       state[handler]();
       assert.equal(events.some(([key]) => key === event), false);
@@ -384,7 +380,6 @@ for (const [name, handler, event] of [
     const { state, events } = await modal(name, { task: { name: 'split-test', templatefile: 'pipeline', mission_config: old } });
     const key = name === 'AddPriorityTaskModal' ? 'configText' : 'config';
     if (name === 'AddPriorityTaskModal') state.form.value.taskName = 'split-test';
-    if (name === 'StartTaskModal') state.setConfigMode(true);
     state.form.value[key] = JSON.stringify(old);
     state[handler]();
     assert.equal(events.some(([key]) => key === event), false);
@@ -458,8 +453,7 @@ for (const [name, handler, eventName] of [
       state[handler]();
       const sent = events.find(([key]) => key === eventName)[1];
       assert.equal(sent.isRemote, isRemote);
-      if (name === 'StartTaskModal') assert.equal(Object.hasOwn(sent, 'config'), false);
-      else assert.deepEqual(sent.config, saved);
+      assert.deepEqual(sent.config, saved);
     }
   });
 }
@@ -496,7 +490,7 @@ for (const [name, handler, event] of [
     for (const key of ['mission_config', 'startConfig', 'config']) {
       const { state, events } = await modal(name, { task: { name: 'weight-test', isRemote: false,
         templatefile: 'pipeline', [key]: JSON.stringify(saved) } });
-      if (name === 'StartTaskModal') { assert.equal(state.form.value.config, ''); state.setConfigMode(true); state.form.value.config = JSON.stringify(saved); }
+
     assert.deepEqual(JSON.parse(state.form.value.config), saved);
       const edited = { ...JSON.parse(state.form.value.config), priority: 250 };
       state.form.value.config = JSON.stringify(edited);
@@ -518,7 +512,6 @@ for (const [name, handler, event] of [
     const { state, events } = await modal(name, { task: { name: 'weight-test', templatefile: 'pipeline' } });
     const field = name === 'AddPriorityTaskModal' ? 'configText' : 'config';
     for (const priority of ['0', '-1', 'null', 'true', '"2"', '1e999', '[]', '{}']) {
-      if (name === 'StartTaskModal') state.setConfigMode(true);
       state.form.value[field] = `{"priority":${priority}}`;
       state[handler]();
       assert.equal(events.some(([key]) => key === event), false);
@@ -539,33 +532,35 @@ test('configuration copy retains actionable formats and bounds without defensive
     /ablation.params 必须为模板参数对象；runner 的身份\/内部参数由运行器管理/);
 });
 
-test('v4 Start explicit mode resets on task/reopen and withdrawal, never inferred from JSON equality', async () => {
-  const { state, events, props, template } = await modal('StartTaskModal', { task: { _id: 'a', name: 'first', mission_config: { priority: 3 } } });
-  assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, '');
-  assert.match(template, /不展示推断的有效 JSON/);
-  state.setConfigMode(true); state.form.value.config = '{}'; state.onConfirm();
-  assert.deepEqual(events.find(([key]) => key === 'start-priority-task')[1].config, {}, 'explicit empty object stays explicit');
+test('Start directly displays last JSON, submits it unchanged or edited, and preserves draft on same-task refresh', async () => {
+  const saved = { priority: 3, extra: { keep: [true, null] } };
+  const { state, events, props, template } = await modal('StartTaskModal', { task: { _id: 'a', name: 'first', status: 'paused', mission_config: saved } });
+  assert.match(template, /label="配置 JSON"/);
+  assert.match(template, /v-model:value="form.config"/);
+  assert.doesNotMatch(template, /n-switch|v-if="editConfig"|v-else|沿用核心保存配置/);
+  assert.deepEqual(JSON.parse(state.form.value.config), saved);
+  state.onConfirm();
+  assert.deepEqual(events.find(([key]) => key === 'start-priority-task')[1].config, saved);
   props.show = false; await nextTick(); props.show = true; await nextTick();
-  assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, '');
-  state.setConfigMode(true); state.form.value.config = '{"priority":2}';
-  props.task = { _id: 'b', name: 'replacement', mission_config: { priority: 8 } }; await nextTick();
-  assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, '');
-  state.setConfigMode(true); state.form.value.config = '{"priority":2}'; state.setConfigMode(false);
-  assert.equal(state.form.value.config, ''); state.onConfirm();
-  const last = events.filter(([key]) => key === 'start-priority-task').at(-1)[1];
-  assert.equal(last.taskName, 'replacement'); assert.equal(Object.hasOwn(last, 'config'), false);
-  state.setConfigMode(true); state.form.value.config = '{"priority":2}';
-  props.task.name = 'changed-in-place'; await nextTick();
-  assert.equal(state.editConfig.value, false); assert.equal(state.form.value.config, '');
+  const edited = { priority: 99, extra: { changed: ['user-controlled'] } };
+  state.form.value.config = JSON.stringify(edited);
+  props.task = { ...props.task, progress: 0.7, mission_config: { priority: 7 } }; await nextTick();
+  assert.deepEqual(JSON.parse(state.form.value.config), edited, 'progress refresh must not erase user input');
+  state.onConfirm();
+  assert.deepEqual(events.filter(([key]) => key === 'start-priority-task').at(-1)[1].config, edited);
+  assert.deepEqual(saved, { priority: 3, extra: { keep: [true, null] } }, 'editing must not mutate stored props');
+  props.show = false; await nextTick(); props.task = { _id: 'b', name: 'replacement', mission_config: { priority: 8 } }; props.show = true; await nextTick();
+  assert.deepEqual(JSON.parse(state.form.value.config), { priority: 8 });
+  state.form.value.config = '{}'; state.onConfirm();
+  assert.deepEqual(events.filter(([key]) => key === 'start-priority-task').at(-1)[1].config, {}, 'user empty object stays explicit');
 });
 
-for (const type of ['regular', 'super', 'priority']) test(`v4 Start ${type}: explicit invalid JSON never silently becomes None`, async () => {
+for (const type of ['regular', 'super', 'priority']) test(`Start ${type}: invalid JSON remains editable and never silently falls back`, async () => {
   const { state, events } = await modal('StartTaskModal', { isPriority: type === 'priority', isSuper: type === 'super', task: { name: 'fixture', taskType: type } });
-  state.setConfigMode(true);
   for (const input of ['null', '[]', 'false', '"null"', 'broken', '']) {
     state.form.value.config = input; state.onConfirm();
     assert.equal(events.some(([key]) => key.startsWith('start-')), false);
-    assert.equal(state.editConfig.value, true); assert.equal(state.form.value.config, input);
+    assert.equal(state.show.value, true); assert.equal(state.form.value.config, input);
   }
   const explicit = { opaque: { $oid: 'business', $numberInt: '01', values: [null, true] } };
   state.form.value.config = JSON.stringify(explicit); state.onConfirm();

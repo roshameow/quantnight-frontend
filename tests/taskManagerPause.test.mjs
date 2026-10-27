@@ -1270,10 +1270,10 @@ test('followup v2 Priority modal fences replacement identity and changed saved d
 
 
 
-// Frozen R1 UX: default emits no override; explicit edits emit the complete JSON.
-// Original raw DB selector parity is exercised by commands.rs native tests.
+// Restored original UX: display saved JSON and always submit the editor value.
+// Native None selector tests remain CLI/core contracts, not a hidden GUI editor policy.
 const parityTable = JSON.parse(await readFile(new URL('./fixtures/startConfigParity.json', import.meta.url), 'utf8'));
-for (const row of parityTable.rows) test(`v4 R1 GUI adapter: actual StartTaskModal -> TaskManager -> invoke ${row.id}`, async () => {
+for (const row of parityTable.rows) test(`visible JSON GUI adapter: actual StartTaskModal -> TaskManager -> invoke ${row.id}`, async () => {
   // Current Task Option<JsonValue> wire represents both absent and null as null.
   const wire = Object.fromEntries(['mission_config', 'startConfig', 'config'].map(key => [key, row.rawTask[key] ?? null]));
   const initial = task({ ...wire, taskType: row.kind, templatefile: 'pipeline', status: 'ready' });
@@ -1300,19 +1300,16 @@ for (const row of parityTable.rows) test(`v4 R1 GUI adapter: actual StartTaskMod
     const form = modal.setup({ show: true, task: h.state.selectedTask.value, isSuper: row.kind === 'super', isPriority: row.kind === 'priority' }, {
       expose() {}, emit(name, args) { emitted.push({ name, args }); if (handlers[name]) pending.push(handlers[name](args)); },
     });
-    assert.equal(form.editConfig.value, false);
-    assert.equal(form.form.value.config, '', 'no inferred effective JSON is displayed');
-    if (row.edit) { form.setConfigMode(true); form.form.value.config = JSON.stringify(row.edit); }
+    const displayed = JSON.parse(form.form.value.config);
+    if (!row.edit) assert.deepEqual(displayed, row.observedGui, 'original saved JSON/default template is visible');
+    if (row.edit) form.form.value.config = JSON.stringify(row.edit);
     form.onConfirm(); await Promise.all(pending); await tick();
     const native = calls.find(call => call.name.startsWith('start_'));
     assert.ok(native, 'actual emitted modal config must reach native boundary');
     assert.equal(emitted.filter(event => event.name.startsWith('start-')).length, 1);
-    if (row.edit) {
-      assert.deepEqual(JSON.parse(native.args.config), row.edit, 'explicit preview equals complete submitted JSON');
-    } else {
-      assert.equal(Object.hasOwn(native.args, 'config'), false, 'default delegates to original core None');
-      assert.equal(Object.hasOwn(emitted.find(event => event.name.startsWith('start-')).args, 'config'), false);
-    }
+    assert.deepEqual(JSON.parse(native.args.config), row.edit ?? displayed,
+      'edited or untouched editor JSON reaches native unchanged');
+    assert.deepEqual(emitted.find(event => event.name.startsWith('start-')).args.config, row.edit ?? displayed);
   } finally { h.stop(); }
 });
 
@@ -2043,5 +2040,29 @@ test('v8 explicit optional diagnostic is read-only and does not cause pause, sta
     assert.deepEqual(h.store.taskStopOperationMap, {});
     assert.equal(h.state.taskRuntimeStatus.value[initial.name].state, 'session_absent');
     assert.equal(h.state.startBlockReason(h.store.tasks[0]), '');
+  } finally { h.stop(); }
+});
+
+test('running task accepts not-compared receipt for explicit edited JSON without claiming config was applied', async () => {
+  const h = await harness(startableTask({ taskType: 'super' }));
+  try {
+    const snapshot = { ...h.store.tasks[0] }, edited = { max_concurrent: 3, user_extension: { keep: true } };
+    let starts = 0;
+    h.hooks.invoke = async (name, args) => {
+      if (name === 'start_super_task') {
+        starts++;
+        assert.deepEqual(JSON.parse(args.config), edited);
+        return typedStart({ configComparison: 'not_compared' });
+      }
+      if (name === 'get_all_tasks') return [snapshot];
+      if (name === 'refresh_task_progress') return;
+      assert.fail(name);
+    };
+    await h.state.openStartModal(h.store.tasks[0]);
+    await h.state.handleStartSuperTask({ taskName: snapshot.name, isRemote: true, config: edited });
+    await tick();
+    assert.equal(starts, 1);
+    assert.equal(h.hooks.errors.length, 0);
+    assert.match(h.hooks.notices.at(-1).text, /原任务已运行.*未新启动.*未应用新配置/);
   } finally { h.stop(); }
 });

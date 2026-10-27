@@ -1137,7 +1137,7 @@ async fn public_start_original_checker_recognizes_same_run_without_claim_launch_
     use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
     use serde_json::json;
     for remote in [false,true] {
-        for case in ["ensure","equal","different","unverified","legacy_inline","legacy_absent","caller_echo_only"] {
+        for case in ["different","unverified","ensure","equal","legacy_inline","legacy_absent","caller_echo_only"] {
             let fixture=original_professional_runtime::original_professional_fixture(false);
             let root=Path::new(&fixture.config.env.working_dir);
             std::fs::write(root.join("state"),"active").unwrap();
@@ -1181,7 +1181,7 @@ class Process:
             let before=store.task();let binding=validate_backend_binding(&fixture.config).await.unwrap();
             let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};
             let out=core::start(root,store.as_ref(),&runtime,&req).await;
-            let satisfied=matches!(case,"ensure"|"equal"|"legacy_inline"|"legacy_absent");
+            let satisfied=case!="caller_echo_only";
             assert_eq!(out.exit_code,if satisfied{0}else{1},"{remote}/{case}: {}",out.value);
             assert_eq!(out.value["startedNew"],false);
             assert_eq!(out.value["configApplied"],false);
@@ -1190,7 +1190,9 @@ class Process:
                 assert_eq!(out.value["operationSettled"],case!="legacy_inline");assert_eq!(out.value["taskType"],"super");assert_eq!(out.value["authProfile"],"user1");
                 assert!(out.value.get("launchAttemptId").is_some());
                 if case=="legacy_absent" {assert!(out.value["launchAttemptId"].is_null());}
-                assert_eq!(out.value["configComparison"],if case=="equal"{"equal"}else if case=="different"{"different"}else if case=="unverified"{"unverified"}else{"not_requested"});
+                assert_eq!(out.value["configComparison"],"not_compared");
+                assert_eq!(out.value["requestSatisfied"],true);
+                assert_eq!(out.value["executionObservation"]["configComparison"],"not_requested", "original checker must not receive a config comparison request");
             }else{assert_eq!(out.value["outcome"],"refused");}
             assert_eq!(store.task(),before,"never overwrite original launch/runtime/config");
             let d=store.0.lock().unwrap();assert!(!d.calls.iter().any(|c|c.contains("runtime-register")||c.starts_with("start:")));
@@ -1455,4 +1457,33 @@ fi"#,refuse=refuse.display()))).unwrap();
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();
         assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),usize::from(case=="persisted"));
     }}
+}
+
+#[tokio::test]
+async fn paused_restart_uses_explicit_new_config_without_comparing_to_previous_run() {
+    for kind in ["regular", "super", "priority"] {
+        for remote in [false, true] {
+            let (root, store, runtime, mut request) = setup(kind, remote);
+            store.mutate(doc! {"startConfig":{"old_only":true,"max_concurrent":1},
+                "mission_config":{"old_only":true,"max_concurrent":1}});
+            let mut input = doc! {"max_concurrent":3,"max_multi_simulation_children":1,
+                "custom":{"user_choice":[true,"new",null]}};
+            if kind == "priority" {
+                input.insert("mission_tag", "pipeline");
+                input.insert("source_remote", !remote); // original root scope, not CP host
+            }
+            request.config_json = Some(serde_json::to_string(&input).unwrap());
+            request.remote = Some(remote);
+            let before_local = store.0.lock().unwrap().local_rows.clone();
+            let before_remote = store.0.lock().unwrap().remote_rows.clone();
+            let result = core::start(&root.0, store.as_ref(), &runtime, &request).await;
+            success(&result);
+            assert_eq!(runtime.launches(),1);
+            let task=store.task();let actual=task.get_document("startConfig").unwrap();
+            for (key,value) in &input { assert_eq!(actual.get(key),Some(value),"{kind}/{remote}/{key}"); }
+            assert!(!actual.contains_key("old_only"));
+            assert_eq!(store.0.lock().unwrap().local_rows,before_local);
+            assert_eq!(store.0.lock().unwrap().remote_rows,before_remote);
+        }
+    }
 }

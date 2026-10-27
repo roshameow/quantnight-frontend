@@ -1,15 +1,14 @@
 <template>
   <n-modal v-model:show="show" title="启动任务配置" preset="dialog">
     <n-form :model="form" label-placement="top">
-      <n-switch :value="editConfig" @update:value="setConfigMode">
-        <template #checked>编辑并覆盖本次配置</template>
-        <template #unchecked>沿用核心保存配置</template>
-      </n-switch>
-      <n-p v-if="!editConfig">未提交配置覆盖；启动时由原核心按当前保存配置及默认规则选择并校验（等价 CLI 不传 --config）。此处不展示推断的有效 JSON。</n-p>
-      <n-form-item v-else label="本次将提交的完整 JSON（显式覆盖）">
-        <n-input type="textarea" v-model:value="form.config" autosize placeholder="请输入完整 JSON 对象；不会合并历史配置或自动回退默认值" />
-      </n-form-item>
-      <n-p v-if="editConfig && isPriority">{{ PRIORITY_CONFIG_HINT }}</n-p>
+                  <n-form-item label="配置 JSON">
+                    <n-input
+                      type="textarea"
+                      v-model:value="form.config"
+                      autosize
+                    />
+                  </n-form-item>
+      <n-p v-if="isPriority">{{ PRIORITY_CONFIG_HINT }}</n-p>
     </n-form>
     <template #action>
       <n-button @click="onCancel">取消</n-button>
@@ -21,50 +20,162 @@
 <script setup>
 import { ref, watch } from "vue";
 import { useMessage } from "naive-ui";
-import { parseTaskConfig, validatePriorityConfig, PRIORITY_CONFIG_HINT } from "@/utils/taskConfig";
+import { priorityDefaultConfig, resolveTaskConfig, parseTaskConfig, validatePriorityConfig, PRIORITY_CONFIG_HINT } from "@/utils/taskConfig";
 
 const props = defineProps({
   show: Boolean,
   task: Object,
-  isSuper: { type: Boolean, default: false },
-  isPriority: { type: Boolean, default: false },
+  isSuper: {
+    type: Boolean,
+    default: false,
+  },
+  isPriority: {
+    type: Boolean,
+    default: false,
+  },
 });
-const emits = defineEmits(["update:show", "start-task", "start-super-task", "start-priority-task"]);
+
+const emits = defineEmits([
+  "update:show",
+  "start-task",
+  "start-super-task",
+  "start-priority-task",
+]);
+
 const message = useMessage();
 const show = ref(props.show);
-const form = ref({ config: "" });
-const editConfig = ref(false);
+watch(
+  () => props.show,
+  (val) => (show.value = val)
+);
+watch(show, (val) => emits("update:show", val));
 
-// Mode is an explicit user choice, never inferred by comparing JSON to defaults.
-const setConfigMode = (enabled) => {
-  editConfig.value = enabled === true;
-  if (!editConfig.value) form.value.config = "";
+const form = ref({ config: "" });
+
+// ✅ 普通任务 defaultJson
+const adaptiveDefaultConfig = {
+  enabled: false, // 改为 true 启用自适应调度（惰性打分 + LightGBM）
+  train_interval: 500, // 攒够几条新结果触发重训
+  sample_size: 50000, // 训练集抽样上限
+  min_train: 100, // 最少训练样本数
+  cand_batch: 10000, // 每轮拉取候选条数
+  explore_ratio: 0.2, // 保底纯随机比例（探索）
+  sat_power: 0.5, // 饱和惩罚强度（探索模式，0=关）
+  max_same_df: 5, // 同一 datafield 同时在测上限
+  good_th: [1.25, 0.8], // good 标记阈值 (sharpe, fitness)
+  grade_bounds: [0.5, 1.25, 2.0], // grade 分档边界
 };
-watch(() => [props.show, props.task, props.task?._id?.$oid ?? props.task?._id,
-  props.task?.name, props.task?.isRemote, props.task?.auth_profile, props.task?.launchAttemptId,
-  props.isSuper, props.isPriority], () => {
-  show.value = props.show;
-  if (props.show) {
-    editConfig.value = false;
-    form.value.config = "";
+
+const normalDefaultJson = {
+  max_concurrent: 8,
+  max_multi_simulation_children: 10,
+  tag: {
+    name: "Unknown Task",
+    tags: ["Unknown Task"],
+    regular: {
+      description:
+        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
+    },
+  },
+  adaptive: adaptiveDefaultConfig,
+};
+
+// ✅ Super 任务 defaultJson
+const superDefaultJson = {
+  max_concurrent: 3,
+  max_multi_simulation_children: 1,
+  tag: {
+    name: "Unknown Task",
+    tags: ["Unknown Task"],
+    selection: {
+      description:
+        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
+    },
+    combo: {
+      description:
+        "Idea: single dataset alpha\nRationale for data used: lower than 3\nRationale for operators used: lower than 8",
+    },
+  },
+};
+
+// ✅ Priority 任务 defaultJson
+// Priority defaults are shared; saved legacy configurations are never expanded.
+
+function generateDefaultConfig(task, isSuper, isPriority) {
+  const template = isSuper
+    ? superDefaultJson
+    : isPriority
+    ? priorityDefaultConfig(task)
+    : normalDefaultJson;
+  const cloned = JSON.parse(JSON.stringify(template)); // 深拷贝
+
+  const taskName = task?.name || "Unknown Task";
+  if (cloned.tag) {
+    cloned.tag.name = taskName;
+    cloned.tag.tags = [taskName];
   }
-}, { immediate: true });
-watch(show, value => emits("update:show", value));
-const onCancel = () => { setConfigMode(false); show.value = false; };
+
+  return resolveTaskConfig(task, cloned);
+}
+
+watch(
+  () => props.show,
+  (val) => {
+    show.value = val;
+
+    // Prefer saved config; use type-specific defaults only for unconfigured tasks.
+    if (val && props.task) {
+      try {
+        const config = generateDefaultConfig(props.task, props.isSuper, props.isPriority);
+        form.value.config = JSON.stringify(config, null, 2);
+      } catch (error) {
+        // Surface invalid saved data instead of silently replacing it with defaults.
+        form.value.config = "";
+        message.error("已保存配置无效: " + error.message);
+      }
+    }
+  },
+  { immediate: true }
+);
+
+const onCancel = () => {
+  show.value = false;
+};
+
 const onConfirm = () => {
   try {
-    if (!props.task?.name) { message.error("任务信息缺失"); return; }
-    const config = editConfig.value
-      ? (props.isPriority ? validatePriorityConfig(form.value.config) : parseTaskConfig(form.value.config))
-      : undefined;
-    emits(props.isPriority ? "start-priority-task" : props.isSuper ? "start-super-task" : "start-task", {
-      taskName: props.task.name,
-      isRemote: props.task.isRemote,
-      ...(editConfig.value ? { config } : {}),
-    });
+    const parsed = props.isPriority
+      ? validatePriorityConfig(form.value.config)
+      : parseTaskConfig(form.value.config);
+
+    if (!props.task || !props.task.name) {
+      message.error("任务信息缺失");
+      return;
+    }
+
+    if (props.isPriority) {
+      emits("start-priority-task", {
+        taskName: props.task.name,
+        config: parsed,
+        isRemote: props.task.isRemote,
+      });
+    } else if (props.isSuper) {
+      emits("start-super-task", {
+        taskName: props.task.name,
+        config: parsed,
+        isRemote: props.task.isRemote,
+      });
+    } else {
+      emits("start-task", {
+        taskName: props.task.name,
+        config: parsed,
+        isRemote: props.task.isRemote,
+      });
+    }
+
     show.value = false;
-  } catch (error) {
-    message.error("JSON 配置无效：" + error.message);
+  } catch (e) {
+    message.error("JSON 格式错误: " + e.message);
   }
 };
 </script>

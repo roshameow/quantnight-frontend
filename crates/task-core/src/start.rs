@@ -891,40 +891,20 @@ async fn start_locked(
         // old same-name controller running on the other host.
         runtime.assert_consumer_absent(root, &task, actual_remote).await?;
     }
-    let requested = if request.config_json.is_some() {
-        if original_kind == "priority" { Some(resolve_priority_start_config(root,runtime,&task,request.config_json.as_deref()).await?) }
-        else { Some(saved_start_config(&task,request.config_json.as_deref())?) }
-    } else { None };
-    if let Some(config)=&requested {
-        for (key,expected) in [
-            ("mission_tag",Bson::String(request.name.clone())),
-            ("dist",Bson::String(if remote{"remote"}else{"local"}.into())),
-            ("auth_profile",Bson::String(profile(&task)?.into())),
-            ("source_task_id",Bson::String(task_id(&task)?.to_hex())),
-            ("source_remote",Bson::Boolean(remote)),
-        ] {
-            if config.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original source/task identity config conflicts: {key}"));}
-        }
-        if let Some(Bson::Document(binding))=config.get("startup_binding"){
-            for (key,expected) in [("taskId",Bson::String(task_id(&task)?.to_hex())),("remote",Bson::Boolean(remote)),("auth_profile",Bson::String(profile(&task)?.into()))]{
-                if binding.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original startup identity config conflicts: {key}"));}
-            }
-        }
-    }
     let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero(){return Err("start deadline exhausted before original execution observation".into());}
-    let observation=runtime.inspect_execution(root,store,&task,remote,requested.as_ref(),remaining).await?;
+    let observation=runtime.inspect_execution(root,store,&task,remote,None,remaining).await?;
     if let Some(observed)=observation {
         unchanged(store,&task).await?;
         match observed.get("state").and_then(Value::as_str) {
             Some("live") if observed["identityVerified"]==true && observed["consumerRunning"]==true => {
-                let comparison=if request.config_json.is_none(){"not_requested"}else{observed["configComparison"].as_str().unwrap_or("unverified")};
-                let satisfied=request.config_json.is_none()||comparison=="equal";
-                return Ok(outcome("start",&request.name,satisfied,json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
+                // A live same-task consumer is an idempotent start result, not a
+                // configuration-comparison gate. No submitted config is applied.
+                return Ok(outcome("start",&request.name,true,json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
                     "launchAttemptId":observed_launch(&task)?,"taskType":original_kind,"authProfile":profile(&task)?,"operationSettled":!launch_unresolved,"outcome":"already_running",
-                    "startedNew":false,"consumerRunning":true,"configApplied":false,"configComparison":comparison,
-                    "requestSatisfied":satisfied,"executionObservation":observed,"controlStatus":task.get_str("status").unwrap_or(""),
-                    "controlReconciled":false,"error":if satisfied {Value::Null}else{json!("original consumer remains running; requested config not applied")}})));
+                    "startedNew":false,"consumerRunning":true,"configApplied":false,"configComparison":"not_compared",
+                    "requestSatisfied":true,"executionObservation":observed,"controlStatus":task.get_str("status").unwrap_or(""),
+                    "controlReconciled":false,"error":Value::Null})));
             }
             Some("owned_residue") if observed["identityVerified"]==true && observed["ownedResidue"]==true => {
                 if launch_unresolved {return Err("original launcher still unresolved; no automatic residue cleanup".into());}
@@ -958,6 +938,30 @@ async fn start_locked(
         }
     } else if launch_unresolved {
         return Err("generation/launch is in progress or unconfirmed; original execution observation required".into());
+    }
+    // Resolve/validate supplied business parameters only for an actual new launch.
+    let requested = if request.config_json.is_some() {
+        if original_kind == "priority" { Some(resolve_priority_start_config(root,runtime,&task,request.config_json.as_deref()).await?) }
+        else { Some(saved_start_config(&task,request.config_json.as_deref())?) }
+    } else { None };
+    // Priority mission_tag selects a template and source_remote describes roots;
+    // neither is the ordinary consumer task/host identity. Its original owner
+    // already validates its configuration and auth profile.
+    if let Some(config)=requested.as_ref().filter(|_| original_kind != "priority") {
+        for (key,expected) in [
+            ("mission_tag",Bson::String(request.name.clone())),
+            ("dist",Bson::String(if remote{"remote"}else{"local"}.into())),
+            ("auth_profile",Bson::String(profile(&task)?.into())),
+            ("source_task_id",Bson::String(task_id(&task)?.to_hex())),
+            ("source_remote",Bson::Boolean(remote)),
+        ] {
+            if config.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original source/task identity config conflicts: {key}"));}
+        }
+        if let Some(Bson::Document(binding))=config.get("startup_binding"){
+            for (key,expected) in [("taskId",Bson::String(task_id(&task)?.to_hex())),("remote",Bson::Boolean(remote)),("auth_profile",Bson::String(profile(&task)?.into()))]{
+                if binding.get(key).is_some_and(|actual|*actual!=expected){return Err(format!("original startup identity config conflicts: {key}"));}
+            }
+        }
     }
     let kind=kind(&task)?;
     let profile=profile(&task)?;

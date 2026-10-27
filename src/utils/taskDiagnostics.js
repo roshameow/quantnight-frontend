@@ -259,13 +259,13 @@ export function taskStartOutcome(value, target) {
     if (!['started', 'already_running', 'refused'].includes(value.outcome) ||
         typeof value.startedNew !== 'boolean' || typeof value.configApplied !== 'boolean' ||
         typeof value.requestSatisfied !== 'boolean' ||
-        !['equal', 'different', 'unverified', 'not_requested'].includes(value.configComparison)) {
+        !['equal', 'different', 'unverified', 'not_requested', 'not_compared'].includes(value.configComparison)) {
       throw new Error('启动结构化回执字段无效；未认定成功')
     }
     if (value.ok && (!value.requestSatisfied || value.outcome === 'refused')) throw new Error('启动回执成功/意图结果矛盾')
     if (value.outcome === 'already_running' &&
         (value.startedNew || value.configApplied || value.consumerRunning !== true || !identityMatches ||
-         (value.ok && !['equal', 'not_requested'].includes(value.configComparison)))) {
+         (value.ok && !['equal', 'not_requested', 'not_compared'].includes(value.configComparison)))) {
       throw new Error('已运行回执矛盾；未认定配置应用或消费者归属')
     }
     if (value.outcome === 'started' && value.ok && !value.startedNew) throw new Error('启动回执未确认新启动')
