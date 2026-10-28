@@ -100,7 +100,7 @@
       <span :title="PRIORITY_SCHEDULING_HINT">调度优先级 {{ priorityConfig?.priority ?? 1 }}</span>
     </div>
 
-    <div style="font-size: 12px; margin: 4px 0"><n-text :type="taskMutationIssue(task) ? 'warning' : 'default'">{{ taskControlLabel(task) }}</n-text></div>
+    <div v-if="taskMutationIssue(task)" style="font-size: 12px; margin: 4px 0"><n-text type="warning">{{ taskMutationIssue(task) }}</n-text></div>
     <n-space align="center" style="margin-top: 2px">
       <n-switch
         :value="task.isRemote"
@@ -230,7 +230,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
-import { taskMutationIssue, taskControlLabel, RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
+import { taskMutationIssue, RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 
 const props = defineProps({

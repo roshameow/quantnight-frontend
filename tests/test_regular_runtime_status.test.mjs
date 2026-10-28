@@ -383,6 +383,6 @@ test('v4 R3 real Regular/SUPER card keeps view but disables remote-only mutators
       assert.equal(byLabel(label)[1].includes('disabled'), controlSource === 'remote_only', label);
     }
     if (controlSource === 'remote_only') assert.match(plain(html), /仅远端登记.*原 owner/);
-    if (controlSource === undefined) assert.match(plain(html), /登记来源未提供/);
+    assert.doesNotMatch(plain(html), /本控端登记|执行端可为本地或远程|登记来源未提供/);
   }
 });

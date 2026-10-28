@@ -825,5 +825,7 @@ test('v4 R3 actual Priority card retains details but fences known remote-only mu
     const byLabel = label => buttons.find(row => row[2].replace(/<[^>]*>/g, '').trim().endsWith(label));
     assert.equal(byLabel('查看任务详情')[1].includes('disabled'), false);
     for (const label of ['启动', '更新', '停止', '删除']) assert.equal(byLabel(label)[1].includes('disabled'), controlSource === 'remote_only');
+    assert.doesNotMatch(html.replace(/<[^>]*>/g, ''), /本控端登记|执行端可为本地或远程|登记来源未提供/);
+    if (controlSource === 'remote_only') assert.match(html.replace(/<[^>]*>/g, ''), /仅远端登记/);
   }
 });

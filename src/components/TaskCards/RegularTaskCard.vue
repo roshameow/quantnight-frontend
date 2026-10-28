@@ -59,7 +59,7 @@
         </div>
       </template>
     </div>
-    <div style="font-size: 12px; margin: 4px 0"><n-text :type="taskMutationIssue(task) ? 'warning' : 'default'">{{ taskControlLabel(task) }}</n-text></div>
+    <div v-if="taskMutationIssue(task)" style="font-size: 12px; margin: 4px 0"><n-text type="warning">{{ taskMutationIssue(task) }}</n-text></div>
     <n-space align="center" style="margin-top: 2px">
       <n-switch
         :value="task.isRemote"
@@ -119,7 +119,7 @@ export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR
 
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
-import { taskMutationIssue, taskControlLabel, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason } from '../../utils/taskDiagnostics.js';
+import { taskMutationIssue, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 import { isGenerating, canGenerate, generationBusyOrUnknown } from '../../utils/taskGeneration.js';
 

@@ -1371,3 +1371,179 @@ async fn fc_p1_1_public_pause_grace_root_replacement_never_confirms_or_cas() {
         assert!(!trace.contains("kill-session")&&!trace.contains("new-session"));
     }
 }
+
+// The original inspector validates the primary consumer; its descendants inherit
+// that root's scope without needing their own business argv or helper whitelist.
+// Keep the original professional script fixture and change only leaf OS facts.
+fn explicit_pause_tree(root: &Path, kind: &str, remote: bool) -> Document {
+    original_professional_runtime::install_original_super_process(root, ID, NAME, remote, "launch-1");
+    std::fs::write(root.join("state"), "active").unwrap();
+    let path = root.join("psutil.py");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let source = source.replace("scripts.super_alpha_simulate_param", match kind {
+        "regular" => "scripts.alpha_simulate_param",
+        "super" => "scripts.super_alpha_simulate_param",
+        "priority" => "scripts.refine_simulate_param",
+        _ => panic!("unexpected fixture type"),
+    }).replace("(1001,1002)", "(1001,1002,1003,1004,1005)")
+      .replace("def create_time(self): return 1700000010.0 if self.pid==1002 else 1700000000.0",
+          "def create_time(self): return 1700000000.0 + (self.pid-1001)*10\n def ppid(self): return {1001:1,1002:1001,1003:1002,1004:1002,1005:1003}[self.pid]")
+      .replace("return ARGV if self.pid==1002 else ['bash']",
+          "return {1001:['bash'],1002:ARGV,1003:['python','-c','import worker_pool; worker_pool.serve()'],1004:['node','queue-worker.js'],1005:['/opt/tools/cache-agent','--stdio']}[self.pid]");
+    std::fs::write(path, source).unwrap();
+    let ps = root.join("bin/ps");
+    let source = std::fs::read_to_string(&ps).unwrap()
+        .replace("echo \"1002 1001 Mon Jan 1 00:00:01 2024 S\";",
+            "echo \"1002 1001 Mon Jan 1 00:00:01 2024 S\"; echo \"1003 1002 Mon Jan 1 00:00:02 2024 S\"; echo \"1004 1002 Mon Jan 1 00:00:03 2024 S\"; echo \"1005 1003 Mon Jan 1 00:00:04 2024 S\";")
+        .replace("echo \"1002 1001 python\"", "echo \"1002 1001 python\"; echo \"1003 1002 python\"; echo \"1004 1002 node\"; echo \"1005 1003 cache-agent\"");
+    assert!(source.contains("1005 1003 Mon"), "original ps fixture changed");
+    std::fs::write(ps, source).unwrap();
+    let mut task = normal();
+    task.remove("startupBinding");
+    task.insert("taskType", kind);
+    task.insert("auth_profile", "user1");
+    task.insert("isRemote", remote);
+    task.insert("tmuxContext", doc! {
+        "schemaVersion":1,"backend":"tmux","socketName":"default",
+        "binary":std::fs::canonicalize(root.join("native-tmux")).unwrap().to_string_lossy().as_ref(),
+        "taskId":ID,"launchAttemptId":"launch-1","remote":remote,
+        "sessionId":"$4","sessionCreatedAt":1700000000000i64,
+    });
+    task
+}
+
+async fn explicit_pause_arbitrary_descendants(kind: &str, remote: bool) {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    let fake = original_professional_fixture(false);
+    let root = Path::new(&fake.config.env.working_dir);
+    let task = explicit_pause_tree(root, kind, remote);
+    let evidence = vec![doc! {"_id":"accepted-or-unknown","status":"timeout_error",
+        "acceptance":"UNKNOWN","superSlotId":"preserved","progressUrl":"original-receipt"}];
+    let store = Arc::new(Memory::new(task, Some(evidence.clone())));
+    let binding = validate_backend_binding(&fake.config).await.unwrap();
+    let control = TaskControl::with_store(binding, store.clone());
+    let out = control.pause(NAME, PauseOptions {
+        expected_task_id:Some(ID),expected_remote:Some(remote),
+        expected_launch_attempt_id:Some("launch-1"),..Default::default()
+    }, StopBudget::Cli, None).await;
+    assert_eq!(out.exit_code, 0, "{kind}/{remote}: {}", out.value);
+    assert!(out.confirmed_stop.is_some());
+    assert_eq!(out.value["stopConfirmation"], "confirmed");
+    assert_eq!(out.value["confirmationBasis"], "runners_exited");
+    assert!(!root.join("state").exists());
+    let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+    let signals:Vec<_> = trace.lines().filter(|line| line.contains("if-shell")).collect();
+    assert_eq!(signals.len(), 1, "one original interrupt, no retry");
+    assert!(signals[0].contains("send-keys -t '$4' C-c"));
+    assert!(!trace.contains("kill-session") && !trace.contains("new-session"));
+    let data = store.0.lock().unwrap();
+    assert_eq!(data.writes.len(), 1);
+    assert_eq!(data.tasks[&Host::Local][0].get_str("status").unwrap(), "paused");
+    assert_eq!(data.tasks[&Host::Local][0].get_array("events").unwrap().len(), 1);
+    assert_eq!(data.items[&Host::from_remote(remote)], evidence);
+}
+
+macro_rules! explicit_pause_descendant_case {
+    ($name:ident, $kind:literal, $remote:literal) => {
+        #[tokio::test]
+        async fn $name() { explicit_pause_arbitrary_descendants($kind, $remote).await; }
+    };
+}
+explicit_pause_descendant_case!(generic_explicit_pause_regular_local, "regular", false);
+explicit_pause_descendant_case!(generic_explicit_pause_regular_remote, "regular", true);
+explicit_pause_descendant_case!(generic_explicit_pause_super_local, "super", false);
+explicit_pause_descendant_case!(generic_explicit_pause_super_remote, "super", true);
+explicit_pause_descendant_case!(generic_explicit_pause_priority_local, "priority", false);
+explicit_pause_descendant_case!(generic_explicit_pause_priority_remote, "priority", true);
+
+#[tokio::test]
+async fn generic_explicit_pause_rejects_wrong_requested_and_saved_identity_without_signal() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    for kind in ["regular", "super", "priority"] { for remote in [false, true] {
+        for case in ["request_task", "request_host", "request_launch", "context_task", "context_host",
+            "context_launch", "session_id", "session_birth"] {
+            let fake = original_professional_fixture(false);
+            let root = Path::new(&fake.config.env.working_dir);
+            let mut task = explicit_pause_tree(root, kind, remote);
+            let context = task.get_document_mut("tmuxContext").unwrap();
+            match case {
+                "context_task" => {context.insert("taskId", "ffffffffffffffffffffffff");},
+                "context_host" => {context.insert("remote", !remote);},
+                "context_launch" => {context.insert("launchAttemptId", "replacement-launch");},
+                "session_id" => {context.insert("sessionId", "$5");},
+                "session_birth" => {context.insert("sessionCreatedAt", 1700000999000i64);},
+                _ => (),
+            }
+            let evidence = items();
+            let store = Arc::new(Memory::new(task.clone(), Some(evidence.clone())));
+            let binding = validate_backend_binding(&fake.config).await.unwrap();
+            let control = TaskControl::with_store(binding, store.clone());
+            let out = control.pause(NAME, PauseOptions {
+                expected_task_id:Some(if case=="request_task" {"ffffffffffffffffffffffff"} else {ID}),
+                expected_remote:Some(if case=="request_host" {!remote} else {remote}),
+                expected_launch_attempt_id:Some(if case=="request_launch" {"replacement-launch"} else {"launch-1"}),
+                ..Default::default()
+            }, StopBudget::Cli, None).await;
+            assert_eq!(out.exit_code, 1, "{kind}/{remote}/{case}: {}", out.value);
+            let expected = match case {
+                "request_task" => "task identity changed",
+                "request_host" => "task execution host changed",
+                "request_launch" => "launch identity changed",
+                "session_id" | "session_birth" => "saved context conflicts with observed session",
+                _ => "conflicting saved context",
+            };
+            assert!(out.value["error"].as_str().unwrap().contains(expected), "{case}: {}", out.value);
+            assert!(out.confirmed_stop.is_none());
+            store.no_write();
+            assert_eq!(store.task(), task);
+            assert_eq!(store.0.lock().unwrap().items[&Host::from_remote(remote)], evidence);
+            assert_eq!(std::fs::read_to_string(root.join("state")).unwrap(), "active");
+            let trace = std::fs::read_to_string(root.join("trace")).unwrap_or_default();
+            assert!(!trace.contains("if-shell") && !trace.contains("kill-session") && !trace.contains("new-session"), "{case}: {trace}");
+        }
+    }}
+}
+
+#[tokio::test]
+async fn generic_explicit_pause_captured_pane_replacement_and_live_descendant_never_confirm() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    for kind in ["regular", "super", "priority"] { for remote in [false, true] {
+        for case in ["pane_replaced", "pane_birth", "orphan_descendant"] {
+            let fake = original_professional_fixture(false);
+            let root = Path::new(&fake.config.env.working_dir);
+            let task = explicit_pause_tree(root, kind, remote);
+            if case == "pane_replaced" {
+                let path = root.join("native-tmux");
+                let source = std::fs::read_to_string(&path).unwrap()
+                    .replace("else '$4|1001|0' if", "else '$4|2001|0' if");
+                assert!(source.contains("$4|2001|0"));
+                std::fs::write(path, source).unwrap();
+            } else {
+                let path = root.join("bin/ps");
+                let source = std::fs::read_to_string(&path).unwrap();
+                let source = if case == "pane_birth" {
+                    source.replace("if [[ \"$*\" == *lstart* ]]; then", "if [[ \"$*\" == *lstart* ]]; then\n if [[ -f \"$STATE.snapshot\" ]]; then\n echo \"9 1 Mon Jan 1 00:00:01 2024 S\"; echo \"1001 1 Tue Jan 2 00:00:01 2024 S\"; exit 0\n fi\n echo captured > \"$STATE.snapshot\"")
+                } else {
+                    source.replace("echo \"9 1 Mon Jan 1 00:00:01 2024 S\"", "echo \"9 1 Mon Jan 1 00:00:01 2024 S\"; if [[ ! -f \"$STATE\" ]]; then echo \"1005 1 Mon Jan 1 00:00:04 2024 S\"; fi")
+                };
+                std::fs::write(path, source).unwrap();
+            }
+            let store = Arc::new(Memory::new(task.clone(), Some(items())));
+            let binding = validate_backend_binding(&fake.config).await.unwrap();
+            let control = TaskControl::with_store(binding, store.clone());
+            let out = control.pause(NAME, PauseOptions::default(), StopBudget::Cli, None).await;
+            assert_eq!(out.exit_code, 1, "{kind}/{remote}/{case}: {}", out.value);
+            let expected = match case {
+                "pane_replaced" => "original pane root replaced or added",
+                "pane_birth" => "original pane root PID birth changed",
+                _ => "known_original_runners_still_live",
+            };
+            assert!(out.value["error"].as_str().unwrap().contains(expected), "{case}: {}", out.value);
+            assert!(out.confirmed_stop.is_none());
+            store.no_write(); assert_eq!(store.task(), task);
+            let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+            assert_eq!(trace.lines().filter(|line| line.contains("if-shell")).count(), usize::from(case=="orphan_descendant"), "{case}: {trace}");
+            assert!(!trace.contains("kill-session") && !trace.contains("new-session"));
+        }
+    }}
+}
