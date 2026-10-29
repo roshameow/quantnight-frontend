@@ -703,6 +703,9 @@ fn pause_filter(name: &str, task: &Document) -> Result<Document, String> {
         "launchAttemptId",
         "launchAttemptAt",
         "launchSettledAttemptId",
+        "taskType",
+        "auth_profile",
+        "runId",
         "startedAt",
         "generation",
         "startupBinding",
@@ -843,16 +846,34 @@ pub(crate) async fn pause_locked(
             }
         }
         let at = bson::DateTime::now(); let now = Utc::now().to_rfc3339();
-        let proof = match basis {
+        let mut proof = match basis {
             StopConfirmationBasis::RunnersExited => doc! {"schema_version":1,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":true},
             StopConfirmationBasis::SessionAbsent => doc! {"schema_version":2,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":Bson::Null,"confirmation_basis":"session_absent"},
         };
         let mut fields = doc! {"status":"paused","pausedAt":&now,"updatedAt":&now,"stopConfirmedAt":at,
             "stopConfirmedRemote":remote,"stopConfirmedTaskId":id.to_hex(),"stopConfirmationBasis":basis.as_str()};
-        if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
-            // V1/V2 stops do not settle an old launcher. Preserve the captured
-            // legacy unknown fact in this same task/launch CAS before changing
-            // its status; do not turn every marker-less legacy task into a hold.
+        let observed_consumer = verification_task.get_document("observedExecutionBeforeStop").ok()
+            .filter(|observed| observed.get_bool("consumerRunning")==Ok(true)
+                && (observed.get_bool("identityVerified")==Ok(true) || observed.get_bool("consumerScopeVerified")==Ok(true))
+                && observed.get_bool("consumerPredatesLaunch")!=Ok(true)
+                && observed.get_str("taskId").ok()==Some(id.to_hex().as_str())
+                && observed.get_bool("remote")==Ok(remote));
+        if let (StopConfirmationBasis::RunnersExited, Some(observed), Ok(launch)) =
+            (basis, observed_consumer, task.get_str("launchAttemptId")) {
+            // Original launchers are one-shot: after the actual consumer is
+            // observed they only check/report. This invocation captured and
+            // confirmed that process scope exited. Close the control lifecycle
+            // in the SAME exact task/host/launch CAS, without inventing an ACK
+            // or requiring a prior START/audit event on legacy tasks.
+            if !launch.is_empty() {
+                fields.insert("launchSettledAttemptId",launch);
+                proof.insert("controlReconciliation",doc!{"basis":"observed_consumer_stopped",
+                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
+                    "launcherAckRecovered":false,"executionObservation":observed});
+            }
+        } else if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
+            // No observed live consumer + full captured exit: V2/absence or a
+            // label alone cannot settle a helper that may not have launched yet.
             fields.insert("launchSettledAttemptId",Bson::Null);
         }
         let event = doc! {"id":ObjectId::new().to_hex(),"command":"pause","status":"paused","at":&now,"detail":proof};

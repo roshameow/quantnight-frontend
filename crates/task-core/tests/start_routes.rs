@@ -72,10 +72,16 @@ struct State {
     mutate_after: BTreeMap<String, Document>,
     id_growth: bool,
     insert_ack_lost: bool,
+    original_control_file: Option<PathBuf>,
 }
 #[derive(Default)]
 struct Store(Mutex<State>);
 impl Store {
+    fn publish_original_control(state:&State) {
+        if let (Some(path),Some(task))=(&state.original_control_file,state.local.last()) {
+            std::fs::write(path,Bson::Document(task.clone()).into_relaxed_extjson().to_string()).unwrap();
+        }
+    }
     fn task(&self) -> Document {
         self.0.lock().unwrap().local.last().unwrap().clone()
     }
@@ -127,6 +133,7 @@ impl TaskStore for Store {
         s.calls.push(if host == Host::Local { "control-create" } else { "runtime-insert" }.into());
         let id = row.get("_id").unwrap().clone();
         if host == Host::Local { s.local.push(row); } else { s.remote.push(row); }
+        Self::publish_original_control(&s);
         if s.insert_ack_lost {
             return Err("runtime insert response lost".into());
         }
@@ -176,6 +183,7 @@ impl TaskStore for Store {
             let rows=if host==Host::Local{&mut s.local}else{&mut s.remote};
             rows.last_mut().unwrap().extend(change);
         }
+        Self::publish_original_control(&s);
         if s.fail_after.remove(&label) {
             return Err(format!("response lost after {label}"));
         }
@@ -1152,12 +1160,14 @@ async fn public_start_original_checker_recognizes_same_run_without_claim_launch_
                 "--dist".into(),if remote{"remote".into()}else{"local".into()},"--auth_profile".into(),"user1".into(),"--config".into(),config];
             std::fs::write(root.join("psutil.py"),format!(r#"STATUS_ZOMBIE='zombie'
 ARGV={argv}
+import os
 class NoSuchProcess(Exception): pass
 class Process:
  def __init__(self,pid):
   self.pid=pid
   if pid not in (1001,1002): raise NoSuchProcess(pid)
  def create_time(self): return 1700000010.0 if self.pid==1002 else 1700000000.0
+ def cwd(self): return os.getcwd()
  def cmdline(self): return ARGV if self.pid==1002 else ['bash']
  def is_running(self): return True
  def status(self): return 'running'
@@ -1181,20 +1191,33 @@ class Process:
             let before=store.task();let binding=validate_backend_binding(&fixture.config).await.unwrap();
             let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};
             let out=core::start(root,store.as_ref(),&runtime,&req).await;
-            let satisfied=case!="caller_echo_only";
+            // User contract now permits non-destructive exact legacy scope. The
+            // caller echo still never becomes independent identity evidence.
+            let satisfied=true;
             assert_eq!(out.exit_code,if satisfied{0}else{1},"{remote}/{case}: {}",out.value);
             assert_eq!(out.value["startedNew"],false);
             assert_eq!(out.value["configApplied"],false);
-            if case!="caller_echo_only" {
+            if satisfied {
                 assert_eq!(out.value["outcome"],"already_running");assert_eq!(out.value["consumerRunning"],true);
-                assert_eq!(out.value["operationSettled"],case!="legacy_inline");assert_eq!(out.value["taskType"],"super");assert_eq!(out.value["authProfile"],"user1");
+                assert_eq!(out.value["operationSettled"],true);assert_eq!(out.value["taskType"],"super");assert_eq!(out.value["authProfile"],"user1");
                 assert!(out.value.get("launchAttemptId").is_some());
                 if case=="legacy_absent" {assert!(out.value["launchAttemptId"].is_null());}
                 assert_eq!(out.value["configComparison"],"not_compared");
                 assert_eq!(out.value["requestSatisfied"],true);
                 assert_eq!(out.value["executionObservation"]["configComparison"],"not_requested", "original checker must not receive a config comparison request");
             }else{assert_eq!(out.value["outcome"],"refused");}
-            assert_eq!(store.task(),before,"never overwrite original launch/runtime/config");
+            if case=="caller_echo_only" {
+                assert_eq!(out.value["executionObservation"]["identityVerified"],false);
+                assert_eq!(out.value["executionObservation"]["consumerScopeVerified"],true);
+            }
+            if case=="legacy_inline" {
+                assert_eq!(out.value["controlReconciled"],true);
+                let saved=store.task();assert_eq!(saved.get_str("status"),Ok("running"));
+                assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
+                for key in ["_id","launchAttemptId","simulatorRuntime","startConfig","mission_config","tmuxContext"] {
+                    assert_eq!(saved.get(key),before.get(key),"never overwrite original launch/runtime/config");
+                }
+            }else{assert_eq!(store.task(),before,"never overwrite original launch/runtime/config");}
             let d=store.0.lock().unwrap();assert!(!d.calls.iter().any(|c|c.contains("runtime-register")||c.starts_with("start:")));
             let trace=std::fs::read_to_string(root.join("trace")).unwrap();
             assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
@@ -1486,4 +1509,305 @@ async fn paused_restart_uses_explicit_new_config_without_comparing_to_previous_r
             assert_eq!(store.0.lock().unwrap().remote_rows,before_remote);
         }
     }
+}
+
+#[tokio::test]
+async fn shared_start_legacy_exact_consumer_reconciles_without_config_or_duplicate_launch() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,
+        pause::{PauseOptions,StopBudget}};
+    for kind in ["regular","super","priority"] { for remote in [false,true] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);
+        std::fs::write(root.join("state"),"active").unwrap();
+        let (_unused,store,_runtime,mut request)=setup(kind,remote);
+        request.name="fixture".into();request.notification.no_notify=true;
+        request.config_json=Some("not even JSON: must never parse/apply on already-running".into());
+        {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
+         task.insert("name","fixture");task.insert("status","launch_unknown");
+         task.insert("launchSettledAttemptId",Bson::Null);task.remove("tmuxContext");
+         task.insert("mission_config",doc!{"saved":"unchanged"});}
+        let id=store.task().get_object_id("_id").unwrap().to_hex();
+        original_professional_runtime::install_original_super_process(root,&id,"fixture",remote,"old-launch");
+        let process=root.join("psutil.py");
+        let source=std::fs::read_to_string(&process).unwrap();
+        let module=match kind {"regular"=>"scripts.alpha_simulate_param","super"=>"scripts.super_alpha_simulate_param",_=>"scripts.refine_simulate_param"};
+        let argv=serde_json::json!(["python","-m",module,"--task","fixture","--dist",if remote{"remote"}else{"local"},
+            "--auth_profile","user1","--config",if kind=="priority"{"tmp/tmp_config_fixture.json"}else{"{}"}]);
+        let source=source.lines().map(|line|if line.starts_with("ARGV="){format!("ARGV={argv}")}else{line.to_string()}).collect::<Vec<_>>().join("\n");
+        std::fs::write(process,source).unwrap();
+        let before=store.task();
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let control=TaskControl::with_store(binding,store.clone());
+        // An existing partial publication is not itself a compatibility gate.
+        store.mutate(doc!{"consumer_run_id":"legacy-expected-not-observed","simulatorRuntime":{"configDigestVersion":1}});
+        if remote {let row=store.task();store.0.lock().unwrap().remote.push(row);}
+        for _ in 0..2 {
+            let result=control.start(&request,None).await;success(&result);
+            assert_eq!(result.value["outcome"],"already_running","{kind}/{remote}: {}",result.value);
+            assert_eq!(result.value["startedNew"],false);assert_eq!(result.value["configApplied"],false);
+            assert_eq!(result.value["consumerRunning"],true);assert_eq!(result.value["operationSettled"],true,"this non-launching RPC is completed");
+            assert_eq!(store.task().get("launchSettledAttemptId"),Some(&Bson::Null),"current RPC completion must not settle historical launch");
+            assert_eq!(result.value["executionObservation"]["identityVerified"],false,"never invent independent launch identity");
+            assert_eq!(result.value["executionObservation"]["configComparison"],"not_requested");
+            if let Ok(directory)=std::env::var("QUANTNIGHT_TEST_START_WIRE") {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(Path::new(&directory).join(format!("{kind}-{remote}.json")),result.value.to_string()).unwrap();
+            }
+        }
+        let saved=store.task();assert_eq!(saved.get_str("status"),Ok("running"));
+        assert_eq!(saved.get("launchAttemptId"),before.get("launchAttemptId"));
+        assert_eq!(saved.get("launchSettledAttemptId"),Some(&Bson::Null),"scope must not settle a lost launch");
+        assert_eq!(saved.get("mission_config"),before.get("mission_config"));
+        assert_eq!(saved.get("tmuxContext"),None,"do not turn echoed context into future independent launch proof");
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
+        let pause=control.pause("fixture",PauseOptions::default(),StopBudget::Cli,None).await;
+        assert_eq!(pause.exit_code,0,"{}",pause.value);assert_eq!(store.task().get_str("status"),Ok("paused"));
+        assert_eq!(store.task().get("launchSettledAttemptId"),store.task().get("launchAttemptId"),"only original confirmed pause closes historical launch");
+    }}
+}
+
+#[tokio::test]
+async fn shared_start_strong_original_consumer_recovers_lost_control_ack_through_cas() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    for remote in [false,true] {for fault in ["none","lost_ack","replacement"] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);
+        std::fs::write(root.join("state"),"active").unwrap();
+        let (_unused,store,_runtime,mut request)=setup("super",remote);
+        request.name="fixture".into();request.notification.no_notify=true;
+        {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
+         task.insert("name","fixture");task.insert("status","launch_unknown");
+         task.insert("launchSettledAttemptId",Bson::Null);task.remove("tmuxContext");
+         task.insert("mission_config",doc!{"saved":"unchanged"});}
+        let id=store.task().get_object_id("_id").unwrap().to_hex();
+        original_professional_runtime::install_original_super_process(root,&id,"fixture",remote,"old-launch");
+        if fault=="lost_ack" {store.0.lock().unwrap().fail_after.insert("start-reconciled:running".into());}
+        if fault=="replacement" {store.0.lock().unwrap().mutate_before.insert("start-reconciled:running".into(),doc!{"launchAttemptId":"successor"});}
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let control=TaskControl::with_store(binding,store.clone());
+        let result=control.start(&request,None).await;
+        if fault=="none" {success(&result);}else{failed(&result);assert_ne!(result.value["operationSettled"],true,"failed current control CAS is not settled");}
+        if fault=="replacement" {
+            assert_eq!(store.task().get_str("launchAttemptId"),Ok("successor"));
+            assert_eq!(store.task().get_str("status"),Ok("launch_unknown"));
+        }else{
+            let repeat=control.start(&request,None).await;success(&repeat);
+            assert_eq!(repeat.value["startedNew"],false);assert_eq!(repeat.value["configApplied"],false);
+            assert_eq!(repeat.value["operationSettled"],true);
+            let saved=store.task();assert_eq!(saved.get_str("status"),Ok("running"));
+            assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
+        }
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
+    }}
+}
+
+#[tokio::test]
+async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_start() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,
+        create_generate::CreateRequest,pause::{PauseOptions,StopBudget}};
+    struct RestorePath(Option<std::ffi::OsString>);
+    impl Drop for RestorePath {
+        fn drop(&mut self) { if let Some(value)=&self.0 { std::env::set_var("PATH",value); } else {std::env::remove_var("PATH");} }
+    }
+    // Gate executes native tests on one thread; only the actual uv OS boundary
+    // is selected via PATH. No original launcher/config/checker is stubbed.
+    for kind in ["regular","super","priority"] {for remote in [false,true] {
+      let cases:&[&str]=if kind=="priority"{&["none","launcher","control","direct_pause","v2_only","pause_launch_race","pause_host_race","pause_ack_lost","nextafter_stop"]}else{&["launcher","direct_pause"]};
+      for &lost in cases {
+        let mut fixture=original_professional_runtime::original_professional_fixture(false);
+        fixture.config.mongodb.databases.mission="simulation_mission".into();
+        fixture.config.mongodb.databases.simulation="simulation_db".into();
+        let root=Path::new(&fixture.config.env.working_dir);
+        let backend=std::env::var("QUANTNIGHT_BACKEND_SOURCE").unwrap();
+        let python=std::env::var("QUANTNIGHT_TEST_PYTHON").unwrap();
+        let support=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/priority_start_os.py");
+        let fixture_setup=std::process::Command::new(&python).args(["-B"]).arg(support).arg(root).arg(&backend)
+            .env("PYTHONPATH",&backend).output().unwrap();
+        assert!(fixture_setup.status.success(),"{}",String::from_utf8_lossy(&fixture_setup.stderr));
+        let _path=RestorePath(std::env::var_os("PATH"));
+        std::env::set_var("PATH",format!("{}:/bin:/usr/bin",root.join("bin").display()));
+        let store=if kind=="priority"{Arc::new(Store::default())}else{setup(kind,remote).1};
+        if kind!="priority" {store.mutate(doc!{"name":"fixture","status":"ready","tmuxContext":Bson::Null});}
+        {let mut state=store.0.lock().unwrap();state.original_control_file=Some(root.join("original-control.json"));Store::publish_original_control(&state);}
+        let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let control=TaskControl::with_store(binding,store.clone());
+        if kind=="priority" {
+            let mut create=CreateRequest::new("fixture","pipeline");create.task_type="priority".into();create.target_remote=remote;
+            create.mission_config=Some(doc!{"mission_tag":"pipeline","refine_templates":[],"rounds":{"enabled":false},"interval":37});
+            let created=control.create(&create,None).await;success(&created);
+        }
+        let original_rows={let state=store.0.lock().unwrap();(state.local_rows.clone(),state.remote_rows.clone())};
+        let original=store.task();
+        if !matches!(lost,"none"|"control") {std::fs::write(root.join("lose-launch-ack"),"injected lowest-OS lost ACK").unwrap();}
+        if lost=="control" {store.0.lock().unwrap().fail_after.insert("start:running".into());}
+        let mut request=StartRequest::new("fixture");request.remote=Some(remote);request.notification.no_notify=true;
+        request.expected_task_id=Some(original.get_object_id("_id").unwrap().to_hex());
+        let first=control.start(&request,None).await;
+        if lost=="none" {success(&first);assert_eq!(first.value["startedNew"],true);}
+        else {failed(&first);}
+        assert!(root.join("launched-argv.json").exists(),"{}",first.value);
+        let claimed=store.task();assert_ne!(claimed.get("launchAttemptId"),original.get("launchAttemptId"));
+        assert_eq!(claimed.get_object_id("_id"),original.get_object_id("_id"));
+        let config_path=root.join("tmp/tmp_config_fixture.json");
+        assert!(config_path.exists(),"real original launcher must publish its file config");
+        let bytes=std::fs::read(&config_path).unwrap();
+        let argv:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("launched-argv.json")).unwrap()).unwrap();
+        let args=argv.as_array().unwrap();
+        let option=|key:&str|args[args.iter().position(|v|v==key).unwrap()+1].as_str().unwrap();
+        assert_eq!(option("--task"),"fixture");assert_eq!(option("--dist"),if remote{"remote"}else{"local"});
+        // Mutable file changed AFTER launch. Neither it nor new supplied config
+        // may be mistaken for loaded data or used as already-running admission.
+        std::fs::write(&config_path,"not the loaded config anymore").unwrap();
+        request.config_json=Some("invalid submitted JSON is not used by ensure".into());
+        for _ in 0..if lost=="direct_pause"{0}else{2} {
+            let repeat=control.start(&request,None).await;success(&repeat);
+            assert_eq!(repeat.value["outcome"],"already_running");
+            assert_eq!(repeat.value["startedNew"],false);assert_eq!(repeat.value["configApplied"],false);
+            assert_eq!(repeat.value["consumerRunning"],true);
+        }
+        let saved=store.task();assert_eq!(saved.get_str("status"),Ok(if lost=="direct_pause"{"launch_unknown"}else{"running"}));
+        if lost=="direct_pause" {assert!(!saved.get_array("events").unwrap().iter().any(|e|e.as_document().unwrap().get_str("command")==Ok("start-reconciled")));}
+        assert_eq!(saved.get("launchAttemptId"),claimed.get("launchAttemptId"));
+        if kind=="priority" {assert!(store.0.lock().unwrap().remote.is_empty(),"no new Priority registry");}
+        {let state=store.0.lock().unwrap();assert_eq!((state.local_rows.clone(),state.remote_rows.clone()),original_rows,"accepted rows unchanged, no POST/reset");}
+        assert_ne!(std::fs::read(&config_path).unwrap(),bytes,"start must not republish config");
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1,"no duplicate launcher");
+        assert!(!trace.contains("if-shell"),"START never stops existing consumer");
+        if lost=="v2_only" {std::fs::remove_file(root.join("state")).unwrap();}
+        if lost=="pause_launch_race" {store.0.lock().unwrap().mutate_before.insert("pause:paused".into(),doc!{"launchAttemptId":"successor"});}
+        if lost=="pause_host_race" {store.0.lock().unwrap().mutate_before.insert("pause:paused".into(),doc!{"isRemote":!remote});}
+        if lost=="pause_ack_lost" {store.0.lock().unwrap().fail_after.insert("pause:paused".into());}
+        if lost=="nextafter_stop" {std::fs::write(root.join("nextafter-on-stop"),"next representable birth, not same process").unwrap();}
+        let pause=control.pause("fixture",PauseOptions::default(),StopBudget::Cli,None).await;
+        if matches!(lost,"pause_launch_race"|"pause_host_race"|"nextafter_stop") {
+            assert_eq!(pause.exit_code,1,"{}",pause.value);
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+            assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
+            if lost=="nextafter_stop"{assert!(!trace.contains("if-shell"),"one-ULP changed birth must reject BEFORE signal");}
+            continue;
+        }
+        assert_eq!(pause.exit_code,0,"{}",pause.value);
+        assert_eq!(pause.value["confirmationBasis"],if lost=="v2_only"{"session_absent"}else{"runners_exited"});
+        if lost!="v2_only" {
+            let paused=store.task();assert_eq!(paused.get("launchSettledAttemptId"),paused.get("launchAttemptId"));
+            let detail=paused.get_array("events").unwrap().last().unwrap().as_document().unwrap().get_document("detail").unwrap();
+            assert_eq!(detail.get_document("controlReconciliation").unwrap().get_str("basis"),Ok("observed_consumer_stopped"));
+        }
+        if root.join("lose-launch-ack").exists(){std::fs::remove_file(root.join("lose-launch-ack")).unwrap();}
+        request.config_json=Some(if kind=="priority"{serde_json::json!({"mission_tag":"pipeline","refine_templates":[],"rounds":{"enabled":false},"interval":93})}else{serde_json::json!({"mission_tag":"fixture","max_concurrent":1,"max_multi_simulation_children":1,"interval":93})}.to_string());
+        let restarted=control.start(&request,None).await;
+        if lost=="v2_only" {
+            failed(&restarted);
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+            assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
+            continue;
+        }
+        success(&restarted);
+        assert_eq!(restarted.value["startedNew"],true);assert_eq!(restarted.value["configApplied"],true);
+        assert_ne!(store.task().get("launchAttemptId"),claimed.get("launchAttemptId"));
+        assert_eq!(store.task().get_document("mission_config").unwrap().get_i32("interval"),Ok(93));
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),2);
+    }}}
+}
+
+#[tokio::test]
+async fn shared_start_scope_never_adopts_known_foreign_or_replaced_original_execution() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    for kind in ["regular","super","priority"] {for remote in [false,true] {
+      for fault in ["task","profile","host","cwd","module_origin","recreated_task","preexisting_consumer","registry_id","registry_profile","registry_host","registry_launch","run","pid","birth","session","pane"] {
+        let fixture=original_professional_runtime::original_professional_fixture(false);
+        let root=Path::new(&fixture.config.env.working_dir);
+        std::fs::write(root.join("state"),"active").unwrap();
+        let (_unused,store,_runtime,mut request)=setup(kind,remote);
+        request.name="fixture".into();request.notification.no_notify=true;
+        {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
+         task.insert("name","fixture");task.insert("status","launch_unknown");task.remove("tmuxContext");}
+        let id=store.task().get_object_id("_id").unwrap().to_hex();
+        original_professional_runtime::install_original_super_process(root,&id,"fixture",remote,"old-launch");
+        let module=match kind {"regular"=>"scripts.alpha_simulate_param","super"=>"scripts.super_alpha_simulate_param",_=>"scripts.refine_simulate_param"};
+        let argv=serde_json::json!(["python","-m",module,"--task",if fault=="task"{"foreign"}else{"fixture"},
+          "--dist",if remote != (fault=="host"){"remote"}else{"local"},"--auth_profile",if fault=="profile"{"foreign"}else{"user1"},"--config","tmp/tmp_config_fixture.json"]);
+        let process=root.join("psutil.py");let source=std::fs::read_to_string(&process).unwrap();
+        std::fs::write(process,source.lines().map(|line|if line.starts_with("ARGV="){format!("ARGV={argv}")}else{line.to_string()}).collect::<Vec<_>>().join("\n")).unwrap();
+        match fault {
+          "cwd"=>{
+            let process=root.join("psutil.py");let text=std::fs::read_to_string(&process).unwrap();
+            std::fs::write(process,text.replace("def cwd(self): return str(Path(os.environ['STATE']).parent)","def cwd(self): return '/foreign/checkout'")).unwrap();
+          },
+          "module_origin"=>{
+            let process=root.join("psutil.py");let text=std::fs::read_to_string(&process).unwrap();
+            let mut args=argv.as_array().unwrap().clone();args.remove(1);args[1]=serde_json::json!("/foreign/scripts/refine_simulate_param.py");
+            let argv=serde_json::Value::Array(args);
+            std::fs::write(process,text.lines().map(|line|if line.starts_with("ARGV="){format!("ARGV={argv}")}else{line.to_string()}).collect::<Vec<_>>().join("\n")).unwrap();
+          },
+          "recreated_task"=>store.mutate(doc!{"createdAt":bson::DateTime::now()}),
+          "preexisting_consumer"=>store.mutate(doc!{"launchAttemptAt":bson::DateTime::now()}),
+          "run"=>store.mutate(doc!{"consumer_run_id":"known-original-run","simulatorRuntime":{"consumer_run_id":"observed-foreign-run"}}),
+          "pid"=>store.mutate(doc!{"simulatorRuntime":{"pid":9999,"pidCreatedAt":1700000010.0}}),
+          "birth"=>store.mutate(doc!{"simulatorRuntime":{"pid":1002,"pidCreatedAt":1700000011.0}}),
+          "session"=>store.mutate(doc!{"tmuxContext":{"sessionId":"$9"}}),
+          "pane"=>{
+            let native=root.join("native-tmux");let source=std::fs::read_to_string(&native).unwrap();
+            let replacement="".to_owned()+"elif a[0]=='list-panes':\n marker=state.parent/'pane-read'\n if marker.exists(): print('$4|0|0|9001|bash|0')\n else:\n  marker.write_text('read')\n  print('$4|0|0|1001|bash|0')";
+            std::fs::write(native,source.lines().map(|line|if line.starts_with("elif a[0]=='list-panes':"){replacement.as_str()}else{line}).collect::<Vec<_>>().join("\n")).unwrap();
+          }, _=>(),
+        }
+        if fault.starts_with("registry_") {
+            let mut row=store.task();
+            match fault {"registry_id"=>{row.insert("_id",ObjectId::new());},"registry_profile"=>{row.insert("auth_profile","foreign");},
+              "registry_host"=>{row.insert("isRemote",!remote);},_=>{row.insert("launchAttemptId","foreign");}}
+            if remote {store.0.lock().unwrap().remote.push(row);} else {
+                // Local lookup sees the current control record; inject the
+                // authoritative known identity through runtime instead.
+                let field=match fault {"registry_id"=>"source_task_id","registry_profile"=>"auth_profile","registry_host"=>"source_remote",_=>"launchAttemptId"};
+                let value=if fault=="registry_host"{Bson::Boolean(!remote)}else{Bson::String("foreign".into())};
+                let mut runtime=doc!{"pid":1002,"pidCreatedAt":1700000010.0};runtime.insert(field,value);
+                store.mutate(doc!{"simulatorRuntime":runtime});
+            }
+        }else if remote && matches!(fault,"pid"|"birth"|"run") {let row=store.task();store.0.lock().unwrap().remote.push(row);}
+        let before=store.task();let binding=validate_backend_binding(&fixture.config).await.unwrap();
+        let control=TaskControl::with_store(binding,store.clone());let result=control.start(&request,None).await;
+        if fault=="preexisting_consumer" {
+            success(&result);assert_eq!(result.value["outcome"],"already_running");
+            assert_eq!(result.value["operationSettled"],true,"completed acknowledgment is not historical launch settlement");
+            assert_eq!(result.value["executionObservation"]["consumerPredatesLaunch"],true);
+            let pause=control.pause("fixture",quantnight_task_core::pause::PauseOptions::default(),quantnight_task_core::pause::StopBudget::Cli,None).await;
+            assert_eq!(pause.exit_code,0,"{}",pause.value);
+            assert_ne!(store.task().get("launchSettledAttemptId"),store.task().get("launchAttemptId"));
+            failed(&control.start(&request,None).await);
+            let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session"));
+            continue;
+        }
+        assert_eq!(result.exit_code,1,"{kind}/{remote}/{fault}: {}",result.value);
+        assert_eq!(store.task(),before,"foreign execution must not reconcile control");
+        let trace=std::fs::read_to_string(root.join("trace")).unwrap_or_default();
+        assert!(!trace.contains("new-session")&&!trace.contains("if-shell"),"no launch/signal on foreign or replaced primary");
+      }
+    }}
+}
+
+#[test]
+fn original_checker_pid_birth_wire_keeps_exact_f64_identity() {
+    // Python decimal/bits -> actual Rust Value parse/serialize -> Python bits.
+    // No epsilon, timestamp truncation, string-wire substitute or custom parser.
+    let python=std::env::var("QUANTNIGHT_TEST_PYTHON").unwrap_or_else(|_|"python3".into());
+    let probe="import json,struct,sys; x=float(sys.argv[1]); print(json.dumps({'decimal':sys.argv[1],'number':x,'bits':struct.unpack('>Q',struct.pack('>d',x))[0]}))";
+    let mut rows=Vec::new();
+    for raw in ["1793237748.0946019","1793234992.019803","1793237748.094602","0.1","0.30000000000000004","1.7976931348623157e308"] {
+        let original=std::process::Command::new(&python).args(["-B","-c",probe,raw]).output().unwrap();
+        assert!(original.status.success());
+        let value:serde_json::Value=serde_json::from_slice(&original.stdout).unwrap();
+        let expected=value["bits"].as_u64().unwrap();
+        let number=value["number"].as_f64().unwrap();
+        assert_eq!(number.to_bits(),expected,"original parser changed Python PID birth {raw}");
+        let serialized=value["number"].to_string();
+        let returned=std::process::Command::new(&python).args(["-B","-c",probe,&serialized]).output().unwrap();
+        assert!(returned.status.success());
+        let returned:serde_json::Value=serde_json::from_slice(&returned.stdout).unwrap();
+        assert_eq!(returned["bits"].as_u64(),Some(expected));
+        rows.push(serde_json::json!({"python":value,"rustBits":number.to_bits(),"rustSerialized":serialized,"pythonReturned":returned}));
+    }
+    if let Ok(path)=std::env::var("QUANTNIGHT_TEST_PID_WIRE") {std::fs::write(path,serde_json::to_string_pretty(&rows).unwrap()).unwrap();}
 }

@@ -51,7 +51,7 @@ impl OriginalOperationsRuntime<'_> {
         tokio::time::timeout_at(deadline,async {
         self.verify_root(root).await?;
         let name = task.get_str("name").map_err(|_| "missing task name")?;
-        let profile = task.get_str("auth_profile").unwrap_or("");
+        let profile = task.get_str("auth_profile").unwrap_or("user1");
         let id = task.get_object_id("_id").map_err(|_| "missing original task ID")?;
         let side = Host::from_remote(remote);
         let registry = {
@@ -66,7 +66,7 @@ impl OriginalOperationsRuntime<'_> {
             return Err("original runtime registry evidence malformed; not missing legacy metadata".into());
         }
         let mut evidence = registry.as_ref().and_then(|r| r.get_document("simulatorRuntime").ok()).cloned().unwrap_or_default();
-        evidence=evidence.iter().filter(|(key,_)| ["pid","pidCreatedAt","heartbeatAt","consumer_run_id","configDigestVersion","effectiveConfigDigest","launchAttemptId","startupRecovery"].contains(&key.as_str())).map(|(key,value)|(key.clone(),value.clone())).collect();
+        evidence=evidence.iter().filter(|(key,_)| ["pid","pidCreatedAt","heartbeatAt","consumer_run_id","configDigestVersion","effectiveConfigDigest","launchAttemptId","startupRecovery","task","auth_profile","dist","source_task_id","source_remote"].contains(&key.as_str())).map(|(key,value)|(key.clone(),value.clone())).collect();
         if !evidence.is_empty() { evidence.insert("registryTaskId", id.to_hex()); }
         if task.get_str("taskType").ok() == Some("regular") && !profile.is_empty() {
             if let Some(capability) = store.consumer_runtime(side, name, profile).await? { evidence = capability; }
@@ -82,7 +82,10 @@ impl OriginalOperationsRuntime<'_> {
             }
             if let Some(run)=row.get("consumer_run_id") {known_runs.push(run.clone().into_relaxed_extjson());}
         }
-        let binding = json!({"knownConsumerRuns":known_runs,"taskId":id.to_hex(),"remote":remote,"taskType":task.get_str("taskType").unwrap_or("regular"),
+        let binding = json!({"knownConsumerRuns":known_runs,
+            "taskCreatedAt":task.get("createdAt").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "launchAttemptAt":task.get("launchAttemptAt").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+            "taskId":id.to_hex(),"remote":remote,"taskType":task.get_str("taskType").unwrap_or("regular"),
             "auth_profile":profile,"launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
             "consumer_run_id":task.get_document("startupBinding").ok().and_then(|b| b.get_str("consumer_run_id").ok())
                 .or_else(||task.get_document("simulatorRuntime").ok().and_then(|b|b.get_str("consumer_run_id").ok()))
@@ -115,6 +118,16 @@ impl OriginalOperationsRuntime<'_> {
             _=>false,
         };
         if !coherent{return Err("original execution observation contains contradictory facts".into());}
+        // Scoped legacy evidence is solely for idempotent START, never a
+        // launch/run attestation or owned-residue authority.
+        if observed["consumerScopeVerified"]==true && (observed["state"]!="unverified"
+            || observed["consumerRunning"]!=true || observed["explicitPauseVerified"]!=true
+            || observed["identityVerified"]!=false || observed["ownedResidue"]!=false
+            || observed["taskId"]!=id.to_hex()
+            || !observed["pid"].as_i64().is_some_and(|p|p>1)
+            || !observed["pidCreatedAt"].as_f64().is_some_and(|v|v.is_finite()&&v>0.0)) {
+            return Err("original consumer scope observation contains contradictory facts".into());
+        }
         if observed["identityVerified"]==true && (observed["taskId"]!=id.to_hex()
             || observed["launchAttemptId"]!=binding["launchAttemptId"]) {
             return Err("independent execution identity disagrees with captured control".into());

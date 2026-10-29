@@ -8,6 +8,7 @@ import subprocess
 import sys
 import base64
 import re
+import time
 ROOT = Path(__file__).resolve().parent
 kind, args = sys.argv[1], sys.argv[2:]
 statefile = ROOT / 'os_state.json'
@@ -32,7 +33,11 @@ try:
             assert state is None and '-s' in args and '-d' in args
             name = args[args.index('-s') + 1]
             counterfile = ROOT / 'os_birth.txt'
-            birth = int(counterfile.read_text()) + 1 if counterfile.exists() else 1700000000
+            # A newly created OS consumer must follow the real core create/claim.
+            # The old fixed2023 clock contradicted present-day task metadata.
+            pane_birth = time.time()
+            consumer_birth = pane_birth + 0.000001
+            birth = int(pane_birth)
             counterfile.write_text(str(birth))
             binding=json.loads(os.environ['QUANTNIGHT_TMUX_BINDING'])
             remote=binding['remote']
@@ -48,13 +53,13 @@ try:
             # inline binding or reopen mutable config as ownership evidence.
             argv=['python','-m','scripts.alpha_simulate_param','--task',name,
                   '--dist','remote' if remote else 'local','--auth_profile','user1','--config',str(path)]
-            statefile.write_text(json.dumps({'name':name,'sid':'$4','created':birth,'argv':argv,'loaded':loaded}))
+            statefile.write_text(json.dumps({'name':name,'sid':'$4','created':birth,'pane_birth':pane_birth,'consumer_birth':consumer_birth,'argv':argv,'loaded':loaded}))
             assert loaded['source_task_id']==binding['taskId'] and loaded['source_remote'] is remote
             sys.path.insert(0,str(ROOT/'scripts'))
             from script_config import loaded_config_digest
             capability=dict(task=name,auth_profile='user1',source_task_id=loaded['source_task_id'],
                 source_remote=remote,dist='remote' if remote else 'local',consumer_run_id='fixture-run-'+str(birth),
-                pid=1002,pidCreatedAt=float(birth+10),configDigestVersion=1,
+                pid=1002,pidCreatedAt=consumer_birth,configDigestVersion=1,
                 effectiveConfigDigest=loaded_config_digest(loaded,name,remote,'user1'))
             (ROOT/'os_capability.json').write_text(json.dumps(capability))
             if fault.get('shell') or fault.get('dead'):
@@ -88,8 +93,10 @@ try:
         if args[1:] == ['pid=,ppid=,lstart=,stat=']:
             print('9 1 Mon Jan 1 00:00:01 2024 S')
             if state and not fault.get('dead'):
-                print('1001 1 Mon Jan 1 00:00:01 2024 S')
-                if not fault.get('shell'): print('1002 1001 Mon Jan 1 00:00:01 2024 S')
+                pane_stamp=time.strftime('%a %b %d %H:%M:%S %Y',time.localtime(state['pane_birth']))
+                consumer_stamp=time.strftime('%a %b %d %H:%M:%S %Y',time.localtime(state['consumer_birth']))
+                print('1001 1 '+pane_stamp+' S')
+                if not fault.get('shell'): print('1002 1001 '+consumer_stamp+' S')
         elif args[1:] == ['pid=,ppid=,comm=']:
             print('9 1 fixture')
             if state and not fault.get('dead'):

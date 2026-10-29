@@ -28,7 +28,7 @@ class Process:
     def create_time(self):
         s=state()
         if s is None: raise NoSuchProcess(self.pid)
-        value=float(s['created']+(10 if self.pid==1002 else 0))
+        value=float(s['consumer_birth'] if self.pid==1002 else s['pane_birth'])
         return value+1 if fault().get('wrongProcessBirth') and self.pid==1002 else value
     def cmdline(self):
         s=state()

@@ -66,6 +66,7 @@ class Process:
   self.pid=pid
   if pid not in (1001,1002) or not Path(os.environ['STATE']).exists(): raise NoSuchProcess(pid)
  def create_time(self): return 1700000010.0 if self.pid==1002 else 1700000000.0
+ def cwd(self): return str(Path(os.environ['STATE']).parent)
  def cmdline(self): return ARGV if self.pid==1002 else ['bash']
  def is_running(self): return Path(os.environ['STATE']).exists()
  def status(self): return 'running'

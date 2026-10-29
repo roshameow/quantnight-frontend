@@ -801,11 +801,47 @@ fn observed_launch(task:&Document)->Result<Value,String> {
     }
 }
 
-// Known pending launch state survives explicit pause; missing optional evidence
-// on other legacy tasks is NOT a global new admission requirement.
+// Pending launch state survives absence-only pause. Original observed-consumer
+// stop can settle it; missing optional legacy metadata is not an admission gate.
 pub(crate) fn launch_attempt_unsettled(task:&Document)->bool {
     (task.get_str("status").ok()==Some("launch_unknown") || task.contains_key("launchSettledAttemptId")) &&
         (task.get_str("launchAttemptId").map_or(true,|v|v.trim().is_empty()) || task.get("launchSettledAttemptId")!=task.get("launchAttemptId"))
+}
+
+// Same original operation, not a second reconciliation command or registry.
+// Only launch_unknown is repaired here; terminal/paused status is not inferred
+// from liveness. Scoped legacy evidence never settles a launch or promotes
+// today's caller-echo context to historical independent proof.
+async fn already_running(store:&dyn TaskStore,task:&Document,remote:bool,observed:Value)->Result<TaskOutcome,String> {
+    let reconcile = task.get_str("status")==Ok("launch_unknown");
+    let strong = observed["identityVerified"]==true && observed["consumerPredatesLaunch"]!=true;
+    let current = if reconcile {
+        let mut fields=doc!{"status":"running"};
+        if strong {
+            if let Some(launch)=task.get("launchAttemptId").filter(|v| **v!=Bson::Null) {
+                fields.insert("launchSettledAttemptId",launch.clone());
+            }
+        } else if launch_attempt_unsettled(task) {
+            // Preserve the pending-launch fence after correcting the control
+            // label. Later absence must not permit duplicate launch.
+            fields.insert("launchSettledAttemptId",Bson::Null);
+        }
+        update(store,task,"start-reconciled",fields,
+            doc!{"basis":if strong{"original_consumer_identity"}else{"original_consumer_scope"},
+                "taskId":task_id(task)?.to_hex(),"remote":remote,"taskType":kind(task)?,"authProfile":profile(task)?,
+                "launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null),
+                "launchAttemptAt":task.get("launchAttemptAt").cloned().unwrap_or(Bson::Null),
+                "executionObservation":config_document(observed.clone())?,"configApplied":false}).await?
+    } else {task.clone()};
+    // This non-launching START invocation has completed its observation/CAS.
+    // Historical launch settlement remains in launchSettledAttemptId; it must
+    // not prevent the caller from joining an explicit pause to this response.
+    Ok(outcome("start",required_str(&current,"name")?,true,json!({
+        "taskId":task_id(&current)?.to_hex(),"remote":remote,"taskType":kind(&current)?,"authProfile":profile(&current)?,
+        "launchAttemptId":observed_launch(&current)?,"operationSettled":true,
+        "outcome":"already_running","startedNew":false,"consumerRunning":true,"configApplied":false,
+        "configComparison":"not_compared","requestSatisfied":true,"executionObservation":observed,
+        "controlStatus":current.get_str("status").unwrap_or(""),"controlReconciled":reconcile,"error":Value::Null})))
 }
 
 struct OwnedResidueStop<'a>{runtime:&'a dyn StartRuntime,observation:&'a Value}
@@ -897,14 +933,9 @@ async fn start_locked(
     if let Some(observed)=observation {
         unchanged(store,&task).await?;
         match observed.get("state").and_then(Value::as_str) {
-            Some("live") if observed["identityVerified"]==true && observed["consumerRunning"]==true => {
-                // A live same-task consumer is an idempotent start result, not a
-                // configuration-comparison gate. No submitted config is applied.
-                return Ok(outcome("start",&request.name,true,json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
-                    "launchAttemptId":observed_launch(&task)?,"taskType":original_kind,"authProfile":profile(&task)?,"operationSettled":!launch_unresolved,"outcome":"already_running",
-                    "startedNew":false,"consumerRunning":true,"configApplied":false,"configComparison":"not_compared",
-                    "requestSatisfied":true,"executionObservation":observed,"controlStatus":task.get_str("status").unwrap_or(""),
-                    "controlReconciled":false,"error":Value::Null})));
+            Some("live" | "unverified") if observed["consumerRunning"]==true
+                && (observed["identityVerified"]==true || observed["consumerScopeVerified"]==true) => {
+                return already_running(store, &task, remote, observed).await;
             }
             Some("owned_residue") if observed["identityVerified"]==true && observed["ownedResidue"]==true => {
                 if launch_unresolved {return Err("original launcher still unresolved; no automatic residue cleanup".into());}
@@ -1120,8 +1151,9 @@ async fn start_locked(
     runtime
         .validate_execution_binding(root, &observed_binding, remote)
         .await?;
-    // Only a successful return from the original synchronous launcher settles
-    // its launch action. Timeout/transport rejection never writes this fence.
+    // A successful original synchronous launcher return settles this fresh
+    // action. Transport failure alone never does. Later original consumer/stop
+    // reconciliation may close it on its explicit evidence, not a fabricated ACK.
     // Persist against this exact attempt, before later validation/control ACKs.
     claimed = update(store, &claimed, "start-settled",
         doc! {"launchSettledAttemptId":claimed.get_str("launchAttemptId").map_err(|_|"missing claimed launch")?}, Document::new()).await?;
