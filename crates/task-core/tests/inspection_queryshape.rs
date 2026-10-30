@@ -14,7 +14,7 @@ fn list_is_projected_newest_first_without_item_payload_or_candidate_cap() {
     assert_eq!(
         o.projection,
         Some(
-            doc! {"name":1,"status":1,"taskType":1,"auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1}
+            doc! {"name":1,"status":1,"taskType":1,"auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1,"generation":1}
         )
     );
 }

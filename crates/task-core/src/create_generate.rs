@@ -420,8 +420,11 @@ pub fn generation_begin_plan(
         "$push": {"events": {"command": "generation-begin", "status": "generating", "at": at, "detail": generation}}},
     ))
 }
-/// Original finish token CAS. Caller fields cannot override terminal phase or
-/// token/identity query; preparing->pending remains available for original owners.
+/// Original finish token CAS. `status` is the operation outcome, not always
+/// the resulting task status: a failed generation restores a captured pending
+/// or waiting task, while its phase/event keep the failure. Legacy ready and
+/// other failure inputs retain their old behavior. Preparing->pending is unchanged.
+/// Caller fields cannot override phase or the token/identity query.
 pub fn generation_finish_plan(
     task: &Document,
     token: &str,
@@ -446,7 +449,11 @@ pub fn generation_finish_plan(
         _ => return Err("invalid generation outcome".into()),
     };
     let query = doc! {"_id": task.get("_id").ok_or("'_id'")?.clone(), "name": task.get("name").ok_or("'name'")?.clone(), "status": "generating", "generation.id": token};
-    fields.extend(doc! {"status": status, "generation.phase": phase, "generation.finishedAt": at, "updatedAt": at});
+    let task_status = match (status, task.get_str("status").ok()) {
+        ("generation_failed", Some(previous @ ("pending" | "waiting"))) => previous,
+        _ => status,
+    };
+    fields.extend(doc! {"status": task_status, "generation.phase": phase, "generation.finishedAt": at, "updatedAt": at});
     Ok((
         query,
         doc! {"$set": fields, "$push": {"events": {"command": "generation-finish", "status": status, "at": at, "detail": {"generationId": token}}}},

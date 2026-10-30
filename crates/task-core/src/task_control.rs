@@ -27,7 +27,7 @@ impl<T> GuiContext<T> {
 impl GuiContext {
     pub fn into_parts(self) -> Result<(AppConfig, Arc<MongoClients>, TaskControl), String> {
         let (config, clients, binding, store) = self.checked_parts()?;
-        Ok((config, clients, TaskControl { binding, store: Arc::new(store) }))
+        Ok((config, clients, TaskControl { binding: Arc::new(binding), store: Arc::new(store) }))
     }
 }
 
@@ -44,7 +44,7 @@ where F: FnMut(String, String) -> Fut,
 }
 
 pub struct TaskControl {
-    binding: BackendBinding,
+    binding: Arc<BackendBinding>,
     store: Arc<dyn TaskStore>,
 }
 impl TaskControl {
@@ -59,17 +59,17 @@ impl TaskControl {
     pub async fn connect(config: &AppConfig) -> Result<Self, String> {
         let binding = validate_backend_binding(config).await?;
         let store = Arc::new(MongoTaskStore::from_config(config)?);
-        Ok(Self { binding, store })
+        Ok(Self { binding: Arc::new(binding), store })
     }
     /// Desktop reuses its existing application pools; never connects per button.
     pub async fn with_existing_clients(config: &AppConfig, clients: Arc<MongoClients>) -> Result<Self, String> {
         let binding = validate_backend_binding(config).await?;
-        Ok(Self { binding, store: Arc::new(MongoTaskStore::new(clients, config)?) })
+        Ok(Self { binding: Arc::new(binding), store: Arc::new(MongoTaskStore::new(clients, config)?) })
     }
     /// Injection of already-verified context and lowest storage port. This is
     /// not an alternate configuration or no-validation production shortcut.
     pub fn with_store(binding: BackendBinding, store: Arc<dyn TaskStore>) -> Self {
-        Self { binding, store }
+        Self { binding: Arc::new(binding), store }
     }
     pub fn root(&self) -> &std::path::Path { self.binding.root() }
 
@@ -115,9 +115,29 @@ impl TaskControl {
     }
     pub async fn generate(&self, request: &crate::create_generate::GenerateRequest,
         observer: Option<BashScriptObserver>) -> TaskOutcome {
-        if let Err(error) = self.binding.refresh_if_changed().await { return rejected("generate", &request.name, error); }
-        let runtime = OriginalOperationsRuntime { binding: &self.binding, observer };
-        crate::create_generate::generate(self.root(), self.store.as_ref(), &runtime, request).await
+        // One operation owns the SAME binding/store through claim, writer and
+        // final CAS. Dropping a GUI/CLI response future drops only this waiting
+        // handle, not the operation or its MissionLocks. Runtime/process death
+        // remains unsupported; this is not a durable job or a second bootstrap.
+        let binding = Arc::clone(&self.binding);
+        let store = Arc::clone(&self.store);
+        let owned_request = request.clone();
+        let operation = tokio::spawn(async move {
+            if let Err(error) = binding.refresh_if_changed().await {
+                return rejected("generate", &owned_request.name, error);
+            }
+            let runtime = OriginalOperationsRuntime { binding: &binding, observer };
+            let result = crate::create_generate::generate(binding.root(), store.as_ref(), &runtime, &owned_request).await;
+            if result.exit_code != 0 {
+                log::error!("Generation failed for {}: {}", owned_request.name, result.value["error"]);
+            }
+            result
+        });
+        match operation.await {
+            Ok(result) => result,
+            Err(error) => rejected("generate", &request.name,
+                format!("generation operation interrupted; ownership/result unconfirmed: {error}")),
+        }
     }
     pub async fn list(&self, request: &crate::inspection::ListRequest) -> TaskOutcome {
         if let Err(error) = self.binding.refresh_if_changed().await {

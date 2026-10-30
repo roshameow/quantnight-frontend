@@ -322,6 +322,14 @@ pub async fn list(store: &dyn TaskStore, request: &ListRequest) -> TaskOutcome {
     result
 }
 
+// Failure belongs to this generation operation even when its task was restored.
+// Do not let an old failure phase override a later running/paused/completed task.
+fn restored_generation_failure(task: &Document) -> bool {
+    matches!(task.get_str("status").ok(), Some("pending" | "waiting"))
+        && task.get_document("generation").ok()
+            .and_then(|generation| generation.get_str("phase").ok()) == Some("generation_failed")
+}
+
 /// Pure startup applicability checks plus exact execution-registry read. This
 /// gate runs BEFORE fresh item counts, including on local execution.
 async fn startup_gate(
@@ -396,7 +404,7 @@ async fn startup_gate(
     let generation_phase = checked_token(
         task.get("status"),
         &["generating", "generation_failed", "generation_unknown"],
-    )? || generated;
+    )? || generated || restored_generation_failure(task);
     if (status == "paused" && truthy(task.get("acceptedObservation"))) || generation_phase {
         return Ok(not_required());
     }
@@ -588,7 +596,8 @@ async fn status_inner(
                 json!({"terminal":false,"watchControl":watch_control(&task)}), &observed_at,
                 "lifecycle mutation unresolved; watcher cannot reconcile it".into()));
         }
-        if ["paused", "deactive", "generating", "generation_failed", "generation_unknown"].contains(&old) {
+        if ["paused", "deactive", "generating", "generation_failed", "generation_unknown"].contains(&old)
+            || restored_generation_failure(&task) {
             let state = if ["paused", "deactive"].contains(&old) { "stopped" } else { "source_changed" };
             confirm_status_snapshot(store, &status_snapshot_query(&task, &doc! {})?).await?;
             return Ok(outcome("status", &request.name, true,
@@ -704,7 +713,8 @@ async fn status_inner(
     }
     legacy_ready=legacy_ready&&receipt_observation["rowCount"].as_u64()==Some(execution.total)&&unfinished==0;
     let terminal = ((startup.get_bool("ready").unwrap_or(false) && closure.get_bool("ready").unwrap_or(false))||legacy_ready)
-            && execution.total > 0 && unfinished == 0;
+            && execution.total > 0 && unfinished == 0
+            && !restored_generation_failure(&task);
     let mut status = task.get("status").cloned().unwrap_or(Bson::Null);
     let old_status = task.get_str("status").unwrap_or("");
     let query = status_snapshot_query(&task, &fence)?;

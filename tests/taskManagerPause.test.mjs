@@ -22,6 +22,14 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+const advanceJoinTime = async (h, ms) => {
+  h.hooks.now += ms;
+  for (const [id, timer] of [...h.hooks.timers].sort((a, b) => a[1].at - b[1].at)) {
+    if (timer.at <= h.hooks.now && h.hooks.timers.has(id)) { h.hooks.timers.delete(id); timer.callback(); }
+  }
+  await tick();
+};
+
 const task = (extra = {}) => ({ _id: { $oid: 'id-a' }, name: 'priority-a', taskType: 'priority',
   isRemote: true, status: 'running', mission_config: { rounds: { enabled: true } }, ...extra });
 
@@ -1566,13 +1574,7 @@ async function ownStartHarness(extra = {}) {
   assert.equal(calls.filter(c => c.name.startsWith('start_')).length, 1);
   return { ...h, native, fresh, stopReply: stop, ownCalls: calls, starting: start, latest };
 }
-const advanceJoinTime = async (h, ms) => {
-  h.hooks.now += ms;
-  for (const [id, timer] of [...h.hooks.timers].sort((a, b) => a[1].at - b[1].at)) {
-    if (timer.at <= h.hooks.now && h.hooks.timers.has(id)) { h.hooks.timers.delete(id); timer.callback(); }
-  }
-  await tick();
-};
+
 
 test('v6 join positive: one owned start -> one clicked pause succeeds through original stop, with one promise/reservation', async () => {
   const h = await ownStartHarness();

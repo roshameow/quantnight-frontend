@@ -858,3 +858,135 @@ async fn completed_status_then_watch_preserves_business_timestamps_and_binding()
         }
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_generation_failure_restores_task_and_cli_list_keeps_operation_evidence() {
+    for (prior, expected) in [("pending", "pending"), ("waiting", "waiting"), ("ready", "generation_failed")] {
+        let f = Fixture::new().await;
+        let name = "generation_failure";
+        ok(&f.run(&["create", "--name", name, "--templatefile", "frozen"]).await);
+        f.store.alter(name, doc! {"status":prior});
+        let partial = vec![doc! {"_id":bson::oid::ObjectId::new(),"status":"pending","opaque":"preserve"}];
+        f.store.put_rows(Host::Local, name, partial.clone());
+        // Real OriginalOperationsRuntime and process transport; only the external
+        // professional body remains synthetic, as in all this binary's fixtures.
+        let uv = f.root.join("bin/uv");
+        let script = fs::read_to_string(&uv).unwrap().replacen("exec ", "", 1);
+        fs::write(&uv, format!("{script}\nexit 23\n")).unwrap();
+        let out = f.run(&["generate", "--name", name]).await;
+        failed(&out);
+        assert_eq!(out.value["generationStatus"], "generation_failed");
+        let saved = f.store.task(name);
+        assert_eq!(saved.get_str("status"), Ok(expected));
+        assert_eq!(saved.get_document("generation").unwrap().get_str("phase"), Ok("generation_failed"));
+        assert!(saved.get_str("lastError").unwrap().contains("23"));
+        assert_eq!(f.store.rows_at(Host::Local, name), partial);
+        let writes = f.store.data.lock().unwrap().writes.len();
+        let listed = f.run(&["list"]).await;
+        ok(&listed);
+        let shown = &listed.value["tasks"][0];
+        assert_eq!(shown["status"], expected);
+        assert_eq!(shown["generation"]["id"], out.value["generationId"]);
+        assert_eq!(shown["generation"]["phase"], "generation_failed");
+        assert!(shown["generation"]["finishedAt"].is_string());
+        assert_eq!(shown["lastError"], saved.get_str("lastError").unwrap());
+        assert_eq!(f.store.data.lock().unwrap().writes.len(), writes, "list cannot recover old tasks");
+        assert_eq!(f.count("run"), 1);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_cli_generate_response_retains_original_operation_lock_and_finalizes_once() {
+    use std::sync::Arc;
+    let f = Fixture::new().await;
+    let name = "dropped_generation";
+    ok(&f.run(&["create", "--name", name, "--templatefile", "frozen"]).await);
+    let gate = Arc::new(GenerationReadGate::default());
+    let done = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut data = f.store.data.lock().unwrap();
+        data.generation_summary_gate = Some(gate.clone());
+        data.generation_finished = Some(done.clone());
+    }
+    let argv = ["generate", "--name", name];
+    let mut caller = Box::pin(f.run(&argv));
+    tokio::select! {
+        _ = gate.entered.notified() => (),
+        result = &mut caller => panic!("generation unexpectedly finished before suspended I/O: {}", result.value),
+    }
+    let claim = f.store.task(name);
+    assert_eq!(claim.get_str("status"), Ok("generating"));
+    drop(caller); // No runtime/process shutdown; only the original caller goes away.
+    let duplicate = f.run(&argv).await;
+    failed(&duplicate);
+    assert!(duplicate.value["error"].as_str().unwrap().contains("another lifecycle mutator"));
+    assert_eq!(f.count("run"), 1, "no second child/dispatcher/bootstrap");
+    assert_eq!(f.store.task(name), claim);
+    gate.release.notify_one();
+    done.notified().await;
+    let saved = f.store.task(name);
+    assert_eq!(saved.get_str("status"), Ok("ready"));
+    assert_eq!(saved.get_document("generation").unwrap().get_str("phase"), Ok("complete"));
+    assert_eq!(saved.get_document("generation").unwrap().get_str("id"), claim.get_document("generation").unwrap().get_str("id"));
+    assert_eq!(saved.get_array("events").unwrap().iter().filter(|e| e.as_document().unwrap().get_str("command")==Ok("generation-finish")).count(), 1);
+    assert_eq!(f.count("run"), 1);
+    // Unchanged binding must be reused, not validated/exported afresh.
+    assert_eq!(owner_calls(&f, "--validate-task-control-binding").len(), 1);
+    assert!(quantnight_task_core::mission_lock::MissionLocks::acquire(&f.root, &[name], false).is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restored_failed_generation_does_not_add_start_admission_restrictions() {
+    for status in ["pending", "waiting", "generation_failed"] {
+        let f = Fixture::new().await;
+        let name = "failed_generation_start";
+        f.create_generate(name, "regular", false).await;
+        f.store.alter(name, doc! {"status":status, "generation":{"id":"old-generation","phase":"generation_failed","finishedAt":"stamp"},"lastError":"old failure"});
+        ok(&f.run(&["start", "--name", name, "--config", &config(name), "--no-notify"]).await);
+        assert_eq!(f.store.task(name).get_str("status"), Ok("running"));
+        assert_eq!(f.count("regular"), 1);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_facade_caller_keeps_live_writer_until_ordinary_failure_finalization() {
+    use std::sync::Arc;
+    use quantnight_task_core::{config::{BashScriptEvent, BashScriptObserver}, create_generate::GenerateRequest};
+    let f = Fixture::new().await;
+    let name = "live_writer_failure";
+    ok(&f.run(&["create", "--name", name, "--templatefile", "frozen"]).await);
+    let fifo = f.root.join("generation-release");
+    assert!(std::process::Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap().success());
+    let uv = f.root.join("bin/uv");
+    let shim = fs::read_to_string(&uv).unwrap().replacen("exec ", "", 1);
+    fs::write(&uv, shim.replacen("#!/bin/sh\n", "#!/bin/sh\nprintf 'generation-writer-entered\\n'\nIFS= read -r release < generation-release\n", 1) + "\nexit 23\n").unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let done = Arc::new(tokio::sync::Notify::new());
+    f.store.data.lock().unwrap().generation_finished = Some(done.clone());
+    let observer: BashScriptObserver = { let entered = entered.clone(); Arc::new(move |event| {
+        if let BashScriptEvent::Stdout(line) = event {
+            if line == "generation-writer-entered" { entered.notify_one(); }
+        }
+    }) };
+    let request = GenerateRequest::new(name);
+    let mut caller = Box::pin(f.core.generate(&request, Some(observer)));
+    tokio::select! {
+        _ = entered.notified() => (),
+        result = &mut caller => panic!("writer not suspended: {}", result.value),
+    }
+    let claim = f.store.task(name);
+    drop(caller);
+    assert!(quantnight_task_core::mission_lock::MissionLocks::acquire(&f.root, &[name], false).is_err(),
+        "dropping caller must not release ownership while original child is active");
+    assert_eq!(f.store.task(name), claim);
+    fs::write(&fifo, b"finish\n").unwrap();
+    done.notified().await;
+    let saved = f.store.task(name);
+    assert_eq!(saved.get_str("status"), Ok("pending"));
+    assert_eq!(saved.get_document("generation").unwrap().get_str("phase"), Ok("generation_failed"));
+    assert_eq!(saved.get_document("generation").unwrap().get_str("id"), claim.get_document("generation").unwrap().get_str("id"));
+    assert!(saved.get_str("lastError").unwrap().contains("23"));
+    assert_eq!(f.count("run"), 1);
+    assert_eq!(owner_calls(&f, "--validate-task-control-binding").len(), 1);
+    assert!(quantnight_task_core::mission_lock::MissionLocks::acquire(&f.root, &[name], false).is_ok());
+}

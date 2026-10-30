@@ -210,6 +210,12 @@ pub struct Task {
     pub templatefile: String,
     pub auth_profile: Option<String>,
     pub status: String,
+    // Persisted generation outcome is independent of the task control status.
+    // Optional for old task records; retain it through the actual list DTO.
+    #[serde(default)]
+    pub generation: Option<JsonValue>,
+    #[serde(default, rename = "lastError")]
+    pub last_error: Option<String>,
     #[serde(rename = "isRemote")] // 👈 加上这个
     pub is_remote: Option<bool>, // 可选字段
     #[serde(default, rename = "targetRemote")]
@@ -2637,6 +2643,50 @@ mod shared_start_tests {
 #[cfg(test)]
 mod task_control_source_tests {
     use super::*;
+    #[test]
+    fn listed_generation_failure_survives_actual_bson_to_task_to_json() {
+        let id = ObjectId::parse_str("0123456789abcdef01234567").unwrap();
+        let generation = doc! {"id":"attempt-original","phase":"generation_failed",
+            "producerPid":1234,"startedAt":"2026-10-31T00:00:00Z","finishedAt":"2026-10-31T00:00:01Z"};
+        let original_error = "writer exited 17\noriginal cause: invalid template";
+        for status in ["pending", "ready", "generation_failed", "generation_unknown"] {
+            for source in [TaskControlSource::Local, TaskControlSource::RemoteOnly] {
+                let row = doc! {"_id":id,"name":"generation-fixture","status":status,
+                    "isRemote":false,"taskType":"regular","generation":generation.clone(),
+                    "lastError":original_error};
+                let listed = listed_task(row, source.clone()).unwrap();
+                let wire = serde_json::to_value(listed).unwrap();
+                assert_eq!(wire["_id"]["$oid"], id.to_hex());
+                assert_eq!(wire["status"], status); // Never promote failure to ready in a DTO.
+                assert_eq!(wire["generation"], serde_json::to_value(&generation).unwrap());
+                assert_eq!(wire["lastError"], original_error);
+                assert_eq!(wire["controlSource"], serde_json::to_value(source).unwrap());
+                assert!(wire.get("last_error").is_none());
+            }
+        }
+    }
+    #[test]
+    fn listed_generation_optional_legacy_and_new_attempt_data_are_not_reinterpreted() {
+        let base = doc! {"_id":ObjectId::new(),"name":"generation-fixture","status":"pending"};
+        for optional in [doc! {}, doc! {"generation":bson::Bson::Null,"lastError":bson::Bson::Null}] {
+            let mut row = base.clone(); row.extend(optional);
+            let wire = serde_json::to_value(listed_task(row, TaskControlSource::Local).unwrap()).unwrap();
+            assert_eq!(wire["status"], "pending");
+            assert!(wire["generation"].is_null());
+            assert!(wire["lastError"].is_null());
+        }
+        for (status, phase) in [("generating", "writing"), ("ready", "complete"),
+            ("pending", "prepared"), ("generation_unknown", "generation_unknown")] {
+            let mut row = base.clone();
+            row.extend(doc! {"status":status,"generation":{"id":"attempt-new","phase":phase},
+                "lastError":"previous error retained by owner"});
+            let wire = serde_json::to_value(listed_task(row, TaskControlSource::Local).unwrap()).unwrap();
+            assert_eq!(wire["status"], status);
+            assert_eq!(wire["generation"]["id"], "attempt-new");
+            assert_eq!(wire["generation"]["phase"], phase);
+            assert_eq!(wire["lastError"], "previous error retained by owner");
+        }
+    }
     #[test]
     fn list_source_is_assigned_by_original_read_branch_not_db_self_claim() {
         for forged in [bson::Bson::String("local".into()), bson::Bson::String("remote_only".into()),

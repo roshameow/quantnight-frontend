@@ -1599,3 +1599,36 @@ async fn bound_watch_cannot_write_same_name_successor_or_another_launch() {
         assert_eq!(out.value["terminal"],false);assert_eq!(m.control(),replacement);m.no_writes();
     }
 }
+
+
+#[tokio::test]
+async fn restored_failed_generation_never_becomes_simulation_terminal_from_old_rows() {
+    for kind in ["regular", "super"] { for state in ["pending", "waiting"] {
+        let root = Root::new();
+        let mut t = task(false);
+        t.insert("taskType", kind); t.insert("status", state);
+        t.insert("generation", doc! {"id":"same-generation", "phase":"generation_failed", "finishedAt":"stamp"});
+        t.insert("lastError", "original writer failure");
+        // Terminal-looking preexisting/partial rows are not proof of a simulation.
+        let m = Memory::new(t.clone(), success_rows());
+        let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+        assert_eq!(out.value["ok"], true, "{}", out.value);
+        assert_eq!(out.value["taskStatus"], state);
+        assert_eq!(out.value["terminal"], false);
+        assert_eq!(out.value["startupRecovery"]["required"], false);
+        assert_eq!(m.control(), t); m.no_writes();
+        let out = status(&root.0, &m, &Runtime::default(), &bound_watch(&t)).await;
+        assert_eq!(out.value["watchState"], "source_changed");
+        assert_eq!(out.value["terminal"], false);
+        assert_eq!(out.value["watchControl"]["generation"]["phase"], "generation_failed");
+        assert_eq!(m.control(), t); m.no_writes();
+    }}
+    // A subsequent explicit start changes status; old failure metadata is not
+    // a new start-admission gate or a veto on actual simulation completion.
+    let root = Root::new(); let mut t = task(false);
+    t.insert("generation", doc! {"id":"old", "phase":"generation_failed"});
+    let m = Memory::new(t, success_rows());
+    let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+    assert_eq!(out.value["terminal"], true);
+    assert_eq!(out.value["taskStatus"], "completed");
+}

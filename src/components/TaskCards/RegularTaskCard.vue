@@ -23,6 +23,10 @@
         </div>
       </div>
     </template>
+    <div v-if="generationFailureResult" class="generation-result" role="status" style="font-size: 12px; margin-bottom: 4px">
+      <n-tag type="error" size="small">生成失败（{{ generationFailureResult.status }}）</n-tag>
+      <div v-if="generationFailureResult.error" style="white-space: pre-wrap; overflow-wrap: anywhere"><n-text type="error">{{ generationFailureResult.error }}</n-text></div>
+    </div>
     <details v-if="diagnosticDetails || dispatchDetails" class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
       <summary style="cursor: pointer">运行 / 停止详情</summary>
       <div v-if="diagnosticDetails" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ diagnosticDetails }}</div>
@@ -92,7 +96,7 @@
           :disabled="!!taskMutationIssue(task) || !canGenerate(task, generationBusy)"
           :loading="isGenerating(task, generationBusy)"
         >
-          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : task.status === 'generation_unknown' ? '生成状态待核验' : '生成list' }}
+          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : task.status === 'generation_unknown' ? '生成状态待核验' : generationFailureResult ? '重新生成' : '生成list' }}
         </n-button>
         <n-button
           size="small"
@@ -125,7 +129,7 @@ export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
 import { taskMutationIssue, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
-import { isGenerating, canGenerate, generationBusyOrUnknown } from '../../utils/taskGeneration.js';
+import { isGenerating, canGenerate, generationBusyOrUnknown, generationFailure } from '../../utils/taskGeneration.js';
 
 const props = defineProps({
   generationBusy: { type: Boolean, default: false },
@@ -168,6 +172,7 @@ const refreshRuntimeExpiry = () => {
 const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
 onMounted(() => { mounted = true; refreshRuntimeExpiry(); });
 onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(); });
+const generationFailureResult = computed(() => generationFailure(props.task, props.generationBusy));
 const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
 const startBlockReason = computed(() => taskStartBlockReason(props.task, {
   busy: props.operationBusy || props.generationBusy, stopping: stopStatus.value === 'stopping',

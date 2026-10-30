@@ -618,7 +618,7 @@ async fn generation_failure_classification_and_empty_exit0_match_original() {
         )
         .await;
         failed(&result);
-        assert_eq!(store.task().get_str("status"), Ok(expected));
+        assert_eq!(store.task().get_str("status"), Ok(if expected == "generation_failed" { "pending" } else { expected }));
         assert_eq!(result.value["generationStatus"], expected);
         assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
         assert!(core::gui_generated(&result).is_err());
@@ -901,7 +901,7 @@ async fn original_create_failed_generate_idempotent_retry_history_is_retained() 
         &CreateRequest::new("task", "tpl"),
     )
     .await);
-    assert_eq!(store.task().get_str("status"), Ok("generation_failed"));
+    assert_eq!(store.task().get_str("status"), Ok("pending"));
     runtime.failure = None;
     ok(&core::generate(
         &root.0,
@@ -1090,4 +1090,50 @@ async fn legacy_missing_runid_uses_original_fallback_without_overwriting_explici
         assert_eq!(state.items[0].get("runId"), Some(&expected));
         assert_eq!(state.tasks[0].get("runId"), original.as_ref());
     }
+}
+
+
+#[tokio::test]
+async fn failed_operation_restores_only_captured_pending_waiting_and_preserves_rows() {
+    for (before, after) in [("pending", "pending"), ("waiting", "waiting"),
+                            ("ready", "generation_failed"), ("generation_failed", "generation_failed")] {
+        let (root, store, mut runtime) = setup(Some(before));
+        runtime.failure = Some(Kind::Ordinary);
+        runtime.rows[0].insert("opaque", doc! {"retained": true});
+        let rows = runtime.rows.clone();
+        let result = core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await;
+        failed(&result);
+        assert_eq!(result.value["generationStatus"], "generation_failed");
+        let saved = store.task();
+        assert_eq!(saved.get_str("status"), Ok(after));
+        assert_eq!(saved.get_str("lastError"), Ok("original writer failure"));
+        let generation = saved.get_document("generation").unwrap();
+        assert_eq!(generation.get_str("phase"), Ok("generation_failed"));
+        assert!(generation.get_str("finishedAt").is_ok());
+        assert_eq!(generation.get_str("id").unwrap(), result.value["generationId"]);
+        let state = store.0.lock().unwrap();
+        assert_eq!(state.items, rows, "do not roll back, delete or rewrite partial rows");
+        assert_eq!(state.writes.len(), 2, "one begin and one final CAS only");
+        let finish = state.writes.last().unwrap();
+        assert_eq!(finish.0.get_str("status"), Ok("generating"));
+        assert_eq!(finish.0.get_str("generation.id"), generation.get_str("id"));
+        let event = finish.1.get_document("$push").unwrap().get_document("events").unwrap();
+        assert_eq!(event.get_str("status"), Ok("generation_failed"), "event retains operation outcome");
+        assert_eq!(event.get_document("detail").unwrap().get_str("generationId"), generation.get_str("id"));
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn lost_failed_finish_ack_keeps_restored_state_without_regeneration() {
+    let (root, store, mut runtime) = setup(Some("pending"));
+    runtime.failure = Some(Kind::Ordinary);
+    store.0.lock().unwrap().fail_after.insert("generation-finish:generation_failed".into());
+    let result = core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await;
+    failed(&result);
+    assert_eq!(result.value["generationReconciliationUnconfirmed"], true);
+    assert_eq!(store.task().get_str("status"), Ok("pending"));
+    assert_eq!(store.task().get_document("generation").unwrap().get_str("phase"), Ok("generation_failed"));
+    assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.0.lock().unwrap().writes.len(), 2);
 }

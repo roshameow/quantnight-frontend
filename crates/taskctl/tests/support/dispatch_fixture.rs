@@ -118,7 +118,14 @@ fn project(row: &Document, projection: Option<&Document>) -> Document {
     result
 }
 #[derive(Default)]
+pub struct GenerationReadGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+#[derive(Default)]
 pub struct Data {
+    pub generation_summary_gate: Option<Arc<GenerationReadGate>>,
+    pub generation_finished: Option<Arc<tokio::sync::Notify>>,
     pub read_queries: Vec<(Host, Document)>,
     pub after_summary: Option<(Host, Document)>,
     pub before_update: Option<(Host, Document)>,
@@ -324,6 +331,10 @@ impl TaskStore for Memory {
             return Ok(0);
         };
         apply(row, &u);
+        if u.get_document("$push").ok().and_then(|p| p.get_document("events").ok())
+            .and_then(|e| e.get_str("command").ok()) == Some("generation-finish") {
+            if let Some(done) = &data.generation_finished { done.notify_one(); }
+        }
         self.publish_snapshot(&data);
         if lose_ack {
             Err("injected lost control ACK after apply".into())
@@ -342,6 +353,11 @@ impl TaskStore for Memory {
             .collect())
     }
     async fn summary(&self, h: Host, n: &str) -> Result<CollectionSummary, String> {
+        let gate = { self.data.lock().unwrap().generation_summary_gate.take() };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let mut data = self.data.lock().unwrap();
         Self::access(&mut data, format!("summary:{h:?}:{n}"))?;
         self.generated(&mut data, n);

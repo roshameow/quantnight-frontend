@@ -220,7 +220,7 @@ impl CanonicalNamespace {
 }
 pub fn list_tasks_options() -> FindOptions {
     FindOptions::builder().projection(doc! {"name":1,"status":1,"taskType":1,
-        "auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1})
+        "auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1,"generation":1})
         .sort(doc! {"_id":-1}).max_time(CONTROL_BUDGET).build()
 }
 pub fn result_items_options(limit: i64, offset: i64) -> Result<FindOptions, String> {
