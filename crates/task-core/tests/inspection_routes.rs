@@ -552,7 +552,6 @@ async fn super_local_runtime_proof_is_bound_in_final_cas() {
             "control-read",
             "startup-read",
             "summary",
-            "summary",
             "status-revalidate",
             "terminal-cas"
         ]
@@ -681,7 +680,7 @@ async fn status_lock_and_store_errors_do_not_look_like_empty_success() {
     let lock = MissionLocks::acquire(&root.0, &[NAME], false).unwrap();
     let r = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
     assert_eq!(r.exit_code, 1);
-    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "summary", "summary"]);
+    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "summary"]);
     m.no_writes(); // Long reads are now allowed; the terminal EX must still fail.
     drop(lock);
     for fail in ["control-read", "summary", "terminal-cas"] {
@@ -712,6 +711,7 @@ async fn priority_uses_original_owner_override_inspect_and_preserves_invalid_exi
             name: NAME.into(),
             remote: Some(true),
             inspect_items: true,
+            watch_observation: None,
         },
     )
     .await;
@@ -1519,4 +1519,83 @@ async fn completion_ordinary_status_missing_closure_does_not_query_processes() {
         assert_eq!(out.value["execution"]["total"],1);
         assert!(!runtime.calls.lock().unwrap().iter().any(|c|c=="process-inspection"));m.no_writes();
     }}
+}
+
+// Shared with watcher pipeline/DTO and actual Pinia/card rendering tests.
+#[tokio::test]
+async fn item_status_count_contract_preserves_original_terminal_policy() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/item-status-counts.json")).unwrap();
+    let root = Root::new();
+    for (remote, is_super) in [(false, false), (true, false), (false, true), (true, true)] {
+        for case in cases.as_array().unwrap() {
+            let state = case["status"].as_str().unwrap();
+            let t = if is_super { super_task(remote) } else { task(remote) };
+            let m = Memory::new(t.clone(), vec![doc! {"_id":1,"status":state}]);
+            if remote && is_super { m.0.lock().unwrap().controls.insert(Host::Remote, vec![t]); }
+            let result = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+            let statuses = serde_json::from_value(result.value["execution"]["statuses"].clone()).unwrap();
+            let counts = quantnight_task_core::task_store::item_progress_counts(&statuses);
+            for key in ["success", "error", "cancelled"] {
+                assert_eq!(Some(counts[key]), case[key].as_u64(), "{state}: {key}");
+            }
+            assert_eq!(result.value["terminal"], case["terminal"], "{state}");
+            let expected = if !case["terminal"].as_bool().unwrap() { "running" }
+                else if state == "success" { "completed" } else { "completed_with_errors" };
+            assert_eq!(result.value["taskStatus"], expected, "{state}");
+            if expected == "running" { m.no_writes(); }
+        }
+    }
+}
+
+fn bound_watch(t: &Document) -> StatusRequest {
+    let mut request=StatusRequest::new(NAME);
+    request.watch_observation=Some(WatchObservation {task_id:t.get_object_id("_id").unwrap().to_hex(),
+        launch_id:t.get_str("launchAttemptId").unwrap().into(),remote:t.get_bool("isRemote").unwrap()});
+    request
+}
+
+#[tokio::test]
+async fn bound_watch_uses_same_terminal_writer_and_preserves_repeat_completion() {
+    for remote in [false,true] {
+        let root=Root::new();let t=task(remote);let request=bound_watch(&t);
+        let m=Memory::new(t,vec![doc!{"status":"timeout_error"}]);
+        let rt=Runtime::default();
+        let first=status(&root.0,&m,&rt,&request).await;
+        assert_eq!(first.value["taskStatus"],"completed_with_errors");
+        let completed=m.control();let n=m.0.lock().unwrap().writes.len();
+        let second=status(&root.0,&m,&rt,&request).await;
+        assert_eq!(second.value["terminal"],true);
+        assert_eq!(m.control(),completed);
+        assert_eq!(m.0.lock().unwrap().writes.len(),n);
+    }
+}
+
+#[tokio::test]
+async fn bound_watch_stop_and_generation_observe_without_changing_ordinary_status() {
+    for state in ["paused","deactive","generating","generation_failed","generation_unknown"] {
+        let root=Root::new();let mut t=task(false);t.insert("status",state);
+        let request=bound_watch(&t);let m=Memory::new(t.clone(),vec![doc!{"status":"success"}]);
+        let out=status(&root.0,&m,&Runtime::default(),&request).await;
+        assert_eq!(out.value["terminal"],false);
+        assert_eq!(out.value["watchState"],if ["paused","deactive"].contains(&state){"stopped"}else{"source_changed"});
+        assert_eq!(m.control(),t);m.no_writes();
+        assert!(!m.0.lock().unwrap().calls.iter().any(|s|s=="summary"));
+    }
+    let root=Root::new();let mut t=task(false);t.insert("status","paused");
+    let m=Memory::new(t,vec![doc!{"status":"success"}]);
+    let out=status(&root.0,&m,&Runtime::default(),&StatusRequest::new(NAME)).await;
+    assert_eq!(out.value["taskStatus"],"completed"); // original public status contract
+}
+
+#[tokio::test]
+async fn bound_watch_cannot_write_same_name_successor_or_another_launch() {
+    for change in [doc!{"_id":ObjectId::new()},doc!{"launchAttemptId":"next"},doc!{"isRemote":true}] {
+        let root=Root::new();let t=task(false);let request=bound_watch(&t);
+        let mut replacement=t;replacement.extend(change);
+        let m=Memory::new(replacement.clone(),vec![doc!{"status":"success"}]);
+        let out=status(&root.0,&m,&Runtime::default(),&request).await;
+        assert_eq!(out.value["watchState"],"source_changed");
+        assert_eq!(out.value["terminal"],false);assert_eq!(m.control(),replacement);m.no_writes();
+    }
 }

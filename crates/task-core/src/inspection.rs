@@ -54,11 +54,20 @@ pub struct ListRequest {
     pub include_deactive: bool,
     pub remote: bool,
 }
+/// Existing producer identity, optional for ordinary status callers.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WatchObservation {
+    pub task_id: String,
+    pub launch_id: String,
+    pub remote: bool,
+}
 #[derive(Debug, Clone)]
 pub struct StatusRequest {
     pub name: String,
     pub remote: Option<bool>,
     pub inspect_items: bool,
+    pub watch_observation: Option<WatchObservation>,
 }
 impl StatusRequest {
     pub fn new(name: impl Into<String>) -> Self {
@@ -66,6 +75,7 @@ impl StatusRequest {
             name: name.into(),
             remote: None,
             inspect_items: false,
+            watch_observation: None,
         }
     }
 }
@@ -518,6 +528,30 @@ fn failed_observation(task: &Document, mut facts: Value, observed_at: &str, erro
     facts["terminal"] = json!(false);
     outcome("status", task.get_str("name").unwrap_or(""), false, facts)
 }
+fn watch_control(task: &Document) -> Value {
+    let observed: Document = ["_id", "name", "taskType", "isRemote", "launchAttemptId", "startedAt",
+        "status", "generation", "lastError", "expectedCount"]
+        .iter().filter_map(|key| task.get(*key).map(|v| ((*key).into(), v.clone()))).collect();
+    wire_document(&observed)
+}
+fn watch_launch(task: &Document) -> String {
+    for key in ["launchAttemptId", "startedAt"] {
+        if let Some(value) = task.get(key).filter(|v| truthy(Some(v))) {
+            // Python's original marker uses str(BSON datetime) for old launches.
+            return match value {
+                Bson::DateTime(v) => {
+                    let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(v.timestamp_millis()).expect("BSON launch datetime");
+                    let base = stamp.format("%Y-%m-%d %H:%M:%S").to_string();
+                    if stamp.timestamp_subsec_micros() == 0 { base }
+                    else { format!("{base}.{:06}", stamp.timestamp_subsec_micros()) }
+                },
+                Bson::String(v) => v.clone(),
+                _ => wire(Some(value)).to_string(),
+            };
+        }
+    }
+    "legacy".into()
+}
 async fn status_inner(
     root: &Path,
     store: &dyn TaskStore,
@@ -525,9 +559,43 @@ async fn status_inner(
     request: &StatusRequest,
 ) -> Result<TaskOutcome, Error> {
     policy::validate_name(&request.name).map_err(invalid)?;
-    let task = task(store, &request.name, true).await?;
+    let task = if let Some(watch) = &request.watch_observation {
+        let id = ObjectId::parse_str(&watch.task_id).map_err(|e| invalid(e.to_string()))?;
+        match store.find_task(Host::Local, doc! {"_id":id}, false).await? {
+            Some(task) => task,
+            None => return Ok(outcome("status", &request.name, true,
+                json!({"watchState":"source_changed","reason":"mission identity/route changed", "terminal":false,"watchControl":{}}))),
+        }
+    } else { task(store, &request.name, true).await? };
     let observed_at = now();
     let execution_host = host(&task);
+    // The producer's existing binding is checked before any possible write.
+    // Ordinary status has no watcher context and retains its existing semantics.
+    if let Some(watch) = &request.watch_observation {
+        let reason = if text_id(task.get("_id")) != watch.task_id || task.get_str("name").ok() != Some(request.name.as_str())
+            || execution_host.is_remote() != watch.remote {
+            Some("mission identity/route changed")
+        } else if watch_launch(&task) != watch.launch_id {
+            Some("mission launch changed")
+        } else { None };
+        let old = task.get_str("status").unwrap_or("");
+        if let Some(reason) = reason {
+            return Ok(outcome("status", &request.name, true,
+                json!({"watchState":"source_changed","reason":reason,"terminal":false,"watchControl":watch_control(&task)})));
+        }
+        if ["launch_unknown", "syncing", "deleting"].contains(&old) {
+            return Ok(failed_observation(&task,
+                json!({"terminal":false,"watchControl":watch_control(&task)}), &observed_at,
+                "lifecycle mutation unresolved; watcher cannot reconcile it".into()));
+        }
+        if ["paused", "deactive", "generating", "generation_failed", "generation_unknown"].contains(&old) {
+            let state = if ["paused", "deactive"].contains(&old) { "stopped" } else { "source_changed" };
+            confirm_status_snapshot(store, &status_snapshot_query(&task, &doc! {})?).await?;
+            return Ok(outcome("status", &request.name, true,
+                json!({"watchState":state,"terminal":false,"watchControl":watch_control(&task),
+                    "reason":"generation began outside simulation watch binding","controlStatus":old})));
+        }
+    }
     if task.get_str("taskType").ok() == Some("priority") {
         let value = runtime
             .priority_snapshot(
@@ -571,8 +639,11 @@ async fn status_inner(
     let mut execution_observation=Value::Null;
     let mut receipt_observation=Value::Null;
     let mut legacy_ready=false;
+    let mut legacy_registry = None;
     let local_read = store.summary(Host::Local, &request.name).await;
-    let execution_read = store.summary(execution_host, &request.name).await;
+    let execution_read = if execution_host == Host::Local {
+        local_read.clone()
+    } else { store.summary(execution_host, &request.name).await };
     if local_read.is_err() || execution_read.is_err() {
         let facts = json!({"remote":execution_host.is_remote(),
             "local":local_read.as_ref().map(summary_value).unwrap_or(Value::Null),
@@ -600,6 +671,12 @@ async fn status_inner(
     if task.get_str("taskType").ok()==Some("super") && startup.get_bool("required").unwrap_or(false)
         && !closure.get_bool("ready").unwrap_or(false) && startup_read_error.is_none()
         && execution.total>0 && unfinished==0 && original_v1_stop(&task,execution_host.is_remote()) {
+        if request.watch_observation.is_some() {
+            legacy_registry = Some(store.find_task(execution_host,
+                doc! {"name":&request.name,"status":{"$ne":"deactive"}}, false).await?);
+            fence.insert("simulatorRuntime", task.get("simulatorRuntime").cloned()
+                .unwrap_or_else(|| Bson::Document(doc! {"$exists":false})));
+        }
         match runtime.inspect_execution(root,store,&task,execution_host).await {
             Ok(Some(observation))=>{
                 let absent=observation["state"]=="session_absent";
@@ -635,6 +712,9 @@ async fn status_inner(
         "local":summary_value(&local),"execution":summary_value(&execution),"terminal":terminal,
         "unfinished":unfinished,"startupRecovery":wire_document(&startup),"lifecycleClosure":wire_document(&closure)});
     captured["observedAt"] = json!(&observed_at);
+    if request.watch_observation.is_some() {
+        captured["watchControl"] = watch_control(&task);
+    }
     if let Some(error)=startup_read_error {
         captured["readErrors"]=json!({"startupRecovery":error});
         return Ok(failed_observation(&task,captured,&observed_at,error.into()));
@@ -644,6 +724,33 @@ async fn status_inner(
         captured["receiptObservation"]=receipt_observation;
         captured["completionVerification"]=json!({"ready":legacy_ready,"basis":if legacy_ready{"legacy_revalidated"}else{"legacy_insufficient"},
             "naturalClosure":false,"runnerProofCreated":false,"taskId":text_id(task.get("_id")),"remote":execution_host.is_remote()});
+    }
+    if terminal && request.watch_observation.is_some() {
+        let recheck: Result<(), Error> = async {
+            if let Some(expected) = legacy_registry {
+                if store.find_task(execution_host,doc! {"name":&request.name,"status":{"$ne":"deactive"}},false).await? != expected {
+                    return Err("legacy execution registry changed before observation delivery".into());
+                }
+            } else if execution_host.is_remote() && startup.get_bool("required").unwrap_or(false)
+                && ["completed", "completed_with_errors"].contains(&old_status) {
+                // Existing completion needs only the same proof predicate read,
+                // never another remote no-op write or completion timestamp.
+                let binding=task.get_document("startupBinding").map_err(|e|e.to_string())?;
+                let mut q=startup_query(&task,binding);
+                q.insert("simulatorRuntime.startupRecovery",startup.get_document("proof").map_err(|e|e.to_string())?.clone());
+                q.insert("simulatorRuntime.lifecycleClosure",closure.get_document("proof").map_err(|e|e.to_string())?.clone());
+                q.insert("simulatorRuntime.consumer_run_id",binding.get("consumer_run_id").cloned().unwrap_or(Bson::Null));
+                if store.find_task(execution_host,q,false).await?.is_none() {
+                    return Err("SUPER execution startup proof changed before terminal CAS".into());
+                }
+            }
+            Ok(())
+        }.await;
+        if let Err(error)=recheck { return Ok(failed_observation(&task,captured,&observed_at,error)); }
+        // Observation protection also applies to an already-completed task.
+        if let Err(error) = policy::assert_observation_closed(&task) {
+            return Ok(failed_observation(&task, captured, &observed_at, error.into()));
+        }
     }
     if terminal && !legacy_ready
         && !(old_status == "paused" && truthy(task.get("acceptedObservation")))
@@ -666,12 +773,16 @@ async fn status_inner(
         // Acquiring EX alone is insufficient: a pause/new launch may have
         // completed while this exact original snapshot was being read.
         let _lock = MissionLocks::acquire(root, &[&request.name], false)?;
-        confirm_status_snapshot(store, &query).await?;
+        confirm_status_snapshot(store, &query).await.map_err(|error| {
+            if request.watch_observation.is_some() { Error {kind:error.kind, message:format!("mission changed during terminal reconciliation: {}",error.message)} }
+            else { error }
+        })?;
         policy::assert_observation_closed(&task)?;
-        let failures: u64 = ["permanent_error", "timeout_error", "cancelled", "error"]
-            .iter()
-            .map(|k| execution.statuses.get(*k).copied().unwrap_or(0))
-            .sum();
+        // The unchanged terminal-state gate above excludes legacy `fail`.
+        // A cancelled item still retains the existing completed_with_errors task
+        // outcome, but is no longer presented as an expression failure.
+        let counts = crate::task_store::item_progress_counts(&execution.statuses);
+        let failures = counts["error"] + counts["cancelled"];
         status = Bson::String(
             if failures > 0 {
                 "completed_with_errors"
@@ -712,7 +823,9 @@ async fn status_inner(
         let stamp = now();
         let event = doc! {"id":ObjectId::new().to_hex(),"command":command,"status":status.clone(),"at":&stamp,"detail":summary_document(&execution)?};
         if store.update_task(Host::Local,query,doc! {"$set":{"status":status.clone(),"completedAt":&stamp,"updatedAt":&stamp},"$push":{"events":event}}).await? != 1 {
-            return Err(format!("active task not found: {}",request.name).into());
+            return Err(if request.watch_observation.is_some() {
+                "mission changed during terminal reconciliation".into()
+            } else { format!("active task not found: {}",request.name).into() });
         }
         Ok(())
         }.await;

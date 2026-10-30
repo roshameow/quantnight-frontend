@@ -15,7 +15,7 @@ fn original_argparse_matches_registered_rust_parser() {
     let cases: Vec<Value> = serde_json::from_str(GOLDEN).unwrap();
     for case in cases {
         let args: Vec<String> = serde_json::from_value(case["args"].clone()).unwrap();
-        let actual = match parse_args(&args) {
+        let mut actual = match parse_args(&args) {
             Ok(CliParse::Help { command }) => {
                 json!({"kind":"help","exit":CLI_HELP_EXIT_CODE,"command":command})
             }
@@ -32,6 +32,18 @@ fn original_argparse_matches_registered_rust_parser() {
                 json!({"kind":"error","exit":error.exit_code})
             }
         };
+        // The historical parser predates the approved optional status watcher
+        // context. Its original fixtures remain byte-for-byte unchanged. Every
+        // legacy status case must leave this new field exactly null; compare
+        // ALL remaining fields against the original oracle without alteration.
+        if actual["kind"] == "command" && actual["command"] == "status" {
+            assert_eq!(
+                actual["options"].as_object_mut().unwrap().remove("watch_observation"),
+                Some(json!({"kind":"null"})),
+                "legacy status must not acquire a watch context: {} argv={:?}",
+                case["label"], args
+            );
+        }
         let mut expected = case["expected"].clone();
         // Error formatting/prog/usage wrapping differs across argparse versions;
         // compare usage exit semantics, while preserving original text in fixtures.

@@ -37,10 +37,14 @@
           ✓ {{ (progress?.success ?? 0) - (progress?.priority_success ?? 0) }}+{{ progress?.priority_success ?? 0 }}
         </n-text>
         &nbsp;|&nbsp;
-        <n-text type="error" title="失败 (普通+插队)">
+        <n-text type="error" title="错误/超时 (普通+插队；不代表平台取消或表达式失败)">
           ✗ {{ (progress?.error ?? 0) - (progress?.priority_error ?? 0) }}+{{ progress?.priority_error ?? 0 }}
         </n-text>
         &nbsp;|&nbsp;
+        <n-text v-if="progress?.cancelled" type="warning" title="已取消 (普通+插队；不计入错误)">
+          已取消 {{ (progress?.cancelled ?? 0) - (progress?.priority_cancelled ?? 0) }}+{{ progress?.priority_cancelled ?? 0 }}
+        </n-text>
+        <span v-if="progress?.cancelled">&nbsp;|&nbsp;</span>
         <n-text depth="3" title="总计 (普通+插队)">
           Σ {{ (progress?.total ?? 0) - (progress?.priority_total ?? 0) }}+{{ progress?.priority_total ?? 0 }}
         </n-text>
@@ -188,6 +192,7 @@ const progressBarStyle = computed(() => {
   const p = props.progress || {};
   const success = typeof p.success === "number" ? p.success : 0;
   const error = typeof p.error === "number" ? p.error : 0;
+  const cancelled = typeof p.cancelled === "number" ? p.cancelled : 0;
   const total = typeof p.total === "number" && p.total > 0 ? p.total : 1;
   const priority_success = typeof p.priority_success === "number" ? p.priority_success : 0;
   const priority_error = typeof p.priority_error === "number" ? p.priority_error : 0;
@@ -199,6 +204,7 @@ const progressBarStyle = computed(() => {
   const redPercent = (nonPriorityError / total) * 100;
   const pGreenPercent = (priority_success / total) * 100;
   const pRedPercent = (priority_error / total) * 100;
+  const cancelledPercent = (cancelled / total) * 100;
 
   const isSuper = props.task.taskType === "super";
   const mainColor = isSuper ? "#64b5f6" : "#a1e3a1";
@@ -230,6 +236,11 @@ const progressBarStyle = computed(() => {
   layers.push(`linear-gradient(to right, ${pErrorColor}, ${pErrorColor})`);
   sizes.push(`${pRedPercent}% 100%`);
   positions.push(`${greenPercent + redPercent + pGreenPercent}% 0`);
+
+  // Cancellation is a separate neutral segment, never a red failure segment.
+  layers.push(`linear-gradient(to right, #b0bec5, #b0bec5)`);
+  sizes.push(`${cancelledPercent}% 100%`);
+  positions.push(`${greenPercent + redPercent + pGreenPercent + pRedPercent}% 0`);
 
   return {
     position: "absolute",

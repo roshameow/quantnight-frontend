@@ -204,7 +204,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt, taskStopDisplayStatus } from "../stores/taskStore";
-import { createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler, mutateTaskSource } from "../utils/taskProgress.js";
+import { createTaskFetcher, createTaskProgressLifecycle, mutateTaskSource } from "../utils/taskProgress.js";
 import { newTaskRequestId, validOperationStage, taskRuntimeTarget, sameRuntimeIdentity, taskStartBlockReason, isCompletedTask, taskMutationIssue, taskStartOutcome, taskStartFailure, taskStartJoinEvidence, taskMatchesJoinEvidence, taskLaunchValue, taskLaunchMatches } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
@@ -931,26 +931,9 @@ const openUpdateModal = (task) => {
 };
 
 // --- Lifecycle Hooks ---
-// No periodic process discovery. Explicit read-only diagnostics remain optional;
-// progress events/refresh and count-based automatic pause keep their original owner.
-const autoPause = createAutoPauseScheduler({
-  getTasks: () => tasks.value.filter(task => !taskMutationIssue(task)),
-  getProgress: () => taskProgressMap.value,
-  pause: (task) => {
-    // Progress recovery must not blindly retry a failed/unconfirmed stop.
-    if (taskStopOperationMap.value[task.name]) return;
-    return pauseTask(task, { joinOwnedStart: false }); // existing auto-pause never creates a new deferred user intent
-  },
-  onError: (error) => {
-    console.error("自动暂停失败", error);
-    message.error("自动暂停失败: " + error);
-  },
-});
-const stopAutoPauseWatch = watch([tasks, taskProgressMap], () => autoPause.reconcile(), {
-  deep: true,
-  flush: "sync",
-});
-
+// Progress is display-only: counts do not establish lifecycle completion or
+// authorize a stop. Existing lifecycle owners supply task state; pause stays explicit.
+// No periodic process discovery or GUI completion timer.
 const progressLifecycle = createTaskProgressLifecycle({
   listen,
   ready: () => invoke("frontend_ready"),
@@ -973,7 +956,6 @@ onMounted(async () => {
     if (disposed) { unlisten(); return; }
     registryUnlisten = unlisten;
     await progressLifecycle.start();
-    if (!disposed) autoPause.reconcile();
   } catch (error) {
     operationUnlisten?.();
     operationUnlisten = undefined;
@@ -1001,8 +983,6 @@ onUnmounted(() => {
   runtimeRequests.clear();
   stopRuntimeWatch();
   progressLifecycle.stop();
-  stopAutoPauseWatch();
-  autoPause.stop();
 });
 
 watch(() => route.fullPath, () => fetchTasks());

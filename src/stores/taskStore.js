@@ -4,8 +4,8 @@ import { computed, ref } from 'vue'
 import { newTaskRequestId, failureKind, errorStage, validOperationStage, taskLaunchMatches } from '../utils/taskDiagnostics.js'
 
 const emptyProgress = (task, previous) => ({
-  success: 0, error: 0, total: 0,
-  priority_success: 0, priority_error: 0, priority_total: 0,
+  success: 0, error: 0, cancelled: 0, total: 0,
+  priority_success: 0, priority_error: 0, priority_cancelled: 0, priority_total: 0,
   is_remote: task.isRemote === true,
   stale: true,
   lastError: null,
@@ -239,6 +239,9 @@ export const useTaskStore = defineStore('task', () => {
     if (!accepted || !validCount(event.success) || !validCount(event.total)) return false
     const counts = {
       success: event.success, total: event.total, error: event.error ?? 0,
+      // Additive read projection; older native events omit cancellation counts.
+      cancelled: event.cancelled ?? 0,
+      priority_cancelled: event.priority_cancelled ?? 0,
       priority_success: event.priority_success ?? 0,
       priority_error: event.priority_error ?? 0,
       priority_total: event.priority_total ?? 0,

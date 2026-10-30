@@ -1,0 +1,452 @@
+[
+  {
+    "name": "ordinary:ERROR",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "ERROR",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:FAIL",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAIL",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:FAILED",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAILED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:CANCELLED",
+    "row": {
+      "status": "cancelled",
+      "terminalStatus": "CANCELLED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 0,
+      "cancelled": 1
+    }
+  },
+  {
+    "name": "ordinary:timeout_error",
+    "row": {
+      "status": "timeout_error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_monitor_timeout"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:UNKNOWN",
+    "row": {
+      "status": "error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:COMPLETE",
+    "row": {
+      "status": "success",
+      "terminalStatus": "COMPLETE",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "ordinary:WARNING",
+    "row": {
+      "status": "success",
+      "terminalStatus": "WARNING",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:ERROR",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "ERROR",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:FAIL",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAIL",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:FAILED",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAILED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:CANCELLED",
+    "row": {
+      "status": "cancelled",
+      "terminalStatus": "CANCELLED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 0,
+      "cancelled": 1
+    }
+  },
+  {
+    "name": "super:timeout_error",
+    "row": {
+      "status": "timeout_error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_monitor_timeout"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:UNKNOWN",
+    "row": {
+      "status": "error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "simulation_platform_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:COMPLETE",
+    "row": {
+      "status": "success",
+      "terminalStatus": "COMPLETE",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "super:WARNING",
+    "row": {
+      "status": "success",
+      "terminalStatus": "WARNING",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:ERROR",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "ERROR",
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:FAIL",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAIL",
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:FAILED",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "FAILED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:CANCELLED",
+    "row": {
+      "status": "cancelled",
+      "terminalStatus": "CANCELLED",
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 0,
+      "cancelled": 1
+    }
+  },
+  {
+    "name": "batch:timeout_error",
+    "row": {
+      "status": "timeout_error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:UNKNOWN",
+    "row": {
+      "status": "error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED",
+      "errorClass": "original_child_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:COMPLETE",
+    "row": {
+      "status": "success",
+      "terminalStatus": "COMPLETE",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "batch:WARNING",
+    "row": {
+      "status": "success",
+      "terminalStatus": "WARNING",
+      "alphaId": "kept-alpha",
+      "acceptance": "ACCEPTED",
+      "errorClass": null
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "legacy-super-cancel",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "CANCELLED"
+    },
+    "counts": {
+      "success": 0,
+      "error": 0,
+      "cancelled": 1
+    }
+  },
+  {
+    "name": "actual-platform-error",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "ERROR"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "status-only-permanent",
+    "row": {
+      "status": "permanent_error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "status-only-error",
+    "row": {
+      "status": "error"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "local-timeout",
+    "row": {
+      "status": "timeout_error",
+      "terminalStatus": null,
+      "acceptance": "ACCEPTED"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "timeout-stale-meta",
+    "row": {
+      "status": "timeout_error",
+      "terminalStatus": "CANCELLED"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "success-stale-meta",
+    "row": {
+      "status": "success",
+      "terminalStatus": "CANCELLED",
+      "alphaId": "kept-alpha"
+    },
+    "counts": {
+      "success": 1,
+      "error": 0,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "unknown-terminal",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "UNKNOWN"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  },
+  {
+    "name": "lowercase-not-confirmed",
+    "row": {
+      "status": "permanent_error",
+      "terminalStatus": "cancelled"
+    },
+    "counts": {
+      "success": 0,
+      "error": 1,
+      "cancelled": 0
+    }
+  }
+]

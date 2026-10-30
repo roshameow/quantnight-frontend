@@ -59,9 +59,11 @@ struct ProgressRequest {
 struct ProgressCounts {
     success: usize,
     error: usize,
+    cancelled: usize,
     total: usize,
     priority_success: usize,
     priority_error: usize,
+    priority_cancelled: usize,
     priority_total: usize,
 }
 
@@ -588,6 +590,9 @@ fn priority_stats_pipeline(ids: Option<&[bson::oid::ObjectId]>) -> Vec<Document>
     ] } } });
     let mut group = stats_pipeline().remove(0);
     let fields = group.get_document_mut("$group").unwrap();
+    // Priority ledger's historical error/unresolved semantics are independent.
+    fields.remove("cancelled");
+    fields.remove("priority_cancelled");
     let success = doc! { "$sum": { "$cond": [{ "$eq": ["$_priority_state", "success"] }, 1, 0] } };
     let error = doc! { "$sum": { "$cond": [{ "$in": ["$_priority_state", PRIORITY_FAILURES.to_vec()] }, 1, 0] } };
     fields.insert("success", success.clone());
@@ -667,6 +672,8 @@ fn parse_counts(document: Option<Document>) -> Result<ProgressCounts> {
         Some(doc) => Ok(ProgressCounts {
             success: count_field(&doc, "success")?,
             error: count_field(&doc, "error")?,
+            cancelled: if doc.contains_key("cancelled") { count_field(&doc, "cancelled")? } else { 0 },
+            priority_cancelled: if doc.contains_key("priority_cancelled") { count_field(&doc, "priority_cancelled")? } else { 0 },
             total: count_field(&doc, "total")?,
             priority_success: count_field(&doc, "priority_success")?,
             priority_error: count_field(&doc, "priority_error")?,
@@ -676,19 +683,7 @@ fn parse_counts(document: Option<Document>) -> Result<ProgressCounts> {
 }
 
 fn stats_pipeline() -> Vec<Document> {
-    vec![doc! { "$group": {
-        "_id": null,
-        "total": { "$sum": 1 },
-        "success": { "$sum": { "$cond": [ { "$eq": ["$status", "success"] }, 1, 0 ] } },
-        "error": { "$sum": { "$cond": [ { "$in": ["$status", ["fail", "error"]] }, 1, 0 ] } },
-        "priority_total": { "$sum": { "$cond": [ { "$gt": ["$priority", 0] }, 1, 0 ] } },
-        "priority_success": { "$sum": { "$cond": [
-            { "$and": [ { "$eq": ["$status", "success"] }, { "$gt": ["$priority", 0] } ] }, 1, 0
-        ] } },
-        "priority_error": { "$sum": { "$cond": [
-            { "$and": [ { "$in": ["$status", ["fail", "error"]] }, { "$gt": ["$priority", 0] } ] }, 1, 0
-        ] } },
-    }}]
+    quantnight_task_core::task_store::item_progress_pipeline()
 }
 
 async fn read_counts(mut cursor: impl futures_util::TryStream<Ok = Document, Error = mongodb::error::Error> + Unpin) -> Result<ProgressCounts> {
@@ -1427,9 +1422,19 @@ mod tests {
                 let args = || arg.as_array().unwrap().iter().map(|e| eval(e, row)).collect::<Vec<_>>();
                 match name.as_str() {
                     "$eq" => { let a = args(); Bson::Boolean(a[0] == a[1]) },
+                    "$gt" => { let a = args(); Bson::Boolean(a[0].as_i32().unwrap_or(0) > a[1].as_i32().unwrap()) },
+                    "$and" => Bson::Boolean(args().iter().all(|v| v.as_bool() == Some(true))),
                     "$or" => Bson::Boolean(args().iter().any(|v| v.as_bool() == Some(true))),
                     "$in" => { let a = arg.as_array().unwrap(); Bson::Boolean(a[1].as_array().unwrap().contains(&eval(&a[0], row))) },
                     "$cond" => { let a = arg.as_array().unwrap(); eval(&a[if eval(&a[0], row).as_bool() == Some(true) { 1 } else { 2 }], row) },
+                    "$switch" => {
+                        let switch = arg.as_document().unwrap();
+                        switch.get_array("branches").unwrap().iter().find_map(|branch| {
+                            let branch = branch.as_document().unwrap();
+                            (eval(branch.get("case").unwrap(), row).as_bool() == Some(true))
+                                .then(|| eval(branch.get("then").unwrap(), row))
+                        }).unwrap_or_else(|| eval(switch.get("default").unwrap(), row))
+                    },
                     "$toLower" => Bson::String(eval(arg, row).as_str().unwrap_or("").to_lowercase()),
                     "$convert" => { let d = arg.as_document().unwrap(); let v = eval(d.get("input").unwrap(), row);
                         if matches!(v, Bson::String(_)) { v } else { Bson::String("".into()) } },
@@ -1437,6 +1442,87 @@ mod tests {
                 }
             }
             _ => expr.clone(),
+        }
+    }
+
+    // Lowest fake DB boundary: evaluate the *production* BSON aggregation,
+    // then consume its cursor through the original decoder and serialized DTO.
+    #[tokio::test]
+    async fn item_status_count_contract_matches_core_and_progress_dto() {
+        use quantnight_task_core::task_store::item_progress_counts;
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/item-status-counts.json")).unwrap();
+        let pipeline = stats_pipeline();
+        let group = pipeline[0].get_document("$group").unwrap();
+        for priority in [0, 1] {
+            let mut mixed = Document::new();
+            let mut statuses = std::collections::BTreeMap::new();
+            for case in cases.as_array().unwrap() {
+                let state = case["status"].as_str().unwrap();
+                let row = doc! {"status":state,"priority":priority};
+                let mut totals = Document::new();
+                for (key, expression) in group.iter().filter(|(key, _)| key.as_str() != "_id") {
+                    let value = eval(expression.as_document().unwrap().get("$sum").unwrap(), &row);
+                    let n = value.as_i32().unwrap();
+                    totals.insert(key, value);
+                    mixed.insert(key, mixed.get_i32(key).unwrap_or(0) + n);
+                }
+                statuses.insert(state.to_string(), 1);
+                let counts = read_counts(futures_util::stream::iter(vec![Ok(totals)])).await.unwrap();
+                let dto = TaskProgress {collection:"contract".into(), task_id:"id".into(),
+                    counts, priority_campaign:None, is_remote:false, updated_at:1};
+                let wire = serde_json::to_value(dto).unwrap();
+                let core = item_progress_counts(&[(state.to_string(), 1)].into_iter().collect());
+                for key in ["success", "error", "cancelled"] {
+                    assert_eq!(wire[key], case[key], "{state}: {key}");
+                    assert_eq!(wire[key].as_u64(), Some(core[key]));
+                    let subset = format!("priority_{key}");
+                    assert_eq!(wire[&subset], if priority > 0 {case[key].clone()} else {serde_json::json!(0)});
+                }
+                assert_eq!(wire["total"], 1);
+            }
+            let counts = read_counts(futures_util::stream::iter(vec![Ok(mixed)])).await.unwrap();
+            let wire = serde_json::to_value(counts).unwrap();
+            let core = item_progress_counts(&statuses);
+            for key in ["success", "error", "cancelled"] {
+                assert_eq!(wire[key].as_u64(), Some(core[key]));
+            }
+            assert_eq!(wire["total"].as_u64(), Some(cases.as_array().unwrap().len() as u64));
+        }
+        assert_eq!(read_counts(futures_util::stream::empty::<Result<Document, mongodb::error::Error>>()).await.unwrap(), ProgressCounts::default());
+        // Local timeout remains an error even with no platform terminal evidence.
+        // This projection cannot cancel requests, release capacity or write task status.
+        assert_eq!(item_progress_counts(&[("timeout_error".into(), 1)].into_iter().collect())["cancelled"], 0);
+    }
+
+    #[tokio::test]
+    async fn verified_writer_and_legacy_rows_use_same_core_rules_without_mutation() {
+        use quantnight_task_core::task_store::item_progress_counts_with_terminal;
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/item-receipt-counts.json")).unwrap();
+        let pipeline = stats_pipeline();
+        let group = pipeline[0].get_document("$group").unwrap();
+        for case in cases.as_array().unwrap() {
+            for priority in [0, 1] {
+                let mut row: Document = bson::to_document(&case["row"]).unwrap();
+                row.insert("priority", priority);
+                let before = row.clone();
+                let totals: Document = group.iter().filter(|(key, _)| key.as_str() != "_id")
+                    .map(|(key, expression)| (key.clone(), eval(expression.as_document().unwrap().get("$sum").unwrap(), &row)))
+                    .collect();
+                let counts = read_counts(futures_util::stream::iter(vec![Ok(totals)])).await.unwrap();
+                let wire = serde_json::to_value(counts).unwrap();
+                let core = item_progress_counts_with_terminal([(
+                    row.get_str("status").unwrap(), row.get_str("terminalStatus").ok(), 1)]);
+                for key in ["success", "error", "cancelled"] {
+                    assert_eq!(wire[key], case["counts"][key], "{}: {key}", case["name"]);
+                    assert_eq!(wire[key].as_u64(), Some(core[key]));
+                    let subset = format!("priority_{key}");
+                    assert_eq!(wire[&subset], if priority > 0 {case["counts"][key].clone()} else {serde_json::json!(0)});
+                }
+                assert_eq!(row, before); // pure projection; historical receipt never rewritten
+                assert_eq!(wire["total"], 1);
+            }
         }
     }
 
@@ -1750,7 +1836,7 @@ mod tests {
         assert_eq!(json["task_id"], "identity");
         assert_eq!(json["is_remote"], true);
         assert_eq!(json["updated_at"], 123);
-        for name in ["total", "success", "error", "priority_total", "priority_success", "priority_error"] {
+        for name in ["total", "success", "error", "cancelled", "priority_total", "priority_success", "priority_error", "priority_cancelled"] {
             assert_eq!(json[name], 0);
         }
         assert!(json.get("counts").is_none()); // Counters are flattened, not nested.
@@ -1761,7 +1847,10 @@ mod tests {
         let counts = parse_counts(Some(doc! {
             "total": 7196_i64, "success": 2136_i32, "error": 46_i64,
             "priority_total": 11_i32, "priority_success": 11_i64, "priority_error": 0_i32,
+            "cancelled": 2_i32, "priority_cancelled": 1_i64,
         })).unwrap();
+        assert_eq!(counts.cancelled, 2);
+        assert_eq!(counts.priority_cancelled, 1);
         assert_eq!(counts.total, 7196);
         assert_eq!(counts.success - counts.priority_success, 2125);
         assert_eq!(counts.error, 46);

@@ -1,0 +1,100 @@
+[
+  {
+    "status": "success",
+    "success": 1,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": true
+  },
+  {
+    "status": "error",
+    "success": 0,
+    "error": 1,
+    "cancelled": 0,
+    "terminal": true
+  },
+  {
+    "status": "fail",
+    "success": 0,
+    "error": 1,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "permanent_error",
+    "success": 0,
+    "error": 1,
+    "cancelled": 0,
+    "terminal": true
+  },
+  {
+    "status": "timeout_error",
+    "success": 0,
+    "error": 1,
+    "cancelled": 0,
+    "terminal": true
+  },
+  {
+    "status": "cancelled",
+    "success": 0,
+    "error": 0,
+    "cancelled": 1,
+    "terminal": true
+  },
+  {
+    "status": "pending",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "running",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "processing",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "transient_error",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "quota_deferred",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "unknown",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "UNKNOWN",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  },
+  {
+    "status": "missing",
+    "success": 0,
+    "error": 0,
+    "cancelled": 0,
+    "terminal": false
+  }
+]

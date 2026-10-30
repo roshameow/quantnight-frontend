@@ -342,6 +342,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "status",
         args: &[
             NAME,
+            arg("--watch-observation", "watch_observation", Kind::Text, DefaultValue::Null, false),
             REMOTE_OPTION,
             arg(
                 "--inspect-items",

@@ -31,7 +31,6 @@ async function harness(initial = task(), options = {}) {
   store.replaceTasks([initial]);
   const compiled = compileScript(descriptor, { id: `pause-${instance++}` }).content;
   const code = compiled
-    .replace('createAutoPauseScheduler,', 'createAutoPauseScheduler as realAutoPauseScheduler,')
     .replace('createTaskProgressLifecycle,', 'createTaskProgressLifecycle as realTaskProgressLifecycle,')
     .replaceAll('performance.now()', 'hooks.now')
     .replace('ref, onMounted, onUnmounted, watch, computed', 'ref, watch, computed')
@@ -54,7 +53,6 @@ async function harness(initial = task(), options = {}) {
     const createTaskProgressLifecycle = (options) => realTaskProgressLifecycle({ ...options,
       setIntervalFn: (callback, delay) => { const id = ++hooks.nextInterval; hooks.intervals.set(id, { callback, delay }); return id; },
       clearIntervalFn: id => hooks.intervals.delete(id) });
-    const createAutoPauseScheduler = (options) => realAutoPauseScheduler({ ...options, setTimeoutFn: setTimeout, clearTimeoutFn: clearTimeout });
     const onMounted = (fn) => { hooks.mount = fn; };
     const onUnmounted = (fn) => { hooks.unmount = fn; };
   `;
@@ -140,7 +138,7 @@ test('native failure or proof-verified/DB-writeback failure remains unconfirmed,
       assert.equal(h.store.taskStopOperationMap['priority-a'].status, 'stop_unconfirmed');
       assert.equal(h.store.taskProgressMap['priority-a'], progress);
       assert.equal(h.lists.length, 0);
-      await h.state.autoPause.reconcile();
+      await advanceJoinTime(h, 3600000);
       assert.equal(h.calls.length, 1);
       assert.equal(h.hooks.timers.size, 0);
     } finally { h.stop(); }
@@ -310,18 +308,17 @@ test('explicit start clears prior action and persisted local proof without clear
   } finally { h.stop(); }
 });
 
-test('actual generic auto-pause timer does not retry after an uncertain manual stop', async () => {
+test('full progress never retries an uncertain manual stop after time advances', async () => {
   const h = await harness(task({ mission_config: {} }));
   try {
     h.store.updateProgress({ collection: 'priority-a', task_id: 'id-a', is_remote: true,
       updated_at: 100, success: 10, error: 0, total: 10 });
-    h.state.autoPause.reconcile();
-    const timer = [...h.hooks.timers.values()].find(timer => timer.delay === 300000);
-    assert.ok(timer);
+    await tick();
+    assert.equal(h.hooks.timers.size, 0);
     const pausing = h.state.pauseTask(h.store.tasks[0]);
     h.command.reject(new Error('DB writeback outcome unknown'));
     await assert.rejects(pausing, /outcome unknown/);
-    await timer.callback();
+    await advanceJoinTime(h, 3600000);
     assert.equal(h.calls.filter(call => call.name === 'pause_task').length, 1);
     assert.equal(stopStatus(h), '停止执行失败');
   } finally { h.stop(); }
@@ -1876,14 +1873,14 @@ test('v6 regular successful start and positively settled preflight refusal both 
   }
 });
 
-test('v6 original automatic-pause admission does not create a deferred user join intent', async () => {
+test('v6 explicit no-join option still does not create a deferred user join intent', async () => {
   const h = await ownStartHarness();
   try {
     assert.equal(await h.state.pauseTask(h.store.tasks[0], { joinOwnedStart: false }), false);
     assert.equal(h.state.mutationRequests.value.get('id-a').pauseIntent, null);
     h.native.resolve(settledStart()); await h.starting; h.fresh.resolve([h.latest]); await tick();
     assert.equal(h.ownCalls.filter(c => c.name === 'pause_task').length, 0);
-    assert.match(source, /return pauseTask\(task, \{ joinOwnedStart: false \}\)/);
+    assert.doesNotMatch(source, /createAutoPauseScheduler/);
   } finally { h.native.resolve(settledStart()); h.fresh.resolve([h.latest]); h.stopReply.resolve(receipt()); h.stop(); }
 });
 
@@ -1988,7 +1985,7 @@ test('v8 modal fences task/source/type/profile replacement but a same-task launc
   }
 });
 
-test('v8 mount/history adds no process queries or interval; original progress refresh and count-based autoPause remain operational', async () => {
+test('v8 mount/history adds no process queries or interval; progress refresh never auto-pauses', async () => {
   const active = regularTask({ _id: 'active-id', name: 'business-progress' });
   let rows = [active, ...Array.from({ length: 1453 }, (_, i) => regularTask({ _id: `old-${i}`, name: `history-${i}`,
     status: 'completed_with_errors', launchAttemptId: `old-launch-${i}` }))];
@@ -2019,13 +2016,13 @@ test('v8 mount/history adds no process queries or interval; original progress re
     assert.equal(h.store.taskProgressMap[active.name].success, 1);
     assert.equal(h.hooks.timers.size, 0);
     emitProgress(2); await tick();
-    assert.equal(h.hooks.timers.size, 1);
-    assert.equal([...h.hooks.timers.values()][0].delay, 300000, 'original business auto-pause timer, not PID poll');
+    assert.equal(h.store.taskProgressMap[active.name].success, 2);
+    assert.equal(h.hooks.timers.size, 0, 'full counts must not register an automatic stop');
     await advanceJoinTime(h, 300000); await tick(); await tick();
-    assert.equal(calls.filter(c => c.name === 'pause_task').length, 1);
+    assert.equal(calls.filter(c => c.name === 'pause_task').length, 0);
     assert.equal(calls.filter(c => c.name === 'check_task_status').length, 0);
-    assert.equal(h.store.tasks[0].status, 'paused');
-    assert.ok(calls.filter(c => c.name === 'refresh_task_progress').length >= 2);
+    assert.equal(h.store.tasks[0].status, 'running');
+    assert.deepEqual(calls.map(c => c.name), ['frontend_ready', 'get_all_tasks', 'refresh_task_progress']);
   } finally { h.stop(); }
 });
 
@@ -2126,5 +2123,101 @@ test('R1 actual scope response cannot revive cancelled pause or adopt fresh succ
       assert.equal(h.ownCalls.filter(c=>c.name==='pause_task').length,0);
       assert.equal(h.ownCalls.filter(c=>c.name.startsWith('start_')).length,1);
     } finally {h.native.resolve(wire);h.fresh.resolve([latest]);h.stopReply.resolve(r1ScopeReceipt(wire));h.stop();}
+  }
+});
+
+// R01: item success precedes result collection; the GUI is not a completion owner.
+// These execute the production SFC + Pinia listeners; only native I/O and time are fake.
+for (const taskType of ['regular', 'super', 'priority']) {
+  for (const isRemote of [false, true]) {
+    test(`R01 full success with collection outstanding never pauses: ${taskType}/${isRemote}`, async () => {
+      const initial = task({ taskType, isRemote, mission_config: {},
+        simulatorRuntime: { lifecycleClosure: { phase: 'collecting' } } });
+      const h = await harness(initial);
+      try {
+        const calls = [];
+        let rows = [initial];
+        h.hooks.invoke = async (name, args) => {
+          calls.push({ name, args });
+          if (name === 'get_all_tasks') return rows;
+          if (name === 'frontend_ready' || name === 'refresh_task_progress') return;
+          // Baseline may reach this: record the real stop command, do not mask it.
+          if (name === 'pause_task') return receipt({ isRemote });
+          assert.fail(`unexpected automatic operation: ${name}`);
+        };
+        await h.hooks.mount(); await tick();
+        const counts = { success: 10, error: 0, total: 10,
+          priority_success: 3, priority_error: 0, priority_total: 3 };
+        h.hooks.handlers.get('task-progress-update')({ payload: {
+          collection: initial.name, task_id: 'id-a', is_remote: isRemote,
+          updated_at: 100, ...counts,
+        } });
+        await tick();
+        for (const [key, value] of Object.entries(counts)) assert.equal(h.store.taskProgressMap[initial.name][key], value);
+        assert.equal(h.store.tasks[0].status, 'running');
+        await advanceJoinTime(h, 300000); await tick();
+        await advanceJoinTime(h, 3600000); await tick();
+        assert.equal(calls.filter(c => c.name === 'pause_task').length, 0,
+          'full item success must not stop a consumer still collecting results');
+        assert.equal(h.hooks.timers.size, 0, 'no count-completion timer registration');
+        assert.equal(h.hooks.intervals.size, 0, 'no replacement polling');
+        assert.deepEqual(calls.map(c => c.name), ['frontend_ready', 'get_all_tasks', 'refresh_task_progress']);
+        assert.deepEqual(h.store.taskStopOperationMap, {});
+        assert.equal(h.store.tasks[0].status, 'running');
+        // Only the existing registry snapshot supplies a later completed state.
+        rows = [{ ...initial, status: 'completed', completedAt: '2026-10-30T00:00:00Z' }];
+        h.hooks.handlers.get('task-registry-changed')({ payload: {} }); await tick();
+        assert.equal(h.store.tasks[0].status, 'completed');
+        assert.equal(h.store.taskProgressMap[initial.name].success, 10);
+        await advanceJoinTime(h, 3600000); await tick();
+        assert.deepEqual(calls.map(c => c.name), ['frontend_ready', 'get_all_tasks', 'refresh_task_progress',
+          'get_all_tasks', 'refresh_task_progress']);
+      } finally { h.stop(); }
+    });
+  }
+}
+
+test('R01 complete progress registers no automatic timer or callback in the production SFC', async () => {
+  const h = await harness(regularTask());
+  try {
+    h.store.updateProgress({ collection: 'priority-a', task_id: 'id-a', is_remote: true,
+      updated_at: 100, success: 10, error: 0, total: 10 });
+    await tick();
+    assert.equal(h.hooks.timers.size, 0);
+    assert.equal(h.hooks.intervals.size, 0);
+    assert.equal(h.state.autoPause, undefined);
+    assert.equal(h.state.stopAutoPauseWatch, undefined);
+    assert.doesNotMatch(source, /createAutoPauseScheduler|autoPause\.reconcile/);
+  } finally { h.stop(); }
+});
+
+test('R01 full counts still allow explicit pause through the original task/host-fenced core request', async () => {
+  for (const taskType of ['regular', 'super', 'priority']) {
+    for (const isRemote of [false, true]) {
+      const initial = task({ taskType, isRemote, mission_config: {} });
+      const h = await harness(initial);
+      try {
+        h.store.updateProgress({ collection: initial.name, task_id: 'id-a', is_remote: isRemote,
+          updated_at: 100, success: 10, error: 0, total: 10 });
+        await tick();
+        await advanceJoinTime(h, 3600000);
+        assert.equal(h.calls.length, 0);
+        const progress = h.store.taskProgressMap[initial.name];
+        const pausing = h.state.pauseTask(h.store.tasks[0]);
+        const operation = h.store.taskStopOperationMap[initial.name];
+        assert.deepEqual(h.calls, [{ name: 'pause_task', status: 'running', args: {
+          taskName: initial.name, taskId: 'id-a', isRemote, requestId: operation.requestId,
+        } }]);
+        assert.equal(operation.status, 'stopping');
+        h.command.resolve(receipt({ isRemote })); await tick();
+        assert.equal(h.store.tasks[0].status, 'paused');
+        h.lists[0].resolve([{ ...h.store.tasks[0] }]);
+        await pausing;
+        assert.equal(h.store.taskProgressMap[initial.name], progress);
+        await advanceJoinTime(h, 3600000);
+        assert.deepEqual(h.calls.map(call => call.name), ['pause_task', 'get_all_tasks', 'refresh_task_progress']);
+        assert.equal(h.hooks.timers.size, 0);
+      } finally { h.stop(); }
+    }
   }
 });

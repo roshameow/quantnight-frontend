@@ -184,6 +184,9 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
             name: name()?,
             remote: a.optional_bool("remote")?,
             inspect_items: a.flag("inspect_items")?,
+            watch_observation: a.text("watch_observation")?.map(|raw|
+                serde_json::from_str(&raw).map_err(|e| format!("invalid watcher observation: {e}")))
+                .transpose()?,
         }),
         "pause" => Request::Pause(PauseRequest {
             name: name()?,

@@ -38,6 +38,69 @@ pub struct CollectionSummary {
     pub latest_heartbeat_at: Option<Bson>,
 }
 
+/// Read-only progress rules, in precedence order. One semantic definition drives
+/// both in-memory counts and Mongo aggregation. This is not terminal policy.
+/// Only the known legacy SUPER encoding has a metadata override; local timeout,
+/// unknown evidence and successful rows never become cancellations by inference.
+const ITEM_PROGRESS_RULES: [(&str, &[&str], Option<&str>); 4] = [
+    ("success", &["success"], None),
+    ("cancelled", &["permanent_error"], Some("CANCELLED")),
+    ("error", &["fail", "error", "permanent_error", "timeout_error"], None),
+    ("cancelled", &["cancelled"], None),
+];
+const ITEM_PROGRESS_BUCKETS: [&str; 3] = ["success", "error", "cancelled"];
+
+/// Status-only callers (including task terminal reconciliation) retain their
+/// original input and policy. Raw status maps are not rewritten by this view.
+pub fn item_progress_counts(statuses: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    item_progress_counts_with_terminal(statuses.iter().map(|(s, n)| (s.as_str(), None, *n)))
+}
+
+/// Optional *observed* terminal metadata supports read-only historical display.
+/// Weight allows original aggregated groups and single rows to use the same rule.
+pub fn item_progress_counts_with_terminal<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>, u64)>,
+) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = ITEM_PROGRESS_BUCKETS.iter()
+        .map(|key| ((*key).to_string(), 0)).collect();
+    for (status, terminal, count) in rows {
+        if let Some((bucket, _, _)) = ITEM_PROGRESS_RULES.iter().find(|(_, states, required)| {
+            states.contains(&status) && required.map_or(true, |value| terminal == Some(value))
+        }) {
+            *counts.get_mut(*bucket).unwrap() += count;
+        }
+    }
+    counts
+}
+
+/// Same ordered rules rendered as Mongo expressions, not a second classification.
+fn item_progress_bucket_expression() -> Document {
+    let branches: Vec<Document> = ITEM_PROGRESS_RULES.iter().map(|(bucket, states, terminal)| {
+        let status = doc! {"$in": ["$status", states.to_vec()]};
+        let condition = match terminal {
+            Some(value) => doc! {"$and": [status, {"$eq": ["$terminalStatus", *value]}]},
+            None => status,
+        };
+        doc! {"case": condition, "then": *bucket}
+    }).collect();
+    doc! {"$switch": {"branches": branches, "default": Bson::Null}}
+}
+
+/// GUI ordinary/SUPER projection, preserving its existing priority > 0 subset.
+/// Priority campaigns have a different ledger scope and retain their own pipeline.
+pub fn item_progress_pipeline() -> Vec<Document> {
+    let mut group = doc! {"_id": Bson::Null, "total": {"$sum": 1},
+        "priority_total": {"$sum": {"$cond": [{"$gt": ["$priority", 0]}, 1, 0]}}};
+    let bucket_expression = item_progress_bucket_expression();
+    for bucket in ITEM_PROGRESS_BUCKETS {
+        let condition = doc! {"$eq": [bucket_expression.clone(), bucket]};
+        group.insert(bucket, doc! {"$sum": {"$cond": [condition.clone(), 1, 0]}});
+        group.insert(format!("priority_{bucket}"), doc! {"$sum": {"$cond": [
+            {"$and": [condition, {"$gt": ["$priority", 0]}]}, 1, 0]}});
+    }
+    vec![doc! {"$group": group}]
+}
+
 /// EXACT taskctl RECEIPT_PROJECTION. Do not add payload/result/code fields here.
 pub fn receipt_projection() -> Document {
     [
@@ -591,6 +654,47 @@ impl TaskStore for MongoTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verified_writer_rows_and_historical_metadata_are_read_only_counts() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/item-receipt-counts.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let row: Document = bson::to_document(&case["row"]).unwrap();
+            let before = row.clone();
+            let status = row.get_str("status").unwrap();
+            let terminal = row.get_str("terminalStatus").ok();
+            let counts = item_progress_counts_with_terminal([(status, terminal, 1)]);
+            for bucket in ITEM_PROGRESS_BUCKETS {
+                assert_eq!(Some(counts[bucket]), case["counts"][bucket].as_u64(), "{}: {bucket}", case["name"]);
+            }
+            let summary = decode_summary(vec![doc! {"_id":status,"count":1}], None).unwrap();
+            assert_eq!(summary.statuses[status], 1); // no raw status migration
+            if case["name"] == "legacy-super-cancel" {
+                assert_eq!(item_progress_counts(&summary.statuses)["error"], 1);
+                assert_eq!(counts["cancelled"], 1); // only the metadata-aware view differs
+            }
+            assert_eq!(row, before);
+        }
+    }
+
+    #[test]
+    fn item_status_count_contract_uses_original_summary_decoder() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/item-status-counts.json")).unwrap();
+        let groups = cases.as_array().unwrap().iter().map(|case| {
+            doc! {"_id":case["status"].as_str().unwrap(),"count":1}
+        }).collect();
+        let summary = decode_summary(groups, None).unwrap();
+        let counts = item_progress_counts(&summary.statuses);
+        assert_eq!(summary.total, cases.as_array().unwrap().len() as u64);
+        assert_eq!(counts["success"], 1);
+        assert_eq!(counts["error"], 4);
+        assert_eq!(counts["cancelled"], 1);
+        assert_eq!(summary.statuses["timeout_error"], 1);
+        assert_eq!(summary.statuses["fail"], 1); // not rewritten to a terminal state
+        assert_eq!(item_progress_counts(&BTreeMap::new())["cancelled"], 0);
+    }
+
     #[test]
     fn metadata_queries_are_projected_and_only_nonempty_probe_has_a_limit() {
         assert_eq!(

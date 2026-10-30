@@ -802,3 +802,59 @@ async fn resume_flags_require_typed_no_post_and_do_not_clear_accepted_or_unknown
     assert_eq!(bytes(&f.store.rows_at(Host::Local, name)[3..]), protected);
     assert_eq!(f.count("regular"), 0);
 }
+
+#[path = "support/watch_status_fixture.rs"]
+mod watch_status_fixture;
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_status_then_watch_preserves_business_timestamps_and_binding() {
+    // Main timestamp_scope_correction#4: attach is a real metadata operation;
+    // only subsequent observation is a no-write transaction. Keep completion
+    // protected across both phases; do not change maintenance_ops semantics.
+    for row_status in ["success", "timeout_error"] {
+        let f=Fixture::new().await;
+        let name="rewatch_completed";
+        f.create_generate(name,"regular",false).await;
+        ok(&f.run(&["start","--name",name,"--no-notify"]).await);
+        let mut rows=f.store.rows_at(Host::Local,name);
+        for row in &mut rows { row.insert("status",row_status); }
+        f.store.put_rows(Host::Local,name,rows);
+        // Completion is produced by real core, never seeded as a result DTO.
+        ok(&f.run(&["status","--name",name]).await);
+        let completed=f.store.task(name);
+        assert_eq!(completed.get_str("status"),Ok(if row_status=="success" {"completed"}else{"completed_with_errors"}));
+        for receiver in ["main-original","main-rebound"] {
+            let previous=f.store.task(name);
+            let write_count=f.store.data.lock().unwrap().writes.len();
+            ok(&f.run(&["watch","--name",name,"--notify-session-id",receiver,"--replace-watcher"]).await);
+            let watched=f.store.task(name);
+            for field in ["_id","status","completedAt"] {
+                assert_eq!(watched.get(field),completed.get(field),"watch changed completion field {field}");
+            }
+            assert_ne!(watched.get("updatedAt"),previous.get("updatedAt"));
+            let mut business_before=previous.clone();let mut business_after=watched.clone();
+            for field in ["agentNotification","updatedAt","events"] {
+                business_before.remove(field);business_after.remove(field);
+            }
+            assert_eq!(business_after,business_before,"only original notification metadata may change");
+            let old_events=previous.get_array("events").unwrap();let events=watched.get_array("events").unwrap();
+            assert_eq!(&events[..old_events.len()],old_events.as_slice());
+            assert_eq!(events.len(),old_events.len()+1);
+            assert_eq!(events.last().unwrap().as_document().unwrap().get_str("command"),Ok("watch-attach"));
+            assert_eq!(watched.get_document("agentNotification").unwrap()
+                .get_document("target").unwrap().get_str("sessionId"),Ok(receiver));
+            {
+                let data=f.store.data.lock().unwrap();assert_eq!(data.writes.len(),write_count+1);
+                let set=data.writes.last().unwrap().2.get_document("$set").unwrap();
+                assert_eq!(set.len(),2);assert!(set.contains_key("agentNotification")&&set.contains_key("updatedAt"));
+            }
+            let binding=json!({"taskId":completed.get_object_id("_id").unwrap().to_hex(),
+                "launchId":completed.get_str("launchAttemptId").unwrap(),"remote":false}).to_string();
+            for args in [vec!["status","--name",name,"--watch-observation",binding.as_str()],vec!["status","--name",name]] {
+                ok(&f.run(&args).await);
+                assert_eq!(f.store.task(name),watched,"observation must preserve the post-attach snapshot");
+                assert_eq!(f.store.data.lock().unwrap().writes.len(),write_count+1);
+            }
+        }
+    }
+}

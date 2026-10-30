@@ -4,8 +4,8 @@ import { createPinia, setActivePinia } from 'pinia'
 import { watch } from 'vue'
 import { useTaskStore } from '../src/stores/taskStore.js'
 import {
-  createTaskFetcher, createTaskProgressLifecycle, createAutoPauseScheduler,
-  isTaskComplete, syncTaskToRemote, mutateTaskSource,
+  createTaskFetcher, createTaskProgressLifecycle,
+  syncTaskToRemote, mutateTaskSource,
 } from '../src/utils/taskProgress.js'
 
 const task = (overrides = {}) => ({ _id: 'id-a', name: 'alpha', isRemote: false, status: 'running', ...overrides })
@@ -127,7 +127,7 @@ test('same-name new task does not inherit completed progress from the old identi
   store.replaceTasks([task({ _id: { $oid: 'new-id' } })])
   assert.equal(store.taskProgressMap.alpha.success, 0)
   assert.equal(store.taskProgressMap.alpha.stale, true)
-  assert.equal(isTaskComplete(store.tasks[0], store.taskProgressMap.alpha), false)
+  assert.equal(store.tasks[0].status, 'running') // counts are not lifecycle authority
 })
 
 test('atomic replacement never publishes tasks with the wrong progress source', () => {
@@ -339,132 +339,45 @@ test('third listener registration failure removes already installed success/erro
   assert.deepEqual(h.intervals, [])
 })
 
-function autoPauseHarness() {
+// R01 retires the count-completion scheduler and its implementation-only tests.
+// Before/why is preserved in the task implementation/before snapshot. Actual
+// SFC timer absence and manual pause/queued-pause are tested in taskManagerPause.
+test('full success remains display data; progress/error/recovery never changes task state', () => {
   const store = freshStore()
-  const timers = new Map(), cleared = [], paused = [], errors = []
-  let nextId = 0
-  let pauseResult = Promise.resolve()
-  const scheduler = createAutoPauseScheduler({
-    getTasks: () => store.tasks, getProgress: () => store.taskProgressMap,
-    pause: (item) => { paused.push(item); return pauseResult },
-    onError: (error) => errors.push(error),
-    setTimeoutFn: (callback, delay) => { const id = ++nextId; timers.set(id, { callback, delay }); return id },
-    clearTimeoutFn: (id) => { cleared.push(id); timers.delete(id) },
-  })
-  const complete = () => store.updateProgress(progress({ success: 10, updated_at: 100 }))
-  return { store, scheduler, timers, cleared, paused, errors, complete,
-    setPauseResult: (result) => { pauseResult = result } }
-}
-
-test('real store watcher schedules, cancels and recovers without scheduling on rejected events', () => {
-  const h = autoPauseHarness()
-  const stopWatch = watch(() => [h.store.tasks, h.store.taskProgressMap], () => h.scheduler.reconcile(), {
-    deep: true, flush: 'sync',
-  })
-  h.complete()
-  assert.equal(h.timers.size, 1)
-  h.store.updateProgressError(failure({ updated_at: 99 }))
-  assert.equal(h.timers.size, 1)
-  h.store.updateProgressError(failure())
-  assert.equal(h.timers.size, 0)
-  h.store.updateProgress(progress({ updated_at: 199, success: 10 }))
-  assert.equal(h.timers.size, 0)
-  h.store.updateProgress(progress({ updated_at: 201, success: 10 }))
-  assert.equal(h.timers.size, 1)
-  h.store.removeTask('alpha')
-  assert.equal(h.timers.size, 0)
-  stopWatch()
-  h.scheduler.stop()
+  store.updateProgress(progress({ success: 10, updated_at: 100 }))
+  assert.equal(store.taskProgressMap.alpha.success, 10)
+  assert.equal(store.tasks[0].status, 'running')
+  assert.equal(store.updateProgressError(failure({ updated_at: 99 })), false)
+  assert.equal(store.taskProgressMap.alpha.stale, false)
+  assert.equal(store.updateProgressError(failure()), true)
+  assert.equal(store.taskProgressMap.alpha.success, 10)
+  assert.equal(store.taskProgressMap.alpha.stale, true)
+  assert.equal(store.updateProgress(progress({ updated_at: 199, success: 10 })), false)
+  assert.equal(store.updateProgress(progress({ updated_at: 201, success: 10 })), true)
+  assert.equal(store.taskProgressMap.alpha.stale, false)
+  assert.equal(store.tasks[0].status, 'running')
+  assert.deepEqual(store.taskStopOperationMap, {})
+  store.removeTask('alpha')
+  assert.equal(store.taskProgressMap.alpha, undefined)
 })
 
-test('completion timer deduplicates repeated events and pauses only once at expiry', async () => {
-  const h = autoPauseHarness()
-  h.complete(); h.scheduler.reconcile()
-  h.complete(); h.scheduler.reconcile(); h.scheduler.reconcile()
-  assert.equal(h.timers.size, 1)
-  const timer = [...h.timers.values()][0]
-  assert.equal(timer.delay, 300000)
-  await timer.callback()
-  assert.equal(h.paused.length, 1)
-  await timer.callback()
-  assert.equal(h.paused.length, 1)
-})
-
-test('failure preserves complete counts but cancels auto-pause', async () => {
-  const h = autoPauseHarness()
-  h.complete(); h.scheduler.reconcile()
-  const queued = [...h.timers.values()][0].callback
-  h.store.updateProgressError(failure())
-  h.scheduler.reconcile()
-  assert.equal(h.store.taskProgressMap.alpha.success, 10)
-  assert.equal(h.timers.size, 0)
-  await queued()
-  assert.equal(h.paused.length, 0)
-  assert.equal(isTaskComplete(h.store.tasks[0], h.store.taskProgressMap.alpha), false)
-})
-
-test('expiry rechecks status, identity, source, deletion, completion and stale without relying on watch', async () => {
-  const mutate = [
-    (store) => store.replaceTasks([task({ status: 'waiting' })]),
-    (store) => store.replaceTasks([task({ _id: 'new-id' })]),
-    (store) => store.setTaskSource('alpha', true),
-    (store) => store.removeTask('alpha'),
-    (store) => store.updateProgress(progress({ success: 9, updated_at: 101 })),
-    (store) => store.updateProgressError(failure()),
-  ]
-  for (const change of mutate) {
-    const h = autoPauseHarness()
-    h.complete(); h.scheduler.reconcile()
-    const queued = [...h.timers.values()][0].callback
-    change(h.store)
-    await queued()
-    assert.equal(h.paused.length, 0)
-  }
-})
-
-test('source/status changes cancel timers and queued old callbacks cannot affect new timer', async () => {
-  const h = autoPauseHarness()
-  h.complete(); h.scheduler.reconcile()
-  const oldCallback = [...h.timers.values()][0].callback
-  h.store.setTaskSource('alpha', true)
-  h.scheduler.reconcile()
-  assert.equal(h.timers.size, 0)
-  h.store.updateProgress(progress({ is_remote: true, success: 10, updated_at: 101 }))
-  h.scheduler.reconcile()
-  assert.equal(h.timers.size, 1)
-  await oldCallback()
-  assert.equal(h.paused.length, 0)
-  await [...h.timers.values()][0].callback()
-  assert.equal(h.paused.length, 1)
-  assert.equal(h.paused[0].isRemote, true)
-})
-
-test('in-flight auto-pause cannot duplicate when progress fails and recovers', async () => {
-  const h = autoPauseHarness(), paused = deferred()
-  h.setPauseResult(paused.promise)
-  h.complete(); h.scheduler.reconcile()
-  const running = [...h.timers.values()][0].callback()
-  assert.equal(h.paused.length, 1)
-  h.store.updateProgressError(failure())
-  h.scheduler.reconcile()
-  h.store.updateProgress(progress({ success: 10, updated_at: 201 }))
-  h.scheduler.reconcile()
-  assert.equal(h.timers.size, 0)
-  paused.resolve()
-  await running
-  assert.equal(h.paused.length, 1)
-})
-
-test('unmount cleans auto-pause timers and even already queued callbacks are inert', async () => {
-  const h = autoPauseHarness()
-  h.complete(); h.scheduler.reconcile()
-  const queued = [...h.timers.values()][0].callback
-  h.scheduler.stop()
-  assert.equal(h.timers.size, 0)
-  await queued()
-  h.scheduler.reconcile()
-  assert.equal(h.timers.size, 0)
-  assert.equal(h.paused.length, 0)
+test('full counts do not override registry status, identity or execution source', () => {
+  const store = freshStore()
+  store.updateProgress(progress({ success: 10, updated_at: 100 }))
+  store.replaceTasks([task({ status: 'completed' })])
+  assert.equal(store.tasks[0].status, 'completed')
+  assert.equal(store.taskProgressMap.alpha.success, 10)
+  store.replaceTasks([task({ status: 'running' })])
+  assert.equal(store.tasks[0].status, 'running')
+  store.setTaskSource('alpha', true)
+  assert.equal(store.taskProgressMap.alpha.success, 0)
+  assert.equal(store.taskProgressMap.alpha.stale, true)
+  store.updateProgress(progress({ is_remote: true, success: 10, updated_at: 101 }))
+  assert.equal(store.taskProgressMap.alpha.success, 10)
+  store.replaceTasks([task({ _id: 'new-id', isRemote: true })])
+  assert.equal(store.taskProgressMap.alpha.success, 0)
+  assert.equal(store.tasks[0].status, 'running')
+  assert.deepEqual(store.taskStopOperationMap, {})
 })
 
 test('sync awaits sync -> source update -> exactly one refresh', async () => {
@@ -596,19 +509,15 @@ test('invalid discovery failures and empty remote scopes do not change the store
   assert.deepEqual(store.taskProgressMap, {})
 })
 
-test('discovery failure cancels remote auto-pause without resetting complete counts', () => {
-  const h = autoPauseHarness()
-  h.store.setTaskSource('alpha', true)
-  h.store.updateProgress(progress({ is_remote: true, success: 10, updated_at: 100 }))
-  const stopWatch = watch(() => [h.store.tasks, h.store.taskProgressMap], () => h.scheduler.reconcile(), {
-    deep: true, flush: 'sync',
-  })
-  h.scheduler.reconcile()
-  assert.equal(h.timers.size, 1)
-  h.store.markProgressStale(discoveryFailure({ scope: 'remote' }))
-  assert.equal(h.timers.size, 0)
-  assert.equal(h.store.taskProgressMap.alpha.success, 10)
-  stopWatch(); h.scheduler.stop()
+test('discovery failure preserves full remote counts without changing task state', () => {
+  const store = freshStore()
+  store.setTaskSource('alpha', true)
+  store.updateProgress(progress({ is_remote: true, success: 10, updated_at: 100 }))
+  store.markProgressStale(discoveryFailure({ scope: 'remote' }))
+  assert.equal(store.taskProgressMap.alpha.success, 10)
+  assert.equal(store.taskProgressMap.alpha.stale, true)
+  assert.equal(store.tasks[0].status, 'running')
+  assert.deepEqual(store.taskStopOperationMap, {})
 })
 
 test('fetch invalidate discards all in-flight successes/errors and permits a fresh request', async () => {
@@ -756,14 +665,14 @@ test('source changes and same-name replacements cannot reuse campaign metadata',
 });
 
 
-test('complete intermediate priority round does not trigger generic auto-pause', () => {
+test('complete intermediate priority round remains display data, not a task state transition', () => {
   const priority = task({ taskType: 'priority', mission_config: { rounds: { enabled: true } } })
-  const completeRound = progress({ stale: false, success: 60, total: 60,
-    priority_campaign: { status: 'waiting', current_round: 1, max_rounds: 3 } })
-  assert.equal(isTaskComplete(priority, completeRound), false)
-  assert.equal(isTaskComplete(task(), progress({ stale: false, success: 10, total: 10 })), true)
-  assert.equal(isTaskComplete(task({ taskType: 'priority', mission_config: { rounds: { enabled: false } } }),
-    progress({ stale: false, success: 10, total: 10 })), true)
+  const store = freshStore([priority])
+  assert.equal(store.updateProgress(campaignProgress({ success: 60, total: 60 })), true)
+  assert.equal(store.taskProgressMap.alpha.success, 60)
+  assert.equal(store.taskProgressMap.alpha.total, 60)
+  assert.equal(store.tasks[0].status, 'running')
+  assert.deepEqual(store.taskStopOperationMap, {})
 })
 
 test('root pool counts over 180 remain cached only within the same pool identity', () => {

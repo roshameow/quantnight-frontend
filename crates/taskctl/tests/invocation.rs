@@ -597,3 +597,22 @@ fn global_selection_is_explicit_prefix_only_and_does_not_steal_business_values()
     ]))
     .is_err());
 }
+
+#[test]
+fn status_bound_observation_is_optional_and_preserves_existing_identity_only() {
+    match request(&["status","--name","task"]) {
+        Request::Status(r)=>assert!(r.watch_observation.is_none()), _=>panic!(),
+    }
+    let context=r#"{"taskId":"0123456789abcdef01234567","launchId":"original-launch","remote":true}"#;
+    match request(&["status","--name","task","--watch-observation",context]) {
+        Request::Status(r)=> {
+            let binding=r.watch_observation.unwrap();
+            assert_eq!(binding.task_id,"0123456789abcdef01234567");
+            assert_eq!(binding.launch_id,"original-launch");assert!(binding.remote);
+        },_=>panic!(),
+    }
+    for bad in ["not-json",r#"{"taskId":"x","launchId":"x","remote":"false"}"#,
+        r#"{"taskId":"x","launchId":"x","remote":false,"newToken":"forbidden"}"#] {
+        assert!(to_request(&invocation(&["status","--name","task","--watch-observation",bad])).is_err());
+    }
+}

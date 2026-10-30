@@ -119,6 +119,9 @@ fn project(row: &Document, projection: Option<&Document>) -> Document {
 }
 #[derive(Default)]
 pub struct Data {
+    pub read_queries: Vec<(Host, Document)>,
+    pub after_summary: Option<(Host, Document)>,
+    pub before_update: Option<(Host, Document)>,
     pub tasks: HashMap<Host, Vec<Document>>,
     pub collections: HashMap<(Host, String), Vec<Document>>,
     pub calls: Vec<String>,
@@ -266,6 +269,7 @@ impl TaskStore for Memory {
     ) -> Result<Option<Document>, String> {
         let mut data = self.data.lock().unwrap();
         Self::access(&mut data, format!("find:{h:?}"))?;
+        data.read_queries.push((h, q.clone()));
         let mut rows = data.tasks.get(&h).cloned().unwrap_or_default();
         rows.sort_by_key(|d| d.get_object_id("_id").unwrap().to_hex());
         if newest {
@@ -305,6 +309,9 @@ impl TaskStore for Memory {
         let mut data = self.data.lock().unwrap();
         Self::access(&mut data, format!("update-task:{h:?}"))?;
         data.writes.push((h, q.clone(), u.clone()));
+        if let Some((host,row))=data.before_update.take() {
+            data.tasks.insert(host,vec![row]);
+        }
         let lose_ack = data.fail_after_update;
         data.fail_after_update = false;
         let Some(row) = data
@@ -350,6 +357,10 @@ impl TaskStore for Memory {
             *s.statuses
                 .entry(row.get_str("status").unwrap_or("missing").into())
                 .or_default() += 1;
+        }
+        s.latest_heartbeat_at=rows.iter().filter_map(|r|r.get("heartbeatAt").cloned()).last();
+        if let Some((host,row))=data.after_summary.take() {
+            data.tasks.insert(host,vec![row]);
         }
         Ok(s)
     }
