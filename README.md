@@ -54,7 +54,8 @@ npm run tauri:dev
 
 - [用户指南](docs/user-guide.zh.md)：首次配置、任务管理与数据分析。
 - [开发架构](docs/architecture.zh.md)：数据流、本地/远程执行与脚本接口。
-- [命令行工具](crates/taskctl/README.md)：构建、配置与使用。
+- [CLI 使用手册](docs/cli-usage.md)：全部16个命令、调用方式、参数与常用流程。
+- [CLI 构建与开发绑定](crates/taskctl/README.md)：独立程序、配置选择和开发模式登记。
 - [版本记录](CHANGELOG.md) · [问题反馈](https://github.com/roshameow/quantnight-frontend/issues)（请附版本、系统、复现步骤及脱敏日志）。
 
 ## 许可

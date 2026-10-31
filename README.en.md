@@ -54,7 +54,8 @@ To try only the interface, use `npm run demo`; desktop development registration 
 
 - [User guide](docs/user-guide.en.md): initial setup, tasks and data analysis.
 - [Developer architecture](docs/architecture.en.md): data flow, local/remote execution and script interfaces.
-- [Command-line tool](crates/taskctl/README.md): building, configuration and usage.
+- [CLI usage guide (中文)](docs/cli-usage.md): all 16 commands, invocation, arguments and common workflows.
+- [CLI build and development binding](crates/taskctl/README.md): standalone binary, configuration selectors and dev enrollment.
 - [Changelog](CHANGELOG.md) · [Report an issue](https://github.com/roshameow/quantnight-frontend/issues) with your version, OS, reproduction steps and redacted logs.
 
 ## License

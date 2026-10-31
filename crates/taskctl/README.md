@@ -1,5 +1,9 @@
 # Native taskctl — shared core, not automatically installed
 
+For the complete command list, arguments and copyable workflows, see the
+[CLI usage guide (中文)](../../docs/cli-usage.md). This file covers building,
+configuration selection and development binding; the usage guide is the command reference.
+
 All 16 original commands call `task-core::task_control::TaskControl`, also used
 by the desktop. The CLI does not implement task/DB/receipt policy, link Tauri,
 start a daemon, or fall back to the retired Python controller.
