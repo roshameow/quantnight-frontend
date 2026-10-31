@@ -23,12 +23,12 @@
         </div>
       </div>
     </template>
-    <div v-if="generationFailureResult" class="generation-result" role="status" style="font-size: 12px; margin-bottom: 4px">
-      <n-tag type="error" size="small">生成失败（{{ generationFailureResult.status }}）</n-tag>
-      <div v-if="generationFailureResult.error" style="white-space: pre-wrap; overflow-wrap: anywhere"><n-text type="error">{{ generationFailureResult.error }}</n-text></div>
-    </div>
-    <details v-if="diagnosticDetails || dispatchDetails" class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
+    <details v-if="generationFailureResult || diagnosticDetails || dispatchDetails" class="operation-diagnostics" style="font-size: 12px; margin-bottom: 4px">
       <summary style="cursor: pointer">运行 / 停止详情</summary>
+      <div v-if="generationFailureResult" class="generation-result" role="status" style="margin-top: 4px; margin-bottom: 4px">
+        <n-tag type="error" size="small">生成失败（{{ generationFailureResult.status }}）</n-tag>
+        <div v-if="generationFailureResult.error" style="white-space: pre-wrap; overflow-wrap: anywhere"><n-text type="error">{{ generationFailureResult.error }}</n-text></div>
+      </div>
       <div v-if="diagnosticDetails" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ diagnosticDetails }}</div>
       <div v-if="dispatchDetails" style="overflow-wrap: anywhere"><n-text depth="3">{{ dispatchDetails }}</n-text></div>
     </details>

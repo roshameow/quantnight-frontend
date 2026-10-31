@@ -139,11 +139,18 @@ impl TaskControl {
                 format!("generation operation interrupted; ownership/result unconfirmed: {error}")),
         }
     }
+    pub async fn reconcile_generation_for_list(&self, observed: &Document)
+        -> Result<crate::create_generate::GenerationRefresh, String> {
+        self.binding.refresh_if_changed().await?;
+        let runtime = OriginalOperationsRuntime { binding: &self.binding, observer: None };
+        crate::create_generate::reconcile_generation_for_list(self.root(), self.store.as_ref(), &runtime, observed).await
+    }
     pub async fn list(&self, request: &crate::inspection::ListRequest) -> TaskOutcome {
         if let Err(error) = self.binding.refresh_if_changed().await {
             let mut value = rejected("list", "", error); value.value["task"] = serde_json::Value::Null; return value;
         }
-        crate::inspection::list(self.store.as_ref(), request).await
+        let runtime = OriginalOperationsRuntime { binding: &self.binding, observer: None };
+        crate::inspection::list_with_generation(self.root(), self.store.as_ref(), &runtime, request).await
     }
     pub async fn status(&self, request: &crate::inspection::StatusRequest) -> TaskOutcome {
         if let Err(error) = self.binding.refresh_if_changed().await { return rejected("status", &request.name, error); }

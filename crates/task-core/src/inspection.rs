@@ -322,6 +322,42 @@ pub async fn list(store: &dyn TaskStore, request: &ListRequest) -> TaskOutcome {
     result
 }
 
+/// CLI adapter uses the same generation owner as GUI refresh. Remote-control
+/// listings remain read-only; a row failure does not erase unrelated tasks.
+pub async fn list_with_generation(root: &Path, store: &dyn TaskStore,
+    runtime: &dyn crate::create_generate::GenerationRuntime, request: &ListRequest) -> TaskOutcome {
+    if request.remote { return list(store, request).await; }
+    let result = async {
+        let rows = store.list_tasks(Host::Local, request.include_deactive).await?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            if !crate::create_generate::generation_refresh_candidate(&row) {
+                tasks.push(wire_document(&row)); continue;
+            }
+            let (task, diagnostic) = match crate::create_generate::reconcile_generation_for_list(root, store, runtime, &row).await {
+                Ok(result) => (result.task, result.diagnostic),
+                Err(error) => {
+                    log::warn!("Generation list refresh {:?}: {}", row.get("_id"), error);
+                    (Some(row), Some(error))
+                }
+            };
+            if let Some(task) = task {
+                // Preserve the original projected CLI shape; no events/config
+                // or other full reread fields leak into the list response.
+                let projection = crate::task_store::list_tasks_options().projection.unwrap();
+                let projected: Document = task.into_iter().filter(|(key, _)| key == "_id" || projection.contains_key(key)).collect();
+                let mut value = wire_document(&projected);
+                if let Some(error) = diagnostic { value["generationRefreshError"] = json!(error); }
+                tasks.push(value);
+            }
+        }
+        Ok::<Value, Error>(json!({"tasks":tasks}))
+    }.await;
+    let mut result = finish("list", "", result);
+    result.value["task"] = Value::Null;
+    result
+}
+
 // Failure belongs to this generation operation even when its task was restored.
 // Do not let an old failure phase override a later running/paused/completed task.
 fn restored_generation_failure(task: &Document) -> bool {

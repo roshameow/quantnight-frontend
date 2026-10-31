@@ -1,17 +1,26 @@
 <template>
   <div style="padding: 0px">
     <TaskManagerToolbar
+      :refreshing="tasksRefreshing"
+      @refresh="fetchTasks"
       @add-task="showAddModal = true"
       @add-super-task="showAddSuperModal = true"
       @add-priority-task="showAddPriorityModal = true"
     />
 
-    <n-empty v-if="taskIsEmpty" description="暂无任务" />
+    <div v-if="taskListError" role="alert" style="margin-bottom: 12px">
+      <n-text type="error">刷新任务失败，保留上次列表：{{ taskListError }}</n-text>
+    </div>
+    <div v-for="task in generationRefreshWarnings" :key="getObjectId(task._id)"
+      role="status" style="margin-bottom: 12px">
+      <n-text type="warning">{{ task.name }}：生成状态核验未完成，保留原状态：{{ task.generationRefreshError }}</n-text>
+    </div>
+    <n-empty v-if="taskIsEmpty && showTaskEmpty" description="暂无任务" />
 
     <n-collapse default-expanded-names="others">
       <!-- Priority 任务 -->
       <n-collapse-item title="Priority 任务" name="priority">
-        <n-empty v-if="priorityTasks.length === 0" description="暂无 Priority 任务" />
+        <n-empty v-if="priorityTasks.length === 0 && showTaskEmpty" description="暂无 Priority 任务" />
         <n-grid
           x-gap="20"
           y-gap="20"
@@ -45,7 +54,7 @@
 
       <!-- 普通 / Super 任务 -->
       <n-collapse-item title="普通 / Super 任务" name="others">
-        <n-empty v-if="otherTasks.length === 0" description="暂无任务" />
+        <n-empty v-if="otherTasks.length === 0 && showTaskEmpty" description="暂无任务" />
         <n-grid
           x-gap="20"
           y-gap="20"
@@ -266,14 +275,27 @@ const priorityTasks = computed(() => (tasks.value || []).filter((t) => t.taskTyp
 const otherTasks = computed(() => (tasks.value || []).filter((t) => t.taskType !== "priority"));
 
 // --- Data Fetching and Store Management ---
+// One latest-request owner for every refresh source; not a task operation lock.
+const tasksRefreshing = ref(false);
+const tasksLoaded = ref(false);
+const taskListError = ref('');
+const showTaskEmpty = computed(() => tasksLoaded.value && !tasksRefreshing.value && !taskListError.value);
+const generationRefreshWarnings = computed(() => tasks.value.filter(task =>
+  typeof task.generationRefreshError === 'string' && task.generationRefreshError.length > 0));
 const fetchTasks = createTaskFetcher({
   load: () => invoke("get_all_tasks"),
-  replace: (activeTasks) => taskStore.replaceTasks(activeTasks),
+  replace: (activeTasks) => {
+    taskStore.replaceTasks(activeTasks);
+    tasksLoaded.value = true;
+    taskListError.value = '';
+  },
+  onLoadingChange: (loading) => { tasksRefreshing.value = loading; },
   refresh: () => invoke("refresh_task_progress"),
   isActive: () => !disposed,
   onError: (error) => {
     console.error("加载任务失败", error);
-    message.error("加载任务失败");
+    taskListError.value = error instanceof Error ? error.message : String(error);
+    message.error("刷新任务失败：" + taskListError.value);
   },
   onRefreshError: (error) => console.error("刷新任务进度失败", error),
 });

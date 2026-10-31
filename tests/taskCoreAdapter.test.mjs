@@ -76,9 +76,27 @@ test('mutations require exact local ID, keep legacy DTO and preserve existing op
   assert.match(facade, /find_task\(Host::Local, doc! \{"_id": id\}/);
 });
 
-test('view/cache and runtime inspection retain read-only semantics, not state-reconciling core status', () => {
-  assert.match(body('get_all_tasks'), /fetch_remote_tasks/);
-  assert.doesNotMatch(body('get_all_tasks'), /core.status|\bTaskControl\b|update_one/);
+test('list delegates only local writing generation through original control; remote/cache/runtime stay observational', () => {
+  const list = body('get_all_tasks');
+  assert.match(list, /control: State<'_, TaskControlState>/);
+  assert.match(list, /fetch_remote_tasks/);
+  assert.match(list, /append_local_listed_task[\s\S]*control.get\(config, clients\)[\s\S]*core.reconcile_generation_for_list\(&observed\)/);
+  assert.match(list, /merge_remote_listed_tasks/);
+  const adapter = commands.slice(commands.indexOf('async fn append_local_listed_task'), commands.indexOf('/// 远程任务列表缓存'));
+  assert.match(adapter, /task.status == "generating"/);
+  assert.match(adapter, /generation.get_str\("phase"\)[\s\S]*Some\("writing"\)/);
+  assert.match(adapter, /configured_mission_database != GUI_TASK_MISSION_DATABASE/);
+  assert.match(adapter, /reconcile\(document\).await/);
+  assert.match(adapter, /generation_refresh_error = Some\(error\)/);
+  assert.doesNotMatch(list + adapter, /core\.status|\bTaskControl::|update_one|insert_one|MongoClients::new|TaskControl::connect|run_bash_script|check_task_status|\.(?:generate|start|pause|sync)\(/);
+  const remote = commands.slice(commands.indexOf('async fn fetch_remote_tasks'), commands.indexOf('pub async fn get_all_tasks'));
+  assert.doesNotMatch(remote, /reconcile_generation|append_local_listed_task|control.get/);
+  assert.match(remote, /remote_uri == local_uri/);
+  assert.match(remote, /REMOTE_TASK_CACHE_TTL/);
+  assert.match(remote, /timeout\(REMOTE_TASK_TIMEOUT/);
+  assert.match(commands, /REMOTE_TASK_CACHE_TTL: Duration = Duration::from_secs\(10\)/);
+  assert.match(commands, /REMOTE_TASK_TIMEOUT: Duration = Duration::from_secs\(2\)/);
+  assert.match(commands, /skip_deserializing, skip_serializing_if = "Option::is_none", rename = "generationRefreshError"/);
   assert.match(body('check_task_status'), /execute_task_script/);
   assert.match(body('check_task_status'), /read_runtime_evidence/);
   assert.doesNotMatch(body('check_task_status'), /core.status|update_one|\.pause\(/);
@@ -119,4 +137,13 @@ test('read-only dependency guard distinguishes source metadata enum from control
   for (const mutation of ['TaskControl::new()', 'core.status(request)', 'collection.update_one(query, update)']) {
     assert.match(mutation, forbidden);
   }
+});
+
+
+test('generation-list route guard rejects generic status, process, mutation and new-pool bypasses', () => {
+  const forbidden = /core\.status|\bTaskControl::|update_one|insert_one|MongoClients::new|run_bash_script|check_task_status|\.(?:generate|start|pause|sync)\(/;
+  assert.doesNotMatch('core.reconcile_generation_for_list(&observed).await', forbidden);
+  for (const bad of ['core.status(request)', 'collection.update_one(query, update)', 'core.generate(request)',
+    'core.start(request)', 'core.pause(request)', 'core.sync(request)', 'MongoClients::new(config)',
+    'TaskControl::connect(config)', 'check_task_status(task)', 'run_bash_script(script)']) assert.match(bad, forbidden);
 });

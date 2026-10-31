@@ -788,3 +788,44 @@ test('v6 explicit absence stop target never interprets malformed launch as missi
     assert.ok(store.beginTaskStop({ ...original, expectedLaunchAbsent: true }));
   }
 });
+
+test('loading belongs to latest eligible list request, not obsolete reads or progress work', async () => {
+  const reads = [], loading = [], failures = [], progress = deferred()
+  const fetch = createTaskFetcher({
+    load: () => { const read = deferred(); reads.push(read); return read.promise },
+    replace: () => {}, refresh: () => progress.promise, isActive: () => true,
+    onError: error => failures.push(error), onRefreshError: error => failures.push(error),
+    onLoadingChange: value => loading.push(value),
+  })
+  const old = fetch(), current = fetch()
+  assert.deepEqual(loading, [true, true])
+  reads[0].resolve([]); assert.equal(await old, false)
+  assert.deepEqual(loading, [true, true])
+  reads[1].resolve([]); assert.equal(await current, true)
+  assert.deepEqual(loading, [true, true, false])
+  progress.reject(new Error('progress failed')); await tick()
+  assert.equal(failures[0].message, 'progress failed')
+  assert.deepEqual(loading, [true, true, false])
+})
+
+test('invalidation releases loading without cancellation; old completion cannot clear a new owner', async () => {
+  const reads = [], loading = [], errors = []
+  let active = true
+  const fetch = createTaskFetcher({
+    load: () => { const read = deferred(); reads.push(read); return read.promise },
+    replace: () => {}, refresh: () => {}, isActive: () => active,
+    onError: error => errors.push(error), onRefreshError: () => {},
+    onLoadingChange: value => loading.push(value),
+  })
+  const old = fetch(); fetch.invalidate()
+  assert.deepEqual(loading, [true, false])
+  const latest = fetch()
+  reads[0].reject(new Error('obsolete')); assert.equal(await old, false)
+  assert.deepEqual(loading, [true, false, true]); assert.deepEqual(errors, [])
+  reads[1].reject(new Error('latest')); assert.equal(await latest, false)
+  assert.deepEqual(loading, [true, false, true, false]); assert.equal(errors.length, 1)
+  const disposed = fetch(); active = false
+  fetch.invalidate(); reads[2].resolve([]); assert.equal(await disposed, false)
+  assert.deepEqual(loading, [true, false, true, false, true])
+  assert.equal(await fetch(), false)
+})

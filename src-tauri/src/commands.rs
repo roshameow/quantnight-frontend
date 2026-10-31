@@ -16,7 +16,7 @@ use crate::config::{run_bash_script_observed_with_env, AppConfig,
     BashScriptEvent, BashScriptObserver};
 use crate::mongo_manager::MongoClients;
 use quantnight_task_core::{task_control::TaskControl, cleanup_sync::TaskOutcome,
-    create_generate::{CreateRequest, GenerateRequest, gui_created_task, gui_generated},
+    create_generate::{CreateRequest, GenerateRequest, GenerationRefresh, gui_created_task, gui_generated},
     start::StartRequest, pause::{PauseOptions, StopBudget}};
 pub use quantnight_task_core::create_generate::GuiCreatedTask as CreatedTask;
 pub use quantnight_task_core::pause::ConfirmedTaskStop;
@@ -216,6 +216,10 @@ pub struct Task {
     pub generation: Option<JsonValue>,
     #[serde(default, rename = "lastError")]
     pub last_error: Option<String>,
+    // Response-only refresh diagnostic. Stored data cannot impersonate this result
+    // and a probe error never overwrites the persisted generation outcome.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none", rename = "generationRefreshError")]
+    pub generation_refresh_error: Option<String>,
     #[serde(rename = "isRemote")] // 👈 加上这个
     pub is_remote: Option<bool>, // 可选字段
     #[serde(default, rename = "targetRemote")]
@@ -245,6 +249,61 @@ fn listed_task(document: Document, source: TaskControlSource) -> Result<Task, bs
     let mut task = bson::from_document::<Task>(document)?;
     task.control_source = Some(source);
     Ok(task)
+}
+
+// Keep the original GUI list namespace; do not silently reroute its reads.
+const GUI_TASK_MISSION_DATABASE: &str = "simulation_mission";
+
+// The facade callback is lazy: ordinary/remote-only rows never initialize a
+// control runtime or probe processes. This same orchestration is tested offline.
+async fn append_local_listed_task<F, Fut>(
+    tasks: &mut Vec<Task>, seen_names: &mut std::collections::HashSet<String>,
+    document: Document, configured_mission_database: &str, reconcile: F,
+) where
+    F: FnOnce(Document) -> Fut,
+    Fut: std::future::Future<Output = Result<GenerationRefresh, String>>,
+{
+    let Ok(mut task) = listed_task(document.clone(), TaskControlSource::Local) else { return; };
+    // Reserve the local snapshot's name even if the exact record disappears
+    // during reconciliation. Never resurrect a cached remote duplicate.
+    seen_names.insert(task.name.clone());
+    if task.status == "generating" && document.get_document("generation").ok()
+        .and_then(|generation| generation.get_str("phase").ok()) == Some("writing") {
+        // TaskControlState uses this same verified config for its store. An
+        // original hardcoded GUI namespace must match before any mutation.
+        let result = if configured_mission_database != GUI_TASK_MISSION_DATABASE {
+            Err("GUI task-list namespace differs from the verified core binding; generation reconciliation skipped".into())
+        } else {
+            reconcile(document).await
+        };
+        match result {
+            Ok(GenerationRefresh { task: None, .. }) => return,
+            Ok(GenerationRefresh { task: Some(current), diagnostic, .. }) => {
+                match listed_task(current, TaskControlSource::Local) {
+                    Ok(mut current) if current.id == task.id && current.name == task.name => {
+                        current.generation_refresh_error = diagnostic;
+                        task = current;
+                    }
+                    Ok(_) => task.generation_refresh_error = Some(
+                        "generation refresh returned another task identity; original snapshot retained".into()),
+                    Err(error) => task.generation_refresh_error = Some(
+                        format!("generation refresh document could not be displayed; original snapshot retained: {error}")),
+                }
+            }
+            Err(error) => task.generation_refresh_error = Some(error),
+        }
+        if let Some(error) = &task.generation_refresh_error {
+            log::warn!("Generation refresh unconfirmed for {} ({}): {}", task.name, task.id, error);
+        }
+    }
+    tasks.push(task);
+}
+
+fn merge_remote_listed_tasks(tasks: &mut Vec<Task>, seen_names: &mut std::collections::HashSet<String>, remote_tasks: Vec<Task>) {
+    for task in remote_tasks {
+        // Local names, including deactive records, shadow cached remote rows.
+        if seen_names.insert(task.name.clone()) { tasks.push(task); }
+    }
 }
 
 /// 远程任务列表缓存：短 TTL，避免每次本地操作都穿透 SSH 隧道查远程库。
@@ -324,39 +383,26 @@ async fn fetch_remote_tasks(clients: &Arc<MongoClients>, local_uri: &str, remote
 pub async fn get_all_tasks(
     clients: State<'_, Arc<MongoClients>>,
     config: State<'_, AppConfig>,
+    control: State<'_, TaskControlState>,
 ) -> Result<Vec<Task>, String> {
-    let client = &clients.local;
-
-    let db = client.database("simulation_mission");
+    let clients = clients.inner();
+    let config = config.inner();
+    let control = control.inner();
+    let db = clients.local.database(GUI_TASK_MISSION_DATABASE);
     let collection = db.collection::<Document>("tasks");
-
-    // 查找所有本地任务
     let mut cursor = collection.find(None, None).await.map_err(|e| e.to_string())?;
-
-    // 用一个 Vec 来存储所有任务
     let mut tasks = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
-
-    // 遍历 cursor，获取每一个 Document
     while let Some(document) = cursor.try_next().await.map_err(|e| e.to_string())? {
-        // 假设你有一个 `Task` 类型，使用 `from_document` 方法将 Document 转换为 Task
-        if let Ok(task) = listed_task(document, TaskControlSource::Local) {
-            seen_names.insert(task.name.clone());
-            tasks.push(task);
-        }
+        append_local_listed_task(&mut tasks, &mut seen_names, document,
+            &config.mongodb.databases.mission, |observed| async move {
+                let core = control.get(config, clients).await?;
+                core.reconcile_generation_for_list(&observed).await
+            }).await;
     }
-
-    // 聚合远程任务列表（remote 端 agent 直接生成的任务只注册在 remote mission.tasks）。
-    // 带 TTL 缓存 + 超时，远程不可用/慢时不再拖慢每次操作。
-    let remote_tasks = fetch_remote_tasks(&clients, &config.mongodb.local_uri, &config.mongodb.remote_uri).await;
-    for task in remote_tasks {
-        // 同名任务以本地为准（本地创建后 sync 过去的），不重复显示
-        if !seen_names.contains(&task.name) {
-            seen_names.insert(task.name.clone());
-            tasks.push(task);
-        }
-    }
-
+    // Preserve the original remote-only display, TTL, timeout and pool owner.
+    let remote_tasks = fetch_remote_tasks(clients, &config.mongodb.local_uri, &config.mongodb.remote_uri).await;
+    merge_remote_listed_tasks(&mut tasks, &mut seen_names, remote_tasks);
     Ok(tasks)
 }
 
@@ -2822,6 +2868,204 @@ mod generated_start_ipc_tests {
             let text = error.as_str().unwrap();
             assert!(text.contains("missing required key taskName"), "required scalar still required: {text}");
             assert!(!text.contains("state not managed"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod task_list_refresh_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn row(name: &str, status: &str) -> Document {
+        doc! {"_id": ObjectId::parse_str("0123456789abcdef01234567").unwrap(),
+            "name": name, "status": status, "isRemote": false, "taskType": "regular"}
+    }
+    fn writing(name: &str) -> Document {
+        let mut task = row(name, "generating");
+        task.insert("generation", doc! {"id":"original-attempt","phase":"writing"});
+        task
+    }
+    fn result(task: Option<Document>, changed: bool, diagnostic: Option<&str>) -> GenerationRefresh {
+        GenerationRefresh { task, changed, diagnostic: diagnostic.map(str::to_owned) }
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_nonwriting_rows_never_initialize_or_probe_control() {
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        for status in ["pending", "waiting", "ready", "running", "paused", "completed",
+            "completed_with_errors", "generation_failed", "generation_unknown", "deactive"] {
+            let mut document = writing(status); document.insert("status", status);
+            append_local_listed_task(&mut tasks, &mut seen, document, "other-namespace", |_| async {
+                panic!("ordinary list must not acquire control/probe processes")
+            }).await;
+        }
+        for phase in [None, Some("complete"), Some("generation_unknown")] {
+            let mut document = row("nonwriting", "generating");
+            if let Some(phase) = phase { document.insert("generation", doc! {"phase":phase}); }
+            append_local_listed_task(&mut tasks, &mut seen, document, GUI_TASK_MISSION_DATABASE, |_| async {
+                panic!("nonwriting generation must not be reconciled by list")
+            }).await;
+        }
+        assert_eq!(tasks.len(), 13);
+        assert!(tasks.iter().all(|task| task.generation_refresh_error.is_none()));
+        append_local_listed_task(&mut tasks, &mut seen, doc! {"name":"malformed","status":"generating"},
+            GUI_TASK_MISSION_DATABASE, |_| async { panic!("invalid GUI row must retain original skip behavior") }).await;
+        assert_eq!(tasks.len(), 13); assert!(!seen.contains("malformed"));
+    }
+
+    #[tokio::test]
+    async fn local_remote_execution_passes_full_original_snapshot_and_preserves_rich_dto() {
+        let mut original = writing("rich-local");
+        original.extend(doc! {"isRemote":true,"targetRemote":true,"auth_profile":"user1",
+            "mission_config":{"workers":3},"startConfig":{"workers":4},"config":{"workers":5},
+            "launchAttemptId":"launch","stopConfirmedAt":bson::DateTime::from_millis(1234),
+            "stopConfirmedRemote":true,"stopConfirmedTaskId":"0123456789abcdef01234567",
+            "stopConfirmationBasis":"session_absent","lastError":"original error",
+            "privateCoreFact":{"keep":"full snapshot"}});
+        let expected = original.clone();
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        append_local_listed_task(&mut tasks, &mut seen, original, GUI_TASK_MISSION_DATABASE, |mut observed| async move {
+            assert_eq!(observed, expected); // Not a lossy Task -> BSON roundtrip.
+            observed.insert("status", "pending");
+            observed.insert("generation", doc! {"id":"original-attempt","phase":"generation_failed","finishedAt":"original-time"});
+            Ok(result(Some(observed), true, None))
+        }).await;
+        let wire = serde_json::to_value(&tasks[0]).unwrap();
+        assert_eq!(wire["controlSource"], "local"); assert_eq!(wire["isRemote"], true);
+        assert_eq!(wire["status"], "pending"); assert_eq!(wire["generation"]["id"], "original-attempt");
+        assert_eq!(wire["generation"]["phase"], "generation_failed");
+        assert_eq!(wire["lastError"], "original error");
+        assert_eq!(wire["mission_config"]["workers"], 3);
+        assert_eq!(wire["startConfig"]["workers"], 4); assert_eq!(wire["config"]["workers"], 5);
+        assert_eq!(wire["launchAttemptId"], "launch");
+        assert_eq!(tasks[0].stop_confirmed_at.unwrap().timestamp_millis(), 1234);
+        assert_eq!(wire["stopConfirmedTaskId"], "0123456789abcdef01234567");
+        assert_eq!(wire["stopConfirmationBasis"], "session_absent");
+        assert!(wire.get("generationRefreshError").is_none());
+    }
+
+    #[tokio::test]
+    async fn error_and_namespace_mismatch_keep_original_outcome_and_do_not_hide_other_rows() {
+        let mut original = writing("failed-probe"); original.insert("lastError", "persisted writer outcome");
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        append_local_listed_task(&mut tasks, &mut seen, original.clone(), GUI_TASK_MISSION_DATABASE,
+            |_| async { Err("fixture process observation failed".into()) }).await;
+        append_local_listed_task(&mut tasks, &mut seen, row("unrelated", "ready"), GUI_TASK_MISSION_DATABASE,
+            |_| async { panic!("unrelated task was probed") }).await;
+        append_local_listed_task(&mut tasks, &mut seen, original, "different-mission",
+            |_| async { panic!("namespace mismatch reached mutating facade") }).await;
+        assert_eq!(tasks.len(), 3);
+        for task in [&tasks[0], &tasks[2]] {
+            assert_eq!(task.status, "generating"); assert_eq!(task.last_error.as_deref(), Some("persisted writer outcome"));
+            assert_eq!(task.generation.as_ref().unwrap()["phase"], "writing");
+        }
+        assert_eq!(tasks[0].generation_refresh_error.as_deref(), Some("fixture process observation failed"));
+        assert!(tasks[1].generation_refresh_error.is_none());
+        assert!(tasks[2].generation_refresh_error.as_ref().unwrap().contains("namespace"));
+    }
+
+    #[tokio::test]
+    async fn unchanged_and_diagnostic_are_response_facts_never_reinterpreted_as_generation_failure() {
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        for diagnostic in [None, Some("owner evidence unavailable")] {
+            append_local_listed_task(&mut tasks, &mut seen, writing("current"), GUI_TASK_MISSION_DATABASE,
+                |observed| async move { Ok(result(Some(observed), false, diagnostic)) }).await;
+        }
+        assert!(tasks.iter().all(|task| task.status == "generating" && task.last_error.is_none()));
+        assert!(tasks[0].generation_refresh_error.is_none());
+        assert_eq!(tasks[1].generation_refresh_error.as_deref(), Some("owner evidence unavailable"));
+        let wire = serde_json::to_value(&tasks[1]).unwrap();
+        assert_eq!(wire["generationRefreshError"], "owner evidence unavailable");
+    }
+
+    #[tokio::test]
+    async fn original_merge_keeps_local_deactive_and_disappeared_name_precedence_remote_only_is_untouched() {
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        append_local_listed_task(&mut tasks, &mut seen, row("hidden", "deactive"), GUI_TASK_MISSION_DATABASE,
+            |_| async { panic!("deactive probe") }).await;
+        append_local_listed_task(&mut tasks, &mut seen, writing("gone"), GUI_TASK_MISSION_DATABASE,
+            |_| async { Ok(result(None, false, None)) }).await;
+        let remote: Vec<Task> = ["hidden", "gone", "remote-only", "remote-only"].into_iter().map(|name| {
+            let mut document = writing(name); document.insert("isRemote", true);
+            listed_task(document, TaskControlSource::RemoteOnly).unwrap()
+        }).collect();
+        merge_remote_listed_tasks(&mut tasks, &mut seen, remote);
+        assert_eq!(tasks.iter().map(|task| task.name.as_str()).collect::<Vec<_>>(), vec!["hidden", "remote-only"]);
+        assert_eq!(tasks[0].status, "deactive");
+        assert_eq!(tasks[1].status, "generating");
+        assert_eq!(tasks[1].control_source, Some(TaskControlSource::RemoteOnly));
+        assert!(tasks[1].generation_refresh_error.is_none());
+        assert_eq!(tasks[1].is_remote, Some(true));
+    }
+
+    #[tokio::test]
+    async fn other_identity_or_invalid_return_keeps_original_with_diagnostic_not_adoption() {
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        let mut other_id = writing("original"); other_id.insert("_id", ObjectId::new());
+        for replacement in [writing("another-name"), other_id, doc! {"status":"pending"}] {
+            append_local_listed_task(&mut tasks, &mut seen, writing("original"), GUI_TASK_MISSION_DATABASE,
+                |_| async move { Ok(result(Some(replacement), true, None)) }).await;
+        }
+        assert!(tasks.iter().all(|task| task.name == "original" && task.status == "generating"
+            && task.generation_refresh_error.is_some()));
+    }
+
+    // Adapter -> actual TaskControl -> actual generation owner. The original
+    // inode is held, so no store/process observation is permitted. Only binding
+    // export's lowest process IO is a fixture; no Mongo client is constructed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_facade_busy_lock_stays_observational_through_gui_adapter() {
+        use quantnight_task_core::{backend_binding::validate_backend_binding,
+            config::bash_test_support::FakeBash, mission_lock::MissionLocks,
+            task_store::{CollectionSummary, Host, TaskStore}};
+        use std::os::unix::fs::PermissionsExt;
+        struct NoIo;
+        #[async_trait::async_trait]
+        impl TaskStore for NoIo {
+            async fn find_task(&self, _: Host, _: Document, _: bool) -> Result<Option<Document>, String> { panic!("busy refresh read store") }
+            async fn update_task(&self, _: Host, _: Document, _: Document) -> Result<u64, String> { panic!("busy refresh wrote store") }
+            async fn collection_names(&self, _: Host) -> Result<Vec<String>, String> { panic!("collection scan") }
+            async fn summary(&self, _: Host, _: &str) -> Result<CollectionSummary, String> { panic!("item summary") }
+            async fn has_rows(&self, _: Host, _: &str) -> Result<bool, String> { panic!("inventory probe") }
+            async fn rows(&self, _: Host, _: &str, _: Option<Document>) -> Result<Vec<Document>, String> { panic!("item scan") }
+            async fn insert_rows(&self, _: Host, _: &str, _: Vec<Document>) -> Result<(), String> { panic!("item insert") }
+            async fn rename_collection(&self, _: Host, _: &str, _: &str) -> Result<(), String> { panic!("archive") }
+            async fn ping(&self, _: Host) -> Result<(), String> { panic!("DB ping") }
+        }
+        let mut fake = FakeBash::new("echo unexpected-process >> forbidden; exit 17");
+        fake.config.mongodb.databases.mission = GUI_TASK_MISSION_DATABASE.into();
+        let root = Path::new(&fake.config.env.working_dir);
+        fs::write(root.join("credentials.yaml"), "synthetic binding only\n").unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        let python = root.join(".venv/bin/python");
+        fs::write(&python, "#!/bin/sh\nprintf '%s\\n' '{\"schemaVersion\":1,\"command\":\"validate-task-control-binding\",\"ok\":true}'\n").unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = validate_backend_binding(&fake.config).await.unwrap();
+        let core = TaskControl::with_store(binding, Arc::new(NoIo));
+        let _lock = MissionLocks::acquire(root, &["busy-local"], false).unwrap();
+        let mut tasks = Vec::new(); let mut seen = HashSet::new();
+        for _ in 0..2 {
+            append_local_listed_task(&mut tasks, &mut seen, writing("busy-local"), GUI_TASK_MISSION_DATABASE,
+                |observed| { let core = &core; async move { core.reconcile_generation_for_list(&observed).await } }).await;
+        }
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.status == "generating"
+            && task.generation_refresh_error.is_none())); // Normal busy is a silent no-op, not an error.
+        assert!(!root.join("forbidden").exists());
+    }
+
+    #[test]
+    fn stored_diagnostic_is_ignored_for_both_sources_and_cannot_replace_last_error() {
+        for source in [TaskControlSource::Local, TaskControlSource::RemoteOnly] {
+            for forged in [bson::Bson::String("fake refresh failure".into()), bson::Bson::Boolean(true)] {
+                let mut document = writing("forged");
+                document.insert("generationRefreshError", forged); document.insert("lastError", "original outcome");
+                let task = listed_task(document, source.clone()).unwrap();
+                assert!(task.generation_refresh_error.is_none()); assert_eq!(task.last_error.as_deref(), Some("original outcome"));
+                assert!(serde_json::to_value(task).unwrap().get("generationRefreshError").is_none());
+            }
         }
     }
 }

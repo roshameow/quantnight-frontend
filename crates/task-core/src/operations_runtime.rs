@@ -529,8 +529,58 @@ async fn generation_child(command: Command, budget: Duration, observer: Option<B
         })
 }
 
+fn generation_observation(stdout: &str, task: &Document)
+    -> Result<crate::create_generate::GenerationProcesses, String> {
+    use crate::create_generate::GenerationProcesses;
+    let prefix = "QUANTNIGHT_GENERATION_OBSERVED ";
+    if stdout.lines().any(|line| !line.is_empty() && !line.starts_with(prefix)
+        && !line.starts_with("QUANTNIGHT_TASK_STAGE ")) {
+        return Err("unexpected generation inspector output".into());
+    }
+    let mut packets = stdout.lines().filter_map(|line| line.strip_prefix(prefix));
+    let packet: Value = serde_json::from_str(packets.next().ok_or("generation observation missing")?)
+        .map_err(|_| "generation observation malformed")?;
+    let generation = task.get_document("generation").map_err(|_| "generation binding missing")?;
+    if packets.next().is_some() || packet["schemaVersion"] != 1
+        || packet["taskId"].as_str() != Some(task.get_object_id("_id").map_err(|_| "task id missing")?.to_hex().as_str())
+        || packet["taskName"].as_str() != task.get_str("name").ok()
+        || packet["generationId"].as_str() != generation.get_str("id").ok()
+        || packet["producerPid"] != serde_json::to_value(generation.get("producerPid")).map_err(|e| e.to_string())?
+        || packet["remote"] != false {
+        return Err("generation observation identity/host mismatch".into());
+    }
+    let reason = packet["reason"].as_str().filter(|s| !s.is_empty())
+        .ok_or("generation observation lacks concrete reason")?.to_string();
+    match packet["state"].as_str() {
+        Some("stopped") => Ok(GenerationProcesses::Stopped),
+        Some("live") => Ok(GenerationProcesses::Live(reason)),
+        Some("unverified") => Ok(GenerationProcesses::Unverified(reason)),
+        _ => Err("generation observation state unrecognized".into()),
+    }
+}
+
 #[async_trait]
 impl crate::create_generate::GenerationRuntime for OriginalOperationsRuntime<'_> {
+    async fn inspect_generation(&self, root: &Path, task: &Document)
+        -> Result<crate::create_generate::GenerationProcesses, String> {
+        self.verify_root(root).await?;
+        let name = task.get_str("name").map_err(|_| "generation task name missing")?;
+        validate_name(name)?;
+        let id = task.get_object_id("_id").map_err(|_| "generation task ObjectId missing")?;
+        let generation = task.get_document("generation").map_err(|_| "generation binding missing")?;
+        let binding = json!({"taskId":id.to_hex(), "generation":generation});
+        let mut command = self.process("/bin/bash");
+        command.arg("scripts/check_tmux_python.sh").arg(name).arg("false")
+            .arg("--inspect-generation").arg("--binding").arg(binding.to_string());
+        // Same diagnostic transport/budget. Only the inspector is an owned
+        // diagnostic child; the business generator is neither launched nor killed.
+        let (out, err) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
+        if !err.trim().is_empty() {
+            return Err(format!("generation process inspection stderr unconfirmed: {err}"));
+        }
+        generation_observation(&out, task)
+    }
+
     async fn creation_metadata(&self, root: &Path, desired: &Document)
         -> Result<crate::create_generate::CreationMetadata, crate::create_generate::GenerationFailure> {
         use crate::create_generate::{CreationMetadata, GenerationErrorKind as Kind};

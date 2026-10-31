@@ -1,9 +1,10 @@
 // Latest-only task snapshots; progress refresh never blocks operation feedback.
-export function createTaskFetcher({ load, replace, refresh, isActive, onError, onRefreshError }) {
+export function createTaskFetcher({ load, replace, refresh, isActive, onError, onRefreshError, onLoadingChange = () => {} }) {
   let latestRequest = 0
   const fetch = async () => {
     if (!isActive()) return false
     const request = ++latestRequest
+    onLoadingChange(true)
     try {
       const result = await load()
       if (!isActive() || request !== latestRequest) return false
@@ -14,9 +15,15 @@ export function createTaskFetcher({ load, replace, refresh, isActive, onError, o
     } catch (error) {
       if (isActive() && request === latestRequest) onError(error)
       return false
+    } finally {
+      if (isActive() && request === latestRequest) onLoadingChange(false)
     }
   }
-  fetch.invalidate = () => { latestRequest++ }
+  // Release logical loading ownership, not the underlying native operation.
+  fetch.invalidate = () => {
+    latestRequest++
+    if (isActive()) onLoadingChange(false)
+  }
   return fetch
 }
 

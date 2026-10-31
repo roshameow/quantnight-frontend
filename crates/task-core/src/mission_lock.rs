@@ -9,6 +9,13 @@ pub struct MissionLocks {
 
 impl MissionLocks {
     pub fn acquire(root: &Path, names: &[&str], shared: bool) -> Result<Self, String> {
+        Self::try_acquire(root, names, shared)?
+            .ok_or_else(|| "another lifecycle mutator owns this mission".into())
+    }
+
+    /// Same inode and nonblocking flock. Busy is not an IO failure and callers
+    /// must not interpret it as evidence that a generation owner has died.
+    pub fn try_acquire(root: &Path, names: &[&str], shared: bool) -> Result<Option<Self>, String> {
         if names.is_empty() || names.iter().any(|name| {
             name.is_empty() || name.len() > 134
                 || !name.as_bytes()[0].is_ascii_alphanumeric()
@@ -27,30 +34,30 @@ impl MissionLocks {
             let file = OpenOptions::new().create(true).append(true)
                 .open(directory.join(format!("{name}.lock")))
                 .map_err(|e| format!("mission lock open: {e}"))?;
-            lock(&file, shared)?;
+            if !lock(&file, shared)? { return Ok(None); }
             guard.files.push(file);
         }
-        Ok(guard)
+        Ok(Some(guard))
     }
 }
 
 #[cfg(unix)]
-fn lock(file: &File, shared: bool) -> Result<(), String> {
+fn lock(file: &File, shared: bool) -> Result<bool, String> {
     use std::os::fd::AsRawFd;
     let operation = (if shared { libc::LOCK_SH } else { libc::LOCK_EX }) | libc::LOCK_NB;
     // SAFETY: the File owns a live fd for this entire call. flock stores no pointer.
     if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Err("another lifecycle mutator owns this mission".into());
+            return Ok(false);
         }
         return Err(format!("mission lock failed: {error}"));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(unix))]
-fn lock(_: &File, _: bool) -> Result<(), String> {
+fn lock(_: &File, _: bool) -> Result<bool, String> {
     Err("the original lifecycle requires Unix flock; no alternate lock namespace is available".into())
 }
 

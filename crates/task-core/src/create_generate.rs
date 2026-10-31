@@ -112,6 +112,12 @@ pub struct GeneratedOutput {
 
 #[async_trait]
 pub trait GenerationRuntime: Send + Sync {
+    /// Read-only original local writer inspection, never a simulation/tmux probe.
+    async fn inspect_generation(&self, _root: &Path, _task: &Document)
+        -> Result<GenerationProcesses, String> {
+        Err("original generation process inspection unavailable".into())
+    }
+
     async fn creation_metadata(
         &self,
         root: &Path,
@@ -496,11 +502,20 @@ async fn finish(
     status: &str,
     fields: Document,
 ) -> Result<(), GenerationFailure> {
+    finish_at(store, original, generation, status, fields, &now(), None).await
+}
+async fn finish_at(
+    store: &dyn TaskStore, original: &Document, generation: &Document,
+    status: &str, fields: Document, at: &str, expected_snapshot: Option<&Document>,
+) -> Result<(), GenerationFailure> {
     let current = current_claim(store, original, generation).await?;
+    if expected_snapshot.is_some_and(|expected| expected != &current) {
+        return Err(GenerationFailure::ordinary("generation snapshot changed during refresh"));
+    }
     let token = generation
         .get_str("id")
         .map_err(GenerationFailure::ordinary)?;
-    let (mut query, update) = generation_finish_plan(original, token, status, fields, &now())
+    let (mut query, update) = generation_finish_plan(original, token, status, fields, at)
         .map_err(GenerationFailure::ordinary)?;
     query.extend(
         snapshot_filter(&current, "generation-finish").map_err(GenerationFailure::ordinary)?,
@@ -569,6 +584,199 @@ pub fn generation_failure_status(
         GenerationErrorKind::Interrupted if interrupted_total == Some(0) => "generation_failed",
         GenerationErrorKind::Interrupted => "generation_unknown",
     }
+}
+
+/// A response-only refresh result. It is never persisted as task metadata.
+#[derive(Debug)]
+pub struct GenerationRefresh {
+    pub task: Option<Document>,
+    pub changed: bool,
+    pub diagnostic: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub enum GenerationProcesses {
+    Stopped,
+    Live(String),
+    Unverified(String),
+}
+fn refresh(task: Option<Document>, diagnostic: Option<String>) -> GenerationRefresh {
+    if let Some(message) = &diagnostic {
+        log::warn!("Generation refresh {:?}: {}", task.as_ref().and_then(|t| t.get("_id")), message);
+    }
+    GenerationRefresh { task, changed: false, diagnostic }
+}
+pub fn generation_refresh_candidate(task: &Document) -> bool {
+    task.get_str("status").ok() == Some("generating")
+}
+
+/// Recognize the original maintenance_ops::watch_locked/update audit shape.
+/// This is historical notification metadata, not a status transition or a
+/// claim that the watcher is still alive. Reattachment may legitimately change
+/// the recipient/producer, so validate each recorded receipt, not today's route.
+fn refresh_watch_event(task: &Document, generation: &Document, event: &Document) -> Option<()> {
+    if event.get_str("status").ok()? != "ok" || event.get_str("id").ok()?.is_empty() { return None; }
+    let receipt = event.get_document("detail").ok()?;
+    let target = receipt.get_document("target").ok()?;
+    if target.len() != 1 || !["taskId", "sessionId"].iter()
+        .any(|key| target.get_str(key).is_ok_and(|value| !value.is_empty())) { return None; }
+    let key = receipt.get_str("itemKey").ok()?;
+    if key.is_empty() { return None; }
+    let remote = match task.get("isRemote") {
+        None | Some(Bson::Null) => false, Some(Bson::Boolean(v)) => *v, _ => return None,
+    };
+    // These are the original watcher's legacy launch facts, not a new launch
+    // requirement or a value accepted from the receipt being validated.
+    let launch = task.get_str("launchAttemptId").ok().filter(|v| !v.is_empty())
+        .or_else(|| task.get_str("startedAt").ok().filter(|v| !v.is_empty())).unwrap_or("legacy");
+    crate::start::notification_receipt_bound(receipt, task, remote,
+        &doc! {"target":target,"itemKey":key},
+        &doc! {"launchId":launch,"generationId":generation.get_str("id").ok()?,
+            "generationPhase":generation.get_str("phase").ok()?}).ok()
+}
+
+/// Only existing unambiguous adjacent generation/create facts, not an event
+/// sourcing engine. In particular a failed finish event records the outcome,
+/// not the restored control status, so it cannot establish a prior status.
+fn refresh_previous_status(task: &Document, generation: &Document) -> Option<&'static str> {
+    let events = task.get_array("events").ok()?;
+    let mut relevant: Vec<&Document> = Vec::new();
+    let mut previous_at = None;
+    for event in events {
+        let row = event.as_document()?;
+        let at = chrono::DateTime::parse_from_rfc3339(row.get_str("at").ok()?).ok()?;
+        if previous_at.is_some_and(|previous| at < previous) { return None; }
+        previous_at = Some(at);
+        // Only the original non-status-mutating watch receipt after THIS
+        // generation's begin is transparent. Unknown/state-changing events
+        // are retained below and therefore cannot manufacture a prior status.
+        if row.get_str("command").ok() == Some("watch-attach")
+            && relevant.last().is_some_and(|begin|
+                begin.get_str("command").ok() == Some("generation-begin")
+                && begin.get_document("detail").ok() == Some(generation)) {
+            refresh_watch_event(task, generation, row)?;
+            continue;
+        }
+        if row.get_str("command").ok() == Some("create")
+            && row.get_str("status").ok() == Some("idempotent")
+            && row.get_document("detail").ok()?.is_empty() { continue; }
+        relevant.push(row);
+    }
+    let begin = *relevant.last()?;
+    if begin.get_str("command").ok()? != "generation-begin"
+        || begin.get_str("status").ok()? != "generating"
+        || begin.get_document("detail").ok()? != generation { return None; }
+    let began = chrono::DateTime::parse_from_rfc3339(generation.get_str("startedAt").ok()?).ok()?;
+    let event_at = chrono::DateTime::parse_from_rfc3339(begin.get_str("at").ok()?).ok()?;
+    if began > event_at { return None; }
+    let token = generation.get_str("id").ok()?;
+    if relevant.iter().filter(|e| e.get_str("command").ok() == Some("generation-begin")
+        && e.get_document("detail").ok().and_then(|d| d.get_str("id").ok()) == Some(token)).count() != 1 { return None; }
+    let previous = *relevant.get(relevant.len().checked_sub(2)?)?;
+    let before = chrono::DateTime::parse_from_rfc3339(previous.get_str("at").ok()?).ok()?;
+    if before > began { return None; }
+    match (previous.get_str("command").ok()?, previous.get_str("status").ok()?) {
+        ("create", "pending") if relevant.len() == 2
+            && !previous.get_str("id").ok()?.is_empty()
+            && previous.get_document("detail").ok()?.is_empty() => Some("pending"),
+        ("generation-finish", status @ ("pending" | "ready")) => {
+            let old = *relevant.get(relevant.len().checked_sub(3)?)?;
+            let detail = old.get_document("detail").ok()?;
+            let old_token = detail.get_str("id").ok()?;
+            if old.get_str("command").ok()? != "generation-begin"
+                || old.get_str("status").ok()? != "generating"
+                || old_token == token || old_token.is_empty()
+                || previous.get_document("detail").ok()?.get_str("generationId").ok()? != old_token
+                || detail.get_str("phase").ok()? != if status == "pending" { "preparing" } else { "writing" }
+                || chrono::DateTime::parse_from_rfc3339(old.get_str("at").ok()?).ok()? > before { return None; }
+            Some(if status == "pending" { "pending" } else { "ready" })
+        }
+        _ => None,
+    }
+}
+
+/// Shared GUI/CLI list reconciliation. No-op branches perform zero writes.
+/// All observation and finalization is per exact local task under the ORIGINAL
+/// nonblocking mutation lock. A remote execution intent never routes the writer.
+pub async fn reconcile_generation_for_list(
+    root: &Path, store: &dyn TaskStore, runtime: &dyn GenerationRuntime, observed: &Document,
+) -> Result<GenerationRefresh, String> {
+    if !generation_refresh_candidate(observed) { return Ok(refresh(Some(observed.clone()), None)); }
+    let id = observed.get_object_id("_id").map_err(|_| "generation refresh requires exact local ObjectId")?;
+    let name = observed.get_str("name").map_err(|_| "generation refresh requires exact name")?;
+    lifecycle_policy::validate_name(name)?;
+    let expected_generation = observed.get_document("generation").map_err(|_| "generation record missing/malformed")?;
+    if expected_generation.get_str("phase").ok() != Some("writing") {
+        return Ok(refresh(Some(observed.clone()), Some("generation phase is not writing; original preparation/unknown owner retained".into())));
+    }
+    let token = expected_generation.get_str("id").map_err(|_| "generation id missing/malformed")?;
+    if token.is_empty() { return Err("generation id empty".into()); }
+    let Some(_lock) = MissionLocks::try_acquire(root, &[name], false)? else {
+        // An ordinary owner holding this lock is not a refresh error. Keep
+        // automatic refresh silent, without even reading or probing the task.
+        return Ok(refresh(Some(observed.clone()), None));
+    };
+    let query = doc! {"_id":id,"name":name};
+    let Some(task) = store.find_task(Host::Local, query.clone(), false).await? else {
+        return Ok(refresh(None, Some("exact local task disappeared; no same-name adoption".into())));
+    };
+    if task.get_object_id("_id").ok() != Some(id) || task.get_str("name").ok() != Some(name) {
+        return Err("store returned a foreign task identity".into());
+    }
+    if task.get_str("status").ok() != Some("generating")
+        || task.get_document("generation").ok() != Some(expected_generation) {
+        return Ok(refresh(Some(task), Some("generation changed since list snapshot; not reconciled".into())));
+    }
+    identity(&task, name, Some(id))?;
+    let generation = task.get_document("generation").unwrap().clone();
+    // Do not pass a malformed parent to an inspector that might interpret zero
+    // or a missing PID as absence. Birth metadata is not a migration prerequisite.
+    let pid = generation.get("producerPid").and_then(|v| match v {
+        Bson::Int32(v) => Some(i64::from(*v)), Bson::Int64(v) => Some(*v), _ => None,
+    }).filter(|v| *v > 1 && *v <= i64::from(u32::MAX));
+    if pid.is_none() { return Err("generation producerPid missing/malformed; owner absence unverified".into()); }
+    match runtime.inspect_generation(root, &task).await? {
+        GenerationProcesses::Stopped => (),
+        GenerationProcesses::Live(reason) | GenerationProcesses::Unverified(reason) =>
+            return Ok(refresh(Some(task), Some(reason))),
+    }
+    let (total, inventory_error) = match store.has_rows(Host::Local, name).await {
+        Ok(false) => (Some(0), None), Ok(true) => (Some(1), None), Err(e) => (None, Some(e)),
+    };
+    let previous = refresh_previous_status(&task, &generation);
+    let mut status = generation_failure_status(&GenerationErrorKind::Interrupted, total);
+    let mut error = "generation_interrupted: original owner absent and local mongo_datum writer absence verified".to_owned();
+    if let Some(e) = inventory_error { error.push_str(&format!("; local collection probe unconfirmed: {e}")); }
+    if total == Some(1) { error.push_str("; nonempty collection does not prove complete generation"); }
+    if previous.is_none() {
+        status = generation_failure_status(&GenerationErrorKind::DatabaseUncertain, None);
+        error.push_str("; previous_status_unverified: existing create/generation facts are incomplete or ambiguous");
+    }
+    let mut original = task.clone();
+    if let Some(previous) = previous { original.insert("status", previous); }
+    let at = now();
+    let fields = doc! {"lastError": tail(&error, 4000)};
+    // Use the same planner to derive the intended read-back, never a second
+    // status algorithm. finish_at retains current_claim and full snapshot CAS.
+    let (_, intended) = generation_finish_plan(&original, token, status, fields.clone(), &at)?;
+    let finished = finish_at(store, &original, &generation, status, fields, &at, Some(&task)).await;
+    let current = store.find_task(Host::Local, query, false).await?;
+    let applied = current.as_ref().is_some_and(|row| {
+        row.get_object_id("_id").ok() == Some(id) && row.get_str("name").ok() == Some(name)
+            && row.get_document("generation").ok().is_some_and(|g|
+                g.get_str("id").ok() == Some(token)
+                && g.get_str("finishedAt").ok() == Some(at.as_str())
+                && g.get_str("phase").ok() == Some(status))
+            && row.get("status") == intended.get_document("$set").ok().and_then(|d| d.get("status"))
+            && row.get("lastError") == intended.get_document("$set").ok().and_then(|d| d.get("lastError"))
+    });
+    if applied {
+        return Ok(GenerationRefresh { task: current, changed: true, diagnostic: None });
+    }
+    let reason = match finished {
+        Ok(()) => "generation finalization read-back changed/unconfirmed; retained current exact record".into(),
+        Err(e) => format!("generation reconciliation unconfirmed: {}", e.message),
+    };
+    Ok(refresh(current, Some(reason)))
 }
 
 pub async fn generate(

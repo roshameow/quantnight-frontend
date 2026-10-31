@@ -1,7 +1,23 @@
 <template>
-  <n-page-header title="回测任务管理" style="margin-bottom: 20px">
+  <n-page-header style="margin-bottom: 20px">
+    <template #title>
+      <span style="display: inline-flex; align-items: center; gap: 6px">
+        <span>回测任务管理</span>
+        <n-button quaternary circle size="small" :loading="refreshing" :disabled="refreshing"
+          :title="refreshing ? '刷新中…' : '刷新任务'" aria-label="刷新任务" :aria-busy="refreshing"
+          @click="$emit('refresh')">
+          <template #icon>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 0 1 15.36-6.36L21 8M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-15.36 6.36L3 16M8 16H3v5" />
+            </svg>
+          </template>
+        </n-button>
+      </span>
+    </template>
     <template #extra>
-      <div style="display: flex; gap: 12px">
+      <div style="display: flex; flex-wrap: wrap; gap: 12px">
         <n-button
           type="primary"
           size="large"
@@ -59,5 +75,6 @@
 </template>
 
 <script setup>
-defineEmits(['addTask', 'addSuperTask', 'addPriorityTask']);
+defineProps({ refreshing: { type: Boolean, default: false } });
+defineEmits(['addTask', 'addSuperTask', 'addPriorityTask', 'refresh']);
 </script>
