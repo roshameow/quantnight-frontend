@@ -862,7 +862,7 @@ pub(crate) async fn pause_locked(
                 && observed.get_bool("remote")==Ok(remote));
         let any_launch = task.get_str("launchAttemptId").ok().filter(|v| !v.is_empty());
         let unsettled_fence_launch = any_launch.filter(|launch| {
-            (task.get_str("status").ok() == Some("launch_unknown")
+            (task.get_str("status").ok() == Some("launching")
                 || task.contains_key("launchSettledAttemptId"))
                 && task.get_str("launchSettledAttemptId").ok() != Some(*launch)
         });
@@ -906,10 +906,10 @@ pub(crate) async fn pause_locked(
                 proof.insert("controlReconciliation", doc!{"basis":"confirmed_absent_no_live_launcher",
                     "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
                     "launcherAckRecovered":false});
-            } else if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
+            } else if task.get_str("status").ok()==Some("launching") && !task.contains_key("launchSettledAttemptId") {
                 fields.insert("launchSettledAttemptId",Bson::Null);
             }
-        } else if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
+        } else if task.get_str("status").ok()==Some("launching") && !task.contains_key("launchSettledAttemptId") {
             // No observed live consumer + full captured exit: V2/absence or a
             // label alone cannot settle a helper that may not have launched yet.
             fields.insert("launchSettledAttemptId",Bson::Null);

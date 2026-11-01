@@ -896,7 +896,7 @@ test('archive confirmation closes immediately while progress remains until the a
 
 
 test('one confirmation pauses running, unknown launch and missing-proof tasks before archive', async () => {
-  for (const status of ['running', 'launch_unknown', 'paused']) {
+  for (const status of ['running', 'launching', 'paused']) {
     const h = await harness(task({ status }));
     try {
       const paused = deferred(), archived = deferred(), calls = [];
@@ -1888,7 +1888,7 @@ test('v6 explicit no-join option still does not create a deferred user join inte
 
 test('v8 normal open is local-only and one submit reaches core without PID/proof preflight across control states and all task types', async () => {
   for (const taskType of ['regular', 'super', 'priority']) {
-    for (const status of ['ready', 'running', 'launch_unknown', 'completed', 'completed_with_errors', 'paused', 'generation_unknown', 'unknown']) {
+    for (const status of ['ready', 'running', 'launching', 'completed', 'completed_with_errors', 'paused', 'generation_unknown', 'unknown']) {
       const initial = task({ taskType, status });
       const h = await harness(initial);
       try {
@@ -2078,7 +2078,7 @@ async function r1ScopeResponses() {
 }
 const r1ScopeInitial = wire => ({ _id: { $oid: wire.taskId }, name: wire.task,
   taskType: wire.taskType, auth_profile: wire.authProfile, isRemote: wire.remote,
-  targetRemote: wire.remote, status: 'launch_unknown', launchAttemptId: wire.launchAttemptId,
+  targetRemote: wire.remote, status: 'launching', launchAttemptId: wire.launchAttemptId,
   launchSettledAttemptId: null });
 const r1ScopeReceipt = wire => receipt({taskId:wire.taskId,taskName:wire.task,isRemote:wire.remote,
   confirmationBasis:'runners_exited'});

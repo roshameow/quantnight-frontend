@@ -69,7 +69,7 @@ fn blocked_status(task: &Document) -> Result<bool, ResumeError> {
     }
     Ok(
         matches!(task.get("status"), Some(Bson::String(status) | Bson::Symbol(status))
-        if ["generating", "generation_unknown", "launch_unknown", "syncing", "deleting"].contains(&status.as_str())),
+        if ["generating", "generation_unknown", "launching", "syncing", "deleting"].contains(&status.as_str())),
     )
 }
 fn task_id_text(id: &Bson) -> Option<String> {

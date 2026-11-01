@@ -1474,11 +1474,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-False-launch_unknown-success",
+    "label": "regular-False-launching-success",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -1494,7 +1494,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -1523,11 +1523,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-False-launch_unknown-timeout_error",
+    "label": "regular-False-launching-timeout_error",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -1543,7 +1543,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -1572,11 +1572,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-False-launch_unknown-pending",
+    "label": "regular-False-launching-pending",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -1592,7 +1592,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -3328,11 +3328,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-True-launch_unknown-success",
+    "label": "regular-True-launching-success",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -3348,7 +3348,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,
@@ -3375,11 +3375,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-True-launch_unknown-timeout_error",
+    "label": "regular-True-launching-timeout_error",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -3395,7 +3395,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,
@@ -3422,11 +3422,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "regular-True-launch_unknown-pending",
+    "label": "regular-True-launching-pending",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "regular",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -3442,7 +3442,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,
@@ -6037,11 +6037,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-False-launch_unknown-success",
+    "label": "super-False-launching-success",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -6078,7 +6078,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -6117,11 +6117,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-False-launch_unknown-timeout_error",
+    "label": "super-False-launching-timeout_error",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -6158,7 +6158,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -6197,11 +6197,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-False-launch_unknown-pending",
+    "label": "super-False-launching-pending",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": false,
       "auth_profile": "fixture-profile",
@@ -6238,7 +6238,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": false,
         "local": {
           "exists": true,
@@ -8983,11 +8983,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-True-launch_unknown-success",
+    "label": "super-True-launching-success",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -9024,7 +9024,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,
@@ -9061,11 +9061,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-True-launch_unknown-timeout_error",
+    "label": "super-True-launching-timeout_error",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -9102,7 +9102,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,
@@ -9139,11 +9139,11 @@ pub const CASES: &str = r###"[
     }
   },
   {
-    "label": "super-True-launch_unknown-pending",
+    "label": "super-True-launching-pending",
     "task": {
       "_id": "0123456789abcdef01234567",
       "name": "inspection_fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "taskType": "super",
       "isRemote": true,
       "auth_profile": "fixture-profile",
@@ -9180,7 +9180,7 @@ pub const CASES: &str = r###"[
     "expected": {
       "value": {
         "ok": true,
-        "taskStatus": "launch_unknown",
+        "taskStatus": "launching",
         "remote": true,
         "local": {
           "exists": true,

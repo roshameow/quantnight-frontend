@@ -141,7 +141,7 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
     return diagnostic.status === '消费者存活' ? '控制记录已完成，但原消费者仍存活' : `${task.status} · ${diagnostic.status}`
   }
   if (task.status !== 'running') {
-    const historical = { unknown: '控制记录缺少执行阶段', generation_unknown: '生成结果核验缺少最终回执', launch_unknown: '启动结果核验缺少最终回执' }
+    const historical = { unknown: '控制记录缺少执行阶段', generation_unknown: '生成结果核验缺少最终回执' }
     return historical[String(task.status).toLowerCase()] ?? task.status
   }
   if (!observation) return task.status // business control state; not a liveness claim

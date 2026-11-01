@@ -675,7 +675,7 @@ async fn delete_inner(
 ) -> Result<(), String> {
     if matches!(
         original.get_str("status").ok(),
-        Some("generating" | "generation_unknown" | "launch_unknown" | "syncing" | "running")
+        Some("generating" | "generation_unknown" | "launching" | "syncing" | "running")
     ) {
         receipt["requiredAction"] = json!(if matches!(original.get_str("status").ok(),
             Some("generating" | "generation_unknown" | "syncing")) {

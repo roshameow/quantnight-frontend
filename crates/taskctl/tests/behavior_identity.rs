@@ -17,7 +17,7 @@ async fn acknowledged_state_not_assumed_when_control_claim_reply_is_lost() {
     f.store.data.lock().unwrap().fail_after_update = true;
     failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
     let uncertain = f.store.task(name);
-    assert_eq!(uncertain.get_str("status"), Ok("launch_unknown"));
+    assert_eq!(uncertain.get_str("status"), Ok("launching"));
     assert_eq!(uncertain.get("_id"), original.get("_id"));
     assert_eq!(
         f.count("regular"),
@@ -164,7 +164,7 @@ async fn frozen_core_known_no_dispatch_failure_settles_only_original_attempt_the
     f.faults(json!({"ownerFail":"validate-execution-binding"}));
     failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
     let failed_task = f.store.task(name);
-    assert_eq!(failed_task.get_str("status"), Ok("launch_unknown"));
+    assert_eq!(failed_task.get_str("status"), Ok("launching"));
     assert_eq!(
         failed_task.get("launchSettledAttemptId"),
         failed_task.get("launchAttemptId")

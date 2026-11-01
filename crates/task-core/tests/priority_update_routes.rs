@@ -97,7 +97,7 @@ async fn identity_host_observer_busy_and_validator_guards_precede_publication() 
         let mut f=Fixture::new("paused");
         match mode {"id"=>f.request.expected_task_id=Some(ObjectId::new().to_hex()),"host"=>f.request.remote=Some(true),
             "observer"=>{f.store.row.lock().unwrap().insert("acceptedObservation",doc!{"id":"open"});},
-            "busy"=>{f.store.row.lock().unwrap().insert("status","launch_unknown");},_=>{}}
+            "busy"=>{f.store.row.lock().unwrap().insert("status","launching");},_=>{}}
         let runtime=f.runtime(mode);
         let result=update_priority(&f.root,f.store.as_ref(),&runtime,&f.request).await;
         assert_eq!(result.exit_code,1,"{mode}"); assert_eq!(runtime.published.load(Ordering::SeqCst),0,"{mode}");

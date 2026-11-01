@@ -653,7 +653,7 @@ async fn begin_busy_observer_expected_id_and_flock_block_before_writer() {
         "running",
         "generating",
         "generation_unknown",
-        "launch_unknown",
+        "launching",
         "syncing",
         "deleting",
         "paused",

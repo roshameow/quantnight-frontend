@@ -646,7 +646,7 @@ const pauseTask = (task, options) => {
 
 // This only chooses preparation; the native archive rechecks fresh stop/ID/host proof.
 const needsArchivePause = (task) =>
-  ["running", "launch_unknown", "generating", "generation_unknown", "syncing"].includes(task.status) ||
+  ["running", "launching", "generating", "generation_unknown", "syncing"].includes(task.status) ||
   (Boolean(task.launchAttemptId) && task.launchSettledAttemptId !== task.launchAttemptId) ||
   taskStopDisplayStatus({ ...task, status: "paused" }, taskStopOperationMap.value[task.name]) !== "paused";
 

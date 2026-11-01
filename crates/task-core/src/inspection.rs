@@ -627,7 +627,7 @@ async fn status_inner(
             return Ok(outcome("status", &request.name, true,
                 json!({"watchState":"source_changed","reason":reason,"terminal":false,"watchControl":watch_control(&task)})));
         }
-        if ["launch_unknown", "syncing", "deleting"].contains(&old) {
+        if ["launching", "syncing", "deleting"].contains(&old) {
             return Ok(failed_observation(&task,
                 json!({"terminal":false,"watchControl":watch_control(&task)}), &observed_at,
                 "lifecycle mutation unresolved; watcher cannot reconcile it".into()));
@@ -808,7 +808,7 @@ async fn status_inner(
                 "deactive",
                 "generating",
                 "generation_unknown",
-                "launch_unknown",
+                "launching",
                 "syncing",
                 "deleting",
             ],

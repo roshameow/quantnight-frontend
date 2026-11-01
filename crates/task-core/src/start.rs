@@ -804,16 +804,16 @@ fn observed_launch(task:&Document)->Result<Value,String> {
 // Pending launch state survives absence-only pause. Original observed-consumer
 // stop can settle it; missing optional legacy metadata is not an admission gate.
 pub(crate) fn launch_attempt_unsettled(task:&Document)->bool {
-    (task.get_str("status").ok()==Some("launch_unknown") || task.contains_key("launchSettledAttemptId")) &&
+    (task.get_str("status").ok()==Some("launching") || task.contains_key("launchSettledAttemptId")) &&
         (task.get_str("launchAttemptId").map_or(true,|v|v.trim().is_empty()) || task.get("launchSettledAttemptId")!=task.get("launchAttemptId"))
 }
 
 // Same original operation, not a second reconciliation command or registry.
-// Only launch_unknown is repaired here; terminal/paused status is not inferred
+// Only launching is repaired here; terminal/paused status is not inferred
 // from liveness. Scoped legacy evidence never settles a launch or promotes
 // today's caller-echo context to historical independent proof.
 async fn already_running(store:&dyn TaskStore,task:&Document,remote:bool,observed:Value)->Result<TaskOutcome,String> {
-    let reconcile = task.get_str("status")==Ok("launch_unknown");
+    let reconcile = task.get_str("status")==Ok("launching");
     let strong = observed["identityVerified"]==true && observed["consumerPredatesLaunch"]!=true;
     let current = if reconcile {
         let mut fields=doc!{"status":"running"};
@@ -1067,7 +1067,7 @@ async fn start_locked(
     // before the one launch claim. No specialist owns a control-plane write.
     unchanged(store, &task).await?;
     if deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()==0 {return Err("start deadline exhausted before launch claim".into());}
-    let mut launch = doc! {"launchSettledAttemptId":Bson::Null,"status":"launch_unknown","launchAttemptId":nonce(),"launchAttemptAt":bson::DateTime::now(),"isRemote":remote,
+    let mut launch = doc! {"launchSettledAttemptId":Bson::Null,"status":"launching","launchAttemptId":nonce(),"launchAttemptAt":bson::DateTime::now(),"isRemote":remote,
     "stopConfirmedAt":Bson::Null,"stopConfirmedRemote":Bson::Null,"stopConfirmedTaskId":Bson::Null,"stopConfirmationBasis":Bson::Null,"tmuxContext":Bson::Null};
     if kind == "super" {
         let binding = doc! {"taskId":task_id(&task)?.to_hex(),"name":&request.name,"auth_profile":profile,"remote":remote,

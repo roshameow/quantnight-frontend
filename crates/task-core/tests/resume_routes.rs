@@ -533,7 +533,7 @@ async fn blocked_states_open_observer_bad_id_and_live_or_unknown_consumer_do_not
     for status in [
         "generating",
         "generation_unknown",
-        "launch_unknown",
+        "launching",
         "syncing",
         "deleting",
     ] {
@@ -3138,13 +3138,13 @@ const RESUME_ORACLE: &str = r###"[
     }
   },
   {
-    "label": "control-status:'launch_unknown'",
+    "label": "control-status:'launching'",
     "task": {
       "_id": {
         "$oid": "0123456789abcdef01234567"
       },
       "name": "fixture",
-      "status": "launch_unknown",
+      "status": "launching",
       "isRemote": false,
       "taskType": "regular",
       "auth_profile": "fixture-profile",
@@ -3174,7 +3174,7 @@ const RESUME_ORACLE: &str = r###"[
       "row_statuses": [
         "transient_error"
       ],
-      "control_status": "launch_unknown"
+      "control_status": "launching"
     }
   },
   {

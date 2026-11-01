@@ -571,7 +571,7 @@ async fn all_mutating_and_evidence_routes_have_parsed_refusals_without_identity_
     assert_eq!(f.store.task(name), original);
     assert_eq!(bytes(&f.store.rows_at(Host::Local, name)), rows);
     f.faults(json!({}));
-    f.store.alter(name, doc! {"status":"launch_unknown"});
+    f.store.alter(name, doc! {"status":"launching"});
     let unknown = f.store.task(name);
     failed(
         &f.run(&["resume", "--name", name, "--recover-processing"])
@@ -645,7 +645,7 @@ async fn saved_null_default_literal_and_explicit_config_survive_actual_cli_to_la
 #[tokio::test(flavor = "current_thread")]
 async fn absence_and_postclaim_unknown_failures_recover_only_through_original_pause() {
     let f = Fixture::new().await;
-    let name = "launch_unknown";
+    let name = "launching";
     f.create_generate(name, "regular", false).await;
     let original = f.store.task(name);
     f.faults(json!({"presence":true}));
@@ -655,7 +655,7 @@ async fn absence_and_postclaim_unknown_failures_recover_only_through_original_pa
     f.faults(json!({"launchLost":true}));
     failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
     let unknown = f.store.task(name);
-    assert_eq!(unknown.get_str("status"), Ok("launch_unknown"));
+    assert_eq!(unknown.get_str("status"), Ok("launching"));
     assert_eq!(f.count("regular"), 1);
     failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
     assert_eq!(f.count("regular"), 1);

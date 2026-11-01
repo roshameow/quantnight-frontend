@@ -492,7 +492,7 @@ async fn terminal_reconciliation_preserves_all_guarded_control_states() {
         "deactive",
         "generating",
         "generation_unknown",
-        "launch_unknown",
+        "launching",
         "syncing",
         "deleting",
     ] {

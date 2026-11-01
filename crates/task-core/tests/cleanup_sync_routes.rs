@@ -2190,7 +2190,7 @@ async fn partial_retry_retains_diagnostics_and_archive_identity_even_when_next_r
 
 #[tokio::test]
 async fn unresolved_rows_do_not_bypass_control_proof_or_source_archive_failures() {
-    for case in ["generation_unknown", "launch_unknown", "stop-malformed", "host-malformed", "status-malformed", "remote-status-malformed", "source-dependency"] {
+    for case in ["generation_unknown", "launching", "stop-malformed", "host-malformed", "status-malformed", "remote-status-malformed", "source-dependency"] {
         let root = Root::new();
         let original = archive_evidence_rows();
         let store = MemoryStore::new("paused", true, original.clone());
@@ -2200,7 +2200,7 @@ async fn unresolved_rows_do_not_bypass_control_proof_or_source_archive_failures(
             let mut st = store.0.lock().unwrap();
             let task = &mut st.tasks.get_mut(&Host::Local).unwrap()[0];
             match case {
-                "generation_unknown" | "launch_unknown" => { task.insert("status", case); }
+                "generation_unknown" | "launching" => { task.insert("status", case); }
                 "stop-malformed" => { task.insert("stopConfirmedAt", "invalid-proof"); }
                 "host-malformed" => { task.insert("isRemote", "true"); }
                 "status-malformed" => { task.insert("status", doc! {"not":"a status"}); }
@@ -2240,7 +2240,7 @@ async fn diagnostic_count_is_execution_items_not_unique_batch_or_local_plus_remo
 #[tokio::test]
 async fn archive_preconditions_report_the_original_action_without_attempting_archive() {
     for (status, action) in [
-        ("running", "pause"), ("launch_unknown", "pause"),
+        ("running", "pause"), ("launching", "pause"),
         ("generating", "reconcile_generation_or_sync"),
         ("generation_unknown", "reconcile_generation_or_sync"),
         ("syncing", "reconcile_generation_or_sync"),

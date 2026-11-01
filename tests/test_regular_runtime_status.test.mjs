@@ -351,7 +351,7 @@ test('actual Regular card (including SUPER reuse) guards only view-owned pending
   }
   for (const taskType of ['regular', 'super']) {
     for (const [status, runtime, busy, blocked] of [
-      ['running', null, false, false], ['launch_unknown', null, false, false],
+      ['running', null, false, false], ['launching', null, false, false],
       ['paused', null, false, false], // historical proof is left to the original core operation
       ['completed', observation(), false, false], ['completed_with_errors', observation(), false, false],
       ['completed', observation({ state: 'unknown' }), false, false],

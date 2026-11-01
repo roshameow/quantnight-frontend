@@ -43,7 +43,7 @@ pub async fn update_priority(root: &Path, store: &dyn TaskStore, runtime: &dyn P
         }
         if task.get_str("taskType").ok() != Some("priority") { return Err("configuration update requires a Priority task".into()); }
         lifecycle_policy::assert_observation_closed(&task)?;
-        if matches!(task.get_str("status").ok(), Some("generating"|"generation_unknown"|"launch_unknown"|"syncing"|"deleting")) {
+        if matches!(task.get_str("status").ok(), Some("generating"|"generation_unknown"|"launching"|"syncing"|"deleting")) {
             return Err("task mutation is in progress or unconfirmed; reconcile before config publication".into());
         }
         let remote = match task.get("isRemote") {
