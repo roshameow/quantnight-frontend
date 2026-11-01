@@ -56,6 +56,8 @@ pub trait PauseRuntime: Send + Sync {
         -> Result<Option<Value>,String>{Ok(None)}
     async fn confirm_stopped_scope(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,_remaining:Duration)
         -> Result<(),String>{Ok(())}
+    async fn verify_launcher_settled(&self,_root:&Path,_task:&Document,_remaining:Duration)
+        -> Result<bool,String>{Ok(false)}
     async fn stop_bounded(&self, root: &Path, task: &Document, never: bool,
         remaining: Duration) -> Result<StopOutput, String> {
         tokio::time::timeout(remaining, self.stop(root, task, never)).await
@@ -858,18 +860,54 @@ pub(crate) async fn pause_locked(
                 && observed.get_bool("consumerPredatesLaunch")!=Ok(true)
                 && observed.get_str("taskId").ok()==Some(id.to_hex().as_str())
                 && observed.get_bool("remote")==Ok(remote));
-        if let (StopConfirmationBasis::RunnersExited, Some(observed), Ok(launch)) =
-            (basis, observed_consumer, task.get_str("launchAttemptId")) {
+        let any_launch = task.get_str("launchAttemptId").ok().filter(|v| !v.is_empty());
+        let unsettled_fence_launch = any_launch.filter(|launch| {
+            (task.get_str("status").ok() == Some("launch_unknown")
+                || task.contains_key("launchSettledAttemptId"))
+                && task.get_str("launchSettledAttemptId").ok() != Some(*launch)
+        });
+        if let (StopConfirmationBasis::RunnersExited, Some(observed), Some(launch)) =
+            (basis, observed_consumer, any_launch) {
             // Original launchers are one-shot: after the actual consumer is
             // observed they only check/report. This invocation captured and
             // confirmed that process scope exited. Close the control lifecycle
             // in the SAME exact task/host/launch CAS, without inventing an ACK
             // or requiring a prior START/audit event on legacy tasks.
-            if !launch.is_empty() {
-                fields.insert("launchSettledAttemptId",launch);
-                proof.insert("controlReconciliation",doc!{"basis":"observed_consumer_stopped",
+            fields.insert("launchSettledAttemptId",launch);
+            proof.insert("controlReconciliation",doc!{"basis":"observed_consumer_stopped",
+                "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
+                "launcherAckRecovered":false,"executionObservation":observed});
+        } else if let (StopConfirmationBasis::SessionAbsent, Some(launch)) = (basis, unsettled_fence_launch) {
+            let observed_residue = verification_task.get_document("observedExecutionBeforeStop").ok()
+                .filter(|observed| observed.get_str("state").ok()==Some("owned_residue")
+                    && observed.get_bool("identityVerified")==Ok(true)
+                    && observed.get_str("taskId").ok()==Some(id.to_hex().as_str())
+                    && observed.get_str("launchAttemptId").ok()==Some(launch)
+                    && observed.get_bool("remote")==Ok(remote))
+                .cloned();
+            let runtime_recorded_launch = task.get_document("simulatorRuntime").ok().is_some_and(|rt| {
+                rt.get_str("launchAttemptId").ok() == Some(launch)
+                    || rt.get_document("startupRecovery").ok().and_then(|s| s.get_str("launchAttemptId").ok()) == Some(launch)
+                    || rt.get_document("lifecycleClosure").ok().and_then(|c| c.get_str("launchAttemptId").ok()) == Some(launch)
+            });
+            if let Some(observed) = observed_residue {
+                fields.insert("launchSettledAttemptId", launch);
+                proof.insert("controlReconciliation", doc!{"basis":"observed_owned_residue_stopped",
                     "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
                     "launcherAckRecovered":false,"executionObservation":observed});
+            } else if runtime_recorded_launch {
+                fields.insert("launchSettledAttemptId", launch);
+                proof.insert("controlReconciliation", doc!{"basis":"confirmed_absent_after_runtime_launch",
+                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
+                    "launcherAckRecovered":false});
+            } else if runtime.verify_launcher_settled(root, &verification_task,
+                remaining(deadline)?.min(Duration::from_secs(12))).await? {
+                fields.insert("launchSettledAttemptId", launch);
+                proof.insert("controlReconciliation", doc!{"basis":"confirmed_absent_no_live_launcher",
+                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
+                    "launcherAckRecovered":false});
+            } else if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
+                fields.insert("launchSettledAttemptId",Bson::Null);
             }
         } else if task.get_str("status").ok()==Some("launch_unknown") && !task.contains_key("launchSettledAttemptId") {
             // No observed live consumer + full captured exit: V2/absence or a

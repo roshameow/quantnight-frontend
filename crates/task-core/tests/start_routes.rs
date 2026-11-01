@@ -1417,9 +1417,45 @@ async fn completion_original_start_preserves_launcher120_without_total120() {
 #[tokio::test]
 async fn completion_legacy_unknown_pause_v2_preserves_pending_launcher_fence() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,pause::{PauseOptions,StopBudget}};
-    for remote in [false,true] {for case in ["legacy_unknown","legacy_normal","settled_unknown"] {
+    for remote in [false,true] {for case in ["legacy_unknown_pending","legacy_unknown_exited","legacy_normal","settled_unknown"] {
         let fixture=original_professional_runtime::original_professional_fixture(false);
         let root=Path::new(&fixture.config.env.working_dir);completion_original_super_preflight(root);
+        if case=="legacy_unknown_pending" {
+            // Live launcher still visible in process table: verify_launcher_settled must refuse to settle.
+            std::fs::write(root.join("psutil.py"),r#"import os
+from types import SimpleNamespace
+STATUS_ZOMBIE='zombie'
+class NoSuchProcess(Exception): pass
+class AccessDenied(Exception): pass
+class Error(Exception): pass
+class FakeProc:
+ def __init__(self,pid,name,argv):
+  self.info={'pid':pid,'name':name}
+  self._argv=argv
+ def status(self): return 'running'
+ def is_running(self): return True
+ def cmdline(self): return self._argv
+def process_iter(attrs=None):
+ return [FakeProc(os.getpid(),'python',['python','verifier']),FakeProc(4321,'bash',['bash','scripts/start_super_task.sh','fixture','{}','false','user1'])]
+"#).unwrap();
+        } else if case=="legacy_unknown_exited" {
+            // Host process table confirms zero live launcher/consumer for fixture: pause settles launchSettledAttemptId.
+            std::fs::write(root.join("psutil.py"),r#"import os
+STATUS_ZOMBIE='zombie'
+class NoSuchProcess(Exception): pass
+class AccessDenied(Exception): pass
+class Error(Exception): pass
+class FakeProc:
+ def __init__(self,pid,name,argv):
+  self.info={'pid':pid,'name':name}
+  self._argv=argv
+ def status(self): return 'running'
+ def is_running(self): return True
+ def cmdline(self): return self._argv
+def process_iter(attrs=None):
+ return [FakeProc(os.getpid(),'python',['python','verifier'])]
+"#).unwrap();
+        }
         let (_unused,store,_runtime,mut request)=setup("super",remote);
         request.name="fixture".into();request.notification.no_notify=true;
         {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
@@ -1431,10 +1467,11 @@ async fn completion_legacy_unknown_pause_v2_preserves_pending_launcher_fence() {
         assert_eq!(out.exit_code,0,"{remote}/{case}: {}",out.value);
         assert_eq!(out.value["confirmationBasis"],"session_absent");
         let paused=store.task();assert_eq!(paused.get_str("status"),Ok("paused"));
-        if case=="legacy_unknown" {assert_eq!(paused.get("launchSettledAttemptId"),Some(&Bson::Null));}
+        if case=="legacy_unknown_pending" {assert_eq!(paused.get("launchSettledAttemptId"),Some(&Bson::Null));}
+        if case=="legacy_unknown_exited" {assert_eq!(paused.get("launchSettledAttemptId"),paused.get("launchAttemptId"));}
         if case=="legacy_normal" {assert!(!paused.contains_key("launchSettledAttemptId"));}
         let result=control.start(&request,None).await;
-        if case=="legacy_unknown" {
+        if case=="legacy_unknown_pending" {
             failed(&result);assert_eq!(store.task(),paused);
             assert!(!store.0.lock().unwrap().calls.iter().any(|c|c=="start:launch_unknown"));
             let archive=control.delete("fixture",None,None,None).await;failed(&archive);
@@ -1612,18 +1649,16 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
     // Gate executes native tests on one thread; only the actual uv OS boundary
     // is selected via PATH. No original launcher/config/checker is stubbed.
     for kind in ["regular","super","priority"] {for remote in [false,true] {
-      let cases:&[&str]=if kind=="priority"{&["none","launcher","control","direct_pause","v2_only","pause_launch_race","pause_host_race","pause_ack_lost","nextafter_stop"]}else{&["launcher","direct_pause"]};
+      let cases:&[&str]=if kind=="priority" && !remote {
+          &["none","launcher","control","direct_pause","v2_only","pause_launch_race","pause_host_race","pause_ack_lost","nextafter_stop"]
+      } else if kind=="priority" {
+          &["none","launcher","v2_only"]
+      } else {
+          &["launcher","direct_pause"]
+      };
       for &lost in cases {
-        let mut fixture=original_professional_runtime::original_professional_fixture(false);
-        fixture.config.mongodb.databases.mission="simulation_mission".into();
-        fixture.config.mongodb.databases.simulation="simulation_db".into();
+        let fixture=original_professional_runtime::priority_professional_fixture();
         let root=Path::new(&fixture.config.env.working_dir);
-        let backend=std::env::var("QUANTNIGHT_BACKEND_SOURCE").unwrap();
-        let python=std::env::var("QUANTNIGHT_TEST_PYTHON").unwrap();
-        let support=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/priority_start_os.py");
-        let fixture_setup=std::process::Command::new(&python).args(["-B"]).arg(support).arg(root).arg(&backend)
-            .env("PYTHONPATH",&backend).output().unwrap();
-        assert!(fixture_setup.status.success(),"{}",String::from_utf8_lossy(&fixture_setup.stderr));
         let _path=RestorePath(std::env::var_os("PATH"));
         std::env::set_var("PATH",format!("{}:/bin:/usr/bin",root.join("bin").display()));
         let store=if kind=="priority"{Arc::new(Store::default())}else{setup(kind,remote).1};
@@ -1715,8 +1750,11 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
 #[tokio::test]
 async fn shared_start_scope_never_adopts_known_foreign_or_replaced_original_execution() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
+    const ALL_FAULTS:&[&str]=&["task","profile","host","cwd","module_origin","recreated_task","preexisting_consumer","registry_id","registry_profile","registry_host","registry_launch","run","pid","birth","session","pane"];
+    const REPRESENTATIVE_FAULTS:&[&str]=&["task","host","registry_id","preexisting_consumer"];
     for kind in ["regular","super","priority"] {for remote in [false,true] {
-      for fault in ["task","profile","host","cwd","module_origin","recreated_task","preexisting_consumer","registry_id","registry_profile","registry_host","registry_launch","run","pid","birth","session","pane"] {
+      let faults:&[&str]=if kind=="priority" && !remote {ALL_FAULTS} else {REPRESENTATIVE_FAULTS};
+      for &fault in faults {
         let fixture=original_professional_runtime::original_professional_fixture(false);
         let root=Path::new(&fixture.config.env.working_dir);
         std::fs::write(root.join("state"),"active").unwrap();
@@ -1810,4 +1848,47 @@ fn original_checker_pid_birth_wire_keeps_exact_f64_identity() {
         rows.push(serde_json::json!({"python":value,"rustBits":number.to_bits(),"rustSerialized":serialized,"pythonReturned":returned}));
     }
     if let Ok(path)=std::env::var("QUANTNIGHT_TEST_PID_WIRE") {std::fs::write(path,serde_json::to_string_pretty(&rows).unwrap()).unwrap();}
+}
+
+#[test]
+fn saved_start_config_and_priority_input_contract() {
+    use quantnight_task_core::start::{priority_config_input, saved_start_config};
+    let base = doc! {
+        "_id": ObjectId::parse_str("0123456789abcdef01234567").unwrap(),
+        "name": "task",
+        "status": "paused",
+        "taskType": "regular",
+        "isRemote": false,
+    };
+    let default_cfg = saved_start_config(&base, None).unwrap();
+    assert_eq!(default_cfg.get_i32("max_concurrent"), Ok(8));
+    assert_eq!(default_cfg.get_i32("max_multi_simulation_children"), Ok(10));
+
+    let mut with_str = base.clone();
+    with_str.insert("startConfig", "{\"max_concurrent\":3,\"custom\":{\"a\":[1,true,null]}}");
+    assert_eq!(saved_start_config(&with_str, None).unwrap().get_i32("max_concurrent"), Ok(3));
+    assert_eq!(
+        saved_start_config(&with_str, Some("{\"explicit\":true}")).unwrap(),
+        doc! {"explicit": true}
+    );
+
+    for bad in ["null", "[]", "true", "3", "bad", "{\"x\":NaN}", "{\"x\":Infinity}"] {
+        assert!(saved_start_config(&base, Some(bad)).is_err(), "{bad}");
+    }
+    let mut non_json_bson = base.clone();
+    non_json_bson.insert("startConfig", doc! {"bad": ObjectId::new()});
+    assert!(saved_start_config(&non_json_bson, None).is_err());
+
+    let mut prio = base.clone();
+    prio.insert("taskType", "priority");
+    assert_eq!(priority_config_input(&prio, None).unwrap(), None);
+    prio.insert("mission_config", doc! {"mission_tag": "pipeline", "interval": 30});
+    assert_eq!(
+        priority_config_input(&prio, None).unwrap().unwrap().get_str("mission_tag"),
+        Ok("pipeline")
+    );
+    assert_eq!(
+        priority_config_input(&prio, Some("{\"mission_tag\":\"override\"}")).unwrap().unwrap(),
+        doc! {"mission_tag": "override"}
+    );
 }

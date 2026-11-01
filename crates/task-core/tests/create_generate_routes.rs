@@ -1137,3 +1137,46 @@ async fn lost_failed_finish_ack_keeps_restored_state_without_regeneration() {
     assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.0.lock().unwrap().writes.len(), 2);
 }
+
+#[test]
+fn generation_plan_and_failure_classification_contract() {
+    use quantnight_task_core::create_generate::{
+        generation_begin_plan, generation_failure_status, generation_finish_plan,
+        GenerationErrorKind,
+    };
+    let id = ObjectId::parse_str("0123456789abcdef01234567").unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let stamp = "2026-11-01T00:00:00.000000+00:00";
+
+    for (kind, total, expected) in [
+        (GenerationErrorKind::Ordinary, None, "generation_failed"),
+        (GenerationErrorKind::Ordinary, Some(0), "generation_failed"),
+        (GenerationErrorKind::Timeout, Some(5), "generation_unknown"),
+        (GenerationErrorKind::DatabaseUncertain, Some(5), "generation_unknown"),
+        (GenerationErrorKind::Interrupted, Some(0), "generation_failed"),
+        (GenerationErrorKind::Interrupted, Some(5), "generation_unknown"),
+        (GenerationErrorKind::Interrupted, None, "generation_unknown"),
+    ] {
+        assert_eq!(generation_failure_status(&kind, total), expected);
+    }
+
+    let pending = doc! {"_id": id, "name": "task", "status": "pending", "updatedAt": "snap"};
+    let (begin_q, begin_u) = generation_begin_plan(&pending, token, "writing", 321, stamp).unwrap();
+    assert_eq!(begin_q.get_str("status"), Ok("pending"));
+    assert_eq!(begin_q.get_str("updatedAt"), Ok("snap"));
+    assert_eq!(begin_u.get_document("$set").unwrap().get_str("status"), Ok("generating"));
+
+    let generating = doc! {
+        "_id": id,
+        "name": "task",
+        "status": "generating",
+        "generation": {"id": token, "phase": "writing", "startedAt": stamp, "producerPid": 321}
+    };
+    let (fin_q, fin_u) =
+        generation_finish_plan(&generating, token, "ready", doc! {"expectedCount": 4}, stamp)
+            .unwrap();
+    assert_eq!(fin_q.get_str("status"), Ok("generating"));
+    assert_eq!(fin_q.get_str("generation.id"), Ok(token));
+    assert_eq!(fin_u.get_document("$set").unwrap().get_str("status"), Ok("ready"));
+    assert!(generation_begin_plan(&doc! {"name": "task", "status": "pending"}, token, "writing", 1, stamp).is_err());
+}

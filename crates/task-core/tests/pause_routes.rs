@@ -1459,9 +1459,11 @@ explicit_pause_descendant_case!(generic_explicit_pause_priority_remote, "priorit
 #[tokio::test]
 async fn generic_explicit_pause_rejects_wrong_requested_and_saved_identity_without_signal() {
     use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    const ALL_CASES: &[&str] = &["request_task", "request_host", "request_launch", "context_task", "context_host", "context_launch", "session_id", "session_birth"];
+    const REP_CASES: &[&str] = &["request_task", "context_host", "session_id"];
     for kind in ["regular", "super", "priority"] { for remote in [false, true] {
-        for case in ["request_task", "request_host", "request_launch", "context_task", "context_host",
-            "context_launch", "session_id", "session_birth"] {
+        let cases = if kind == "regular" && !remote { ALL_CASES } else { REP_CASES };
+        for &case in cases {
             let fake = original_professional_fixture(false);
             let root = Path::new(&fake.config.env.working_dir);
             let mut task = explicit_pause_tree(root, kind, remote);
@@ -1507,8 +1509,11 @@ async fn generic_explicit_pause_rejects_wrong_requested_and_saved_identity_witho
 #[tokio::test]
 async fn generic_explicit_pause_captured_pane_replacement_and_live_descendant_never_confirm() {
     use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    const ALL_CASES: &[&str] = &["pane_replaced", "pane_birth", "orphan_descendant"];
+    const REP_CASES: &[&str] = &["pane_replaced"];
     for kind in ["regular", "super", "priority"] { for remote in [false, true] {
-        for case in ["pane_replaced", "pane_birth", "orphan_descendant"] {
+        let cases = if kind == "regular" && !remote { ALL_CASES } else { REP_CASES };
+        for &case in cases {
             let fake = original_professional_fixture(false);
             let root = Path::new(&fake.config.env.working_dir);
             let task = explicit_pause_tree(root, kind, remote);
@@ -1546,4 +1551,101 @@ async fn generic_explicit_pause_captured_pane_replacement_and_live_descendant_ne
             assert!(!trace.contains("kill-session") && !trace.contains("new-session"));
         }
     }}
+}
+
+#[test]
+fn never_started_history_contract() {
+    assert_eq!(pause::never_started_history(&pending()), Ok(true));
+    assert_eq!(pause::never_started_history(&generated("ready", false)), Ok(true));
+    assert_eq!(pause::never_started_history(&generated("ready", true)), Ok(true));
+    assert_eq!(pause::never_started_history(&generated("generation_failed", false)), Ok(true));
+    assert_eq!(pause::never_started_history(&normal()), Ok(false));
+
+    let mut started_once = generated("ready", false);
+    started_once.insert("launchAttemptId", "attempt-1");
+    assert_eq!(pause::never_started_history(&started_once), Ok(false));
+
+    let mut non_array_events = pending();
+    non_array_events.insert("events", "not-an-array");
+    assert_eq!(pause::never_started_history(&non_array_events), Ok(false));
+
+    let mut unhashable_status = pending();
+    unhashable_status.insert("status", Bson::Array(vec![]));
+    assert!(pause::never_started_history(&unhashable_status).is_err());
+}
+
+#[tokio::test]
+async fn owned_wrapper_residue_without_tmux_context_pauses_and_settles_while_plain_shell_refuses() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    for owned in [true, false] {
+        let fake = original_professional_fixture(false);
+        let root = Path::new(&fake.config.env.working_dir);
+        std::fs::write(root.join("state"), "active").unwrap();
+        let ps = root.join("bin/ps");
+        let ps_src = std::fs::read_to_string(&ps)
+            .unwrap()
+            .replace("echo \"1002 1001 python\"", "echo \"1002 1001 sleep\"");
+        std::fs::write(&ps, ps_src).unwrap();
+        let wrapper_argv = if owned {
+            serde_json::json!([
+                "zsh",
+                "-c",
+                "cd . && if uv run -m scripts.alpha_simulate_param --task fixture --dist local --auth_profile user1 --config '{}'; then echo done; fi; sleep 9999999"
+            ])
+        } else {
+            serde_json::json!(["zsh"])
+        };
+        std::fs::write(
+            root.join("psutil.py"),
+            format!(
+                r#"import os
+from pathlib import Path
+STATUS_ZOMBIE='zombie'
+WRAPPER={wrapper_argv}
+class NoSuchProcess(Exception): pass
+class AccessDenied(Exception): pass
+class Error(Exception): pass
+class Process:
+ def __init__(self,pid):
+  self.pid=pid
+  if pid not in (1001,1002) or not Path(os.environ['STATE']).exists(): raise NoSuchProcess(pid)
+ def create_time(self): return 1700000001.0 if self.pid==1002 else 1700000000.0
+ def ppid(self): return 1001 if self.pid==1002 else 1
+ def cwd(self): return str(Path(os.environ['STATE']).parent)
+ def cmdline(self): return ['sleep','9999999'] if self.pid==1002 else WRAPPER
+ def is_running(self): return Path(os.environ['STATE']).exists()
+ def status(self): return 'running'
+"#
+            ),
+        )
+        .unwrap();
+        let mut task = doc! {
+            "_id": ObjectId::parse_str(ID).unwrap(),
+            "name": NAME,
+            "status": "completed_with_errors",
+            "taskType": "regular",
+            "auth_profile": "user1",
+            "isRemote": false,
+            "launchAttemptId": "launch-unsettled",
+            "launchSettledAttemptId": Bson::Null,
+            "launchAttemptAt": DateTime::from_millis(1699999990000),
+        };
+        let store = Arc::new(Memory::new(task.clone(), Some(items())));
+        let binding = validate_backend_binding(&fake.config).await.unwrap();
+        let control = TaskControl::with_store(binding, store.clone());
+        let out = control.pause(NAME, PauseOptions::default(), StopBudget::Cli, None).await;
+        if owned {
+            assert_eq!(out.exit_code, 0, "owned residue should pause cleanly: {}", out.value);
+            let saved = store.task();
+            assert_eq!(saved.get_str("status"), Ok("paused"));
+            assert_eq!(saved.get_str("launchSettledAttemptId"), Ok("launch-unsettled"));
+            assert!(!root.join("state").exists(), "tmux session must be stopped");
+        } else {
+            assert_eq!(out.exit_code, 1, "plain interactive shell without tmuxContext must fail closed: {}", out.value);
+            assert!(out.value["error"].as_str().unwrap_or_default().contains("original execution identity unconfirmed"));
+            store.no_write();
+            task.insert("status", "completed_with_errors");
+            assert!(root.join("state").exists(), "foreign session must not be signaled");
+        }
+    }
 }

@@ -504,6 +504,16 @@ impl crate::pause::PauseRuntime for OriginalPauseRuntime<'_> {
         -> Result<Option<crate::pause::StopOutput>, String> {
         self.common.verify_stop_owner(root, task, remaining).await
     }
+    async fn verify_launcher_settled(&self, root: &Path, task: &Document, remaining: Duration)
+        -> Result<bool, String> {
+        let name = task.get_str("name").map_err(|_| "missing task name")?;
+        let remote = task.get_bool("isRemote").unwrap_or(false);
+        match self.common.pause_owner(root, task, Some("--verify-never-started"), remaining.min(Duration::from_secs(12))).await {
+            Ok(out) => Ok(crate::pause::verified_stop_proof(&out.stdout, name, remote).ok()
+                == Some(crate::pause::StopConfirmationBasis::RunnersExited)),
+            Err(_) => Ok(false),
+        }
+    }
 }
 
 fn generation_failure(kind: crate::create_generate::GenerationErrorKind, message: impl ToString)

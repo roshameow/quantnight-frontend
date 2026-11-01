@@ -232,6 +232,8 @@ pub struct Task {
     pub start_config: Option<JsonValue>,
     #[serde(default, rename = "launchAttemptId")]
     pub launch_attempt_id: Option<String>,
+    #[serde(default, rename = "launchSettledAttemptId")]
+    pub launch_settled_attempt_id: Option<String>,
     pub config: Option<JsonValue>,
     #[serde(default, rename = "stopConfirmedAt")]
     pub stop_confirmed_at: Option<bson::DateTime>,
@@ -919,7 +921,12 @@ impl TaskOperationProgress {
 
     fn failure(&self, cause: impl std::fmt::Display) -> String {
         let (stage, message) = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let error = safe_diagnostic_text(&format!("{} stage={}（{}）：{}", self.operation, stage, message, cause));
+        let already_prefixed = format!("{} stage={}（", self.operation, stage);
+        let error = if message.starts_with(&already_prefixed) {
+            safe_diagnostic_text(&format!("{} stage={}：{}", self.operation, stage, cause))
+        } else {
+            safe_diagnostic_text(&format!("{} stage={}（{}）：{}", self.operation, stage, message, cause))
+        };
         // Keep the actual failed step, never collapse it into generic unknown.
         self.stage(&stage, &error);
         error
@@ -1348,8 +1355,7 @@ pub async fn pause_task(task_name: String, is_remote: bool, task_id: Option<Stri
     let left = options.remaining;
     let stages = progress.clone();
     options.observer = Some(Arc::new(move |event| {
-        if event.stage == "failed" { stages.failure(event.message); }
-        else { stages.stage(event.stage, &event.message); }
+        if event.stage != "failed" { stages.stage(event.stage, &event.message); }
     }));
     let operation = core.pause(&task_name, options, StopBudget::Gui, Some(progress.observer()));
     let result = if let Some(left) = left {
