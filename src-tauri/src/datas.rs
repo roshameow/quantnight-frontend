@@ -1,5 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration as StdDuration, Instant};
+
+#[path = "alpha_search_plan.rs"]
+mod alpha_search_plan;
 
 use chrono::{DateTime, Duration, Utc};
 use futures_util::stream::TryStreamExt;
@@ -7,7 +11,7 @@ use futures::join;
 
 use mongodb::{
     bson::{doc, Bson, Document},
-    options::{CountOptions, FindOptions, FindOneOptions},
+    options::{CountOptions, FindOptions, FindOneOptions, Hint, ListIndexesOptions},
 };
 use serde::{Deserialize, Serialize, Deserializer};
 use tauri::{command, State};
@@ -1471,6 +1475,54 @@ fn build_alpha_filter(params: &AlphaQuery) -> Document {
 #[path = "alpha_page_tests.rs"]
 mod alpha_page_tests;
 
+// Read-only metadata cache for the one search shape confirmed by stack/profile
+// evidence. Does not impose a new deadline on the user's actual list query.
+type SearchIndexSnapshot = (Instant, Vec<mongodb::IndexModel>);
+static SEARCH_INDEX_SNAPSHOTS: OnceLock<Mutex<HashMap<String, SearchIndexSnapshot>>> = OnceLock::new();
+
+async fn measured_search_hint(
+    collection: &mongodb::Collection<Document>, filter: &Document, sort: &Document,
+) -> Option<Hint> {
+    if alpha_search_plan::simple_keyword_scope(filter) != Some(true)
+        || sort.len() != 1 || !sort.get("is.sharpe").is_some_and(alpha_search_plan::index_direction) {
+        return None;
+    }
+    let key = collection.namespace().to_string();
+    let cache = SEARCH_INDEX_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let entries = cache.lock().ok()?;
+        if let Some((created, indexes)) = entries.get(&key) {
+            if created.elapsed() < StdDuration::from_secs(60) {
+                return alpha_search_plan::select_keyword_hint(filter, sort, indexes);
+            }
+        }
+    }
+    let read = async {
+        let options = ListIndexesOptions::builder().max_time(StdDuration::from_millis(700)).build();
+        collection.list_indexes(options).await?.try_collect::<Vec<_>>().await
+    };
+    let indexes = match tokio::time::timeout(StdDuration::from_secs(1), read).await {
+        Ok(Ok(indexes)) => indexes,
+        _ => return None, // Unknown metadata preserves the original optimizer.
+    };
+    let hint = alpha_search_plan::select_keyword_hint(filter, sort, &indexes);
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() >= 32 { entries.clear(); }
+        entries.insert(key, (Instant::now(), indexes));
+    }
+    hint
+}
+
+// Empty-filter exact counts otherwise scan every (potentially large) document.
+// Nonempty filters keep the caller's options and MongoDB's existing planner.
+// Missing/unsupported _id_ hints use the caller's original error handling; no retry.
+fn alpha_count_options(filter: &Document, mut options: CountOptions) -> CountOptions {
+    if filter.is_empty() {
+        options.hint = Some(Hint::Name("_id_".to_string()));
+    }
+    options
+}
+
 /// Exact non-RA count, deliberately independent from page retrieval.
 #[command]
 pub async fn get_alpha_count(
@@ -1483,10 +1535,11 @@ pub async fn get_alpha_count(
     }
     let db = clients.local.database(&config.mongodb.databases.alpha);
     let collection = db.collection::<Document>(&alpha_collection_name(&params));
-    let options = CountOptions::builder()
+    let filter = build_alpha_filter(&params);
+    let options = alpha_count_options(&filter, CountOptions::builder()
         .max_time(std::time::Duration::from_secs(30))
-        .build();
-    collection.count_documents(build_alpha_filter(&params), options).await
+        .build());
+    collection.count_documents(filter, options).await
         .map_err(|e| format!("DB count error: {e}"))
 }
 
@@ -1562,8 +1615,11 @@ pub async fn get_alpha_results(
             .iter().filter_map(Bson::as_document).cloned().collect::<Vec<_>>();
         (total, documents)
     } else {
+        let hint = measured_search_hint(&collection, &filter, &sort_doc).await;
+        eprintln!("alpha.page collection={} sort_hint={:?}", coll_name, hint);
         let find_options = FindOptions::builder()
             .projection(get_alpha_projection())
+            .hint(hint)
             .sort(sort_doc)
             .skip(skip)
             .limit(page_size as i64)
@@ -1571,7 +1627,7 @@ pub async fn get_alpha_results(
 
         let (total, cursor_res) = if should_include_total(&params) {
             let (count_res, cursor_res) = join!(
-                collection.count_documents(filter.clone(), None),
+                collection.count_documents(filter.clone(), alpha_count_options(&filter, CountOptions::default())),
                 collection.find(filter, find_options)
             );
             // Keep legacy page behavior for old clients, including count fallback.
@@ -1585,6 +1641,13 @@ pub async fn get_alpha_results(
         let mut cursor = match cursor_res {
             Ok(cursor) => cursor,
             Err(e) => {
+                // A concurrently dropped/hidden index must not poison future
+                // searches for the entire metadata TTL. No automatic retry.
+                if let Some(cache) = SEARCH_INDEX_SNAPSHOTS.get() {
+                    if let Ok(mut entries) = cache.lock() {
+                        entries.remove(&collection.namespace().to_string());
+                    }
+                }
                 println!("❌ collection.find() error: {}", e);
                 return Err(format!("DB query error: {}", e));
             }

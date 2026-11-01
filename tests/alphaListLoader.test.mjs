@@ -192,19 +192,17 @@ test('all semantic filters (including future ones) enter count key; only present
   assert.equal(alphaCountKey({ region: 'USA', custom: { b: 2, a: 1 } }), alphaCountKey({ custom: { a: 1, b: 2 }, region: 'USA' }));
 });
 
-test('different collection/type/time/region scopes issue distinct exact counts', async (t) => {
+test('different collection/type/time/region scopes serialize exact counts', async (t) => {
   const h = harness(t);
-  for (const p of [params(), params({ collection: 'other' }), params({ alpha_type: 'SUPER' }), params({ days_within: 7 }), params({ region: 'ASI' })]) {
+  const scopes = [params(), params({ collection: 'other' }), params({ alpha_type: 'SUPER' }), params({ days_within: 7 }), params({ region: 'ASI' })];
+  for (const [index, p] of scopes.entries()) {
     h.loader.schedule(p, { immediate: true });
     await flush();
+    assert.equal(h.counts().length, index + 1);
+    h.counts()[index].resolve(index + 2);
+    await flush();
+    assert.equal(h.latest().total, index + 2);
   }
-  assert.equal(h.counts().length, 5);
-  h.counts()[0].resolve(999);
-  await flush();
-  assert.equal(h.latest().total, null);
-  h.counts()[4].resolve(2);
-  await flush();
-  assert.equal(h.latest().total, 2);
 });
 
 test('RA and RA_PARENT retain facet totals/corrected pages; never omit or call separate count', async (t) => {
@@ -494,7 +492,7 @@ test('actual panel: multi-field Object.assign advances sync generations but emit
   h.time.advance(1);
   await flush();
   assert.equal(h.rows().length, 1);
-  assert.equal(h.counts().length, 1);
+  assert.equal(h.counts().length, 0);
   const rowParams = h.rows()[0].args.params;
   const expected = {
     collection: 'other', embedding: 'second', region: 'EUR', universe: 'TOP1000',
@@ -502,5 +500,230 @@ test('actual panel: multi-field Object.assign advances sync generations but emit
     messages_in: ['PASS'], min_turnover: 0.1, page: 1,
   };
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(rowParams[key], value, key);
+  h.rows()[0].resolve(pageResult());
+  await flush();
+  assert.equal(h.counts().length, 1);
   assert.equal(alphaCountKey(rowParams), alphaCountKey(h.counts()[0].args.params));
+});
+
+for (const search of [{ query: '  close.*  ' }, { exclude_query: 'volume' }]) {
+  test(`search rows succeed before count starts: ${Object.keys(search)[0]}`, async (t) => {
+    const h = harness(t);
+    h.loader.schedule(params(search), { immediate: true });
+    await flush();
+    assert.equal(h.counts().length, 0);
+    for (const [key, value] of Object.entries(search)) assert.equal(h.rows()[0].args.params[key], value);
+    h.rows()[0].resolve(pageResult());
+    await flush();
+    assert.equal(h.latest().loading, false);
+    assert.equal(h.counts().length, 1);
+    const pending = h.states.findIndex((s) => s.hasRows);
+    assert.ok(pending >= 0);
+    h.counts()[0].resolve(51);
+    await flush();
+    assert.equal(h.latest().total, 51);
+  });
+}
+
+test('rapid searches retain only current ready filter; count concurrency is globally one', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params({ query: 'a' }), { immediate: true });
+  await flush();
+  h.rows()[0].resolve(pageResult());
+  await flush();
+  for (const query of ['ab', 'abc', 'abcd']) {
+    h.loader.schedule(params({ query }), { immediate: true });
+    await flush();
+    h.rows().at(-1).resolve(pageResult());
+    await flush();
+    assert.equal(h.counts().length, 1, 'no second in-flight count across keys');
+  }
+  h.counts()[0].resolve(999);
+  await flush();
+  assert.equal(h.latest().total, null, 'old count must not contaminate current filter');
+  assert.equal(h.counts().length, 2);
+  assert.equal(h.counts()[1].args.params.query, 'abcd');
+  h.counts()[1].resolve(4);
+  await flush();
+  assert.equal(h.latest().total, 4);
+  assert.deepEqual(h.counts().map((c) => c.args.params.query), ['a', 'abcd']);
+});
+
+test('old count completion cannot start current search before its rows or during debounce', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params(), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ query: 'latest' }));
+  h.counts()[0].resolve(999);
+  await flush();
+  assert.equal(h.counts().length, 1);
+  h.time.advance(300);
+  await flush();
+  assert.equal(h.counts().length, 1);
+  h.rows()[1].resolve(pageResult());
+  await flush();
+  assert.equal(h.counts().length, 2);
+  assert.equal(h.counts()[1].args.params.query, 'latest');
+});
+
+test('stale search rows never trigger count, failed current rows do not either', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params({ query: 'old' }), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ query: 'new' }), { immediate: true });
+  await flush();
+  h.rows()[0].resolve(pageResult());
+  h.rows()[1].reject(new Error('search failed'));
+  await flush();
+  assert.equal(h.counts().length, 0);
+  assert.equal(h.latest().total, null);
+  assert.match(h.latest().error.message, /search failed/);
+});
+
+test('count failure releases slot for latest ready search, never zero or self-retries', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params(), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ query: 'new' }), { immediate: true });
+  await flush();
+  h.rows()[1].resolve(pageResult());
+  await flush();
+  h.counts()[0].reject(new Error('obsolete count failed'));
+  await flush();
+  assert.equal(h.counts().length, 2);
+  assert.equal(h.latest().countError, null);
+  h.counts()[1].reject(new Error('new count failed'));
+  await flush();
+  assert.equal(h.latest().total, null);
+  assert.equal(h.latest().countStatus, 'unavailable');
+  assert.equal(h.counts().length, 2);
+  h.loader.schedule(params({ query: 'new', page: 2 }), { immediate: true });
+  await flush();
+  assert.equal(h.counts().length, 2);
+  h.rows()[2].resolve(pageResult(2));
+  await flush();
+  assert.equal(h.counts().length, 3);
+});
+
+test('failed waiting search cannot be started by old count completion', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params(), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ query: 'failed' }), { immediate: true });
+  await flush();
+  h.rows()[1].reject(new Error('rows failed'));
+  await flush();
+  h.counts()[0].reject(new Error('count failed'));
+  await flush();
+  assert.equal(h.counts().length, 1);
+  assert.equal(h.latest().total, null);
+});
+
+test('search pagination and sorting reuse in-flight and 30s cached counts', async (t) => {
+  const h = harness(t);
+  const search = params({ query: 'close', exclude_query: 'volume' });
+  h.loader.schedule(search, { immediate: true });
+  await flush();
+  h.rows()[0].resolve(pageResult());
+  await flush();
+  h.loader.schedule({ ...search, page: 2, sort_field: 'Sharpe', sort_order: -1 }, { immediate: true });
+  await flush();
+  h.rows()[1].resolve(pageResult(2));
+  await flush();
+  assert.equal(h.counts().length, 1);
+  h.counts()[0].resolve(61);
+  await flush();
+  h.time.advance(29999);
+  h.loader.schedule({ ...search, page: 3 }, { immediate: true });
+  await flush();
+  assert.equal(h.latest().total, 61);
+  assert.equal(h.counts().length, 1);
+  h.time.advance(1);
+  h.rows()[2].resolve(pageResult(3));
+  await flush();
+  assert.equal(h.counts().length, 2);
+  assert.equal(h.latest().total, null);
+});
+
+for (const fail of [false, true]) {
+  test(`dispose discards waiting search after old count ${fail ? 'failure' : 'success'}`, async (t) => {
+    const h = harness(t);
+    h.loader.schedule(params(), { immediate: true });
+    await flush();
+    h.loader.schedule(params({ query: 'waiting' }), { immediate: true });
+    await flush();
+    h.rows()[1].resolve(pageResult());
+    await flush();
+    h.loader.dispose();
+    const emissions = h.states.length;
+    if (fail) h.counts()[0].reject(new Error('late failure'));
+    else h.counts()[0].resolve(5);
+    h.loader.schedule(params({ query: 'after dispose' }), { immediate: true });
+    await flush();
+    assert.equal(h.counts().length, 1);
+    assert.equal(h.rows().length, 2);
+    assert.equal(h.states.length, emissions);
+  });
+}
+
+test('dispose before search rows succeed never starts count', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params({ query: 'close' }), { immediate: true });
+  await flush();
+  h.loader.dispose();
+  h.rows()[0].resolve(pageResult());
+  await flush();
+  assert.equal(h.counts().length, 0);
+});
+
+test('switching to RA drops pending separate counts while preserving facet totals', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params(), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ region: 'EUR' }), { immediate: true });
+  await flush();
+  h.loader.schedule(params({ alpha_type: 'RA', query: 'close' }), { immediate: true });
+  await flush();
+  h.rows()[2].resolve(pageResult(1, 2, 2));
+  h.counts()[0].resolve(999);
+  await flush();
+  assert.equal(h.latest().total, 2);
+  assert.equal(h.counts().length, 1);
+});
+
+test('shared search count failure is not retried by later pagination row success', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params({ query: 'close' }), { immediate: true });
+  await flush();
+  h.rows()[0].resolve(pageResult());
+  await flush();
+  h.loader.schedule(params({ query: 'close', page: 2 }), { immediate: true });
+  await flush();
+  h.counts()[0].reject(new Error('shared count failed'));
+  await flush();
+  h.rows()[1].resolve(pageResult(2));
+  await flush();
+  assert.equal(h.counts().length, 1);
+  assert.equal(h.latest().countStatus, 'unavailable');
+  assert.equal(h.latest().total, null);
+  assert.equal(h.latest().rows[0].id, 'p2-0');
+});
+
+test('non-search counts also keep only newest filter and do not drain during debounce', async (t) => {
+  const h = harness(t);
+  h.loader.schedule(params(), { immediate: true });
+  await flush();
+  for (const region of ['EUR', 'ASI']) {
+    h.loader.schedule(params({ region }), { immediate: true });
+    await flush();
+  }
+  h.loader.schedule(params({ region: 'JPN' }));
+  h.counts()[0].resolve(800);
+  await flush();
+  assert.equal(h.counts().length, 1);
+  assert.equal(h.latest().total, null);
+  h.time.advance(300);
+  await flush();
+  assert.equal(h.counts().length, 2);
+  assert.equal(h.counts()[1].args.params.region, 'JPN');
 });

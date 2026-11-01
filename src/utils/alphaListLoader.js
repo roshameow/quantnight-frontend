@@ -41,7 +41,9 @@ export function createAlphaListLoader({
   let pendingKey = null;
   let state = null;
   const pagesInFlight = new Map();
-  const countsInFlight = new Map();
+  // One count slot across all filter keys. `current` is the only waiting request;
+  // obsolete filters are never queued for later replay.
+  let countInFlight = null;
   const countCache = new Map();
 
   function call(command, params) {
@@ -70,7 +72,10 @@ export function createAlphaListLoader({
   }
   function ensureCount(request) {
     const { countKey, params } = request;
-    if (request.ra || cachedCount(countKey) || countsInFlight.has(countKey)) return;
+    if (!active || request !== current || request.ra || !request.countReady) return;
+    // A shared count may have failed while this search page was still loading.
+    // Its later row success must not silently retry; a new schedule resets status.
+    if (state.countStatus === 'unavailable' || cachedCount(countKey) || countInFlight) return;
     if (acceptsCount(countKey)) {
       state.total = null;
       state.countStatus = 'pending';
@@ -78,7 +83,7 @@ export function createAlphaListLoader({
       emit();
     }
     const promise = call('get_alpha_count', countParams(params));
-    countsInFlight.set(countKey, promise);
+    countInFlight = promise;
     promise.then((total) => {
       if (!Number.isSafeInteger(total) || total < 0) throw new Error('Invalid alpha count');
       if (!active) return;
@@ -99,7 +104,13 @@ export function createAlphaListLoader({
         state.countError = error;
         emit();
       }
-    }).finally(() => countsInFlight.delete(countKey));
+    }).finally(() => {
+      countInFlight = null;
+      // Retry failures only on a new schedule, not in a completion loop. A
+      // different current filter may proceed, but only once its rows are ready
+      // (or its non-search request has started).
+      if (active && current?.countKey !== countKey) ensureCount(current);
+    });
   }
   function cancelTimer() {
     if (timer !== null) clearTimer(timer);
@@ -109,6 +120,7 @@ export function createAlphaListLoader({
   function start(request, version) {
     if (!active || version !== generation) return;
     cancelTimer();
+    request.countReady = !request.search;
     ensureCount(request);
     let promise = pagesInFlight.get(request.pageKey);
     if (!promise) {
@@ -130,6 +142,10 @@ export function createAlphaListLoader({
       }
       // Non-RA result.total is a placeholder; only the separate count is authoritative.
       emit();
+      if (request.search) {
+        request.countReady = true;
+        ensureCount(request);
+      }
     }).catch((error) => {
       if (!active || version !== generation) return;
       state.loading = false;
@@ -151,7 +167,11 @@ export function createAlphaListLoader({
     cancelTimer();
     // Invalidate immediately, before the debounce timer fires (including stale errors).
     const version = ++generation;
-    current = { params: frozen, ra, pageKey, countKey: alphaCountKey(frozen) };
+    current = {
+      params: frozen, ra, pageKey, countKey: alphaCountKey(frozen),
+      // Scheduling only: do not normalize or otherwise change matching inputs.
+      search: Boolean(frozen.query || frozen.exclude_query), countReady: false,
+    };
     const entry = ra ? null : cachedCount(current.countKey);
     state = {
       rows: [], hasRows: false, loading: true, error: null,
@@ -172,7 +192,7 @@ export function createAlphaListLoader({
     generation++;
     cancelTimer();
     pagesInFlight.clear();
-    countsInFlight.clear();
+    countInFlight = null;
     countCache.clear();
   }
   return { schedule, dispose, getGeneration: () => generation };

@@ -226,3 +226,92 @@ fn omitted_total_keeps_the_legacy_paged_result_wire_shape() {
         json!({"data": [], "total": 0, "page": 2, "page_size": 50})
     );
 }
+
+
+#[test]
+fn empty_filter_count_uses_id_index_without_changing_other_options() {
+    for seconds in [None, Some(30)] {
+        let options = alpha_count_options(&doc! {}, CountOptions::builder()
+            .max_time(seconds.map(std::time::Duration::from_secs))
+            .build());
+        assert_eq!(options.hint, Some(Hint::Name("_id_".to_string())));
+        assert_eq!(options.max_time, seconds.map(std::time::Duration::from_secs));
+        assert_eq!(options.skip, None);
+        assert_eq!(options.limit, None);
+        assert!(options.collation.is_none());
+        assert!(options.read_concern.is_none());
+        assert!(options.selection_criteria.is_none());
+        assert!(options.comment.is_none());
+    }
+}
+
+#[test]
+fn only_literal_empty_filters_get_the_count_hint() {
+    for value in [json!({}), json!({"query": "  ", "messages_in": []})] {
+        let filter = build_alpha_filter(&query(value));
+        assert!(filter.is_empty());
+        assert_eq!(alpha_count_options(&filter, CountOptions::default()).hint,
+            Some(Hint::Name("_id_".to_string())));
+    }
+    for value in [
+        json!({"query": "close"}), json!({"exclude_query": "volume"}),
+        json!({"query": "{}"}), json!({"query": "{\"$and\": []}"}),
+        json!({"id": "a"}), json!({"region": "USA"}), json!({"delay": 0}),
+        json!({"alpha_type": "REGULAR"}), json!({"min_margin": 0.001}),
+        json!({"messages_nin": ["LOW_SHARPE"]}),
+    ] {
+        let filter = build_alpha_filter(&query(value));
+        assert!(!filter.is_empty());
+        let options = alpha_count_options(&filter, CountOptions::default());
+        assert_eq!(options.hint, None, "nonempty filter: {filter:?}");
+        assert_eq!(options.max_time, None);
+    }
+    // Do not simplify semantic tautologies into empty filters.
+    for filter in [doc! {"$and": []}, doc! {"$expr": true}] {
+        assert_eq!(alpha_count_options(&filter, CountOptions::default()).hint, None);
+    }
+}
+
+#[test]
+fn nonempty_count_preserves_existing_caller_options() {
+    let options = CountOptions::builder()
+        .hint(Hint::Name("caller_index".to_string()))
+        .max_time(std::time::Duration::from_secs(30))
+        .skip(2_u64).limit(7_u64).comment(Bson::String("count-test".into()))
+        .build();
+    let actual = alpha_count_options(&doc! {"settings.region": "USA"}, options);
+    assert_eq!(actual.hint, Some(Hint::Name("caller_index".to_string())));
+    assert_eq!(actual.max_time, Some(std::time::Duration::from_secs(30)));
+    assert_eq!(actual.skip, Some(2));
+    assert_eq!(actual.limit, Some(7));
+    assert_eq!(actual.comment, Some(Bson::String("count-test".into())));
+}
+
+// Source-route guards supplement executable options/filter tests. They prove
+// both real count call sites pass these options, not live Mongo/Tauri execution.
+#[test]
+fn actual_count_callers_pass_scoped_options_and_keep_legacy_routing() {
+    let source = include_str!("datas.rs");
+    let count = source.split("pub async fn get_alpha_count(").nth(1).unwrap()
+        .split("pub async fn get_alpha_results(").next().unwrap();
+    let page = source.split("pub async fn get_alpha_results(").nth(1).unwrap()
+        .split("pub struct PnlPoint").next().unwrap();
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    let count = compact(count);
+    let page = compact(page);
+    assert!(count.contains("ifis_ra_query(&params){returnErr("));
+    assert!(count.contains("letfilter=build_alpha_filter(&params);"));
+    assert!(count.contains("letoptions=alpha_count_options(&filter,CountOptions::builder().max_time(std::time::Duration::from_secs(30)).build());"));
+    assert!(count.contains("collection.count_documents(filter,options).await.map_err(|e|format!(\"DBcounterror:{e}\"))"));
+    assert_eq!(count.matches(".count_documents(").count(), 1);
+    assert!(page.contains("ifshould_include_total(&params){let(count_res,cursor_res)=join!(collection.count_documents(filter.clone(),alpha_count_options(&filter,CountOptions::default())),collection.find(filter,find_options));"));
+    assert!(page.contains("(count_res.unwrap_or(0),cursor_res)"));
+    assert!(page.contains("(0,collection.find(filter,find_options).await)"));
+    let ra = page.split("ifis_ra_query{").nth(1).unwrap().split("}else{").next().unwrap();
+    assert!(ra.contains("collection.aggregate(pipeline,None).await"));
+    assert!(!ra.contains("alpha_count_options"));
+    assert_eq!(page.matches(".count_documents(").count(), 1);
+    for caller in [&count, &page] {
+        assert!(!caller.contains("estimated_document_count"));
+    }
+}
