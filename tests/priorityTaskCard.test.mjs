@@ -440,10 +440,10 @@ test('single-source old metadata uses global distribution once without redundant
 
 test('single-source metadata displays completed and blocked counts clearly on main card face', async () => {
   const saved = poolEvent({ source_tasks: ['glb_spread'], root_count: 53,
-    stage_distribution: { '0': 0, '1': 10, '2': 39, '3': 4 }, completed: 2, blocked: 51 });
+    stage_distribution: { '0': 0, '1': 10, '2': 38, '3': 3 }, completed: 2, blocked: 51 });
   const { main } = sections(await render({ task, progress: { stale: false, priority_campaign: saved } }));
   const text = plainText(main);
-  assert.match(text, /glb_spread · Roots 53 · R0 0 \/ R1 10 \/ R2 39 \/ R3 4 · 已完结 2 \/ 阻塞 51/);
+  assert.match(text, /glb_spread · Roots 53 · R0 0 \/ R1 10 \/ R2 38 \/ R3 3 · 已完结 2 \/ 阻塞 51/);
 });
 
 test('single actual source summary overrides old global fallback and is never duplicated', async () => {
