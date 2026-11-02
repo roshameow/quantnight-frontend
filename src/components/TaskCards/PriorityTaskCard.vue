@@ -59,13 +59,16 @@
           R0 {{ group.stage_distribution ? (group.stage_distribution['0'] ?? 0) : '—' }} /
           R1 {{ group.stage_distribution?.['1'] ?? '—' }} /
           R2 {{ group.stage_distribution?.['2'] ?? '—' }} /
-          R3 {{ group.stage_distribution?.['3'] ?? '—' }}
+          R3 {{ group.stage_distribution?.['3'] ?? '—' }}<template v-if="sourceGroups.length <= 1 && runtime && (runtime.completed != null || runtime.blocked != null)"> · 已完结 {{ runtime.completed ?? 0 }} / 阻塞 {{ runtime.blocked ?? 0 }}</template>
+        </div>
+        <div v-if="sourceGroups.length > 1 && runtime && (runtime.completed != null || runtime.blocked != null)">
+          总计状态：已完结 {{ runtime.completed ?? 0 }} / 阻塞 {{ runtime.blocked ?? 0 }}
         </div>
         <div v-if="!sourceGroups.length">Roots {{ runtime?.root_count ?? '—' }} ·
           R0 {{ runtime?.stage_distribution ? (runtime.stage_distribution['0'] ?? 0) : '—' }} /
           R1 {{ runtime?.stage_distribution?.['1'] ?? '—' }} /
           R2 {{ runtime?.stage_distribution?.['2'] ?? '—' }} /
-          R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}</div>
+          R3 {{ runtime?.stage_distribution?.['3'] ?? '—' }}<template v-if="runtime && (runtime.completed != null || runtime.blocked != null)"> · 已完结 {{ runtime.completed ?? 0 }} / 阻塞 {{ runtime.blocked ?? 0 }}</template></div>
         <div v-if="sourceGroupsUnconfirmed"><n-text type="warning">来源分组未确认，请更新状态</n-text></div>
       </template>
       <n-text v-else type="warning">旧 campaign 记录（只读）</n-text>
