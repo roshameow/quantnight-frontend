@@ -4,11 +4,12 @@ use crate::{config::AppConfig, mongo_manager::{MongoClients, ClientSlots}};
 use async_trait::async_trait;
 use bson::{doc, Bson, Document};
 use futures_util::TryStreamExt;
-use mongodb::options::{AggregateOptions, FindOneOptions, FindOptions, InsertManyOptions, Hint};
+use mongodb::options::{AggregateOptions, FindOneOptions, FindOptions, InsertManyOptions, Hint, ListIndexesOptions};
 use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 const CONTROL_BUDGET: Duration = Duration::from_secs(8);
-const QUERY_BUDGET: Duration = Duration::from_secs(10);
+// Short reads share one connection/command/cursor budget; mutations retain 8s.
+const READ_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Host {
@@ -176,7 +177,7 @@ pub fn heartbeat_query() -> (Document, FindOneOptions) {
         FindOneOptions::builder()
             .projection(doc! {"heartbeatAt": 1, "_id": 0})
             .sort(doc! {"heartbeatAt": -1})
-            .max_time(QUERY_BUDGET)
+            .max_time(READ_BUDGET)
             .build(),
     )
 }
@@ -185,25 +186,25 @@ pub fn nonempty_options() -> FindOptions {
         .projection(id_projection())
         .limit(1)
         .batch_size(1)
-        .max_time(QUERY_BUDGET)
+        .max_time(READ_BUDGET)
         .build()
 }
 fn row_options(projection: Option<Document>) -> FindOptions {
     // No limit: metadata and actual copy must not truncate the candidate set.
     FindOptions::builder()
         .projection(projection)
-        .max_time(QUERY_BUDGET)
+        .max_time(READ_BUDGET)
         .build()
 }
 
 // Original never-started control ambiguity probe: limit applies to control
 // records, never to candidates/items. Full control history is required.
 pub fn never_started_controls_options() -> FindOptions {
-    FindOptions::builder().limit(2).batch_size(2).max_time(CONTROL_BUDGET).build()
+    FindOptions::builder().limit(2).batch_size(2).max_time(READ_BUDGET).build()
 }
 pub fn consumer_capability_query(name: &str) -> (Document, FindOneOptions) {
     (doc! {"task": name}, FindOneOptions::builder()
-        .projection(id_projection()).max_time(CONTROL_BUDGET).build())
+        .projection(id_projection()).max_time(READ_BUDGET).build())
 }
 
 /// Canonical namespace returned by the original MongoConfig profile mapping.
@@ -221,7 +222,7 @@ impl CanonicalNamespace {
 pub fn list_tasks_options() -> FindOptions {
     FindOptions::builder().projection(doc! {"name":1,"status":1,"taskType":1,
         "auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1,"generation":1})
-        .sort(doc! {"_id":-1}).max_time(CONTROL_BUDGET).build()
+        .sort(doc! {"_id":-1}).max_time(READ_BUDGET).build()
 }
 pub fn result_items_options(limit: i64, offset: i64) -> Result<FindOptions, String> {
     if !(1..=200).contains(&limit) || !(0..=10000).contains(&offset) {
@@ -230,7 +231,7 @@ pub fn result_items_options(limit: i64, offset: i64) -> Result<FindOptions, Stri
     Ok(FindOptions::builder().projection(doc! {"_id":1,"alphaId":1,"status":1,
         "variantId":1,"variantHash":1,"candidateHash":1,"ideaId":1,"payloadHash":1,
         "acceptance":1,"terminalStatus":1}).sort(doc! {"_id":1})
-        .skip(offset as u64).limit(limit+1).max_time(Duration::from_secs(5)).build())
+        .skip(offset as u64).limit(limit+1).max_time(READ_BUDGET).build())
 }
 /// Metadata from listIndexes, same first-key/hidden/partial guards as Python.
 pub fn canonical_id_hint(indexes: &[Document]) -> Result<String, String> {
@@ -259,7 +260,7 @@ pub fn canonical_result_options(hint: String, count: usize) -> Result<FindOption
         "dateCreated":1,"dateModified":1,"updated_at":1,"settings.region":1,
         "settings.universe":1,"settings.delay":1,"is.sharpe":1,"is.fitness":1,
         "is.margin":1,"is.turnover":1,"is.returns":1,"is.drawdown":1})
-        .hint(Hint::Name(hint)).limit(count as i64).max_time(Duration::from_secs(5)).build())
+        .hint(Hint::Name(hint)).limit(count as i64).max_time(READ_BUDGET).build())
 }
 
 #[async_trait]
@@ -330,34 +331,62 @@ pub trait TaskStore: Send + Sync {
 /// One application attempt, bounded across connection/command/cursor drain.
 /// Dropping a timed-out mutation does not establish whether Mongo accepted it.
 /// Never resubmit here; the caller retains original identity/partial evidence.
+async fn with_deadline<T, E>(
+    operation: &str,
+    budget: Duration,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, String> {
+    tokio::time::timeout(budget, future).await.map_err(|_| format!(
+        "{operation}: timeout after {} ms; result unconfirmed, not retried",
+        budget.as_millis()
+    ))
+}
 async fn bounded<T>(
     operation: &str,
     budget: Duration,
     future: impl Future<Output = Result<T, mongodb::error::Error>>,
 ) -> Result<T, String> {
-    tokio::time::timeout(budget, future)
-        .await
-        .map_err(|_| {
-            format!(
-                "{operation}: timeout after {} ms; result unconfirmed, not retried",
-                budget.as_millis()
-            )
-        })?
+    with_deadline(operation, budget, future).await?
         .map_err(|e| format!("{operation}: {e}"))
+}
+
+// Moving lazy acquisition under the deadline must not change the original
+// connection/configuration errors, or canonical guard/error strings.
+#[derive(Debug)]
+enum ReadError {
+    Original(String),
+    Command(mongodb::error::Error),
+}
+impl From<String> for ReadError {
+    fn from(error: String) -> Self { Self::Original(error) }
+}
+impl From<mongodb::error::Error> for ReadError {
+    fn from(error: mongodb::error::Error) -> Self { Self::Command(error) }
+}
+/// All short read stages, including lazy pool acquisition, stay in this future.
+async fn bounded_read<T>(
+    operation: &str,
+    future: impl Future<Output = Result<T, ReadError>>,
+) -> Result<T, String> {
+    with_deadline(operation, READ_BUDGET, future).await?.map_err(|error| match error {
+        ReadError::Original(message) => message,
+        ReadError::Command(error) => format!("{operation}: {error}"),
+    })
 }
 
 /// Immutable mappings supplied by the existing app config, never a new factory.
 pub struct MongoTaskStore<T = mongodb::Client> {
-    clients: ClientSlots<T>,
+    clients: Arc<ClientSlots<T>>,
     mission: String,
     simulation: String,
 }
 impl<T> MongoTaskStore<T> {
+    pub(crate) fn shared_clients(&self) -> Arc<ClientSlots<T>> { self.clients.clone() }
     /// Original desktop injection: retain the exact existing pools.
     pub fn new(clients: Arc<MongoClients<T>>, config: &AppConfig) -> Result<Self, String> {
-        Self::with_clients(ClientSlots::existing(&clients), config)
+        Self::with_clients(Arc::new(ClientSlots::existing(&clients)), config)
     }
-    fn with_clients(clients: ClientSlots<T>, config: &AppConfig) -> Result<Self, String> {
+    pub(crate) fn with_clients(clients: Arc<ClientSlots<T>>, config: &AppConfig) -> Result<Self, String> {
         let mission = config.mongodb.databases.mission.clone();
         let simulation = config.mongodb.databases.simulation.clone();
         if mission.trim().is_empty() || simulation.trim().is_empty() {
@@ -370,7 +399,7 @@ impl<T> MongoTaskStore<T> {
         })
     }
     #[cfg(test)]
-    pub(crate) async fn existing_client(&self, host: Host) -> &Arc<T> {
+    pub(crate) async fn existing_client(&self, host: Host) -> &Arc<T> where T: Send + Sync + 'static {
         self.clients.client_with(host.is_remote(), |_| async { panic!("injected pool must never rebuild") }).await.unwrap()
     }
 }
@@ -378,7 +407,7 @@ impl MongoTaskStore {
     /// Native bootstrap does not create unused clients or parse unused URIs.
     /// First access delegates to the original MongoClients connection owner.
     pub fn from_config(config: &AppConfig) -> Result<Self, String> {
-        Self::with_clients(MongoClients::scoped(config), config)
+        Self::with_clients(Arc::new(MongoClients::scoped(config)), config)
     }
     async fn client(&self, host: Host) -> Result<&mongodb::Client, String> {
         self.clients.client(host.is_remote()).await.map(Arc::as_ref)
@@ -430,35 +459,38 @@ impl TaskStore for MongoTaskStore {
             .try_collect().await.map_err(|e| format!("explicit result export: {e}"))
     }
     async fn list_tasks(&self, host: Host, include_deactive: bool) -> Result<Vec<Document>, String> {
-        let tasks = self.client(host).await?.database(&self.mission).collection::<Document>("tasks");
         let filter = if include_deactive { doc! {} } else { doc! {"status":{"$ne":"deactive"}} };
-        bounded("projected task listing", CONTROL_BUDGET, async {
-            tasks.find(filter, list_tasks_options()).await?.try_collect().await
+        bounded_read("projected task listing", async {
+            let tasks = self.client(host).await?.database(&self.mission).collection::<Document>("tasks");
+            tasks.find(filter, list_tasks_options()).await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
         }).await
     }
     async fn result_items_page(&self, host: Host, name: &str, limit: i64, offset: i64) -> Result<Vec<Document>, String> {
         let options = result_items_options(limit, offset)?;
-        let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
-        bounded("projected task result page", CONTROL_BUDGET, async {
-            items.find(doc! {}, options).await?.try_collect().await
+        bounded_read("projected task result page", async {
+            let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            items.find(doc! {}, options).await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
         }).await
     }
     async fn canonical_results(&self, namespace: &CanonicalNamespace, ids: &[Bson]) -> Result<Vec<Document>, String> {
         if ids.is_empty() { return Ok(vec![]); }
         if ids.len() > 200 { return Err("canonical result read exceeds bounded page".into()); }
         CanonicalNamespace::new(namespace.database.clone(), namespace.collection.clone())?;
-        let collection = self.client(Host::Local).await?.database(&namespace.database).collection::<Document>(&namespace.collection);
-        // One budget covers metadata AND cursor drain; no retry, no implicit
+        // One budget covers connection, metadata AND cursor drain; no retry, no
         // index creation, no unhinted fallback when metadata/query fails.
-        tokio::time::timeout(CONTROL_BUDGET, async {
-            let indexes: Vec<mongodb::IndexModel> = collection.list_indexes(None).await.map_err(|e| e.to_string())?
-                .try_collect().await.map_err(|e| e.to_string())?;
-            let indexes = indexes.iter().map(bson::to_document).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        bounded_read("canonical result page", async {
+            let collection = self.client(Host::Local).await?.database(&namespace.database).collection::<Document>(&namespace.collection);
+            let indexes: Vec<mongodb::IndexModel> = collection.list_indexes(
+                ListIndexesOptions::builder().max_time(READ_BUDGET).build()).await.map_err(|e| ReadError::Original(e.to_string()))?
+                .try_collect().await.map_err(|e| ReadError::Original(e.to_string()))?;
+            let indexes = indexes.iter().map(bson::to_document).collect::<Result<Vec<_>, _>>().map_err(|e| ReadError::Original(e.to_string()))?;
             let hint = canonical_id_hint(&indexes)?;
             let options = canonical_result_options(hint, ids.len())?;
-            collection.find(doc! {"id":{"$in":ids.to_vec()}}, options).await.map_err(|e| e.to_string())?
-                .try_collect().await.map_err(|e| e.to_string())
-        }).await.map_err(|_| "canonical result page: timeout after 8000 ms; result unconfirmed, not retried".to_string())?
+            collection.find(doc! {"id":{"$in":ids.to_vec()}}, options).await.map_err(|e| ReadError::Original(e.to_string()))?
+                .try_collect().await.map_err(|e| ReadError::Original(e.to_string()))
+        }).await
     }
     async fn update_item(&self, host: Host, name: &str, filter: Document, update: Document) -> Result<u64, String> {
         let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
@@ -476,34 +508,39 @@ impl TaskStore for MongoTaskStore {
             .await.map(|result| result.matched_count)
     }
     async fn find_tasks(&self, host: Host, filter: Document) -> Result<Vec<Document>, String> {
-        let tasks = self.client(host).await?.database(&self.mission).collection::<Document>("tasks");
-        bounded("never-started control ambiguity query", CONTROL_BUDGET, async {
-            tasks.find(filter, never_started_controls_options()).await?.try_collect().await
+        bounded_read("never-started control ambiguity query", async {
+            let tasks = self.client(host).await?.database(&self.mission).collection::<Document>("tasks");
+            tasks.find(filter, never_started_controls_options()).await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
         }).await
     }
     async fn consumer_capability_exists(&self, host: Host, name: &str) -> Result<bool, String> {
-        let capabilities = self.client(host).await?.database(&self.mission)
-            .collection::<Document>("priority_consumer_capabilities");
         let (filter, options) = consumer_capability_query(name);
-        bounded("never-started consumer capability query", CONTROL_BUDGET,
-            capabilities.find_one(filter, options)).await.map(|row| row.is_some())
+        bounded_read("never-started consumer capability query", async {
+            let capabilities = self.client(host).await?.database(&self.mission)
+                .collection::<Document>("priority_consumer_capabilities");
+            capabilities.find_one(filter, options).await.map_err(ReadError::from)
+        }).await.map(|row| row.is_some())
     }
     async fn execution_receipt_assessment(&self,host:Host,name:&str)->Result<Document,String>{
-        let items=self.client(host).await?.database(&self.simulation).collection::<Document>(name);
-        let options=FindOptions::builder().projection(execution_receipt_projection()).batch_size(100).max_time(QUERY_BUDGET).build();
-        let rows:Vec<Document>=bounded("original execution receipt metadata",QUERY_BUDGET,async{
-            items.find(doc!{},options).await?.try_collect().await
+        let options=FindOptions::builder().projection(execution_receipt_projection()).batch_size(100).max_time(READ_BUDGET).build();
+        let rows:Vec<Document>=bounded_read("original execution receipt metadata",async{
+            let items=self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            items.find(doc!{},options).await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
         }).await?;
         Ok(assess_execution_receipts(&rows))
     }
     async fn consumer_runtime(&self, host: Host, name: &str, profile: &str) -> Result<Option<Document>, String> {
-        let capabilities = self.client(host).await?.database(&self.mission)
-            .collection::<Document>("priority_consumer_capabilities");
-        let options = FindOneOptions::builder().max_time(CONTROL_BUDGET).projection(doc! {
+        let options = FindOneOptions::builder().max_time(READ_BUDGET).projection(doc! {
             "task":1,"auth_profile":1,"source_task_id":1,"source_remote":1,"consumer_run_id":1,
             "pid":1,"pidCreatedAt":1,"heartbeatAt":1,"dist":1,"configDigestVersion":1,"effectiveConfigDigest":1}).build();
-        bounded("original consumer identity", CONTROL_BUDGET,
-            capabilities.find_one(doc! {"_id":format!("{profile}:{name}"),"task":name,"auth_profile":profile}, options)).await
+        bounded_read("original consumer identity", async {
+            let capabilities = self.client(host).await?.database(&self.mission)
+                .collection::<Document>("priority_consumer_capabilities");
+            capabilities.find_one(doc! {"_id":format!("{profile}:{name}"),"task":name,"auth_profile":profile}, options)
+                .await.map_err(ReadError::from)
+        }).await
     }
     async fn find_task(
         &self,
@@ -512,15 +549,14 @@ impl TaskStore for MongoTaskStore {
         newest: bool,
     ) -> Result<Option<Document>, String> {
         let mut options = FindOneOptions::default();
-        options.max_time = Some(CONTROL_BUDGET);
+        options.max_time = Some(READ_BUDGET);
         if newest {
             options.sort = Some(doc! { "_id": -1 });
         }
-        let tasks = self
-            .client(host).await?
-            .database(&self.mission)
-            .collection::<Document>("tasks");
-        bounded("task read", CONTROL_BUDGET, tasks.find_one(filter, options)).await
+        bounded_read("task read", async {
+            let tasks = self.client(host).await?.database(&self.mission).collection::<Document>("tasks");
+            tasks.find_one(filter, options).await.map_err(ReadError::from)
+        }).await
     }
     async fn update_task(
         &self,
@@ -541,56 +577,36 @@ impl TaskStore for MongoTaskStore {
         .map(|result| result.matched_count)
     }
     async fn collection_names(&self, host: Host) -> Result<Vec<String>, String> {
-        let database = self.client(host).await?.database(&self.simulation);
-        bounded(
-            "task collection inventory",
-            CONTROL_BUDGET,
-            database.list_collection_names(None),
-        )
-        .await
+        bounded_read("task collection inventory", async {
+            let database = self.client(host).await?.database(&self.simulation);
+            // Driver 2.8 list_collection_names has no maxTimeMS option.
+            database.list_collection_names(None).await.map_err(ReadError::from)
+        }).await
     }
     async fn summary(&self, host: Host, name: &str) -> Result<CollectionSummary, String> {
         if !self.collection_names(host).await?.iter().any(|n| n == name) {
             return Ok(CollectionSummary::default());
         }
-        let collection = self
-            .client(host).await?
-            .database(&self.simulation)
-            .collection::<Document>(name);
-        let groups: Vec<Document> = bounded("task status aggregation", QUERY_BUDGET, async {
-            collection
-                .aggregate(
-                    summary_pipeline(),
-                    AggregateOptions::builder().max_time(QUERY_BUDGET).build(),
-                )
-                .await?
-                .try_collect()
-                .await
-        })
-        .await?;
+        let groups: Vec<Document> = bounded_read("task status aggregation", async {
+            let collection = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            collection.aggregate(summary_pipeline(),
+                AggregateOptions::builder().max_time(READ_BUDGET).build())
+                .await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
+        }).await?;
         let (filter, options) = heartbeat_query();
-        let latest = bounded(
-            "task latest heartbeat",
-            QUERY_BUDGET,
-            collection.find_one(filter, options),
-        )
-        .await?;
+        let latest = bounded_read("task latest heartbeat", async {
+            let collection = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            collection.find_one(filter, options).await.map_err(ReadError::from)
+        }).await?;
         decode_summary(groups, latest)
     }
     async fn has_rows(&self, host: Host, name: &str) -> Result<bool, String> {
-        let collection = self
-            .client(host).await?
-            .database(&self.simulation)
-            .collection::<Document>(name);
-        bounded("task nonempty probe", QUERY_BUDGET, async {
-            collection
-                .find(doc! {}, nonempty_options())
-                .await?
-                .try_next()
-                .await
-        })
-        .await
-        .map(|row| row.is_some())
+        bounded_read("task nonempty probe", async {
+            let collection = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            collection.find(doc! {}, nonempty_options()).await.map_err(ReadError::from)?
+                .try_next().await.map_err(ReadError::from)
+        }).await.map(|row| row.is_some())
     }
     async fn rows(
         &self,
@@ -601,9 +617,10 @@ impl TaskStore for MongoTaskStore {
         self.find_items(host, name, doc! {}, projection).await
     }
     async fn find_items(&self, host: Host, name: &str, filter: Document, projection: Option<Document>) -> Result<Vec<Document>, String> {
-        let collection = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
-        bounded("task item query/read", QUERY_BUDGET, async {
-            collection.find(filter, row_options(projection)).await?.try_collect().await
+        bounded_read("task item query/read", async {
+            let collection = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            collection.find(filter, row_options(projection)).await.map_err(ReadError::from)?
+                .try_collect().await.map_err(ReadError::from)
         }).await
     }
     async fn insert_rows(&self, host: Host, name: &str, rows: Vec<Document>) -> Result<(), String> {
@@ -640,15 +657,13 @@ impl TaskStore for MongoTaskStore {
         .map(|_| ())
     }
     async fn ping(&self, host: Host) -> Result<(), String> {
-        let database = self.client(host).await?.database("admin");
-        bounded(
-            "task storage availability",
-            CONTROL_BUDGET,
-            database.run_command(doc! {"ping": 1}, None),
-        )
-        .await
-        .map(|_| ())
+        bounded_read("task storage availability", async {
+            let database = self.client(host).await?.database("admin");
+            database.run_command(doc! {"ping": 1, "maxTimeMS": READ_BUDGET.as_millis() as i64}, None)
+                .await.map_err(ReadError::from)
+        }).await.map(|_| ())
     }
+
 }
 
 #[cfg(test)]
@@ -707,7 +722,7 @@ mod tests {
         assert_eq!(filter, doc! {"heartbeatAt": {"$exists": true}});
         assert_eq!(latest.projection, Some(doc! {"heartbeatAt": 1, "_id": 0}));
         assert_eq!(latest.sort, Some(doc! {"heartbeatAt": -1}));
-        assert_eq!(latest.max_time, Some(Duration::from_secs(10)));
+        assert_eq!(latest.max_time, Some(Duration::from_secs(30)));
         let probe = nonempty_options();
         assert_eq!(probe.limit, Some(1));
         assert_eq!(probe.batch_size, Some(1));
@@ -716,10 +731,93 @@ mod tests {
             let options = row_options(projection.clone());
             assert_eq!(options.limit, None);
             assert_eq!(options.projection, projection);
-            assert_eq!(options.max_time, Some(Duration::from_secs(10)));
+            assert_eq!(options.max_time, Some(Duration::from_secs(30)));
         }
         assert_eq!(CONTROL_BUDGET, Duration::from_secs(8));
     }
+    #[test]
+    fn short_read_paths_bound_connection_and_keep_mutations_on_original_budget() {
+        assert_eq!(READ_BUDGET, Duration::from_secs(30));
+        assert_eq!(CONTROL_BUDGET, Duration::from_secs(8));
+        assert_eq!(nonempty_options().max_time, Some(READ_BUDGET));
+        assert_eq!(consumer_capability_query("task").1.max_time, Some(READ_BUDGET));
+        // Guard the production methods, not just a helper tested in isolation:
+        // lazy connection acquisition must remain INSIDE each short read future.
+        let source = include_str!("task_store.rs").split("impl TaskStore for MongoTaskStore {").nth(1).unwrap()
+            .split("\n#[cfg(test)]").next().unwrap();
+        for method in ["list_tasks", "result_items_page", "canonical_results", "find_tasks",
+            "consumer_capability_exists", "execution_receipt_assessment", "consumer_runtime",
+            "find_task", "collection_names", "summary", "has_rows", "find_items", "ping"] {
+            let body = source.split(&format!("async fn {method}(")).nth(1).unwrap()
+                .split("async fn ").next().unwrap();
+            assert!(body.find("bounded_read(").unwrap() < body.find("self.client(").unwrap(), "{method}");
+            assert!(!body.contains("CONTROL_BUDGET"), "{method}");
+        }
+        for method in ["update_item", "insert_task", "update_items", "update_task",
+            "insert_rows", "rename_collection"] {
+            let body = source.split(&format!("async fn {method}(")).nth(1).unwrap()
+                .split("async fn ").next().unwrap();
+            assert!(body.contains("CONTROL_BUDGET"), "{method}");
+            assert!(!body.contains("READ_BUDGET") && !body.contains("bounded_read("), "{method}");
+        }
+        let export = source.split("async fn collect_result_items(").nth(1).unwrap()
+            .split("async fn ").next().unwrap();
+        assert!(!export.contains("bounded")); // no new cap on explicit full export
+    }
+
+    #[tokio::test]
+    async fn read_connection_and_canonical_errors_preserve_original_text() {
+        for original in ["remote MongoDB role is unconfigured; operation unavailable (no fallback)",
+            "canonical result id index missing; refusing a full collection scan"] {
+            let result: Result<(), String> = bounded_read("original read", async {
+                Err(ReadError::Original(original.into()))
+            }).await;
+            assert_eq!(result.unwrap_err(), original);
+        }
+        let result: Result<(), String> = bounded_read("task read", async {
+            Err(mongodb::error::Error::from(std::io::Error::new(
+                std::io::ErrorKind::Other, "sentinel command failure")).into())
+        }).await;
+        let error = result.unwrap_err();
+        assert!(error.starts_with("task read: ") && error.contains("sentinel command failure"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_deadline_covers_connection_command_and_cursor_without_restart_or_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for blocked_stage in 0..3 {
+            let calls = AtomicUsize::new(0);
+            let start = tokio::time::Instant::now();
+            let result: Result<(), String> = bounded_read("phased read", async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                for stage in 0..3 { // lowest-I/O stand-ins: connection, command, cursor
+                    if stage == blocked_stage {
+                        return std::future::pending::<Result<(), ReadError>>().await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(12)).await;
+                }
+                Ok(())
+            }).await;
+            assert_eq!(start.elapsed(), READ_BUDGET);
+            assert_eq!(result.unwrap_err(),
+                "phased read: timeout after 30000 ms; result unconfirmed, not retried");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        let start = tokio::time::Instant::now();
+        let result: Result<(), String> = bounded_read("slow read", async {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            Ok(())
+        }).await;
+        assert!(result.is_ok()); // old 8/10 second limits must not survive
+        assert_eq!(start.elapsed(), Duration::from_secs(29));
+        let start = tokio::time::Instant::now();
+        let result: Result<(), String> = bounded("task control write", CONTROL_BUDGET,
+            std::future::pending::<Result<(), mongodb::error::Error>>()).await;
+        assert_eq!(start.elapsed(), CONTROL_BUDGET);
+        assert_eq!(result.unwrap_err(),
+            "task control write: timeout after 8000 ms; result unconfirmed, not retried");
+    }
+
     #[test]
     fn aggregate_decode_preserves_zero_vs_error_and_bson_heartbeat() {
         let stamp = bson::DateTime::from_millis(1234);
@@ -772,7 +870,7 @@ mod tests {
             );
             assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         }
-        let failure: Result<bool, String> = bounded("task nonempty probe", QUERY_BUDGET, async {
+        let failure: Result<bool, String> = bounded("task nonempty probe", READ_BUDGET, async {
             Err(mongodb::error::Error::from(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "sentinel cursor failure",

@@ -174,3 +174,35 @@ async fn canonical_logical_root_symlink_is_preserved_and_target_changes_do_not_r
     assert!(binding.verify_current().is_err());
     assert!(Arc::ptr_eq(&clients.local, store.existing_client(Host::Local).await));
 }
+
+#[tokio::test]
+async fn actual_host_appconfig_loader_retains_original_task_script_without_endpoint_or_ui_namespace_override(){
+    let fake=fixture("");let root=PathBuf::from(&fake.config.env.working_dir).canonicalize().unwrap();let path=root.join("original-app.toml");
+    let source=format!(r#"[env]
+working_dir = '{}'
+[python.scripts]
+[bash.scripts.check_task_status]
+command = 'bash'
+script = 'scripts/original-diagnostic.sh'
+args = ['{{task_name}}']
+[mongodb]
+local_uri = 'mongodb://legacy.invalid:27017'
+remote_uri = 'mongodb://legacy.invalid:27018'
+[mongodb.databases]
+mission = 'simulation_mission'
+simulation = 'simulation_db'
+alpha = 'custom_ui_a'
+"#,root.display());std::fs::write(&path,&source).unwrap();
+    let selection=crate::runtime::RuntimeSelection{binding_path:root.join("binding.json"),backend_root:root.clone(),frontend_root:root.clone(),executable:std::env::current_exe().unwrap(),configuration:crate::runtime::identity::ConfigurationSelector{kind:"app_config".into(),path:path.clone()},protocol_version:1,binding_revision:"fixture".into(),target:crate::DEV_TARGET.into(),profile:crate::DEV_PROFILE.into()};
+    crate::mongo_manager::local_config_test_support::without_client_construction(async{
+        let config=crate::runtime::identity::load_host_config(&selection).await.unwrap();
+        assert_eq!(config.mongodb.local_uri,LOCAL);assert_eq!(config.mongodb.remote_uri,REMOTE);assert_eq!(config.mongodb.databases.alpha,"custom_ui_a");
+        assert_eq!(config.bash.scripts["check_task_status"].script.as_deref(),Some("scripts/original-diagnostic.sh"));
+        let fingerprint=crate::backend_binding::task_settings_fingerprint(&config).unwrap();
+        let control=TaskControl::connect(&config).await.unwrap();assert_eq!(control.runtime_context().unwrap().pool_snapshot().local.initialization_attempts,0);
+        std::fs::write(&path,source.replace("custom_ui_a","custom_ui_b")).unwrap();crate::runtime::identity::task_settings_fresh(&selection,&fingerprint).unwrap();
+        std::fs::write(&path,source.replace("alpha = 'custom_ui_a'","alpha = 123").replace("script = 'scripts/original-diagnostic.sh'","module = 999\nscript = 'scripts/original-diagnostic.sh'")).unwrap();
+        crate::runtime::identity::task_settings_fresh(&selection,&fingerprint).unwrap();
+        std::fs::write(&path,source.replace("original-diagnostic.sh","explicit-new-diagnostic.sh")).unwrap();assert!(crate::runtime::identity::task_settings_fresh(&selection,&fingerprint).unwrap_err().contains("reload"));
+    }).await;
+}

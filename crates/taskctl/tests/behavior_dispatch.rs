@@ -898,7 +898,9 @@ async fn confirmed_generation_failure_restores_task_and_cli_list_keeps_operation
 #[tokio::test(flavor = "current_thread")]
 async fn dropped_cli_generate_response_retains_original_operation_lock_and_finalizes_once() {
     use std::sync::Arc;
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
+    #[cfg(target_os="macos")]
+    quantnight_task_core::task_control::hosted_generation_test_support::attach(&mut f.core,"accepted-business-host").unwrap();
     let name = "dropped_generation";
     ok(&f.run(&["create", "--name", name, "--templatefile", "frozen"]).await);
     let gate = Arc::new(GenerationReadGate::default());
@@ -917,6 +919,8 @@ async fn dropped_cli_generate_response_retains_original_operation_lock_and_final
     let claim = f.store.task(name);
     assert_eq!(claim.get_str("status"), Ok("generating"));
     drop(caller); // No runtime/process shutdown; only the original caller goes away.
+    #[cfg(target_os="macos")]
+    assert_eq!(quantnight_task_core::task_control::hosted_generation_test_support::scope_active(&f.core,&claim),Some(true));
     let duplicate = f.run(&argv).await;
     failed(&duplicate);
     assert!(duplicate.value["error"].as_str().unwrap().contains("another lifecycle mutator"));
@@ -930,6 +934,8 @@ async fn dropped_cli_generate_response_retains_original_operation_lock_and_final
     assert_eq!(saved.get_document("generation").unwrap().get_str("id"), claim.get_document("generation").unwrap().get_str("id"));
     assert_eq!(saved.get_array("events").unwrap().iter().filter(|e| e.as_document().unwrap().get_str("command")==Ok("generation-finish")).count(), 1);
     assert_eq!(f.count("run"), 1);
+    #[cfg(target_os="macos")]
+    assert_eq!(quantnight_task_core::task_control::hosted_generation_test_support::scope_active(&f.core,&saved),Some(false));
     // Unchanged binding must be reused, not validated/exported afresh.
     assert_eq!(owner_calls(&f, "--validate-task-control-binding").len(), 1);
     assert!(quantnight_task_core::mission_lock::MissionLocks::acquire(&f.root, &[name], false).is_ok());
@@ -989,4 +995,28 @@ async fn dropped_facade_caller_keeps_live_writer_until_ordinary_failure_finaliza
     assert_eq!(f.count("run"), 1);
     assert_eq!(owner_calls(&f, "--validate-task-control-binding").len(), 1);
     assert!(quantnight_task_core::mission_lock::MissionLocks::acquire(&f.root, &[name], false).is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn status_read_timeout_is_explicit_no_retry_and_never_task_completion() {
+    let f = Fixture::new().await;
+    let name = "read_timeout";
+    f.create_generate(name, "regular", false).await;
+    let before = f.store.task(name);
+    let timeout = "task read: timeout after 30000 ms; result unconfirmed, not retried";
+    {
+        let mut data = f.store.data.lock().unwrap();
+        data.calls.clear();
+        data.fail = Some("find:Local".into());
+        data.fail_message = Some(timeout.into());
+    }
+    // Actual parser -> dispatch -> TaskControl -> lowest fake storage.
+    let result = f.run(&["status", "--name", name]).await;
+    failed(&result);
+    assert!(result.value.to_string().contains(timeout), "{}", result.value);
+    assert_ne!(result.value["terminal"], true);
+    assert_eq!(f.store.task(name), before);
+    let data = f.store.data.lock().unwrap();
+    assert_eq!(data.calls.iter().filter(|s| s.as_str() == "find:Local").count(), 1);
+    assert!(!data.calls.iter().any(|s| s.starts_with("update:")));
 }

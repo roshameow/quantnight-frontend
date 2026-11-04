@@ -11,6 +11,7 @@ fn list_is_projected_newest_first_without_item_payload_or_candidate_cap() {
     let o = list_tasks_options();
     assert_eq!(o.sort, Some(doc! {"_id":-1}));
     assert_eq!(o.limit, None);
+    assert_eq!(o.max_time, Some(Duration::from_secs(30)));
     assert_eq!(
         o.projection,
         Some(
@@ -25,7 +26,7 @@ fn results_boundary_page_is_small_id_sorted_projection_not_full_payload() {
         assert_eq!(o.limit, Some(limit + 1));
         assert_eq!(o.skip, Some(offset as u64));
         assert_eq!(o.sort, Some(doc! {"_id":1}));
-        assert_eq!(o.max_time, Some(Duration::from_secs(5)));
+        assert_eq!(o.max_time, Some(Duration::from_secs(30)));
         assert_eq!(
             o.projection,
             Some(
@@ -58,7 +59,7 @@ fn canonical_index_guard_first_key_ascending_visible_nonpartial_and_lexical_name
     let o = canonical_result_options(canonical_id_hint(&indexes).unwrap(), 200).unwrap();
     assert!(matches!(o.hint,Some(Hint::Name(ref name)) if name=="a_id"));
     assert_eq!(o.limit, Some(200));
-    assert_eq!(o.max_time, Some(Duration::from_secs(5)));
+    assert_eq!(o.max_time, Some(Duration::from_secs(30)));
     assert_eq!(o.sort, None);
     assert_eq!(o.skip, None);
     assert_eq!(
@@ -114,11 +115,11 @@ fn additive_read_api_does_not_change_existing_summary_receipt_or_probe_shapes() 
         vec![doc! {"$group":{"_id":{"$ifNull":["$status","missing"]},"count":{"$sum":1}}}]
     );
     assert_eq!(nonempty_options().limit, Some(1));
-    assert_eq!(nonempty_options().max_time, Some(Duration::from_secs(10)));
+    assert_eq!(nonempty_options().max_time, Some(Duration::from_secs(30)));
     assert_eq!(never_started_controls_options().limit, Some(2));
     assert_eq!(
         never_started_controls_options().max_time,
-        Some(Duration::from_secs(8))
+        Some(Duration::from_secs(30))
     );
     let p: Document = receipt_projection();
     assert_eq!(p.get("submissionAttempts"), Some(&Bson::Int32(1)));

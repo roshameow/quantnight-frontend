@@ -34,28 +34,32 @@ npm run demo
 当前源码的连接配置要点：
 
 1. 在应用 TOML 中将 `env.working_dir` 设为后端根目录，并配置数据库/集合名称与脚本映射；可参考[内置配置模板](src-tauri/resources/config.toml)。
-2. 在该后端的私有 `credentials.yaml` 中配置 `mongodb.local_uri` 和 `mongodb.remote_uri`，以及平台账号。桌面连接读取后端配置，不使用 TOML 中的旧 URI 字段；两种数据库角色均需配置，任务数据库名称须与后端一致。
-3. 更改连接配置后，关闭并重新打开应用。模板选择器关联后端已有模板，不上传文件；请先将模板放到对应执行环境。
+2. 在该后端的私有 `credentials.yaml` 中配置 `mongodb.local_uri` 和 `mongodb.remote_uri`，以及平台账号。桌面连接读取后端配置，不使用 TOML 中的旧 URI 字段；任务数据库名称须与后端绑定一致；runtime任务池按需初始化角色，GUI原非任务数据池的配置要求仍保留。
+3. GUI非任务数据配置按原规则重开加载；任务host连接/共享源码变化须按[构建与安全采用手册](crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)明确采用，重开GUI不能替代host换代。模板选择器关联后端已有模板，不上传文件；请先将模板放到对应执行环境。
+
+macOS明确登记runtime后，GUI与CLI平级共用独立headless taskctl任务host；原Python入口直接exec登记的独立runtime程序作client，不依赖GUI文件/ready。launchd socket首次需求启动，关闭GUI不关host或runner。非任务Alpha/data/PNL保留GUI原独立池；未登记schema1保留旧模式。本文描述源码合同，不表示下载包/本机已登记或加载。
+
+GUI任务诊断需按唯一采用手册明确选择原AppConfig以保留原任务脚本合同；纯CLI backend_root模式不捏造GUI脚本默认值。
 
 连接后，在任务页添加任务、选择模板并配置参数；通过任务卡片启动或暂停，在数据页筛选结果。暂停本地执行不等于取消平台已接受的模拟。
 
 ## 源码开发
 
-需要 Node.js 22+、Rust 和 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。桌面开发还需兼容后端及上述配置；先按 [CLI 开发配置指南](crates/taskctl/README.md#explicit-desktop-development-taskctl-mode)登记前后端路径，再运行：
+需要 Node.js 22+、Rust 和 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)。桌面开发还需兼容后端及上述配置；先按 [CLI/任务host构建与明确采用指南](crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)登记前后端路径，再运行：
 
 ```bash
 npm ci
 npm run tauri:dev
 ```
 
-仅体验界面请使用 `npm run demo`，无需桌面开发登记。
+仅体验界面请使用 `npm run demo`，无需桌面开发登记，不启动真实host。上面的Tauri开发命令只负责GUI，不自动构建/安装/升级任务host；UI-only变更不强制host重启。
 
 ## 文档与反馈
 
 - [用户指南](docs/user-guide.zh.md)：首次配置、任务管理与数据分析。
 - [开发架构](docs/architecture.zh.md)：数据流、本地/远程执行与脚本接口。
-- [CLI 使用手册](docs/cli-usage.md)：全部16个命令、调用方式、参数与常用流程。
-- [CLI 构建与开发绑定](crates/taskctl/README.md)：独立程序、配置选择和开发模式登记。
+- [CLI 使用手册](docs/cli-usage.md)：16个业务命令、调用方式、参数与常用流程（宿主管理另见构建手册）。
+- [CLI 构建与开发绑定](crates/taskctl/README.md)：独立CLI/常驻任务host、配置选择、明确登记与安全drain采用。
 - [版本记录](CHANGELOG.md) · [问题反馈](https://github.com/roshameow/quantnight-frontend/issues)（请附版本、系统、复现步骤及脱敏日志）。
 
 ## 许可

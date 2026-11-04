@@ -4,24 +4,24 @@
 
 ## 核心架构
 
-后端采用 Rust 语言编写，基于 Tauri 框架，负责处理核心业务逻辑、数据库交互、外部脚本调用和与前端的通信。主要架构设计如下：
+Tauri Rust层负责WebView命令、UI事件映射及非任务数据能力。明确runtime登记后，**任务域**统一委托task-core公共Unix IPC client与独立headless taskctl host；GUI与CLI平级，不各写codec/身份/错误/dispatcher。schema1未启用runtime保留原embedded模式，已登记错误不fallback。本文描述源码合同，不是安装/loaded证明；构建、登记与drain采用只见[taskctl手册](../crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)。主要职责如下：
 
-- **应用入口 (`main.rs` & `lib.rs`)**: 负责初始化 Tauri Builder，设置状态管理（State Management），注册所有暴露给前端的 Commands，并启动异步后台任务（如 Watcher）。
-- **命令中心 (Commands Layer)**: 定义了所有 `#[tauri::command]` 接口，作为前端请求的第一个入口点。
-- **数据访问层 (Data Layer)**: 基于 `mongodb` crate 实现，封装了复杂的聚合查询、分页和多库关联逻辑。
+- **应用入口 (`main.rs` & `lib.rs`)**：注册原Commands/配置/非任务数据池和一次创建的任务endpoint。enrolled任务endpoint只持公共client，任务watch投影/查询由host共享任务slots；关闭GUI只断客户端/订阅，不停止host。
+- **命令中心 (Commands Layer)**：保留原 `#[tauri::command]` WebView入口；任务统一构造 `TaskRequest` 并调公共 `TaskEndpoint.execute(TaskRequest, observer)` / `RuntimeClient`，不重写dispatcher、codec或持久transport receipt服务。binding/runtime schema与OS image/process identity只复用 `crates/runtime_registration.rs` / `crates/native_identity.rs`；详见上方唯一手册源码索引。
+- **数据访问层 (Data Layer)**：非任务 `datas.rs/metrics.rs` 的Alpha/data/PNL/correlation原功能、GUI独立池与namespace设置保留。任务列表/remote-only缓存、diagnostics、进度投影全部属于公共host，不能偷用GUI数据池。原GUI本来已复用Arc连接，不是每按钮重连。
 
 ## 功能模块详解
 
 | 模块 (Module) | 文件名 (File) | 核心职责 (Core Responsibilities) |
 | :--- | :--- | :--- |
-| **应用入口** | `main.rs` / `lib.rs` | 应用启动点, 注册命令, 初始化数据库连接池, 注入全局状态。 |
-| **任务业务逻辑** | `commands.rs` | 处理任务的生命周期、文件 I/O、外部 Python/Bash 脚本调用。 |
+| **应用入口** | `main.rs` / `lib.rs` | 注册命令/任务endpoint与非任务数据状态；GUI loaded与host loaded分别核验。 |
+| **任务适配** | `commands.rs` | 任务参数/回执/阶段UI映射；公共client→host→原core→原脚本owner，不直接执行第二套任务状态机。 |
 | **高性能查询** | `datas.rs` | 负责 `alpha_db` 和 `data_db` 的复杂查询，支持聚合计算和动态排序。 |
 | **指标计算** | `metrics.rs` | 处理 PNL 序列计算、统计分析等数学密集型任务。 |
-| **配置管理** | `config.rs` | 加载并解析 `config.toml`，提供环境变量和全局路径的标准化访问。 |
+| **配置管理** | `config.rs` | 原AppConfig loader保留；GUI任务host明确app_config selector→resolve_gui_binding→MongoConfig，核原check_task_status脚本/任务namespace，非任务/UI设置保持。纯CLI backend_root不补造GUI脚本；不经IPC传整份配置。 |
 | **前端特定配置** | `frontend_config.rs` | 维护前端界面所需的动态配置项，如集合列表、显示映射等。 |
-| **数据库连接** | `mongo_manager.rs` | 封装 MongoDB 连接逻辑，提供单例模式的 `MongoClients`。 |
-| **实时监听** | `watcher.rs` | 利用 MongoDB Change Streams 实时捕捉状态变更，通过 Event 推送到前端。 |
+| **数据库连接** | `mongo_manager.rs` | 原core Mongo工厂兼容引用；非任务GUI池保留，任务池唯一归host，端点权威仍是原backend MongoConfig。 |
+| **实时监听适配** | `watcher.rs` | 订阅公共host的原任务progress事件并转Tauri emit；Change Streams/查询投影在core任务owner，多订阅共用而非每窗口开池。 |
 
 ## 核心 API 功能开发说明
 

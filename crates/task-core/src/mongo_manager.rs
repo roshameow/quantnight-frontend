@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use mongodb::{options::ClientOptions, Client};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::OnceCell;
+use futures_util::FutureExt;
 
 /// Desktop callers retain their original full-pool fields and constructor.
 #[derive(Clone)]
@@ -71,35 +72,57 @@ fn required_uri<'a>(uri: &'a str, role: &str) -> Result<&'a str> {
 /// replace clients or start an implicit retry loop.
 struct ClientSlot<T> {
     uri: String,
-    client: OnceCell<Result<Arc<T>, String>>,
+    client: Arc<OnceCell<Result<Arc<T>, String>>>,
+    started: std::sync::Once,
+    attempts: std::sync::atomic::AtomicU64,
+    settled: Arc<tokio::sync::Notify>,
 }
 impl<T> ClientSlot<T> {
     fn configured(uri: String) -> Self {
         Self {
             uri,
-            client: OnceCell::new(),
+            client: Arc::new(OnceCell::new()),
+            started: std::sync::Once::new(), attempts: std::sync::atomic::AtomicU64::new(0), settled: Arc::new(tokio::sync::Notify::new()),
         }
     }
     fn existing(client: Arc<T>) -> Self {
         Self {
             uri: String::new(),
-            client: OnceCell::new_with(Some(Ok(client))),
+            client: Arc::new(OnceCell::new_with(Some(Ok(client)))),
+            started: std::sync::Once::new(), attempts: std::sync::atomic::AtomicU64::new(0), settled: Arc::new(tokio::sync::Notify::new()),
         }
     }
     async fn get_with<F, Fut>(&self, role: &str, build: F) -> Result<&Arc<T>, String>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Arc<T>, String>>,
+        Fut: Future<Output = Result<Arc<T>, String>> + Send + 'static,
+        T: Send + Sync + 'static,
     {
         if let Some(result) = self.client.get() {
             return result.as_ref().map_err(Clone::clone);
         }
         required_uri(&self.uri, role).map_err(|error| error.to_string())?;
-        self.client
-            .get_or_init(|| build(self.uri.clone()))
-            .await
-            .as_ref()
-            .map_err(Clone::clone)
+        // The role initializer is owned by this runtime, not by a short GUI
+        // query's 2s/5s waiting future. Cancellation must not reset OnceCell and
+        // construct another driver client on the next click.
+        self.started.call_once(|| {
+            self.attempts.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            let future = build(self.uri.clone());
+            let client = self.client.clone(); let settled = self.settled.clone();
+            tokio::spawn(async move {
+                let result = std::panic::AssertUnwindSafe(future).catch_unwind().await
+                    .unwrap_or_else(|_| Err("MongoDB client initialization interrupted; not retried".into()));
+                let _ = client.set(result); settled.notify_waiters();
+            });
+        });
+        loop {
+            let settled = self.settled.notified();
+            // Register before the result check: completion cannot be lost
+            // between the check and beginning to await a Notify future.
+            tokio::pin!(settled); settled.as_mut().enable();
+            if let Some(result) = self.client.get() { return result.as_ref().map_err(Clone::clone); }
+            settled.await;
+        }
     }
 }
 
@@ -126,7 +149,8 @@ impl<T> ClientSlots<T> {
     pub(crate) async fn client_with<F, Fut>(&self, remote: bool, build: F) -> Result<&Arc<T>, String>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Arc<T>, String>>,
+        Fut: Future<Output = Result<Arc<T>, String>> + Send + 'static,
+        T: Send + Sync + 'static,
     {
         if remote {
             self.remote.get_with("remote", build).await
@@ -140,8 +164,22 @@ impl<T> ClientSlots<T> {
         Self::from_existing(clients.local.clone(), clients.remote.clone())
     }
 }
+#[derive(Clone,Debug,Default,serde::Serialize,serde::Deserialize)]
+pub struct RolePoolSnapshot {pub initialized:bool,pub settled:bool,pub initialization_attempts:u64}
+#[derive(Clone,Debug,Default,serde::Serialize,serde::Deserialize)]
+pub struct PoolSnapshot {pub local:RolePoolSnapshot,pub remote:RolePoolSnapshot}
+impl<T> ClientSlot<T> {
+    fn snapshot(&self)->RolePoolSnapshot {RolePoolSnapshot{initialized:matches!(self.client.get(),Some(Ok(_))),settled:self.client.get().is_some(),initialization_attempts:self.attempts.load(std::sync::atomic::Ordering::Relaxed)}}
+}
+impl<T> ClientSlots<T> {
+    pub(crate) fn snapshot(&self)->PoolSnapshot {PoolSnapshot{local:self.local.snapshot(),remote:self.remote.snapshot()}}
+}
 impl ScopedMongoClients {
     pub(crate) async fn client(&self, remote: bool) -> Result<&Arc<Client>, String> {
+        #[cfg(feature = "test-support")]
+        if {let slot=if remote { &self.remote } else { &self.local };slot.client.get().is_none() && !slot.uri.trim().is_empty() && !slot.started.is_completed()} {
+            assert!(!local_config_test_support::construction_forbidden(), "offline bootstrap attempted Mongo client construction");
+        }
         self.client_with(remote, |uri| async move {
             MongoClients::build_client(if remote { "remote" } else { "local" }, &uri)
                 .await
@@ -172,10 +210,12 @@ pub mod local_config_test_support {
         pub fn from_existing(local: Arc<T>, remote: Arc<T>) -> Self {
             Self(ClientSlots::from_existing(local, remote))
         }
+        pub fn snapshot(&self)->PoolSnapshot {self.0.snapshot()}
         pub async fn client_with<F, Fut>(&self, remote: bool, build: F) -> Result<&Arc<T>, String>
         where
             F: FnOnce(String) -> Fut,
-            Fut: Future<Output = Result<Arc<T>, String>>,
+            Fut: Future<Output = Result<Arc<T>, String>> + Send + 'static,
+            T: Send + Sync + 'static,
         {
             self.0.client_with(remote, build).await
         }

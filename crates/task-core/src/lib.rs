@@ -24,3 +24,16 @@ pub const DEV_TARGET: &str = env!("QUANTNIGHT_CRATE_TARGET");
 pub const DEV_PROFILE: &str = env!("QUANTNIGHT_CRATE_PROFILE");
 pub const DEV_FEATURES: &str = env!("QUANTNIGHT_CRATE_FEATURES");
 pub const DEV_RUSTFLAGS: &str = env!("QUANTNIGHT_CRATE_CARGO_ENCODED_RUSTFLAGS");
+
+pub mod task_request;
+pub mod task_dispatch;
+pub mod runtime;
+
+#[path = "../../native_identity.rs"]
+pub mod native_identity;
+
+pub mod gui_task_queries;
+pub mod task_progress;
+pub mod task_diagnostics;
+
+pub(crate) mod generation_owner;

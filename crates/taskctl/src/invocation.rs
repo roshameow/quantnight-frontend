@@ -49,7 +49,7 @@ pub fn parse(args: &[String]) -> Result<Entry, CliUsageError> {
     }
     match cli_args::parse_args(&args[index..])? {
         CliParse::Help { command } => Ok(Entry::Help(format!(
-            "{}\nNative global (before COMMAND only):\n  --app-config PATH  Explicit existing AppConfig file.\n  --backend-root PATH  Original backend config owner; used by the Python compatibility entry.\n  --config JSON      Remains the start business configuration, NOT a file path.\nNo automatic configuration discovery or installation.\n",
+            "{}\nNative global (before COMMAND only):\n  --app-config PATH  Explicit existing AppConfig file.\n  --backend-root PATH  Original backend config owner; used by the Python compatibility entry.\n  --config JSON      Remains the start business configuration, NOT a file path.\nRuntime management (prefix-free): runtime-plan / runtime-status / runtime-drain / runtime-host --binding PATH.\nNo automatic configuration discovery or installation.\n",
             cli_args::help_text(command.as_deref())?
         ))),
         CliParse::Command(invocation) => Ok(Entry::Command { app_config, backend_root, invocation }),
@@ -64,43 +64,7 @@ fn usage(message: &str) -> CliUsageError {
     }
 }
 
-#[derive(Debug)]
-pub struct NamedRequest {
-    pub name: String,
-    pub expected_task_id: Option<String>,
-}
-#[derive(Debug)]
-pub struct PauseRequest {
-    pub name: String,
-    pub expected_task_id: Option<String>,
-    pub expected_launch_attempt_id: Option<String>,
-}
-#[derive(Debug)]
-pub struct DeleteRequest {
-    pub name: String,
-    pub expected_task_id: Option<String>,
-    pub confirm: Option<String>,
-}
-
-#[derive(Debug)]
-pub enum Request {
-    List(ListRequest),
-    VerifyRegistration(EvidenceRequest),
-    ArchiveResearch(EvidenceRequest),
-    Create(CreateRequest),
-    Generate(GenerateRequest),
-    Sync(NamedRequest),
-    Start(StartRequest),
-    ObserveAccepted(ObserveAcceptedRequest),
-    Watch(WatchRequest),
-    Status(StatusRequest),
-    Pause(PauseRequest),
-    Resume(ResumeRequest),
-    PriorityPrune(PriorityPruneRequest),
-    Delete(DeleteRequest),
-    Results(ResultsRequest),
-    CollectResults(CollectRequest),
-}
+pub use quantnight_task_core::task_request::{TaskRequest as Request, NamedRequest, PauseRequest, DeleteRequest};
 
 /// Public for testing the invocation boundary, not a second argument parser.
 /// Missing/mistyped fields reject rather than inventing defaults. Core parser
@@ -159,6 +123,7 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
         // Original cmd_sync does not read args.timeout. Do not invent a new
         // deadline or silently change the shared coordinator's fixed budgets.
         "sync" => Request::Sync(NamedRequest {
+            expected_remote: None,
             name: name()?,
             expected_task_id: expected_id()?,
         }),
@@ -189,6 +154,7 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
                 .transpose()?,
         }),
         "pause" => Request::Pause(PauseRequest {
+            expected_remote: None, expected_launch_absent: false, remaining_ms: None, budget: quantnight_task_core::pause::StopBudget::Cli,
             name: name()?,
             expected_task_id: expected_id()?,
             expected_launch_attempt_id: a.text("expected_launch_attempt_id")?,
@@ -208,6 +174,7 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
         }),
         // --force is accepted for legacy syntax, never a safety bypass.
         "delete" => Request::Delete(DeleteRequest {
+            expected_remote: None,
             name: name()?,
             expected_task_id: expected_id()?,
             confirm: a.text("confirm")?,

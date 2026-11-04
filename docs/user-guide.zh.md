@@ -12,18 +12,15 @@
 
 ### 2. 配置管理
 
-应用提供了完整的图形化配置界面，您无需手动编辑任何配置文件。首次启动时，应用会自动创建必要的配置文件。
+应用TOML选择 `env.working_dir` 后端根、UI库/集合和脚本设置；连接端点以该后端原MongoConfig（私有 `credentials.yaml`）为权威，不使用TOML旧URI字段。Settings不替代后端凭据/连接配置；不要上传凭据或回执。
 
-- **所有配置均可通过界面完成**：
-  - 前端配置（模板路径、数据筛选选项等）
-  - 后端配置（MongoDB 连接、Python 解释器路径等）
-  - 脚本映射配置
+**macOS明确登记runtime后**，GUI与CLI是同一headless任务host的平级客户端。用户级launchd socket在首次使用时启动host，不需要先开GUI、不经MCP。任务列表/remote-only缓存、诊断、操作与进度投影都由该host负责；Alpha/data/PNL/correlation等非任务功能仍保留GUI原独立数据池。
 
-- **配置文件位置**：
-  - 用户数据目录（优先使用）
-  - 应用资源目录（作为回退）
-
-> **提示**: 通过界面修改配置后，前端配置会立即生效，后端配置需要重启应用才能生效。
+- 构建、登记和安全采用见[唯一构建/部署手册](../crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)，业务CLI见[使用手册](cli-usage.md)。拖入.app或修改磁盘文件不等于host已登记/加载。
+- 关闭GUI不停止host或回测runner，不取消已接受平台请求；重新打开GUI只重新接入客户端。操作断连/失响应不能自动重发，先核原任务/generation/launch/业务回执。
+- UI设置仍沿原界面规则采用；GUI非任务数据配置按原应用重开加载。**任务host配置/共享源码变化不能仅靠重启GUI生效**：由原部署owner先drain已接操作，再明确换代并核host loaded identity，不能杀busy host。
+- GUI任务诊断需要host明确选择原canonical AppConfig，保留check_task_status脚本合同；原loader仍使用MongoConfig连接权威。部署候选旗标为 `--runtime-app-config`（见唯一手册），不上传全AppConfig/URI或任意脚本；backend_root只保留纯CLI语义。已有schema2仅升exe无新cfg保留selector，换selector先旧binding安全停止再发布，不先改指针。
+- schema1未启用runtime时保留原模式；第一版runtime登记仅支持macOS，Windows等原未启用路径不删除。本文描述源码合同，不声称现有安装包已经采用。
 
 ---
 
@@ -64,15 +61,17 @@
   - **Data Filter Options**: 自定义"数据分析"页面中结果集下拉菜单的选项。
 
 - **后端配置**:
-  - **MongoDB 设置**: 配置本地和远程数据库连接字符串（`local_uri` / `remote_uri`），以及数据库名称。
+  - **MongoDB 设置**: UI库/集合名仍按原设置；连接URI来自后端原MongoConfig，不以TOML中的旧URI覆盖。任务namespace必须匹配登记，非任务Alpha/data/PNL保留原设置。
   - **Python 设置**: 设置 Python 解释器路径和工作目录。
   - **脚本映射**: 管理按钮与后端脚本的映射关系，支持添加自定义脚本。
 
-> **注意**: 修改后端配置后需要重启应用才能生效。
+> **注意**：GUI非任务数据池与任务host分别加载配置；任务连接/共享源码变化按上方部署手册安全采用，重开GUI不能替代host换代。
 
 ---
 
 ## 应用安装
+
+以下是桌面包安装，不等于runtime host登记或运行采用；macOS任务host需另按上方部署手册明确采用，不能据此推断launchd已安装。
 
 ### macOS
 

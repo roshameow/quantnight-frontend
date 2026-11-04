@@ -31,6 +31,7 @@ pub fn run_os_with_admission(
             return 2;
         }
     };
+    if let Some(code) = crate::runtime_entry::run(&args) { return code; }
     let (app_config, backend_root, invocation) = match parse(&args) {
         Ok(Entry::Help(text)) => {
             if let Err(error) = io::stdout().lock().write_all(text.as_bytes()) {
@@ -58,7 +59,24 @@ pub fn run_os_with_admission(
             .build()
             .map_err(|error| format!("unable to initialize runtime: {error}"))?;
         runtime.block_on(async {
+            use quantnight_task_core::runtime::{RuntimeSelection,RuntimeClient,CallContext};
+            if let Some(root)=backend_root.as_deref() {
+                if let Some(selection)=RuntimeSelection::for_backend(root)? {
+                    crate::runtime_entry::admit_selected_cli(&selection)?;
+                    let result=async {let client=RuntimeClient::connect(&selection).await?;client.call(CallContext::current()?,request.clone(),None).await}.await;
+                    return Ok(match result {Ok(result)=>quantnight_task_core::cleanup_sync::TaskOutcome{value:result.value,exit_code:result.exit_code},Err(error)=>{
+                        let mut outcome=rejected(&invocation,error.to_string());outcome.value["transport"]=serde_json::to_value(error).unwrap_or(serde_json::Value::Null);outcome
+                    }});
+                }
+            }
             let config = crate::bootstrap::load(app_config.as_deref(), backend_root.as_deref()).await?;
+            if let Some(selection)=RuntimeSelection::for_backend(std::path::Path::new(&config.env.working_dir))? {
+                crate::runtime_entry::admit_selected_cli(&selection)?;
+                let selected=app_config.as_deref().and_then(|path|path.canonicalize().ok());
+                if selection.configuration.kind!="app_config" || selected.as_ref()!=Some(&selection.configuration.path){return Err("explicit AppConfig differs from enrolled runtime selector; no direct fallback".into());}
+                let result=async{let client=RuntimeClient::connect(&selection).await?;client.call(CallContext::current()?,request.clone(),None).await}.await;
+                return Ok(match result{Ok(result)=>quantnight_task_core::cleanup_sync::TaskOutcome{value:result.value,exit_code:result.exit_code},Err(error)=>{let mut outcome=rejected(&invocation,error.to_string());outcome.value["transport"]=serde_json::to_value(error).unwrap_or(serde_json::Value::Null);outcome}});
+            }
             let control = TaskControl::connect(&config).await?;
             Ok::<_, String>(dispatch(&control, &request).await)
         })

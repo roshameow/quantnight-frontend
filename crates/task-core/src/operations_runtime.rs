@@ -8,6 +8,27 @@ use crate::{backend_binding::BackendBinding, cleanup_sync::OperationsRuntime,
     config::{run_process_observed, BashScriptObserver}, lifecycle_policy::validate_name,
     task_store::Host};
 
+/// Original child-process operational context. Never a configuration/auth override.
+/// Captured once by shared callers; task-local scope prevents concurrent cross-talk.
+pub const OPERATION_ENV_KEYS:&[&str]=&["PATH","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy","SSH_AUTH_SOCK","PI_AGENT_NOTIFY_DIR","PI_AGENT_NOTIFY_STATE_DIR"];
+#[derive(Clone,Default,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalEnvironment { values:std::collections::BTreeMap<String,String> }
+impl std::fmt::Debug for OperationalEnvironment {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("OperationalEnvironment").field("keys",&self.values.keys().collect::<Vec<_>>()).finish()}}
+impl OperationalEnvironment {
+    pub fn capture()->Result<Self,String>{
+        let mut values=std::collections::BTreeMap::new();
+        for key in OPERATION_ENV_KEYS {if let Some(value)=std::env::var_os(key){values.insert((*key).into(),value.into_string().map_err(|_|"operational environment contains non-UTF8 value")?);}}
+        Ok(Self{values})
+    }
+    pub fn validate(&self)->Result<(),String>{if self.values.keys().any(|key|!OPERATION_ENV_KEYS.contains(&key.as_str())) || self.values.values().any(|value|value.contains('\0')){return Err("operational environment has an unsupported key/value; no child executed".into());}Ok(())}
+    pub fn entries(&self)->impl Iterator<Item=(&str,&str)>{self.values.iter().map(|(k,v)|(k.as_str(),v.as_str()))}
+    fn apply(&self,command:&mut Command){for key in OPERATION_ENV_KEYS {command.env_remove(key);}command.envs(self.entries());}
+}
+tokio::task_local! {static OPERATION_ENV:OperationalEnvironment;}
+pub fn current_environment()->Option<OperationalEnvironment>{OPERATION_ENV.try_with(Clone::clone).ok()}
+pub async fn with_environment<T>(environment:Option<OperationalEnvironment>,future:impl std::future::Future<Output=T>)->T{if let Some(environment)=environment{OPERATION_ENV.scope(environment,future).await}else{future.await}}
+
 pub struct OriginalOperationsRuntime<'a> {
     pub binding: &'a BackendBinding,
     pub observer: Option<BashScriptObserver>,
@@ -173,6 +194,7 @@ impl OriginalOperationsRuntime<'_> {
     }
     fn process(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
+        if let Some(environment)=current_environment(){environment.apply(&mut command);}
         command.current_dir(self.binding.root()).env("PYTHONPATH", self.binding.root())
             .env_remove("TMUX").env_remove("TMUX_PANE").env_remove("TMUX_TMPDIR")
             .env_remove("QUANTNIGHT_TMUX_BINDING");
@@ -539,7 +561,7 @@ async fn generation_child(command: Command, budget: Duration, observer: Option<B
         })
 }
 
-fn generation_observation(stdout: &str, task: &Document)
+fn generation_observation(stdout: &str, task: &Document,writer_only:bool)
     -> Result<crate::create_generate::GenerationProcesses, String> {
     use crate::create_generate::GenerationProcesses;
     let prefix = "QUANTNIGHT_GENERATION_OBSERVED ";
@@ -562,7 +584,8 @@ fn generation_observation(stdout: &str, task: &Document)
     let reason = packet["reason"].as_str().filter(|s| !s.is_empty())
         .ok_or("generation observation lacks concrete reason")?.to_string();
     match packet["state"].as_str() {
-        Some("stopped") => Ok(GenerationProcesses::Stopped),
+        Some("stopped") if !writer_only => Ok(GenerationProcesses::Stopped),
+        Some("writer_absent") if writer_only => Ok(GenerationProcesses::Stopped),
         Some("live") => Ok(GenerationProcesses::Live(reason)),
         Some("unverified") => Ok(GenerationProcesses::Unverified(reason)),
         _ => Err("generation observation state unrecognized".into()),
@@ -578,17 +601,24 @@ impl crate::create_generate::GenerationRuntime for OriginalOperationsRuntime<'_>
         validate_name(name)?;
         let id = task.get_object_id("_id").map_err(|_| "generation task ObjectId missing")?;
         let generation = task.get_document("generation").map_err(|_| "generation binding missing")?;
+        let owner=crate::generation_owner::current();
+        let writer_only=match owner.as_ref().and_then(|owner|owner.scope_active(task)){
+            Some(true)=>return Ok(crate::create_generate::GenerationProcesses::Live("original exact generation business scope remains active".into())),
+            Some(false)=>true,None=>false,
+        };
         let binding = json!({"taskId":id.to_hex(), "generation":generation});
         let mut command = self.process("/bin/bash");
         command.arg("scripts/check_tmux_python.sh").arg(name).arg("false")
-            .arg("--inspect-generation").arg("--binding").arg(binding.to_string());
+            .arg(if writer_only{"--inspect-generation-writers"}else{"--inspect-generation"}).arg("--binding").arg(binding.to_string());
         // Same diagnostic transport/budget. Only the inspector is an owned
         // diagnostic child; the business generator is neither launched nor killed.
         let (out, err) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
         if !err.trim().is_empty() {
             return Err(format!("generation process inspection stderr unconfirmed: {err}"));
         }
-        generation_observation(&out, task)
+        let observed=generation_observation(&out,task,writer_only)?;
+        if writer_only && owner.as_ref().and_then(|owner|owner.scope_active(task))!=Some(false){return Ok(crate::create_generate::GenerationProcesses::Unverified("exact host generation scope changed while inspecting writers".into()));}
+        Ok(observed)
     }
 
     async fn creation_metadata(&self, root: &Path, desired: &Document)
@@ -835,4 +865,30 @@ echo 'QUANTNIGHT_PAUSE_CONFIRMED {"schema_version":2,"task_name":"fixture","targ
         assert!(runtime.assert_consumer_absent(binding.root(), &task(), Host::Local).await.is_err());
         assert!(!binding.root().join("escaped").exists());
     }
+    #[tokio::test]
+    async fn concurrent_original_child_contexts_resolve_caller_tools_without_global_env_or_secret_forwarding(){
+        let fake=fixture(":");let root=Path::new(&fake.config.env.working_dir);let binding=validate_backend_binding(&fake.config).await.unwrap();
+        for role in ["a","b"]{let directory=root.join(role);std::fs::create_dir_all(&directory).unwrap();let tool=directory.join("uv");std::fs::write(&tool,"#!/bin/sh\nprintf '%s|%s|%s|%s' \"$PATH\" \"$HTTPS_PROXY\" \"$SSH_AUTH_SOCK\" \"$PYTHONPATH\"\n").unwrap();std::fs::set_permissions(tool,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let environment=|role:&str|{let mut values=std::collections::BTreeMap::new();values.insert("PATH".into(),root.join(role).to_string_lossy().into_owned());values.insert("HTTPS_PROXY".into(),format!("http://synthetic-{role}.invalid:1234"));values.insert("SSH_AUTH_SOCK".into(),format!("/synthetic-{role}/agent"));OperationalEnvironment{values}};
+        let run=|environment|async{with_environment(Some(environment),async{let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};run_process_observed(runtime.process("uv"),Duration::from_secs(3),false,None).await.unwrap().0}).await};
+        let(a,b)=tokio::join!(run(environment("a")),run(environment("b")));
+        for(role,output)in[("a",a),("b",b)]{assert_eq!(output,format!("{}|http://synthetic-{role}.invalid:1234|/synthetic-{role}/agent|{}",root.join(role).display(),binding.root().display()));}
+        assert!(current_environment().is_none());
+        let forbidden:OperationalEnvironment=serde_json::from_value(serde_json::json!({"values":{"MONGO_URI":"synthetic-private-secret","DYLD_INSERT_LIBRARIES":"synthetic-private-secret"}})).unwrap();
+        let error=forbidden.validate().unwrap_err();assert!(!error.contains("synthetic-private-secret"));assert!(!format!("{forbidden:?}").contains("synthetic-private-secret"));
+    }
+
+    #[tokio::test]
+    async fn original_notify_environment_profiles_are_child_only_isolated_and_absent_values_are_removed(){
+        let fake=fixture(":");let binding=validate_backend_binding(&fake.config).await.unwrap();
+        let binding=&binding;
+        let run=|role:&'static str|async move{let mut values=std::collections::BTreeMap::new();values.insert("PATH".into(),"/usr/bin:/bin".into());values.insert("PI_AGENT_NOTIFY_DIR".into(),format!("/synthetic-{role}/inbox"));values.insert("PI_AGENT_NOTIFY_STATE_DIR".into(),format!("/synthetic-{role}/state"));
+            let environment=OperationalEnvironment{values};environment.validate().unwrap();
+            with_environment(Some(environment),async{let runtime=OriginalOperationsRuntime{binding:&binding,observer:None};let mut command=runtime.process("/bin/sh");command.args(["-c","printf '%s|%s' \"$PI_AGENT_NOTIFY_DIR\" \"$PI_AGENT_NOTIFY_STATE_DIR\""]);run_process_observed(command,Duration::from_secs(3),false,None).await.unwrap().0}).await};
+        let(a,b)=tokio::join!(run("first"),run("second"));assert_eq!(a,"/synthetic-first/inbox|/synthetic-first/state");assert_eq!(b,"/synthetic-second/inbox|/synthetic-second/state");assert!(current_environment().is_none());
+        let absent=OperationalEnvironment::default();let mut command=Command::new("/bin/sh");command.env("PI_AGENT_NOTIFY_DIR","synthetic-host-only").env("PI_AGENT_NOTIFY_STATE_DIR","synthetic-host-only");absent.apply(&mut command);command.args(["-c","printf '%s|%s' \"${PI_AGENT_NOTIFY_DIR-unset}\" \"${PI_AGENT_NOTIFY_STATE_DIR-unset}\""]);
+        let(out,_)=run_process_observed(command,Duration::from_secs(3),false,None).await.unwrap();assert_eq!(out,"unset|unset");
+        let forbidden:OperationalEnvironment=serde_json::from_value(serde_json::json!({"values":{"PI_SUBAGENT_TASK_ID":"not-forwarded","MONGO_URI":"not-forwarded"}})).unwrap();assert!(forbidden.validate().is_err());
+    }
+
 }

@@ -137,7 +137,7 @@ test('stop lifecycle wins over dispatch pause and metadata cannot serve as stop 
 test('ID/host/profile replacement and old observation expiry fences still win over fresh capability', () => {
   const now = Date.now(); const runtime = observation(meta('waiting_reconciliation', now), positive, now);
   for (const patch of [{ _id: 'other' }, { name: 'other' }, { isRemote: false }, { auth_profile: 'user2' }]) {
-    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行检查身份校验失败');
+    assert.equal(card.regularDisplayStatus(task(patch), runtime, null, now), '运行检查任务匹配失败');
   }
   const old = { ...runtime, observedAt: now - card.REGULAR_RUNTIME_MAX_AGE };
   assert.equal(card.regularDisplayStatus(task(), old, null, now), '运行检查结果已过期');
@@ -222,7 +222,7 @@ test('invalid/foreign/malformed stage lines poison positive evidence and cannot 
 });
 
 test('every actual native runtime script stage is accepted by the real stdout normalizer, with the last diagnostic retained', async () => {
-  const native = await readFile(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+  const native = await readFile(new URL('../crates/task-core/src/task_diagnostics.rs', import.meta.url), 'utf8');
   const section = native.match(/let allowed: &\[&str\] = match self.operation \{([\s\S]*?)_ => &\[\]/)?.[1];
   const ids = [...section.match(/"runtime" => &\[([\s\S]*?)\]/)[1].matchAll(/"([a-z_]+)"/g)].map(match => match[1]);
   const { TASK_SCRIPT_STAGES } = await import('../src/utils/taskDiagnostics.js');

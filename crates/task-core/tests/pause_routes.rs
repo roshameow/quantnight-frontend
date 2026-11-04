@@ -580,8 +580,9 @@ async fn normal_stop_preserves_cli_gui_fields_stage_hook_and_native_cas_fences()
             d.items[&Host::Local][0].get_str("acceptance").unwrap(),
             "UNKNOWN"
         );
-        assert_eq!(stages.lock().unwrap().last(), Some(&"completed"));
-        assert!(!stages.lock().unwrap().contains(&"inventory"));
+        let observed_stages = stages.lock().unwrap();
+        assert_eq!(observed_stages.last().map(String::as_str), Some("completed"));
+        assert!(!observed_stages.iter().any(|stage| stage == "inventory"));
         assert_eq!(budget.seconds(), if version == 1 { 60 } else { 75 });
     }
 }
@@ -975,11 +976,11 @@ fn task_store_additions_use_original_control_limit_and_capability_projection() {
     assert_eq!(controls.limit, Some(2));
     assert_eq!(controls.batch_size, Some(2));
     assert!(controls.projection.is_none());
-    assert_eq!(controls.max_time, Some(std::time::Duration::from_secs(8)));
+    assert_eq!(controls.max_time, Some(std::time::Duration::from_secs(30)));
     let (filter, options) = task_store::consumer_capability_query(NAME);
     assert_eq!(filter, doc! {"task":NAME});
     assert_eq!(options.projection, Some(doc! {"_id":1}));
-    assert_eq!(options.max_time, Some(std::time::Duration::from_secs(8)));
+    assert_eq!(options.max_time, Some(std::time::Duration::from_secs(30)));
     assert_eq!(StopBudget::Cli.seconds(), 60);
     assert_eq!(StopBudget::Gui.seconds(), 75);
 }

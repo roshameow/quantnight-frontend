@@ -25,9 +25,17 @@ impl<T> GuiContext<T> {
     }
 }
 impl GuiContext {
+    /// Runtime-enrolled desktop retains only its original non-task data pools.
+    /// No GUI TaskControl is constructed or used in this branch.
+    pub fn into_data_parts(self) -> Result<(AppConfig, Arc<MongoClients>), String> {
+        let (config, clients, _, _) = self.checked_parts()?;
+        Ok((config, clients))
+    }
     pub fn into_parts(self) -> Result<(AppConfig, Arc<MongoClients>, TaskControl), String> {
         let (config, clients, binding, store) = self.checked_parts()?;
-        Ok((config, clients, TaskControl { binding: Arc::new(binding), store: Arc::new(store) }))
+        let binding = Arc::new(binding);
+        let context = Arc::new(crate::runtime::TaskRuntimeContext::new(config.clone(), binding.clone(), store.shared_clients()));
+        Ok((config, clients, TaskControl { binding, store: Arc::new(store), context: Some(context), generation_owner: None }))
     }
 }
 
@@ -36,16 +44,24 @@ impl GuiContext {
 async fn bootstrap_gui_with<T, F, Fut>(config: AppConfig, build: F) -> Result<GuiContext<T>, String>
 where F: FnMut(String, String) -> Fut,
       Fut: std::future::Future<Output = Result<Arc<T>, String>> {
-    let (config, binding) = resolve_gui_binding(config).await?;
-    let clients = Arc::new(MongoClients::new_with(&config, build).await?);
+    let (config, clients, binding) = bootstrap_gui_pools_with(config,build).await?;
     let store = MongoTaskStore::new(clients.clone(), &config)?;
     binding.verify_current()?;
     Ok(GuiContext { config, clients, binding, store })
 }
 
+async fn bootstrap_gui_pools_with<T,F,Fut>(config:AppConfig,build:F)->Result<(AppConfig,Arc<MongoClients<T>>,BackendBinding),String>
+where F:FnMut(String,String)->Fut,Fut:std::future::Future<Output=Result<Arc<T>,String>>{
+    let(config,binding)=resolve_gui_binding(config).await?;
+    let clients=Arc::new(MongoClients::new_with(&config,build).await?);
+    binding.verify_current()?;Ok((config,clients,binding))
+}
+
 pub struct TaskControl {
     binding: Arc<BackendBinding>,
     store: Arc<dyn TaskStore>,
+    context: Option<Arc<crate::runtime::TaskRuntimeContext>>,
+    generation_owner:Option<Arc<crate::generation_owner::HostedGenerationOwner>>,
 }
 impl TaskControl {
     /// Original GUI startup authority, before all shared reads/watchers.
@@ -55,21 +71,33 @@ impl TaskControl {
             MongoClients::build_client(&role, &uri).await.map_err(|error| error.to_string())
         }).await
     }
+    /// Enrolled GUI keeps only original non-task pools; no TaskControl/TaskStore constructed.
+    pub async fn bootstrap_gui_data(config:AppConfig)->Result<(AppConfig,Arc<MongoClients>),String>{
+        let(config,clients,binding)=bootstrap_gui_pools_with(config,|role,uri|async move{MongoClients::build_client(&role,&uri).await.map_err(|e|e.to_string())}).await?;
+        binding.verify_current()?;Ok((config,clients))
+    }
     /// Headless CLI bootstrap. Configuration proof happens before client setup.
     pub async fn connect(config: &AppConfig) -> Result<Self, String> {
-        let binding = validate_backend_binding(config).await?;
+        let binding = Arc::new(validate_backend_binding(config).await?);
         let store = Arc::new(MongoTaskStore::from_config(config)?);
-        Ok(Self { binding: Arc::new(binding), store })
+        let context = Arc::new(crate::runtime::TaskRuntimeContext::new(config.clone(), binding.clone(), store.shared_clients()));
+        Ok(Self { binding, store, context: Some(context), generation_owner: None })
     }
     /// Desktop reuses its existing application pools; never connects per button.
     pub async fn with_existing_clients(config: &AppConfig, clients: Arc<MongoClients>) -> Result<Self, String> {
-        let binding = validate_backend_binding(config).await?;
-        Ok(Self { binding: Arc::new(binding), store: Arc::new(MongoTaskStore::new(clients, config)?) })
+        let binding = Arc::new(validate_backend_binding(config).await?);
+        let store = Arc::new(MongoTaskStore::new(clients, config)?);
+        let context = Arc::new(crate::runtime::TaskRuntimeContext::new(config.clone(), binding.clone(), store.shared_clients()));
+        Ok(Self { binding, store, context: Some(context), generation_owner: None })
     }
     /// Injection of already-verified context and lowest storage port. This is
     /// not an alternate configuration or no-validation production shortcut.
     pub fn with_store(binding: BackendBinding, store: Arc<dyn TaskStore>) -> Self {
-        Self { binding: Arc::new(binding), store }
+        Self { binding: Arc::new(binding), store, context: None, generation_owner: None }
+    }
+    pub(crate) fn attach_generation_owner(&mut self,owner:Arc<crate::generation_owner::HostedGenerationOwner>){self.generation_owner=Some(owner);}
+    pub fn runtime_context(&self) -> Result<Arc<crate::runtime::TaskRuntimeContext>, String> {
+        self.context.clone().ok_or_else(|| "injected storage has no production Mongo context".into())
     }
     pub fn root(&self) -> &std::path::Path { self.binding.root() }
 
@@ -122,7 +150,9 @@ impl TaskControl {
         let binding = Arc::clone(&self.binding);
         let store = Arc::clone(&self.store);
         let owned_request = request.clone();
-        let operation = tokio::spawn(async move {
+        let environment=crate::operations_runtime::current_environment();
+        let generation_owner=self.generation_owner.clone();
+        let operation = tokio::spawn(async move {crate::generation_owner::scope(generation_owner,crate::operations_runtime::with_environment(environment,async move {
             if let Err(error) = binding.refresh_if_changed().await {
                 return rejected("generate", &owned_request.name, error);
             }
@@ -132,7 +162,7 @@ impl TaskControl {
                 log::error!("Generation failed for {}: {}", owned_request.name, result.value["error"]);
             }
             result
-        });
+        })).await});
         match operation.await {
             Ok(result) => result,
             Err(error) => rejected("generate", &request.name,
@@ -143,14 +173,14 @@ impl TaskControl {
         -> Result<crate::create_generate::GenerationRefresh, String> {
         self.binding.refresh_if_changed().await?;
         let runtime = OriginalOperationsRuntime { binding: &self.binding, observer: None };
-        crate::create_generate::reconcile_generation_for_list(self.root(), self.store.as_ref(), &runtime, observed).await
+        crate::generation_owner::scope(self.generation_owner.clone(),crate::create_generate::reconcile_generation_for_list(self.root(), self.store.as_ref(), &runtime, observed)).await
     }
     pub async fn list(&self, request: &crate::inspection::ListRequest) -> TaskOutcome {
         if let Err(error) = self.binding.refresh_if_changed().await {
             let mut value = rejected("list", "", error); value.value["task"] = serde_json::Value::Null; return value;
         }
         let runtime = OriginalOperationsRuntime { binding: &self.binding, observer: None };
-        crate::inspection::list_with_generation(self.root(), self.store.as_ref(), &runtime, request).await
+        crate::generation_owner::scope(self.generation_owner.clone(),crate::inspection::list_with_generation(self.root(), self.store.as_ref(), &runtime, request)).await
     }
     pub async fn status(&self, request: &crate::inspection::StatusRequest) -> TaskOutcome {
         if let Err(error) = self.binding.refresh_if_changed().await { return rejected("status", &request.name, error); }
@@ -241,3 +271,13 @@ fn rejected(command: &str, name: &str, error: String) -> TaskOutcome {
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "gui_bootstrap_tests.rs"]
 mod gui_bootstrap_tests;
+
+#[cfg(all(feature="test-support",target_os="macos"))]
+pub mod hosted_generation_test_support {
+    use super::*;
+    pub fn scope_active(controller:&TaskControl,task:&Document)->Option<bool>{controller.generation_owner.as_ref()?.scope_active(task)}
+    pub fn attach(controller:&mut TaskControl,instance:&str)->Result<Document,String>{
+        let owner=crate::generation_owner::HostedGenerationOwner::new(crate::native_identity::process_identity(std::process::id())?,instance);
+        let tag=owner.tag();controller.attach_generation_owner(owner);Ok(tag)
+    }
+}

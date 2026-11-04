@@ -135,6 +135,7 @@ pub struct Data {
     pub writes: Vec<(Host, Document, Document)>,
     pub item_writes: usize,
     pub fail: Option<String>,
+    pub fail_message: Option<String>,
     pub fail_after_update: bool,
     pub canonical: Vec<Document>,
 }
@@ -168,7 +169,7 @@ impl Memory {
         data.calls.push(label.clone());
         if data.fail.as_deref() == Some(label.as_str()) {
             data.fail = None;
-            return Err(format!("injected storage failure: {label}"));
+            return Err(data.fail_message.take().unwrap_or_else(|| format!("injected storage failure: {label}")));
         }
         Ok(())
     }

@@ -2,7 +2,7 @@
 
 QuantNight 的 `taskctl` 用于管理 REGULAR、SUPER 和 Priority 任务。它与桌面应用共用 Rust `task-core`；不是另一个回测引擎，也不会提交平台 Alpha。
 
-本页集中维护 **16 个命令、调用方式和操作边界**。构建、开发绑定和版本准入细节见 [CLI 构建与配置](../crates/taskctl/README.md)，桌面操作见[用户指南](user-guide.zh.md)。参数以当前可执行程序的 `--help` 为准；本文对应当前源码，不保证旧安装包已包含同样功能。
+本页集中维护 **16个业务命令、调用方式和操作边界**；runtime宿主管理与任务业务命令分开，构建/登记/安全管理只见下述构建手册。构建、开发绑定和版本准入细节见 [CLI 构建与配置](../crates/taskctl/README.md)，桌面操作见[用户指南](user-guide.zh.md)。参数以当前可执行程序的 `--help` 为准；本文对应当前源码，不保证旧安装包已包含同样功能。
 
 > 除帮助外，真实任务操作需要兼容的私有 QuantNight 后端及相应 MongoDB、脚本、账号配置。后端不包含在本仓库或桌面安装包中。示例不是模拟或数据修改授权；先替换示例路径和任务名，只执行需要且已授权的步骤。不要上传凭据、cookie、私有配置或任务回执。
 
@@ -24,7 +24,9 @@ qn generate --help
 
 后文 `qn ...` 均指这个函数。Python 文件只转发到已登记的原生程序，不自行执行任务控制逻辑，不自动编译、搜索另一份 checkout 或退回旧 Python 实现。
 
-开发模式绑定后，它使用与 GUI 相同的 debug 程序。日常桌面开发仍是 `npm run tauri dev`；不要为使用 CLI 另装一套应用。登记缺失或已加载版本不一致时，按原错误修复绑定／正常开发构建，不能用换数据库或重发任务绕过。帮助能显示不等于数据库、脚本或执行端可用。
+**明确runtime登记后**，Python shim直接exec登记的独立 `runtime.executable` 作CLI client，不经GUI executable/trampoline，也不需要GUI文件、ready或窗口。GUI与CLI平级使用同一task-core Unix IPC客户端、codec、身份/错误与dispatcher，任务Runtime/TaskControl/连接slots由headless host持有。schema1未启用runtime保留旧dev GUI-trampoline或原显式standalone模式；这是启动时选择，不是enrolled错误后的fallback。帮助能显示不等于host/数据库/脚本/执行端可用。
+
+macOS用户级 `gui/<uid>` LaunchAgent在该用户已登录会话中由socket首次需求启动host，不经MCP；这里不依赖GUI仅指QuantNight窗口/进程，不扩称未登录系统headless；关闭GUI不关闭host。runtime登记/编译/安全drain采用与loaded identity只按[构建与采用手册](../crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)，不以GUI重载或磁盘新binary推断host更新。业务旧源代拒新但已接操作继续，UI-only变更不强制host重启；GUI非任务Alpha/data/PNL原独立池保留。
 
 ### 需要独立 CLI：直接调用编译产物
 
@@ -49,8 +51,9 @@ taskctl --backend-root /absolute/backend COMMAND [参数]
 taskctl --app-config /explicit/existing/config.toml COMMAND [参数]
 ```
 
-- `--backend-root`：调用后端原 MongoConfig 配置 owner；原 Python 入口会自行注入它。
-- `--app-config`：独立 CLI 显式读取既有 AppConfig；不是另建一份认证配置。开发绑定的 GUI-host CLI 不使用这个选择器。
+- `--backend-root`：沿原MongoConfig配置owner；Python薄壳注入后端根。runtime登记后必须匹配原selection，不能用参数切换host/数据库。
+- `--app-config`：**业务global**原AppConfig选择器，放在业务子命令前。启用runtime须匹配登记的canonical app_config selector，不是临时连接override；原loader→resolve_gui_binding→MongoConfig仍是endpoint权威。GUI任务诊断需host保留原check_task_status脚本合同，backend_root纯CLI模式不捏造GUI脚本默认值。
+- `runtime-plan`后面的候选 `--app-config` 与上面的业务global不是同一解析位置；Node原部署入口对应 `--runtime-app-config`。schema2只升exe无新cfg须保留selector，改selector前先旧binding安全stop/drain再publish。准确管理/部署调用只维护在[唯一手册](../crates/taskctl/README.md#management-and-deployment-command-reference)，不要把runtime管理加进16业务命令数。
 - `start --config JSON`：是**任务启动配置**，不是 TOML 文件路径，也不是上述全局选择器。
 - 独立 CLI 不依赖 GUI 常驻，但仍需要实际业务所需的后端和配置。不要把“独立 CLI”理解为纯前端演示模式。
 
@@ -189,7 +192,13 @@ qn delete --name "$NAME"
 - 部分兼容路径可能 `ok=false` 但退出码0（例如 Priority 状态失败）；不能只检查 shell 的 `$?`。
 - `status`／`list` 可能发生上述状态核验写回；`results` 不抓平台，但传 `--output` 会写文件；`collect-results` 本身就是导出。
 - `start` 返回成功不等于所有模拟完成；`pause` 成功不等于平台请求取消；`generation_unknown` 或 `ok=false` 不是重新发送的依据。
-- 新鲜源码、磁盘二进制、正在运行的 GUI 加载版本须区分。开发绑定报旧版本时，按原提示完成正常 Tauri 重载；不要修改任务状态掩盖版本问题。
+- 源码、磁盘binary、host与GUI各自loaded image/ready、真实业务结果分别核；不同image的UUID不要求相等。GUI重载不是host升级，不能修改任务状态掩盖版本问题。
+- 从**首次尝试写Call**起，半帧/未收到Accepted/断连都不授权重接重投、退直连或重放list/status。Accepted只是host当前内存接管，不是持久业务回执；host签发连接绑定Call ID，只保留内存inflight/JoinHandle并在收尾删除，不累计永久seen ID。无transport receipt/outcome/journal/operations结果库，重启不加载任何调用。结果未确认时核原task/generation/launch/业务回执，不能猜未执行。
+- 客户端退出/GUI关闭只结束等待或订阅，不取消host已接的core future。只在写Call前允许同一selection的有界connect/Hello重接；10秒是启动预算，不覆盖generate900秒等业务。短读仍每原阶段30秒、write/CAS/rename8秒，**不是status/全命令总30秒deadline**；这不是Mongo根因根治声明。
+- 过程ProgressGap只表示stage更新合并/滞后，不证明业务失败；最终结果/错误及原完整ConfirmedTaskStop独立传回，不能以丢stage或GUI时间代替停止回执。core已开始执行的错误不能标成not_sent。
+- 原操作context仅经公共OperationalEnvironment有限透传必要PATH/proxy/SSH字段给本operation子进程，不复制适配层白名单、全量环境或host全局env，不含凭据/配置override；详见共享源码和唯一host手册。
+- GUI只读运行诊断原总12秒（从caller计时并包含connect）、任务登记读取链2秒、UI observer15秒与TaskStore普通短读30秒/写8秒不是同一层；host不再重起12秒。machine stage identity中文为任务登记/目标匹配，不是任务授权或账号认证；查看与控制归属分开，remote-only原保护不扩，检查失败不隐藏已有详情/结果，未知不等任务停止。
+- 完整collect-results由原writer导出，无新增结果/总量cap；IPC chunk有界不等于总体响应cap。相对 `--output` 在公共client按caller cwd转绝对路径，不改变host cwd。
 
 ## 6. 继续查哪里
 
@@ -197,7 +206,10 @@ qn delete --name "$NAME"
 - [桌面使用指南](user-guide.zh.md)
 - [CLI 参数定义](../crates/task-core/src/cli_args.rs)
 - [参数到请求映射](../crates/taskctl/src/invocation.rs)
-- [16个命令到共享核心的派发](../crates/taskctl/src/dispatch.rs)
+- [共享task请求](../crates/task-core/src/task_request.rs) / [唯一业务dispatcher](../crates/task-core/src/task_dispatch.rs)
+- [公共runtime/IPC owner](../crates/task-core/src/runtime/)：GUI与CLI共用 `RuntimeClient` / `TaskEndpoint.execute(TaskRequest, observer)`，不各复制schema或transport
+- [唯一binding/runtime schema owner](../crates/runtime_registration.rs) / [共享原生image与process identity](../crates/native_identity.rs)
+- [taskctl管理parser适配](../crates/taskctl/src/runtime_entry.rs)：管理命令与16项任务业务分开；准确管理调用/安装步骤只归构建手册，源码可读不等于help已验
 - 兼容后端中的 `docs/task_control_lifecycle.md`：详细状态图、执行归属、原调用链和验收边界；不是本公开前端仓库附带的后端依赖。
 
 本文的参数核对只需要执行各命令的 `--help`，不需要为了验证文档创建、生成、启动、暂停或删除真实任务。

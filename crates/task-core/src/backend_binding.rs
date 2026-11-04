@@ -211,3 +211,32 @@ mod tests {
         assert!(validate_backend_binding(&fake.config).await.is_err());
     }
 }
+
+/// Only actual shared task settings, not Alpha/UI namespaces, endpoints or arbitrary AppConfig.
+#[derive(serde::Deserialize)]
+struct ActiveTaskScript {command:Option<String>,script:Option<String>,args:Vec<String>}
+impl ActiveTaskScript {
+    fn value(&self)->Value{json!({"command":self.command.as_deref().unwrap_or("bash"),"script":self.script,"args":self.args})}
+}
+fn settings_digest(root:&Path,mission:&str,simulation:&str,diagnostic:Option<ActiveTaskScript>)->Result<String,String>{
+    let settings=json!({"root":root.to_string_lossy(),"mission":mission,"simulation":simulation,"check_task_status":diagnostic.map(|script|script.value())});
+    serde_json::to_vec(&settings).map(|v|digest(&v)).map_err(|_|"task settings fingerprint unavailable".into())
+}
+pub fn task_settings_fingerprint(config:&AppConfig)->Result<String,String>{
+    let root=Path::new(&config.env.working_dir).canonicalize().map_err(|_|"task settings backend root unavailable")?;
+    let diagnostic=config.bash.scripts.get("check_task_status").map(|script|ActiveTaskScript{command:script.command.clone(),script:script.script.clone(),args:script.args.clone()});
+    settings_digest(&root,&config.mongodb.databases.mission,&config.mongodb.databases.simulation,diagnostic)
+}
+/// Same original config loader, projected before AppConfig UI deserialization.
+/// An unrelated UI field/type must not become a task-wide admission hold.
+pub(crate) fn task_settings_from_source(path:&Path)->Result<(PathBuf,String),String>{
+    let source=crate::config::load_config_source(path).map_err(|_|"selected task settings unavailable")?;
+    let root:PathBuf=source.get_string("env.working_dir").map_err(|_|"selected task root invalid")?.into();
+    let root=root.canonicalize().map_err(|_|"selected task root unavailable")?;
+    let mission=source.get_string("mongodb.databases.mission").map_err(|_|"selected task mission namespace invalid")?;
+    let simulation=source.get_string("mongodb.databases.simulation").map_err(|_|"selected task simulation namespace invalid")?;
+    let diagnostic=match source.get::<ActiveTaskScript>("bash.scripts.check_task_status"){
+        Ok(script)=>Some(script),Err(::config::ConfigError::NotFound(_))=>None,Err(_)=>return Err("selected active task script settings invalid".into()),
+    };
+    let fingerprint=settings_digest(&root,&mission,&simulation,diagnostic)?;Ok((root,fingerprint))
+}

@@ -34,28 +34,43 @@ Download an installer for your system from [Releases](https://github.com/roshame
 Connection setup for the current source:
 
 1. Set `env.working_dir` in the application TOML to your backend root, and configure database/collection names and script mappings. See the [bundled configuration template](src-tauri/resources/config.toml).
-2. Configure `mongodb.local_uri`, `mongodb.remote_uri` and your platform account in that backend's private `credentials.yaml`. Desktop connections use the backend configuration, not the legacy URI fields in TOML. Both database roles must be configured, and task database names must match the backend.
-3. Close and reopen the application after connection changes. The template picker selects existing backend templates; it does not upload files. Place templates in the relevant execution environment first.
+2. Configure `mongodb.local_uri`, `mongodb.remote_uri` and your platform account in that backend's private `credentials.yaml`. Desktop connections use the backend configuration, not the legacy URI fields in TOML. Task database names must match the backend binding; runtime task pools initialize roles on demand, while the original non-task GUI pool retains its configuration requirements.
+3. Reopen for original non-task GUI data configuration changes. Task-host endpoint/shared-source changes require explicit [build and safe adoption](crates/taskctl/README.md#runtime-enrollment-and-safe-adoption); reopening only the GUI does not replace the host. The template picker selects existing backend templates, not uploads. Place templates in the execution environment first.
+
+After explicit macOS runtime enrollment, GUI and CLI are equal clients of one
+independent headless taskctl task host. The Python entry directly execs the
+registered independent runtime program as a client, without GUI files/ready.
+Launchd socket activation starts the host on first demand; closing GUI does not
+stop it or the runner. Non-task Alpha/data/PNL retains the original GUI pool;
+unenrolled schema 1 keeps the old mode. This is the source contract, not proof
+that a download or this machine is enrolled/loaded.
+
+For GUI task diagnostics, explicitly select the original AppConfig through the
+single build/adoption guide so the host retains the original task-script contract;
+pure CLI backend_root mode does not invent GUI script defaults.
 
 Once connected, add a task, select its template and configure its parameters. Use task cards to start or pause execution and the data page to filter results. Pausing local execution does not cancel simulations already accepted by the platform.
 
 ## Source development
 
-Requires Node.js 22+, Rust and the [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/). Desktop development also needs a compatible backend and the configuration above. First register your frontend/backend paths using the [CLI development setup guide](crates/taskctl/README.md#explicit-desktop-development-taskctl-mode), then run:
+Requires Node.js 22+, Rust and the [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/). Desktop development also needs a compatible backend and the configuration above. First register your frontend/backend paths using the [CLI/task-host build and explicit adoption guide](crates/taskctl/README.md#runtime-enrollment-and-safe-adoption), then run:
 
 ```bash
 npm ci
 npm run tauri:dev
 ```
 
-To try only the interface, use `npm run demo`; desktop development registration is not required.
+To try only the interface, use `npm run demo`; no registration or real host is
+started. The Tauri development command above only manages the GUI; it does not
+automatically build/install/upgrade the task host. UI-only changes must not force
+host restart.
 
 ## Documentation and feedback
 
 - [User guide](docs/user-guide.en.md): initial setup, tasks and data analysis.
 - [Developer architecture](docs/architecture.en.md): data flow, local/remote execution and script interfaces.
-- [CLI usage guide (中文)](docs/cli-usage.md): all 16 commands, invocation, arguments and common workflows.
-- [CLI build and development binding](crates/taskctl/README.md): standalone binary, configuration selectors and dev enrollment.
+- [CLI usage guide (中文)](docs/cli-usage.md): 16 business commands, invocation, arguments and workflows; host management belongs to the build guide.
+- [CLI build and development binding](crates/taskctl/README.md): independent CLI/task host, configuration selection, explicit enrollment and safe drain/adoption.
 - [Changelog](CHANGELOG.md) · [Report an issue](https://github.com/roshameow/quantnight-frontend/issues) with your version, OS, reproduction steps and redacted logs.
 
 ## License

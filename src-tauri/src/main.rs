@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use tauri::async_runtime;
 
-use quantnight_task_core::task_control::TaskControl;
+use quantnight_task_core::runtime;
 use crate::config::load_config;
 use crate::config::default_config_path;
 
@@ -46,28 +46,28 @@ fn main() {
         std::process::exit(1);
     }
 
-    // TOML selects backend root and UI settings. Backend MongoConfig is the
-    // sole endpoint authority for ALL shared reads/watchers and mutations.
-    // Refuse the entire GUI on failure: never show an old-URI task view as a
-    // controllable new context. Recovery is a normal user restart, not replay.
-    let (config, mongo_clients, control) = match async_runtime::block_on(
-        TaskControl::bootstrap_gui(config)
-    ).and_then(|context| context.into_parts()) {
+    // Shared bootstrap fixes enrollment/transport mode once. MongoConfig is
+    // endpoint authority; the GUI's separate non-task data pool remains for
+    // Alpha/data/PNL. Enrolled task queries/operations use only the public host.
+    // A host or binding failure never falls back to direct GUI task access.
+    let (config, mongo_clients, endpoint) = match async_runtime::block_on(
+        runtime::bootstrap_gui(config)
+    ) {
         Ok(context) => context,
         Err(error) => {
-            eprintln!("Application unavailable: backend task configuration authority failed: {error}. Check configuration and restart normally; no task operation was retried.");
+            eprintln!("Application unavailable: backend task configuration or runtime admission failed: {error}. Check configuration and restart normally; no task operation was retried.");
             std::process::exit(1);
         }
     };
 
     // Fixed, non-secret operator notice: never log endpoints or AppConfig.
-    eprintln!("MongoDB endpoint authority: backend MongoConfig supplies all shared GUI connections. TOML still selects the backend root, UI database/collection names and scripts; legacy TOML URI values are not used for transport. Changes require a normal restart, not a task retry.");
+    eprintln!("MongoDB endpoint authority: backend MongoConfig supplies the task runtime and the independent GUI data pool. Enrolled task access uses the public host only; Alpha/data/PNL keep the GUI data pool. TOML still selects backend root and UI settings; legacy TOML URI values are not used for transport. Changes require a normal restart, not a task retry.");
 
     tauri::Builder::default()
         .setup(|_| { dev_identity::ready().map_err(|e| format!("{e}; fix and rerun `npm run tauri dev`"))?; Ok(()) })
         .plugin(tauri_plugin_dialog::init())
-        .manage(mongo_clients.clone()) // 注册 Arc<MongoClients>
-        .manage(commands::TaskControlState::from_verified(control))
+        .manage(mongo_clients.clone()) // Original independent GUI Alpha/data/PNL pool
+        .manage(commands::TaskControlState::from_endpoint(endpoint))
         .manage(config)
         .invoke_handler(tauri::generate_handler![
             commands::create_task,

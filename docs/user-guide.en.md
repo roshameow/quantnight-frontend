@@ -12,18 +12,39 @@ Before you begin, please ensure your environment is configured correctly.
 
 ### 2. Configuration Management
 
-The application provides a complete graphical configuration interface, so you don't need to edit any configuration files manually. On first launch, the application will automatically create the necessary configuration files.
+The application TOML selects `env.working_dir`, UI database/collection names and
+scripts. Connection endpoints remain authoritative in that backend's original
+MongoConfig (private `credentials.yaml`), not legacy TOML URI fields. Settings
+does not replace backend credential/endpoint configuration. Never upload credentials
+or task receipts.
 
-- **All configurations can be done through the UI**:
-  - Frontend config (template paths, data filter options, etc.)
-  - Backend config (MongoDB connections, Python interpreter path, etc.)
-  - Script mapping config
+**After explicit macOS runtime enrollment**, GUI and CLI are equal clients of one
+headless task host. A user-level launchd socket starts it on first demand, without
+an open GUI or MCP. Task lists/remote-only cache, diagnostics, operations and
+progress projections belong to that host. Non-task Alpha/data/PNL/correlation
+features retain the original independent GUI data pool.
 
-- **Config file locations**:
-  - User data directory (preferred)
-  - App resource directory (fallback)
-
-> **Note**: Frontend config changes take effect immediately; backend config changes require an app restart.
+- Follow the [single build/deployment guide](../crates/taskctl/README.md#runtime-enrollment-and-safe-adoption)
+  and [CLI guide](cli-usage.md). Dragging an app into Applications or editing disk
+  files does not enroll or load a task host.
+- Closing the GUI does not stop the host or runner, or cancel accepted platform
+  requests. Reopening reconnects a client. A lost operation response never permits
+  automatic resend; reconcile original task/generation/launch/business receipts.
+- UI settings keep their original application rules; reopen the GUI for its
+  non-task data configuration. **Restarting only the GUI does not adopt task-host
+  configuration/shared-source changes**. The original deployment owner drains
+  accepted work, explicitly adopts the new host and verifies its loaded identity;
+  do not kill a busy host.
+- GUI task diagnostics require the explicitly selected canonical original AppConfig
+  so the host retains its check_task_status script contract. The original loader
+  still uses MongoConfig endpoint authority. The deployment candidate flag is
+  `--runtime-app-config` (see the single guide), not an AppConfig/URI upload or
+  arbitrary script RPC. backend_root keeps pure CLI semantics. Executable-only
+  schema 2 upgrades retain the selector; stop the old binding safely before
+  publishing any selector change.
+- Schema 1 without runtime enrollment retains the original mode. First-version
+  runtime enrollment is macOS-only; original unenrolled Windows/other paths remain.
+  This is the source contract, not proof that a downloaded release has adopted it.
 
 ---
 
@@ -64,15 +85,19 @@ Click the gear icon `⚙️` to open the settings panel:
   - **Data Filter Options**: Customize the result-set dropdown options on the Data analysis page.
 
 - **Backend config**:
-  - **MongoDB Settings**: Configure local and remote connection strings (`local_uri` / `remote_uri`) and database names.
+  - **MongoDB Settings**: Keep UI database/collection settings; endpoints come from original backend MongoConfig, not legacy TOML URI overrides. Task namespaces must match enrollment; non-task Alpha/data/PNL settings remain independent.
   - **Python Settings**: Set the Python interpreter path and working directory.
   - **Script Mapping**: Manage button-to-script mappings, with support for custom scripts.
 
-> **Note**: Backend config changes require an app restart.
+> **Note**: The GUI non-task pool and task host load configuration separately. Adopt task endpoint/shared-source changes safely through the guide above; reopening only the GUI does not replace the task host.
 
 ---
 
 ## Installation
+
+These steps install the desktop package, not runtime enrollment/adoption. Follow
+the guide above for explicit macOS task-host adoption; desktop installation alone
+does not prove launchd registration.
 
 ### macOS
 

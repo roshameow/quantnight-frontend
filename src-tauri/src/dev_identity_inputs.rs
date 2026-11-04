@@ -4,40 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
 #[cfg(test)] use std::time::UNIX_EPOCH;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Binding {
-    pub schema_version: u32,
-    pub frontend_root: PathBuf,
-    pub backend_root: PathBuf,
-    pub executable: PathBuf,
-    pub target: String,
-    pub profile: String,
-}
-
-impl Binding {
-    pub fn read(path: &Path) -> Result<Self, String> {
-        if !path.is_absolute() { return Err("dev binding must be an explicit absolute path".into()); }
-        let bytes = fs::read(path).map_err(|e| format!("dev binding unavailable: {e}"))?;
-        let binding: Self = serde_json::from_slice(&bytes).map_err(|e| format!("invalid dev binding: {e}"))?;
-        if binding.schema_version != 1 || binding.profile != "debug" || binding.target.is_empty() {
-            return Err("unsupported dev binding schema/profile/target (debug only)".into());
-        }
-        for root in [&binding.frontend_root, &binding.backend_root] {
-            if !root.is_absolute() || !root.is_dir() || root.canonicalize().map_err(|e| e.to_string())? != *root {
-                return Err("dev roots must be explicit canonical directories".into());
-            }
-        }
-        if !binding.executable.is_absolute() || binding.executable.file_name().is_none() {
-            return Err("dev executable must be an explicit absolute path".into());
-        }
-        let parent = binding.executable.parent().ok_or("missing executable parent")?;
-        if parent.canonicalize().map_err(|e| format!("dev executable directory: {e}"))? != parent {
-            return Err("dev executable directory must be canonical".into());
-        }
-        Ok(binding)
-    }
-}
+// Same schema owner used by core/runtime; no second Rust binding parser.
+#[path = "../../crates/runtime_registration.rs"]
+mod registration;
+pub use registration::Binding;
 
 pub const LOCATOR: &str = ".quantnight/taskctl-selection.json";
 #[derive(Debug, Deserialize)]
@@ -105,7 +75,7 @@ pub const SOURCE_FILES: &[&str] = &[
     "crates/Cargo.toml", "crates/Cargo.lock", "crates/task-core/Cargo.toml",
     "crates/taskctl/Cargo.toml", "vite.config.js", "scripts/dev-inputs.mjs",
     "package.json", "package-lock.json", "scripts/dev-registration.mjs", "scripts/register-dev-host.mjs", ".cargo/config.toml", "src-tauri/.cargo/config.toml",
-    "src-tauri/src/dev-input.stamp", "crates/source_identity.rs",
+    "src-tauri/src/dev-input.stamp", "crates/source_identity.rs", "crates/native_identity.rs", "crates/runtime_registration.rs",
     "crates/task-core/build.rs", "crates/taskctl/build.rs",
 ];
 
@@ -138,4 +108,35 @@ mod tests {
         assert_ne!(initial, fingerprint(&root).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn shared_binding_schema2_and_schema1_serialize_without_an_extra_configuration_owner() {
+        let root = std::env::temp_dir().join(format!("qn-schema-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(root.join("crates/target/debug")).unwrap();
+        let root = root.canonicalize().unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        let file = root.join("binding.json");
+        let mut value = serde_json::json!({"schema_version":1,"frontend_root":root,"backend_root":root,
+            "executable":root.join("gui-host"),"target":"aarch64-apple-darwin","profile":"debug"});
+        fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let legacy = Binding::read(&file).unwrap();
+        assert!(legacy.runtime.is_none());
+        assert!(serde_json::to_value(legacy).unwrap().get("runtime").is_none());
+        value["schema_version"] = 2.into();
+        value["runtime"] = serde_json::json!({"executable":root.join("crates/target/debug/taskctl"),
+            "configuration":{"kind":"backend_root","path":root},"protocol_version":1});
+        fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let enrolled = Binding::read(&file).unwrap();
+        assert_eq!(serde_json::to_value(enrolled).unwrap(), value);
+        value["schema_version"] = 1.into();
+        fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(Binding::read(&file).is_err()); // schema1 cannot silently enroll
+        value["schema_version"] = 2.into();
+        value["runtime"]["configuration"]["path"] = serde_json::to_value(root.join("another-root")).unwrap();
+        fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(Binding::read(&file).is_err());
+    }
+
 }

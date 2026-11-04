@@ -731,7 +731,7 @@ test('actual Priority SFC receives structured consumer diagnostics and displays 
     [observation({ state: 'checking' }), '运行检查进行中', '核验所有 pane 及消费者进程树'],
     [observation({ error: '[process] Permission denied: /proc/99/stat；exit=13，未发送停止命令' }), '运行检查执行失败', 'Permission denied: /proc/99/stat；exit=13，未发送停止命令'],
     [observation({ error: 'SSH 检查超时（15秒）；等待原连接返回，不重启任务' }), '运行检查超时', 'SSH 检查超时（15秒）；等待原连接返回，不重启任务'],
-    [observation({ taskId: 'other' }), '运行检查身份校验失败', '身份校验失败'],
+    [observation({ taskId: 'other' }), '运行检查任务匹配失败', '任务登记与执行目标匹配失败'],
     [observation({ observedAt: Date.now() - 600000 }), '运行检查结果已过期', '运行检查快照已达到 600 秒有效期'],
   ]) {
     const html = await render({ task: current, taskRuntimeStatus: runtime,

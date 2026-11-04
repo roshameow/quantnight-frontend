@@ -49,20 +49,20 @@ pub trait InspectionRuntime: OperationsRuntime {
         Err("original dataset verification owner unavailable".into())
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ListRequest {
     pub include_deactive: bool,
     pub remote: bool,
 }
 /// Existing producer identity, optional for ordinary status callers.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WatchObservation {
     pub task_id: String,
     pub launch_id: String,
     pub remote: bool,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusRequest {
     pub name: String,
     pub remote: Option<bool>,
@@ -79,7 +79,7 @@ impl StatusRequest {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResultsRequest {
     pub name: String,
     pub limit: i64,
@@ -96,12 +96,12 @@ impl ResultsRequest {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CollectRequest {
     pub name: String,
     pub output: Option<PathBuf>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EvidenceAction {
     VerifyRegistration,
     ArchiveResearch,
@@ -114,7 +114,7 @@ impl EvidenceAction {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvidenceRequest {
     pub name: String,
     pub action: EvidenceAction,

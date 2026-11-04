@@ -2,11 +2,11 @@
 
 ## Current shared-owner regression entry points
 
-Private draft, not adoption evidence. Progress display uses core `task_store.rs::ITEM_PROGRESS_RULES` through Tauri `stats_pipeline → item_progress_pipeline`; in-memory counts and Mongo expressions derive from that one rule definition. Store/cards display cancellations separately, including read-only compatibility for historical `permanent_error + terminalStatus=CANCELLED`; CLI raw statuses are not rewritten. Priority ledger scope remains distinct. The canonical semantics live in the paired backend `docs/task_control_lifecycle.md` §1.7; do not copy another classification table here.
+Source-contract navigation, not adoption evidence. In runtime-enrolled mode, original task query/progress/diagnostic code is extracted into task-core and reached by both adapters through the same runtime client; Tauri only maps events/UI. Progress expressions still derive from `task_store.rs::ITEM_PROGRESS_RULES`, not a second GUI classifier. Original cancellation/legacy/Priority projection assertions must remain. Non-task Alpha/data/PNL retains the original GUI data pool. See the compatible backend `docs/task_control_lifecycle.md#runtime-host-contract` and the [single host build/adoption guide](../crates/taskctl/README.md#runtime-enrollment-and-safe-adoption); tests/help do not prove installed or loaded runtime adoption.
 
 TaskManager no longer infers completion from counts or registers a five-minute auto-pause timer. Progress/registry events remain display inputs; explicit and queued user pause still use the original `pause_task → TaskControl.pause`. `tests/taskManagerPause.test.mjs` exercises the real SFC/store with fake native I/O: full counts across task types/hosts must produce no timer, automatic stop or extra status/PID query, while explicit pause remains functional. `tests/itemStatusCounts.test.mjs` and the shared writer-row fixture cover display through the real store/cards, not a second classifier.
 
-For simulation notifications, the Python watcher delegates to native status / `inspection::status_inner`; `crates/task-core/tests/inspection_routes.rs` and `crates/taskctl/tests/{invocation,behavior_dispatch}.rs` cover the common owner. Generation observation is a separate retained professional path. Exact cross-repo coverage and final freeze/acceptance belong to backend lifecycle §9.3.1. No tests, build, native app or live integration were run for this documentation draft.
+For simulation notifications, the Python watcher delegates to native status / `inspection::status_inner`; `crates/task-core/tests/inspection_routes.rs` and `crates/taskctl/tests/{invocation,behavior_dispatch}.rs` cover the common owner. Generation observation is a separate retained professional path. Current cross-repo regression navigation belongs to backend lifecycle `#reuse-regression-index`; the original Node/native/documentation assertions are retained, not deleted or weakened for extraction. Historical counts below are not new runtime acceptance. No build, native app or live integration is implied by this documentation update.
 
 Run locally, without Tauri, databases, or servers:
 
@@ -40,6 +40,11 @@ New identity-bearing responses cannot contaminate a same-name recreated task. Le
 
 ## Backend progress regression checks
 
+The following block records the **pre-extraction Tauri test entry points**. After
+moving task projections, use the actual task-core/adapter targets from the paired
+runner; do not treat an empty old filter as a passing runtime test. Original
+query/identity/Priority/event assertions must move or remain, never be weakened.
+
 ```sh
 cd src-tauri
 cargo check
@@ -68,7 +73,8 @@ unmount are covered. These are offline regressions, not native-app smoke tests.
 
 ## Exact legacy reconciliation reason compatibility
 
-`commands.rs::dispatch_state_tests` includes a minimal sanitized fixture derived
+The original dispatch-state regression (formerly `commands.rs::dispatch_state_tests`,
+now owned by the extracted task-diagnostics path) includes a minimal sanitized fixture derived
 from a live capability's **shape**, not its account/task/PID/run identity. It has
 fresh UTC v3 evidence, unconfirmed budget, and null daily counters/reset. Native
 accepts the raw `quota.reason` verbatim or, only for `waiting_reconciliation`, the

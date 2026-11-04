@@ -85,13 +85,13 @@ export const taskControlSource = task => ['local', 'remote_only'].includes(task?
 export const taskMutationIssue = task => taskControlSource(task) === 'remote_only'
   ? '仅远端登记：当前本地控端无此任务控制权限，请由原 owner 管理；仍可查看任务详情' : ''
 export const taskControlLabel = task => taskControlSource(task) === 'local'
-  ? '本控端登记（执行端可为本地或远程）' : taskMutationIssue(task) || '登记来源未提供；操作仍由原 native 精确身份核验'
+  ? '本控端登记（执行端可为本地或远程）' : taskMutationIssue(task) || '登记来源未提供；操作仍由原 native 任务登记与执行目标匹配'
 
 export const isCompletedTask = task => ['completed', 'completed_with_errors'].includes(task?.status)
 // Only view-owned admission and known control registration belong here.
 // Runtime/PID snapshots and historical proof/status are never start authority.
 export function taskStartBlockReason(task, { busy = false, stopping = false } = {}) {
-  if (!task || !taskRuntimeTarget(task).taskId || task.status === 'deactive') return '任务身份缺失或已归档，请刷新列表'
+  if (!task || !taskRuntimeTarget(task).taskId || task.status === 'deactive') return '任务登记标识缺失或已归档，请刷新列表'
   if (taskMutationIssue(task)) return taskMutationIssue(task)
   if (busy || stopping) return '本视图的原任务操作正在进行，请等待本次回执'
   return ''
@@ -104,7 +104,7 @@ export function runtimeDiagnostic(task, observation, now = Date.now()) {
       observation.isRemote !== (task.isRemote === true) ||
       (observation.authProfile !== undefined && observation.authProfile !== (task.auth_profile ?? 'user1')) ||
       (observation.launchAttemptId ?? null) !== (task.launchAttemptId ?? null)) {
-    return { status: '运行检查身份校验失败', detail: `身份校验失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异；结果已拒绝。${stageDetails(observation)}` }
+    return { status: '运行检查任务匹配失败', detail: `任务登记与执行目标匹配失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异；结果已拒绝。${stageDetails(observation)}` }
   }
   if (!Number.isSafeInteger(observation.observedAt) || observation.observedAt <= 0 || observation.observedAt > now) {
     return { status: '运行检查时间无效', detail: `结果时间戳缺失、无效或位于未来。${stageDetails(observation)}` }
@@ -114,8 +114,17 @@ export function runtimeDiagnostic(task, observation, now = Date.now()) {
       ? ` · 原检查诊断：${observation.diagnostic || ''}${observation.raw ? ` · 原始输出：${observation.raw}` : ''}` : ''}` }
   const context = stageDetails(observation)
   if (observation.state === 'checking') return { status: '运行检查进行中', detail: `${context} · 正等待本次检查结果。` }
-  if (observation.error) return { status: failureKind(observation.error) === 'timeout' ? '运行检查超时' : '运行检查执行失败',
-    detail: `${context} · 原因：${observation.error}` }
+  if (observation.error) {
+    const cause = String(observation.error).replace(/ \(application; execution=[a-z_]+\)$/, '')
+    const registryTimeout = /任务(?:身份查询|记录读取|登记读取).*?超时/.test(cause)
+    if (registryTimeout) {
+      const elapsed = cause.match(/超时（[^）]+）/)?.[0] ?? '超时'
+      return { status: '未能确认（任务记录读取超时）',
+        detail: `任务登记与执行目标匹配阶段 [identity]：任务登记读取链${elapsed}；尚未取得消费者检查结果；任务详情和结果可独立查看。` }
+    }
+    return { status: failureKind(cause) === 'timeout' ? '运行检查超时' : '运行检查执行失败',
+      detail: context.includes(cause) ? context : `${context} · 原因：${cause}` }
+  }
   if (observation.state === 'session_absent') return { status: '已暂停（tmux会话缺失）',
     detail: `${context} · 已核验目标主机的精确 tmux 会话缺失。` }
   if (observation.state === 'not_running') return { status: '未检测到运行消费者',

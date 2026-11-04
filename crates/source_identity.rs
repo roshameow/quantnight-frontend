@@ -68,7 +68,7 @@ pub fn fingerprint_with_manifests(root: &Path, directories: &[&str], files: &[&s
 }
 
 pub fn crate_fingerprint(root: &Path) -> Result<String, String> {
-    fingerprint(root, &["src"], &["Cargo.toml", "build.rs", "../source_identity.rs"])
+    fingerprint(root, &["src"], &["Cargo.toml", "build.rs", "../source_identity.rs", "../runtime_registration.rs", "../native_identity.rs"])
 }
 
 /// A normal Cargo build step only: sample THIS crate before its compilation.
@@ -76,7 +76,7 @@ pub fn crate_fingerprint(root: &Path) -> Result<String, String> {
 pub fn emit_crate_identity() -> Result<(), String> {
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest dir")?)
         .canonicalize().map_err(|e| e.to_string())?;
-    for p in ["src", "Cargo.toml", "build.rs", "../source_identity.rs"] {
+    for p in ["src", "Cargo.toml", "build.rs", "../source_identity.rs", "../runtime_registration.rs", "../native_identity.rs"] {
         println!("cargo:rerun-if-changed={}", root.join(p).display());
     }
     println!("cargo:rustc-env=QUANTNIGHT_CRATE_SOURCE_ID={}", crate_fingerprint(&root)?);

@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CreateRequest {
     pub name: String,
     pub templatefile: String,
@@ -24,6 +24,7 @@ pub struct CreateRequest {
     pub target_remote: bool,
     pub force: bool,
     pub expected_task_id: Option<String>,
+    #[serde(with = "crate::runtime::wire_document::optional")]
     pub mission_config: Option<Document>,
 }
 impl CreateRequest {
@@ -41,7 +42,7 @@ impl CreateRequest {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GenerateRequest {
     pub name: String,
     pub expected_task_id: Option<String>,
@@ -744,7 +745,7 @@ pub async fn reconcile_generation_for_list(
     };
     let previous = refresh_previous_status(&task, &generation);
     let mut status = generation_failure_status(&GenerationErrorKind::Interrupted, total);
-    let mut error = "generation_interrupted: original owner absent and local mongo_datum writer absence verified".to_owned();
+    let mut error = "generation_interrupted: original generation operation not active and local mongo_datum writer absence verified".to_owned();
     if let Some(e) = inventory_error { error.push_str(&format!("; local collection probe unconfirmed: {e}")); }
     if total == Some(1) { error.push_str("; nonempty collection does not prove complete generation"); }
     if previous.is_none() {
@@ -805,12 +806,19 @@ pub async fn generate(
         return failure("generate", &request.name, e);
     }
     let token = nonce();
+    let hosted_owner=crate::generation_owner::current();
+    let _generation_scope=match hosted_owner.as_ref().map(|owner|owner.enter(task.get_object_id("_id").unwrap(),&token)).transpose(){Ok(scope)=>scope,Err(error)=>return failure("generate",&request.name,error)};
     let stamp = now();
-    let (mut query, update) =
+    let (mut query, mut update) =
         match generation_begin_plan(&task, &token, "writing", std::process::id(), &stamp) {
             Ok(v) => v,
             Err(e) => return failure("generate", &request.name, e),
         };
+    if let Some(owner)=&hosted_owner{
+        let tag=owner.tag();
+        update.get_document_mut("$set").unwrap().get_document_mut("generation").unwrap().insert("controlOwner",tag.clone());
+        update.get_document_mut("$push").unwrap().get_document_mut("events").unwrap().get_document_mut("detail").unwrap().insert("controlOwner",tag);
+    }
     let generation = update
         .get_document("$set")
         .unwrap()

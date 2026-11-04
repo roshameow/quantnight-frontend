@@ -18,7 +18,7 @@ pub struct StopOutput {
     pub stdout: String,
     pub stderr: String,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopBudget {
     Cli,
     Gui,
@@ -64,9 +64,9 @@ pub trait PauseRuntime: Send + Sync {
             .map_err(|_| "original stop allowance exhausted; not retried".to_string())?
     }
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PauseStage {
-    pub stage: &'static str,
+    pub stage: String,
     pub message: String,
 }
 pub type PauseObserver = Arc<dyn Fn(PauseStage) + Send + Sync>;
@@ -85,7 +85,7 @@ pub struct PauseOutcome {
     pub exit_code: i32,
     pub confirmed_stop: Option<ConfirmedTaskStop>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmedTaskStop {
     pub confirmed: bool,
@@ -668,7 +668,7 @@ pub async fn never_started_inventory(
 fn stage(observer: &Option<PauseObserver>, id: &'static str, message: impl Into<String>) {
     if let Some(observer) = observer {
         observer(PauseStage {
-            stage: id,
+            stage: id.into(),
             message: message.into(),
         });
     }

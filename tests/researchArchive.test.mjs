@@ -9,8 +9,11 @@ const runtime = read('../crates/task-core/src/operations_runtime.rs');
 
 test('existing delete button delegates exact identity to shared safe archive before control mutation', () => {
   const body = source.slice(source.indexOf('pub async fn delete_task('), source.indexOf('fn start_request('));
-  assert.match(body, /core\.task_by_id\(&id\)/);
-  assert.match(body, /core\.delete_bound\(name, Some\(&id\), Some\(remote\), None, None\)/);
+  assert.match(body, /task_by_id\(core, &id\)/);
+  assert.match(body, /TaskRequest::Delete\(DeleteRequest/);
+  for (const field of ['expected_task_id: Some(id.clone())', 'expected_remote: Some(remote)', 'confirm: None']) assert.ok(body.includes(field));
+  const dispatcher = read('../crates/task-core/src/task_dispatch.rs');
+  assert.match(dispatcher, /control\.delete_bound\(&r.name,r.expected_task_id.as_deref\(\),r.expected_remote,r.confirm.as_deref\(\),bash\)/);
   for (const field of ['controlHidden', 'localDeleted', 'remoteDeleted', 'itemsPreserved', 'canonicalResultsDeleted']) assert.ok(body.includes(field));
   assert.doesNotMatch(body, /\.drop\(|\.update_one\(|archive_prepared_research|run_taskctl/);
   assert.match(facade, /cleanup_sync::delete_with_expected_host\(self\.root\(\), self\.store\.as_ref\(\), &runtime, name, expected_id, expected_remote\)/);

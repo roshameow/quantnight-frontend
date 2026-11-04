@@ -5,13 +5,20 @@ const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 const commands = read('../src-tauri/src/commands.rs');
 const main = read('../src-tauri/src/main.rs');
 const facade = read('../crates/task-core/src/task_control.rs');
+const dispatcher = read('../crates/task-core/src/task_dispatch.rs');
+const sharedRuntime = read('../crates/task-core/src/runtime/mod.rs');
+const queries = read('../crates/task-core/src/gui_task_queries.rs');
+const diagnostics = read('../crates/task-core/src/task_diagnostics.rs');
+const compact = value => value.replace(/\s+/g, '');
 const body = name => commands.slice(commands.indexOf(`pub async fn ${name}(`)).split('\n}')[0];
 
 test('all active task mutations call the shared facade and never Mongo writes, taskctl Python bridge, or drop sync', () => {
-  for (const [name, route] of [['create_task', '.create('], ['generate_list', '.generate('],
-    ['sync_remote_task', '.sync_bound('], ['delete_task', '.delete_bound('], ['pause_task', '.pause('], ['update_priority_task', '.update_priority(']]) {
+  for (const [name, route] of [['create_task', 'TaskRequest::Create('], ['generate_list', 'TaskRequest::Generate('],
+    ['sync_remote_task', 'TaskRequest::Sync('], ['delete_task', 'TaskRequest::Delete('], ['pause_task', 'TaskRequest::Pause('], ['update_priority_task', 'TaskRequest::PriorityUpdate(']]) {
     const source = body(name);
     assert.ok(source.includes(route), `${name} -> ${route}`);
+    assert.match(source, /execute_task\(|\.execute\(/);
+    assert.ok(dispatcher.includes(route.replace('TaskRequest::','TaskRequest::')));
     assert.doesNotMatch(source, /update_one|insert_one|\.drop\(|run_python_command|run_bash_script|run_taskctl/);
   }
   const production = commands.slice(0, commands.indexOf('mod verified_pause_tests'));
@@ -21,12 +28,12 @@ test('all active task mutations call the shared facade and never Mongo writes, t
 });
 
 test('one verified startup publishes shared AppConfig/pools/control before GUI reads, without button bootstrap', () => {
-  assert.equal((main.match(/TaskControl::bootstrap_gui\(config\)/g) || []).length, 1);
-  assert.equal((main.match(/manage\(commands::TaskControlState::from_verified\(control\)\)/g) || []).length, 1);
-  assert.ok(main.indexOf('load_config(&config_path)') < main.indexOf('TaskControl::bootstrap_gui(config)'));
-  assert.ok(main.indexOf('context.into_parts()') < main.indexOf('tauri::Builder'));
-  assert.ok(main.indexOf('dev_identity::verify_gui_root') < main.indexOf('TaskControl::bootstrap_gui(config)'));
-  assert.ok(main.indexOf('context.into_parts()') < main.indexOf('dev_identity::ready()'));
+  assert.equal((main.match(/runtime::bootstrap_gui\(config\)/g) || []).length, 1);
+  assert.equal((main.match(/manage\(commands::TaskControlState::from_endpoint\(endpoint\)\)/g) || []).length, 1);
+  assert.ok(main.indexOf('load_config(&config_path)') < main.indexOf('runtime::bootstrap_gui(config)'));
+  assert.ok(main.indexOf('runtime::bootstrap_gui(config)') < main.indexOf('tauri::Builder'));
+  assert.ok(main.indexOf('dev_identity::verify_gui_root') < main.indexOf('runtime::bootstrap_gui(config)'));
+  assert.ok(main.indexOf('runtime::bootstrap_gui(config)') < main.indexOf('dev_identity::ready()'));
   assert.match(main.split('Application unavailable:')[1].split('tauri::Builder')[0], /std::process::exit\(1\)/);
   assert.doesNotMatch(main, /MongoClients::new|TaskControlState::default/);
   assert.match(main, /Application unavailable/);
@@ -36,18 +43,25 @@ test('one verified startup publishes shared AppConfig/pools/control before GUI r
   assert.match(main, /manage\(mongo_clients.clone\(\)\)/);
   assert.match(main, /manage\(config\)/);
   const init = commands.slice(commands.indexOf('pub struct TaskControlState'), commands.indexOf('fn core_receipt'));
-  assert.match(init, /OnceCell<Result<TaskControl, String>>/);
-  assert.match(init, /TaskControl::with_existing_clients\(config, clients.clone\(\)\)/);
+  assert.match(init, /TaskControlState<T = TaskEndpoint>/);
+  assert.match(init, /OnceCell<Result<T, String>>/);
   assert.match(init, /get_or_init/);
-  assert.match(init, /OnceCell::new_with\(Some\(Ok\(control\)\)\)/);
-  assert.doesNotMatch(init, /get_or_try_init|bootstrap_gui|export_backend_config/);
+  assert.match(init, /OnceCell::new_with\(Some\(Ok\(endpoint\)\)\)/);
+  assert.doesNotMatch(init, /get_or_try_init|bootstrap_gui|export_backend_config|with_existing_clients/);
+  assert.match(sharedRuntime, /RuntimeSelection::for_backend\(root\)/);
+  assert.match(sharedRuntime, /TaskControl::bootstrap_gui_data\(config\)/);
+  const dataBootstrap = facade.slice(facade.indexOf('pub async fn bootstrap_gui_data('), facade.indexOf('/// Headless CLI bootstrap'));
+  assert.doesNotMatch(dataBootstrap, /MongoTaskStore::|TaskControl \{/);
+  assert.match(sharedRuntime, /RuntimeClient::connect_gui\(&selection,&settings\)/);
+  assert.match(sharedRuntime, /TaskEndpoint::runtime\(client\)/);
+  assert.match(sharedRuntime, /TaskEndpoint::embedded/);
   const binding = read('../crates/task-core/src/backend_binding.rs');
   assert.match(binding, /run_process_private\(command, Duration::from_secs\(8\)\)/);
   assert.doesNotMatch(binding, /run_process_observed|normalize|directConnection/);
   const cli = read('../crates/taskctl/src/bootstrap.rs');
   assert.match(cli, /export_backend_config\(root\)/);
   assert.doesNotMatch(cli, /process::Command|from_value|run_process_private/);
-  assert.match(facade, /MongoClients::new_with\(&config, build\)/);
+  assert.match(facade, /MongoClients::new_with\(&config,\s*build\)/);
   assert.match(facade, /MongoTaskStore::new\(clients.clone\(\), &config\)/);
   assert.match(facade, /binding.verify_current\(\)\?/);
   const watcher = read('../src-tauri/src/watcher.rs');
@@ -61,14 +75,16 @@ test('mutations require exact local ID, keep legacy DTO and preserve existing op
   assert.match(body('sync_remote_task'), /task_id: Option<String>/);
   assert.match(body('sync_remote_task'), /required_task_id\(task_id.as_deref\(\)\)/);
   const pauseOptions = commands.slice(commands.indexOf('fn gui_pause_options'), commands.indexOf('pub async fn pause_task'));
-  assert.match(pauseOptions, /expected_task_id: Some\(id\), expected_remote: Some\(remote\)/);
-  assert.match(pauseOptions, /expected_launch_attempt_id: exact, expected_launch_absent, remaining/);
-  assert.match(body('pause_task'), /gui_pause_options\(id, is_remote, expected_launch_attempt_id.as_deref\(\), expected_launch_absent/);
-  assert.match(body('pause_task'), /remaining_ms, started.elapsed\(\)/);
-  assert.match(body('pause_task'), /core.pause\(&task_name, options, StopBudget::Gui/);
+  assert.ok(compact(pauseOptions).includes('expected_task_id:Some(id),expected_remote:Some(remote)'));
+  assert.ok(compact(pauseOptions).includes('expected_launch_attempt_id:exact,expected_launch_absent,remaining'));
+  assert.ok(compact(body('pause_task')).includes('gui_pause_options(id,is_remote,expected_launch_attempt_id.as_deref(),expected_launch_absent'));
+  assert.ok(compact(body('pause_task')).includes('remaining_ms,started.elapsed()'));
+  assert.match(body('pause_task'), /TaskRequest::Pause\(PauseRequest/);
+  assert.match(dispatcher, /control.pause\(&r.name,PauseOptions/);
+  assert.match(dispatcher, /r.budget,bash/);
   assert.match(body('pause_task'), /StopBudget::Gui/);
   assert.match(body('generate_list'), /timeout_seconds = 900/);
-  assert.match(commands, /Duration::from_secs\(300\), core.start/);
+  assert.ok(compact(commands).includes('Duration::from_secs(300),execute_task(core,TaskRequest::Start('));
   assert.match(commands, /GuiCreatedTask as CreatedTask/);
   assert.match(commands, /pub use quantnight_task_core::pause::ConfirmedTaskStop/);
   assert.match(commands, /required_task_id/);
@@ -79,27 +95,33 @@ test('mutations require exact local ID, keep legacy DTO and preserve existing op
 test('list delegates only local writing generation through original control; remote/cache/runtime stay observational', () => {
   const list = body('get_all_tasks');
   assert.match(list, /control: State<'_, TaskControlState>/);
-  assert.match(list, /fetch_remote_tasks/);
-  assert.match(list, /append_local_listed_task[\s\S]*control.get\(config, clients\)[\s\S]*core.reconcile_generation_for_list\(&observed\)/);
-  assert.match(list, /merge_remote_listed_tasks/);
-  const adapter = commands.slice(commands.indexOf('async fn append_local_listed_task'), commands.indexOf('/// 远程任务列表缓存'));
+  assert.match(list, /execute\(TaskRequest::GuiTasks/);
+  assert.match(list, /gui_task_queries::decode_list/);
+  assert.match(dispatcher, /gui_task_queries::list/);
+  const projection = queries.slice(queries.indexOf('pub async fn list('), queries.indexOf('pub fn decode_list('));
+  assert.match(projection, /fetch_remote_tasks/);
+  assert.match(projection, /append_local_listed_task[\s\S]*control.reconcile_generation_for_list\(&observed\)/);
+  assert.match(projection, /merge_remote_listed_tasks/);
+  const adapter = queries.slice(queries.indexOf('async fn append_local_listed_task'), queries.indexOf('/// 远程任务列表缓存'));
   assert.match(adapter, /task.status == "generating"/);
   assert.match(adapter, /generation.get_str\("phase"\)[\s\S]*Some\("writing"\)/);
   assert.match(adapter, /configured_mission_database != GUI_TASK_MISSION_DATABASE/);
   assert.match(adapter, /reconcile\(document\).await/);
   assert.match(adapter, /generation_refresh_error = Some\(error\)/);
-  assert.doesNotMatch(list + adapter, /core\.status|\bTaskControl::|update_one|insert_one|MongoClients::new|TaskControl::connect|run_bash_script|check_task_status|\.(?:generate|start|pause|sync)\(/);
-  const remote = commands.slice(commands.indexOf('async fn fetch_remote_tasks'), commands.indexOf('pub async fn get_all_tasks'));
+  assert.doesNotMatch(list + projection + adapter, /core\.status|\bTaskControl::|update_one|insert_one|MongoClients::new|TaskControl::connect|run_bash_script|check_task_status|\.(?:generate|start|pause|sync)\(/);
+  const remote = queries.slice(queries.indexOf('async fn fetch_remote_tasks'), queries.indexOf('pub async fn list('));
   assert.doesNotMatch(remote, /reconcile_generation|append_local_listed_task|control.get/);
-  assert.match(remote, /remote_uri == local_uri/);
+  assert.match(compact(remote), /remote_uri==context.config\(\).mongodb.local_uri/);
   assert.match(remote, /REMOTE_TASK_CACHE_TTL/);
   assert.match(remote, /timeout\(REMOTE_TASK_TIMEOUT/);
-  assert.match(commands, /REMOTE_TASK_CACHE_TTL: Duration = Duration::from_secs\(10\)/);
-  assert.match(commands, /REMOTE_TASK_TIMEOUT: Duration = Duration::from_secs\(2\)/);
-  assert.match(commands, /skip_deserializing, skip_serializing_if = "Option::is_none", rename = "generationRefreshError"/);
-  assert.match(body('check_task_status'), /execute_task_script/);
-  assert.match(body('check_task_status'), /read_runtime_evidence/);
+  assert.match(queries, /REMOTE_TASK_CACHE_TTL: Duration = Duration::from_secs\(10\)/);
+  assert.match(queries, /REMOTE_TASK_TIMEOUT: Duration = Duration::from_secs\(2\)/);
+  assert.ok(compact(queries).includes('skip_deserializing,skip_serializing_if="Option::is_none",rename="generationRefreshError"'));
+  assert.match(body('check_task_status'), /TaskRequest::TaskDiagnostics/);
+  assert.match(diagnostics, /execute_task_script/);
+  assert.match(diagnostics, /read_runtime_evidence/);
   assert.doesNotMatch(body('check_task_status'), /core.status|update_one|\.pause\(/);
+
 });
 
 test('start forwards captured actual host to locked core, preserving destination intent without GUI eligibility rules', () => {
@@ -118,10 +140,11 @@ test('start forwards captured actual host to locked core, preserving destination
 });
 
 test('sync and archive send captured host into shared lock, not merely a pre-read GUI check', () => {
-  for (const [name, method] of [['sync_remote_task', 'sync_bound'], ['delete_task', 'delete_bound']]) {
+  for (const [name, method, variant] of [['sync_remote_task', 'sync_bound', 'Sync'], ['delete_task', 'delete_bound', 'Delete']]) {
     assert.match(body(name), /expected_remote: Option<bool>/);
     assert.match(body(name), /let remote = expected_remote.unwrap_or\(task.get_bool\("isRemote"\).unwrap_or\(false\)\)/);
-    assert.ok(body(name).includes(`core.${method}(`));
+    assert.ok(body(name).includes(`TaskRequest::${variant}(`));
+    assert.ok(dispatcher.includes(`control.${method}(`));
     assert.ok(body(name).includes('Some(remote)'));
   }
   const cleanup = read('../crates/task-core/src/cleanup_sync.rs');

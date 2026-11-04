@@ -113,10 +113,12 @@ test('mixed error, timeout and cancelled items remain separate in the rendered b
 test('single core semantic definition is called, never copied by the GUI', async () => {
   const read = path => readFile(new URL(path, import.meta.url), 'utf8');
   const core = await read('../crates/task-core/src/task_store.rs');
-  const watcher = await read('../src-tauri/src/watcher.rs');
+  const adapter = await read('../src-tauri/src/watcher.rs');
+  assert.doesNotMatch(adapter, /fn stats_pipeline|MongoClients|\.aggregate\(/);
+  const watcher = await read('../crates/task-core/src/task_progress.rs');
   const inspection = await read('../crates/task-core/src/inspection.rs');
   const statsBody = watcher.match(/fn stats_pipeline\(\) -> Vec<Document> \{([\s\S]*?)\n\}/)?.[1];
-  assert.equal(statsBody?.trim(), 'quantnight_task_core::task_store::item_progress_pipeline()');
+  assert.equal(statsBody?.trim(), 'crate::task_store::item_progress_pipeline()');
   const countsBody = core.match(/pub fn item_progress_counts\([\s\S]*?\n\}/)?.[0];
   const pipelineBody = core.match(/pub fn item_progress_pipeline\([\s\S]*?\n\}/)?.[0];
   assert.match(countsBody, /item_progress_counts_with_terminal\(statuses\.iter\(\)/);

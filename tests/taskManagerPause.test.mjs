@@ -624,7 +624,7 @@ test('a stage-listener promise resolving after unmount is disposed immediately, 
 });
 
 test('the actual native operation-specific script stage whitelist reaches the real pending UI handlers', async () => {
-  const native = await readFile(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+  const native = await readFile(new URL('../crates/task-core/src/task_diagnostics.rs', import.meta.url), 'utf8');
   const section = native.match(/let allowed: &\[&str\] = match self.operation \{([\s\S]*?)_ => &\[\]/)?.[1];
   assert.ok(section, 'native script-stage contract must remain inspectable; do not silently replace it with local fixtures');
   for (const operation of ['runtime', 'stop']) {
@@ -745,7 +745,9 @@ test('all native GUI start entrypoints delegate once without a second launch or 
     assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
   }
   const body = rust.slice(rust.indexOf('async fn start_via_core('), rust.indexOf('pub async fn start_task('));
-  assert.equal((body.match(/core.start\(/g) || []).length, 1);
+  assert.equal((body.match(/TaskRequest::Start\(/g) || []).length, 1);
+  const dispatcher = await readFile(new URL('../crates/task-core/src/task_dispatch.rs', import.meta.url), 'utf8');
+  assert.equal((dispatcher.match(/control.start\(/g) || []).length, 1);
   assert.doesNotMatch(body, /update_one|find_one|run_bash_script|launchAttemptId/);
   const request = rust.slice(rust.indexOf('fn start_request('), rust.indexOf('async fn start_via_core('));
   for (const arg of ['expected_task_id', 'notification.no_notify = true', 'request.remote = Some(remote)', 'request.config_json = config.map(str::to_owned)']) assert.ok(request.includes(arg));

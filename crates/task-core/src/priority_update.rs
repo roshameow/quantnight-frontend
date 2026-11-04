@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::{cleanup_sync::{outcome, TaskOutcome}, lifecycle_policy, mission_lock::MissionLocks,
     start::StartRuntime, task_store::{Host, TaskStore}};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct UpdatePriorityRequest {
     pub name: String,
     pub config_json: String,

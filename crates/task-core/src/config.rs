@@ -15,7 +15,7 @@ use tokio::{
 };
 
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct ScriptConfig {
     pub module: Option<String>,  // Python 脚本：-m xxx
     pub command: Option<String>, // 如 "bash" 或 "python3"
@@ -67,10 +67,9 @@ pub struct AppConfig {
 }
 
 
+pub(crate) fn load_config_source(path:&Path)->Result<Config,ConfigError>{Config::builder().add_source(File::from(path)).build()}
 pub fn load_config(path: &Path) -> Result<AppConfig, ConfigError> {
-    let builder = Config::builder().add_source(File::from(path));
-    let cfg = builder.build()?;
-    cfg.try_deserialize()
+    load_config_source(path)?.try_deserialize()
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -209,7 +208,7 @@ pub fn replace_args(args: &[String], vars: &[(&str, &str)]) -> Vec<String> {
 }
 
 /// Observations are diagnostics only; callers must validate any stdout protocol.
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BashScriptEvent {
     Config,
     Launch,
@@ -266,6 +265,15 @@ pub async fn run_bash_script_observed_with_env(
     budget: Duration, diagnostic: bool, observer: Option<BashScriptObserver>,
     environment: &[(&str, &str)],
 ) -> Result<(String, String), String> {
+    run_bash_script_observed_with_env_policy(script_key,vars,is_remote,app_config,budget,diagnostic,observer,environment,&[]).await
+}
+
+/// Generic child environment port; caller owns key policy. No runtime/business dependency.
+pub async fn run_bash_script_observed_with_env_policy(
+    script_key:&str,vars:&[(&str,&str)],is_remote:bool,app_config:&AppConfig,
+    budget:Duration,diagnostic:bool,observer:Option<BashScriptObserver>,
+    environment:&[(&str,&str)],remove_environment:&[&str],
+)->Result<(String,String),String>{
     let observe = |event| { if let Some(callback) = &observer { callback(event); } };
     observe(BashScriptEvent::Config);
     let script_cfg = app_config.bash.scripts.get(script_key)
@@ -280,9 +288,14 @@ pub async fn run_bash_script_observed_with_env(
     eprintln!("Executing Bash command: {} {}", command, quoted_args.join(" "));
 
     let mut command = TokioCommand::new(command);
-    command.args(&args).current_dir(&app_config.env.working_dir)
-        .envs(environment.iter().copied());
+    command.args(&args).current_dir(&app_config.env.working_dir);
+    apply_child_environment(&mut command,environment,remove_environment);
     run_process_observed(command, budget, diagnostic, observer).await
+}
+
+fn apply_child_environment(command:&mut TokioCommand,environment:&[(&str,&str)],remove_environment:&[&str]){
+    for key in remove_environment{command.env_remove(key);}
+    command.envs(environment.iter().copied());
 }
 
 // Atomic subprocess transport shared by the existing shell runner and local
@@ -691,4 +704,12 @@ mod bash_runner_tests {
             "diagnostic descendant must be exited, not an orphaned live probe: {state}");
         unrelated.kill().await.unwrap();
     }
+    #[tokio::test]
+    async fn original_generic_child_env_port_can_remove_host_values_without_global_mutation(){
+        let mut command=TokioCommand::new("/bin/sh");command.args(["-c","printf '%s|%s' \"${SSH_AUTH_SOCK-unset}\" \"$PYTHONPATH\""]);
+        command.env("SSH_AUTH_SOCK","synthetic-host-only");
+        apply_child_environment(&mut command,&[("PYTHONPATH","verified-backend")],&["SSH_AUTH_SOCK"]);
+        let(out,_)=run_process_observed(command,Duration::from_secs(3),true,None).await.unwrap();assert_eq!(out,"unset|verified-backend");
+    }
+
 }

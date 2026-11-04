@@ -10,7 +10,7 @@ use bson::{doc, Bson, Document};
 use serde_json::{json, Value};
 use std::path::Path;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResumeRequest {
     pub name: String,
     pub expected_task_id: Option<String>,

@@ -9,7 +9,7 @@ export function relevant(relative) {
   if (/^crates\/(task-core|taskctl)\/src\/.+\.rs$/.test(p)) return true;
   return new Set([
     'crates/Cargo.toml', 'crates/Cargo.lock', 'crates/task-core/Cargo.toml', 'crates/taskctl/Cargo.toml',
-    'crates/source_identity.rs', 'crates/task-core/build.rs', 'crates/taskctl/build.rs',
+    'crates/source_identity.rs', 'crates/native_identity.rs', 'crates/runtime_registration.rs', 'crates/task-core/build.rs', 'crates/taskctl/build.rs',
     'src-tauri/Cargo.lock', 'scripts/dev-registration.mjs', 'scripts/register-dev-host.mjs',
     'vite.config.js', 'scripts/dev-inputs.mjs', 'package.json', 'package-lock.json', '.cargo/config.toml',
   ]).has(p);
@@ -43,7 +43,7 @@ export function devInputs(frontendRoot, env = process.env) {
       server.watcher.add([
         path.join(frontend, 'crates/task-core/src'), path.join(frontend, 'crates/taskctl/src'),
         ...['crates/Cargo.toml', 'crates/Cargo.lock', 'crates/task-core/Cargo.toml', 'crates/taskctl/Cargo.toml',
-    'crates/source_identity.rs', 'crates/task-core/build.rs', 'crates/taskctl/build.rs',
+    'crates/source_identity.rs', 'crates/native_identity.rs', 'crates/runtime_registration.rs', 'crates/task-core/build.rs', 'crates/taskctl/build.rs',
     'src-tauri/Cargo.lock', 'scripts/dev-registration.mjs', 'scripts/register-dev-host.mjs',
           'scripts/dev-inputs.mjs', 'package.json', 'package-lock.json', '.cargo'].map(p => path.join(frontend, p)),
       ]);

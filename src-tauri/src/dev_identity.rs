@@ -3,21 +3,7 @@ use crate::{dev_identity_inputs::{Binding, BuildIdentity, fingerprint}, dev_imag
 use serde::{Deserialize, Serialize};
 use std::{fs::{self, File, OpenOptions}, path::{Path, PathBuf}, sync::OnceLock};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ProcessIdentity { pid: u32, started_seconds: u64, started_micros: u64 }
-#[cfg(target_os = "macos")]
-fn process_identity(pid: u32) -> Result<ProcessIdentity, String> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-    // SAFETY: libproc receives a writable buffer with the documented size.
-    let result = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
-    if result != size { return Err("dev GUI process identity is unavailable/stale".into()); }
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid || info.pbi_status == 5 { return Err("dev GUI process is not live".into()); }
-    Ok(ProcessIdentity { pid, started_seconds: info.pbi_start_tvsec, started_micros: info.pbi_start_tvusec })
-}
-#[cfg(not(target_os = "macos"))]
-fn process_identity(_: u32) -> Result<ProcessIdentity, String> { Err("dev host process identity requires macOS".into()) }
+use quantnight_task_core::native_identity::{ProcessIdentity, process_identity};
 
 // A dev-host lock is not a mission mutator. Keep it outside the existing mission
 // namespace; use the same nonblocking OS flock discipline (no unlink/retries).
@@ -195,7 +181,7 @@ mod tests {
         let _cleanup = Cleanup(root.clone());
         let build = BuildIdentity {
             binding: Binding { schema_version: 1, frontend_root: root.clone(), backend_root: root.clone(),
-                executable: std::env::current_exe().unwrap(), target: "aarch64-apple-darwin".into(), profile: "debug".into() },
+                executable: std::env::current_exe().unwrap(), target: "aarch64-apple-darwin".into(), profile: "debug".into(), runtime: None },
             binding_path: root.join("binding.json"),
             source: "fixture-current-source".into(), target: "aarch64-apple-darwin".into(), profile: "debug".into(),
             features: vec![], rustflags: String::new(),

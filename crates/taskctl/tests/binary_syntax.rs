@@ -151,3 +151,15 @@ fn compiled_gui_host_early_entry_matches_standalone_without_gui_config_or_busine
         assert_eq!(hosted.stderr, b"taskctl: arguments must be valid UTF-8\n");
     }
 }
+
+#[test]
+fn qn_shim_prefix_management_help_needs_no_binding_or_admission(){
+    let code=quantnight_taskctl::run_os_with_admission(["--backend-root","/nonexistent/explicit-shim-root","runtime-plan","--help"].map(std::ffi::OsString::from),|_,_|panic!("management help must precede config/admission"));
+    assert_eq!(code,0);
+}
+
+#[test]
+fn stopped_observation_is_status_only_readonly_flag_and_help_stays_early(){
+    let help=run(&["runtime-status","--stopped-observation","--binding","/nonexistent/fixture","--help"]);assert!(help.status.success());assert!(String::from_utf8(help.stdout).unwrap().contains("--stopped-observation"));
+    for args in [vec!["runtime-status","--stopped-observation"],vec!["runtime-status","--binding","/fixture/binding","--stopped-observation","--stopped-observation"],vec!["runtime-drain","--binding","/fixture/binding","--stopped-observation"],vec!["runtime-host","--binding","/fixture/binding","--stopped-observation"]]{let output=run(&args);assert_eq!(output.status.code(),Some(2));let value:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value["ok"],false);}
+}

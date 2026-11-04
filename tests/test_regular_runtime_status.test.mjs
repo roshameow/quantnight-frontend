@@ -41,12 +41,12 @@ function configure(app) {
 async function render(props) {
   return renderToString(configure(createSSRApp({ render: () => h(card.default, props) })));
 }
-function assertPreserved(html) {
+function assertPreserved(html, expectedName = 'glb_spread') {
   const text = plain(html);
   assert.match(text, /✓ 7\+4.*✗ 2\+1.*Σ 80\+20/);
   assert.match(text, /进度刷新失败：/);
   assert.match(text, /最大并发: 3.*子任务上限: 10/);
-  assert.match(text, /glb_spread/);
+  assert.ok(text.includes(expectedName));
   assert.match(text, /user1/);
 }
 
@@ -73,7 +73,7 @@ test('freshness and identity boundary rejects stale, future, invalid and wrong t
     { observedAt: now - card.REGULAR_RUNTIME_MAX_AGE }, { observedAt: now + 60000 },
     { observedAt: -1 }, { observedAt: null }, { observedAt: NaN }, { observedAt: '123' }]) {
     const runtime = observation(patch);
-    const expected = ['taskId', 'name', 'isRemote'].some(key => key in patch) ? '运行检查身份校验失败'
+    const expected = ['taskId', 'name', 'isRemote'].some(key => key in patch) ? '运行检查任务匹配失败'
       : typeof patch.observedAt === 'number' && patch.observedAt > 0 && patch.observedAt <= now ? '运行检查结果已过期' : '运行检查时间无效';
     assert.equal(card.regularDisplayStatus(task(), runtime, null, now), expected);
     const html = await render({ task: task(), progress, taskRuntimeStatus: runtime });
@@ -150,9 +150,9 @@ test('mounted real card updates evidence/status without losing counters/config a
       assertPreserved(mounted.text());
     }
     props.task = task({ _id: 'replacement' }); await nextTick();
-    assert.match(mounted.text(), /glb_spread 运行检查身份校验失败/);
+    assert.match(mounted.text(), /glb_spread 运行检查任务匹配失败/);
     props.task = task({ isRemote: true }); await nextTick();
-    assert.match(mounted.text(), /glb_spread 运行检查身份校验失败/);
+    assert.match(mounted.text(), /glb_spread 运行检查任务匹配失败/);
     props.task = task();
     props.stopOperation = { _id: 'regular-id', name: 'glb_spread', isRemote: false, status: 'stop_unconfirmed' };
     await nextTick();
@@ -215,7 +215,7 @@ test('actual Regular/Super SFC body shows full stage and failure reasons, not me
       [observation({ state: 'checking', stage: 'ssh', detail: 'SSH 正在握手' }), '运行检查进行中', 'SSH 正在握手'],
       [observation({ state: 'unknown', stage: 'process', detail: '枚举后代进程', error: '[process] /proc/341/status Permission denied；退出码=13' }), '运行检查执行失败', '/proc/341/status Permission denied；退出码=13'],
       [observation({ state: 'unknown', stage: 'tmux', detail: '正在枚举精确会话', error: '15 秒检查超时：tmux 未返回；保留原回执' }), '运行检查超时', '15 秒检查超时：tmux 未返回；保留原回执'],
-      [observation({ taskId: 'old-id', stage: 'identity', detail: '核对身份' }), '运行检查身份校验失败', '身份校验失败'],
+      [observation({ taskId: 'old-id', stage: 'identity', detail: '核对身份' }), '运行检查任务匹配失败', '任务登记与执行目标匹配失败'],
       [observation({ observedAt: Date.now() - card.REGULAR_RUNTIME_MAX_AGE, stage: 'complete', detail: '旧进程快照' }), '运行检查结果已过期', '旧进程快照'],
       [observation({ state: 'unknown', stage: 'complete', detail: '枚举返回', raw: 'SSH banner\nPermission denied: actual output' }), '运行检查输出校验失败', 'Permission denied: actual output'],
     ]) {
@@ -320,7 +320,7 @@ test('copy regression: local/remote checks preserve facts, raw failures, existin
       [snapshot({}), '消费者存活（缺少有效派发快照）', '已识别 Python/uv 消费者进程。', 'warning'],
       [snapshot({ state: 'session_absent' }), '已暂停（tmux会话缺失）', '已核验目标主机的精确 tmux 会话缺失。', 'warning'],
       [snapshot({ state: 'unknown', raw: '' }), '运行检查输出校验失败', '检查输出缺少可校验的 Python/uv 或 shell/sleep 进程行。', 'error'],
-      [snapshot({ authProfile: 'other' }), '运行检查身份校验失败', '身份校验失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异', 'error'],
+      [snapshot({ authProfile: 'other' }), '运行检查任务匹配失败', '任务登记与执行目标匹配失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异', 'error'],
     ]) {
       const input = { task: current, taskRuntimeStatus: runtime, progress };
       const before = JSON.stringify(input);
@@ -385,4 +385,15 @@ test('v4 R3 real Regular/SUPER card keeps view but disables remote-only mutators
     if (controlSource === 'remote_only') assert.match(plain(html), /仅远端登记.*原 owner/);
     assert.doesNotMatch(plain(html), /本控端登记|执行端可为本地或远程|登记来源未提供/);
   }
+});
+
+test('task-registration read timeout is unconfirmed rather than access denial and displays its cause once', async () => {
+  const id='6ae98d4a3833cbc8d291dcc1',name='glb_other54_r1_01a19a76';
+  const error='runtime stage=identity：runtime stage=identity（核对任务）：本地控制面任务身份查询超时（2000 ms）；请求停留在身份核验阶段 (application; execution=unconfirmed)';
+  const input={task:task({_id:id,name,isRemote:false}),progress,taskRuntimeStatus:observation({taskId:id,name,isRemote:false,state:'unknown',stage:'identity',detail:error,error})};
+  const before=JSON.stringify(input);const html=await render(input);const text=plain(html);
+  assert.match(text,/未能确认（任务记录读取超时）/);assert.match(text,/任务登记与执行目标匹配阶段 \[identity\]/);
+  assert.equal((text.match(/任务记录读取超时/g)||[]).length,1,'status appears once');
+  assert.equal((text.match(/任务登记读取链超时/g)||[]).length,1,'the same cause appears once without query-execution attribution');
+  assert.doesNotMatch(text,/runtime stage=|execution=unconfirmed|访问权限|身份核验/);assertPreserved(html,name);assert.equal(JSON.stringify(input),before);
 });

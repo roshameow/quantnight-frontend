@@ -380,3 +380,22 @@ mod binding {
         .await;
     }
 }
+
+#[tokio::test]
+async fn cancelled_short_query_keeps_one_runtime_owned_role_initializer() {
+    let pools=Arc::new(FakeClients::<String>::from_config(&config()));
+    let calls=Arc::new(AtomicUsize::new(0));
+    let entered=Arc::new(tokio::sync::Notify::new());
+    let gate=Arc::new(tokio::sync::Notify::new());
+    let p=pools.clone();let n=calls.clone();let e=entered.clone();let g=gate.clone();
+    let query=tokio::spawn(async move {
+        p.client_with(false,move |uri| {n.fetch_add(1,Ordering::SeqCst);async move {e.notify_one();g.notified().await;Ok(Arc::new(uri))}}).await.cloned()
+    });
+    entered.notified().await;query.abort();let _=query.await;
+    assert_eq!(calls.load(Ordering::SeqCst),1);
+    gate.notify_one();
+    let client=pools.client_with(false, |_| async {panic!("query cancellation must not recreate the shared client")}).await.unwrap();
+    assert_eq!(client.as_str(),config().mongodb.local_uri);
+    assert_eq!(calls.load(Ordering::SeqCst),1);
+    let snapshot=pools.snapshot();assert_eq!(snapshot.local.initialization_attempts,1);assert!(snapshot.local.initialized);assert!(snapshot.local.settled);assert_eq!(snapshot.remote.initialization_attempts,0);
+}

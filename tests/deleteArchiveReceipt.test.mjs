@@ -24,5 +24,7 @@ test('native delete returns validated compact archive JSON after existing proof 
   assert.match(checks, /receipt\["receiptAssessmentUnknownCount"\]\.as_u64\(\)\.is_none\(\)/);
   assert.doesNotMatch(body.slice(returned), /taskConfig|submissionAttempts|progressUrl|result\.value\.clone/);
   assert.doesNotMatch(body, /Ok\(\(\)\)|\.pause\(|\.start\(|\.resume\(|cancel_simulation|release_slot|\.drop\(/);
-  assert.equal((body.match(/\.delete_bound\(/g) || []).length, 1);
+  assert.equal((body.match(/TaskRequest::Delete\(/g) || []).length, 1);
+  const dispatcher = readFileSync(new URL('../crates/task-core/src/task_dispatch.rs', import.meta.url), 'utf8');
+  assert.equal((dispatcher.match(/control\.delete_bound\(/g) || []).length, 1);
 });

@@ -5,18 +5,18 @@ use async_trait::async_trait;
 use bson::Document;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WatchRequest {
     pub name: String,
     pub notification: NotificationOptions,
     pub replace_watcher: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ObserveAcceptedRequest {
     pub name: String,
     pub expected_task_id: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PriorityPruneRequest {
     pub name: String,
     pub confirm: String,

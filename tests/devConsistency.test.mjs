@@ -23,7 +23,9 @@ test('static early entry uses the original library before GUI config/loops; stan
     assert.doesNotMatch(read(`../crates/${crate}/Cargo.toml`), /tauri|linfa|quantnight-frontend/);
   }
   const dispatch = read('../crates/taskctl/src/dispatch.rs');
-  assert.match(dispatch, /StopBudget::Cli/);
+  assert.match(dispatch, /quantnight_task_core::task_dispatch::dispatch\(control,request,None\)/);
+  assert.match(read('../crates/taskctl/src/invocation.rs'), /StopBudget::Cli/);
+  assert.match(read('../crates/task-core/src/task_dispatch.rs').replace(/\s+/g,''), /r.budget,bash/);
   assert.match(read('../src-tauri/src/commands.rs'), /StopBudget::Gui/);
   assert.doesNotMatch(read('../src-tauri/build.rs'), /Command::|cargo (run|build)|spawn/);
 });
@@ -41,6 +43,7 @@ test('existing watcher coalesces source add/change/unlink and does not consume g
     writeEnrollment(enrollmentPlan({ frontendRoot:root, backendRoot:path.join(root,'backend'), executable:path.join(root,'host'), bindingPath:binding, target:'aarch64-apple-darwin' }));
     devInputs(root, {}).configureServer(server);
     assert.ok(added.includes(path.join(root, 'crates/taskctl/src')));
+    for (const input of ['crates/native_identity.rs', 'crates/runtime_registration.rs']) assert.ok(added.includes(path.join(root,input)));
     const stamp = path.join(root, 'src-tauri/src/dev-input.stamp');
     assert.match(readFileSync(stamp, 'utf8'), / 1\n$/);
     const event = new Promise((resolve, reject) => {
@@ -51,7 +54,7 @@ test('existing watcher coalesces source add/change/unlink and does not consume g
     await event;
     assert.match(readFileSync(stamp, 'utf8'), / 2\n$/);
     for (const input of ['target/debug/a.rs', 'artifacts/a.rs', 'src-tauri/src/dev-input.stamp', 'crates/taskctl/target/a.rs', 'logs/a.rs']) assert.equal(relevant(input), false, input);
-    for (const input of ['crates/task-core/src/a.rs', 'crates/taskctl/src/a.rs', 'crates/Cargo.lock', 'crates/taskctl/Cargo.toml']) assert.equal(relevant(input), true, input);
+    for (const input of ['crates/task-core/src/a.rs', 'crates/taskctl/src/a.rs', 'crates/Cargo.lock', 'crates/taskctl/Cargo.toml', 'crates/native_identity.rs', 'crates/runtime_registration.rs', 'crates/task-core/src/runtime/server.rs']) assert.equal(relevant(input), true, input);
   } finally {
     observer?.close(); server.httpServer.emit('close'); rmSync(root, { recursive: true, force: true });
   }

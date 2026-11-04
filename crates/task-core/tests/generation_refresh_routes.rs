@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use bson::{doc, oid::ObjectId, Bson, Document};
 use quantnight_task_core::{create_generate::{self as core, *}, inspection::{list_with_generation, ListRequest}, mission_lock::MissionLocks, task_store::{TaskStore, Host, CollectionSummary}};
-use std::{path::{Path, PathBuf}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}};
+use std::{path::{Path, PathBuf}, sync::{Mutex, atomic::{AtomicUsize, Ordering,AtomicBool}}};
 const ID: &str = "0123456789abcdef01234567";
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Root(PathBuf);
@@ -26,13 +26,13 @@ fn matches(d:&Document,q:&Document)->bool { q.iter().all(|(k,v)| { let a=field(d
     Bson::Document(op) if op.contains_key("$exists") => a.is_some()==op.get_bool("$exists").unwrap(),
     Bson::Document(op) if op.contains_key("$ne") => a!=op.get("$ne"),
     Bson::Null => a.is_none() || a==Some(v), _=>a==Some(v) } }) }
-struct Store { extra_rows:Mutex<Vec<Document>>, row:Mutex<Option<Document>>, writes:Mutex<Vec<Document>>, calls:Mutex<Vec<String>>, has:Result<bool,String>, cas_patch:Mutex<Option<Document>>, after_probe:Mutex<Option<Document>>, ack_loss:bool }
-impl Store { fn new() -> Self { Self {extra_rows:Mutex::new(vec![]),row:Mutex::new(Some(task())),writes:Mutex::new(vec![]),calls:Mutex::new(vec![]),has:Ok(false),cas_patch:Mutex::new(None),after_probe:Mutex::new(None),ack_loss:false} }
+struct Store { extra_rows:Mutex<Vec<Document>>, row:Mutex<Option<Document>>, writes:Mutex<Vec<Document>>, calls:Mutex<Vec<String>>, has:Result<bool,String>, cas_patch:Mutex<Option<Document>>, after_probe:Mutex<Option<Document>>, ack_loss:bool, reject_finish:AtomicBool }
+impl Store { fn new() -> Self { Self {extra_rows:Mutex::new(vec![]),row:Mutex::new(Some(task())),writes:Mutex::new(vec![]),calls:Mutex::new(vec![]),has:Ok(false),cas_patch:Mutex::new(None),after_probe:Mutex::new(None),ack_loss:false,reject_finish:AtomicBool::new(false)} }
 fn row(&self)->Document {self.row.lock().unwrap().clone().unwrap()} }
 #[async_trait] impl TaskStore for Store {
  async fn list_tasks(&self,host:Host,_:bool)->Result<Vec<Document>,String> {self.calls.lock().unwrap().push(format!("list:{host:?}"));let mut rows:Vec<_>=self.row.lock().unwrap().clone().into_iter().collect();rows.extend(self.extra_rows.lock().unwrap().clone());Ok(rows)}
  async fn find_task(&self,host:Host,q:Document,_:bool)->Result<Option<Document>,String> {assert_eq!(host,Host::Local);self.calls.lock().unwrap().push("find".into());Ok(self.row.lock().unwrap().as_ref().filter(|r|matches(r,&q)).cloned())}
- async fn update_task(&self,host:Host,q:Document,u:Document)->Result<u64,String> {assert_eq!(host,Host::Local);self.writes.lock().unwrap().push(q.clone());let mut row=self.row.lock().unwrap();let row=row.as_mut().unwrap();if let Some(p)=self.cas_patch.lock().unwrap().take(){row.extend(p);}if !matches(row,&q){return Ok(0)}
+ async fn update_task(&self,host:Host,q:Document,u:Document)->Result<u64,String> {assert_eq!(host,Host::Local);self.writes.lock().unwrap().push(q.clone());if self.reject_finish.load(Ordering::Relaxed) && u.get_document("$set").unwrap().get_str("status").ok()!=Some("generating"){return Err("synthetic final CAS write failed before application".into());}let mut row=self.row.lock().unwrap();let row=row.as_mut().unwrap();if let Some(p)=self.cas_patch.lock().unwrap().take(){row.extend(p);}if !matches(row,&q){return Ok(0)}
  for(k,v)in u.get_document("$set").unwrap(){set(row,k,v.clone());}if !row.contains_key("events"){row.insert("events",Vec::<Bson>::new());}row.get_array_mut("events").unwrap().push(u.get_document("$push").unwrap().get("events").unwrap().clone());if self.ack_loss{Err("ack lost".into())}else{Ok(1)}}
  async fn has_rows(&self,host:Host,name:&str)->Result<bool,String>{assert_eq!(host,Host::Local);assert_eq!(name,"fixture");self.calls.lock().unwrap().push("has_rows".into());if let Some(p)=self.after_probe.lock().unwrap().take(){self.row.lock().unwrap().as_mut().unwrap().extend(p);}self.has.clone()}
  async fn collection_names(&self,_:Host)->Result<Vec<String>,String>{panic!("no inventory scan")}
@@ -99,7 +99,7 @@ mod facade_route {
    assert_eq!(s.writes.lock().unwrap().len(),1);let argv=std::fs::read_to_string(Path::new(&fake.config.env.working_dir).join("observed.argv")).unwrap();let args:Vec<_>=argv.lines().collect();assert_eq!(&args[..4],&["fixture","false","--inspect-generation","--binding"]);let request:serde_json::Value=serde_json::from_str(args[4]).unwrap();assert_eq!(request["taskId"],ID);assert_eq!(request["generation"]["id"],"g1");
   }
  }
- #[tokio::test] async fn real_facade_original_checker_early_mode_and_leaf_fake_os_close_empty_generation(){
+ fn actual_checker_fixture()->FakeBash {
   let backend=std::env::var_os("QUANTNIGHT_BACKEND_SOURCE").map(PathBuf::from)
       .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../backend"));
   let source=std::fs::read_to_string(backend.join("scripts/check_tmux_python.sh")).expect("paired backend checker required");
@@ -125,6 +125,10 @@ fi
       "NATIVE_TMUX_CANDIDATES = (\"/opt/homebrew/bin/tmux\", \"/usr/local/bin/tmux\", \"/usr/bin/tmux\", \"/bin/tmux\")",
       &format!("NATIVE_TMUX_CANDIDATES = ({:?},)",root.join("bin/tmux").to_str().unwrap()));
   std::fs::write(config_path,config_source).unwrap();
+  fake
+ }
+ #[tokio::test] async fn real_facade_original_checker_early_mode_and_leaf_fake_os_close_empty_generation(){
+  let fake=actual_checker_fixture();
   let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());
   let controller=TaskControl::with_store(binding,s.clone());
   let result=controller.reconcile_generation_for_list(&s.row()).await.unwrap();assert!(result.changed,"{:?}",result.diagnostic);
@@ -133,6 +137,61 @@ fi
  #[tokio::test] async fn adapter_rejects_foreign_duplicate_malformed_and_nonzero_observation(){
   for output in [observation("stopped").replace(ID,"1123456789abcdef01234567"),observation("stopped").replace("g1","foreign"),observation("stopped").replace("42000","42001"),observation("stopped").replace("false","true"),observation("unknown-state"),format!("{}{}",observation("stopped"),observation("stopped")),"echo malformed".into(),format!("{}\necho unverified >&2",observation("stopped")),format!("{}\nexit 23",observation("stopped"))]{let fake=fixture(&output);let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());let controller=TaskControl::with_store(binding,s.clone());assert!(controller.reconcile_generation_for_list(&s.row()).await.is_err());assert!(s.writes.lock().unwrap().is_empty());assert!(!s.calls.lock().unwrap().iter().any(|c|c=="has_rows"));}
  }
+ #[cfg(target_os="macos")]
+ #[tokio::test]
+ async fn same_live_host_generation_ended_after_failed_final_cas_recovers_only_with_original_empty_writer_proof(){
+  let pid=std::process::id();
+  for (process_state,nonempty,expected,tag_fault) in [("writer_absent",false,"pending","none"),("writer_absent",true,"generation_unknown","none"),("live",false,"generating","none"),("unverified",false,"generating","none"),("unverified",false,"generating","legacy"),("unverified",false,"generating","birth"),("unverified",false,"generating","instance")] {
+   let body=format!("printf '%s\\n' \"$@\" > observed.argv\nprintf '%s\\n' 'QUANTNIGHT_GENERATION_OBSERVED {{\"schemaVersion\":1,\"taskId\":\"{ID}\",\"taskName\":\"fixture\",\"generationId\":\"TOKEN\",\"producerPid\":{pid},\"remote\":false,\"state\":\"{process_state}\",\"reason\":\"original writer inventory fact\"}}'\n");
+   let fake=fixture(&body);let root=Path::new(&fake.config.env.working_dir);let binding=validate_backend_binding(&fake.config).await.unwrap();
+   let mut memory=Store::new();memory.reject_finish.store(true,Ordering::Relaxed);memory.has=Ok(nonempty);let mut row=memory.row();row.insert("status","pending");row.remove("generation");row.insert("events",vec![doc!{"id":"created","command":"create","status":"pending","at":"2026-10-01T00:00:00+00:00","detail":{}}]);*memory.row.lock().unwrap()=Some(row);
+   let memory=Arc::new(memory);let mut controller=TaskControl::with_store(binding,memory.clone());
+   let tag=quantnight_task_core::task_control::hosted_generation_test_support::attach(&mut controller,"original-business-host").unwrap();
+   let bin=root.join("tools");std::fs::create_dir(&bin).unwrap();let uv=bin.join("uv");std::fs::write(&uv,"#!/bin/sh\nexit 1\n").unwrap();std::fs::set_permissions(&uv,std::fs::Permissions::from_mode(0o700)).unwrap();
+   let environment=serde_json::from_value(serde_json::json!({"values":{"PATH":format!("{}:/usr/bin:/bin",bin.display())}})).unwrap();
+   let result=quantnight_task_core::operations_runtime::with_environment(Some(environment),controller.generate(&GenerateRequest::new("fixture"),None)).await;
+   assert_eq!(result.value["generationReconciliationUnconfirmed"],true);let mut observed=memory.row();assert_eq!(observed.get_str("status").unwrap(),"generating");
+   assert_eq!(observed.get_document("generation").unwrap().get_document("controlOwner").unwrap(),&tag);
+   if tag_fault!="none"{let generation=observed.get_document_mut("generation").unwrap();match tag_fault{"legacy"=>{generation.remove("controlOwner");},"birth"=>{generation.get_document_mut("controlOwner").unwrap().insert("startedMicros",-1);},_=>{generation.get_document_mut("controlOwner").unwrap().insert("instanceId","other");}}*memory.row.lock().unwrap()=Some(observed.clone());}
+   let token=observed.get_document("generation").unwrap().get_str("id").unwrap();std::fs::write(root.join("scripts/check_tmux_python.sh"),body.replace("TOKEN",token)).unwrap();
+   memory.reject_finish.store(false,Ordering::Relaxed);let before=memory.writes.lock().unwrap().len();
+   let recovered=&memory;
+   let refresh=controller.reconcile_generation_for_list(&observed).await.unwrap();assert_eq!(recovered.row().get_str("status").unwrap(),expected);
+   assert_eq!(refresh.changed,process_state=="writer_absent");
+   let args=std::fs::read_to_string(root.join("observed.argv")).unwrap();if tag_fault=="none"{assert!(args.contains("--inspect-generation-writers"));}else{assert!(!args.contains("--inspect-generation-writers"));assert!(args.contains("--inspect-generation"));}
+   if process_state=="writer_absent"{assert_eq!(recovered.writes.lock().unwrap().len(),before+1);assert_eq!(recovered.writes.lock().unwrap().last().unwrap().get("generation"),observed.get("generation"));}
+  }
+ }
+ #[cfg(target_os="macos")]
+ #[tokio::test]
+ async fn hosted_applied_begin_ack_lost_runs_no_writer_and_recovers_via_actual_writer_only_checker_leaf_os(){
+  let fake=actual_checker_fixture();let root=Path::new(&fake.config.env.working_dir);
+  // The original producer PID is present, not assumed dead. The actual
+  // writer-only original checker must not conflate that host with a writer.
+  std::fs::write(root.join("psutil.py"),format!("class Error(Exception): pass\nclass NoSuchProcess(Error): pass\nclass Process:\n def __init__(self,pid):\n  if pid!={}: raise NoSuchProcess(pid)\n def status(self): return 'running'\n",std::process::id())).unwrap();
+  std::fs::write(root.join("bin/ps"),"#!/bin/sh\necho scanned >> os-scan\necho '1 0 launchd'\n").unwrap();
+  std::fs::write(root.join("bin/uv"),"#!/bin/sh\necho unexpected > writer-launched\nexit 97\n").unwrap();
+  let python=std::env::var("QUANTNIGHT_TEST_PYTHON").expect("original prepared interpreter required");
+  std::fs::write(root.join(".venv/bin/python"),format!(r#"#!/bin/sh
+if [ "$3" = backend.mongodb.mongo_config ]; then
+ echo '{{"schemaVersion":1,"command":"validate-task-control-binding","ok":true}}'
+else
+ for arg in "$@"; do [ "$arg" != --inspect-generation-writers ] || echo writer_only >> checker-mode; done
+ export PATH="$PWD/bin:$PATH"
+ exec '{python}' "$@"
+fi
+"#)).unwrap();
+  let binding=validate_backend_binding(&fake.config).await.unwrap();let mut memory=Store::new();memory.ack_loss=true;
+  let mut pending=memory.row();pending.insert("status","pending");pending.remove("generation");pending.insert("events",vec![doc!{"id":"created","command":"create","status":"pending","at":"2026-10-01T00:00:00+00:00","detail":{}}]);*memory.row.lock().unwrap()=Some(pending);
+  let memory=Arc::new(memory);let mut controller=TaskControl::with_store(binding,memory.clone());quantnight_task_core::task_control::hosted_generation_test_support::attach(&mut controller,"hosted-original-checker").unwrap();
+  let out=controller.generate(&GenerateRequest::new("fixture"),None).await;assert_eq!(out.value["generationClaimUnconfirmed"],true);assert!(!root.join("writer-launched").exists());
+  let observed=memory.row();assert_eq!(observed.get_str("status").unwrap(),"generating");assert_eq!(quantnight_task_core::task_control::hosted_generation_test_support::scope_active(&controller,&observed),Some(false));
+  assert_eq!(observed.get_document("generation").unwrap().get("producerPid"),Some(&Bson::Int32(std::process::id() as i32)));
+  let result=controller.reconcile_generation_for_list(&observed).await.unwrap();assert!(result.changed,"{:?}",result.diagnostic);assert_eq!(memory.row().get_str("status").unwrap(),"pending");
+  assert_eq!(memory.writes.lock().unwrap().len(),2);assert_eq!(memory.writes.lock().unwrap().last().unwrap().get("generation"),observed.get("generation"));
+  assert_eq!(std::fs::read_to_string(root.join("checker-mode")).unwrap(),"writer_only\n");assert_eq!(std::fs::read_to_string(root.join("os-scan")).unwrap(),"scanned\n");assert!(!root.join("writer-launched").exists());
+ }
+
 }
 
 #[tokio::test] async fn history_failure_outcome_is_not_misread_as_pending_and_does_not_expand_replay(){
@@ -234,4 +293,6 @@ mod watch_history_review {
             assert!(row.get_str("lastError").unwrap().contains("previous_status_unverified"));
         }
     }
+
+
 }

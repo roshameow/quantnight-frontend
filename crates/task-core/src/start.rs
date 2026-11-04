@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use bson::Document;
 use std::path::Path;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum NotificationTarget {
     Session(String),
     Worker(String),
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct NotificationOptions {
     pub target: Option<NotificationTarget>,
     pub no_notify: bool,
@@ -17,7 +17,7 @@ pub struct NotificationOptions {
     pub review_seconds: Option<i64>,
     pub watch_timeout: Option<i64>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StartRequest {
     pub name: String,
     pub config_json: Option<String>,

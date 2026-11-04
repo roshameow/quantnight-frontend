@@ -17,3 +17,7 @@ pub const DEV_TARGET: &str = env!("QUANTNIGHT_CRATE_TARGET");
 pub const DEV_PROFILE: &str = env!("QUANTNIGHT_CRATE_PROFILE");
 pub const DEV_FEATURES: &str = env!("QUANTNIGHT_CRATE_FEATURES");
 pub const DEV_RUSTFLAGS: &str = env!("QUANTNIGHT_CRATE_CARGO_ENCODED_RUSTFLAGS");
+
+pub mod runtime_entry;
+#[path = "../../source_identity.rs"]
+pub(crate) mod source_identity;
