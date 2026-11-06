@@ -84,7 +84,7 @@ TEMPLATE=my_existing_template
 | `resume` | `qn resume --name "$NAME"` | 按原回执和类型规则恢复允许重试的项目；**不会自动 start**。 |
 | `priority-prune` | `qn priority-prune --name "$NAME" --sharpe "$SHARPE" --fitness "$FITNESS" --confirm "$NAME" --dry-run` | 仅 paused Priority 的阈值清理；先设置本轮阈值。去掉 `--dry-run` 会实际执行清理。 |
 | `delete` | `qn delete --name "$NAME"` | 原安全归档／退出活动列表：保留任务与候选回执、正式结果；不是直接 drop 数据库。 |
-| `results` | `qn results --name "$NAME" --limit 20 --offset 0` | 分页读取任务映射和正式结果库，不主动全量抓平台。 |
+| `results` | `qn results --name "$NAME" [--sort fitness] [--limit 20]` | 服务端实时聚合回测结果（默认 `source=live`，按指标排序/过滤，返回 Top-K、表达式与 checks 失败项）；亦可用 `--source canonical` 检查正式库入库状态。 |
 | `collect-results` | `qn collect-results --name "$NAME"` | 显式完整导出已有任务结果，默认保存到后端 `reports/missions/<任务名>.json`。 |
 
 GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库角色读取，不做同样的合并。`list --remote` 读取远端控制记录，不代表“筛选本地登记中所有远程执行的任务”，也不对 remote-only 记录做本机生成收尾。
@@ -95,7 +95,7 @@ GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库�
 
 | 命令 | 参数 |
 |---|---|
-| `list` | `--include-deactive`、`--remote`；均默认关闭。 |
+| `list` | `--include-deactive`、`--remote`；均默认关闭。输出包含顶层 `concurrency`（`regular` / `super` / `total`）总账表达式，以及所有 running 任务的 `max_concurrent`。 |
 | `create` | `--templatefile` 必填；`--type regular\|super\|priority`（默认 regular）、`--auth-profile`（默认 user1）、`--remote`、`--force`、`--expected-task-id`。 |
 | `generate` | `--replace`、`--timeout`（默认 **900 秒**）、`--expected-task-id`。 |
 | `sync` | `--expected-task-id`；`--timeout` 保留兼容解析，但原 sync 不使用它来设置新的执行时限。 |
@@ -108,7 +108,7 @@ GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库�
 | `verify-registration` / `archive-research` | `--expected-task-id`、`--expected-remote true\|false`。 |
 | `priority-prune` | `--sharpe`、`--fitness`、`--confirm` 必填；阈值须有限且非负；`--dry-run` 默认关闭。 |
 | `delete` | `--confirm`（可选原任务名）、`--expected-task-id`、`--force`（兼容参数，不能绕过原停止／回执保护）。 |
-| `results` | `--limit`（默认20）、`--offset`（默认0）、`--output <路径>`。offset 按任务 item 分页，不代表全局排名。 |
+| `results` | `--source <live\|canonical>`（默认 live）、`--sort <fitness\|sharpe\|returns\|drawdown\|turnover\|margin>`（默认 fitness）、`--min-fitness <float>`、`--min-sharpe <float>`、`--min-margin <float>`、`--min-turnover <float>`、`--query <string>`（代码搜索或高级Mongo语法）、`--status <string>`（默认 success，可选 error 等）、`--limit`（默认20）、`--offset`（默认0）、`--output <路径>`。 |
 | `collect-results` | `--output <路径>`，不传时使用上表默认导出位置。 |
 
 ### 身份、执行端与重试
@@ -154,7 +154,17 @@ qn sync --name "$NAME"
 
 # 仅在已授权启动时；沿用原保存配置，或使用本轮批准的完整JSON：
 qn start --name "$NAME" --config "$CONFIG_JSON"
-qn results --name "$NAME" --limit 20 --offset 0
+
+# 1. 实时聚合查看 Top-K 回测结果（默认按 fitness 倒序，包含各维度指标与 failedChecks）：
+qn results --name "$NAME" --limit 20
+# 2. 按自定义指标与门槛筛选：
+qn results --name "$NAME" --sort sharpe --min-fitness 0.5 --min-sharpe 1.0
+# 3. 按表达式代码关键词/正则搜索：
+qn results --name "$NAME" --query "ts_decay_linear"
+# 4. 查看报错失败的 item：
+qn results --name "$NAME" --status error --limit 10
+# 5. 原 canonical 模式（检查是否已同步至本地 alpha_results 正式库）：
+qn results --name "$NAME" --source canonical --limit 20 --offset 0
 ```
 
 `CONFIG_JSON` 必须由用户／任务 owner 设置；也可省略 `--config` 沿原保存配置规则执行。不要把示例当通用并发、区域或候选数量策略。Priority 由原专用来源／控制器驱动，不机械套用普通任务的 generate/sync 序列。
