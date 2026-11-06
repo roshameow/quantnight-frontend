@@ -179,12 +179,36 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
             expected_task_id: expected_id()?,
             confirm: a.text("confirm")?,
         }),
-        "results" => Request::Results(ResultsRequest {
-            name: name()?,
-            limit: a.i64("limit")?,
-            offset: a.i64("offset")?,
-            output: a.text("output")?.map(PathBuf::from),
-        }),
+        "results" => {
+            let sort = a.text("sort")?;
+            let min_sharpe = a.optional_float("min_sharpe")?;
+            let min_fitness = a.optional_float("min_fitness")?;
+            let min_margin = a.optional_float("min_margin")?;
+            let min_turnover = a.optional_float("min_turnover")?;
+            let status = a.text("status")?;
+            let query = a.text("query")?;
+            let source = match a.text("source")?.as_deref() {
+                Some("canonical") => quantnight_task_core::inspection::ResultsSource::Canonical,
+                Some("live") | None => quantnight_task_core::inspection::ResultsSource::Live,
+                Some(other) => {
+                    return Err(format!("unknown --source: {other}; expected live|canonical"));
+                }
+            };
+            Request::Results(ResultsRequest {
+                name: name()?,
+                limit: a.i64("limit")?,
+                offset: a.i64("offset")?,
+                output: a.text("output")?.map(PathBuf::from),
+                source,
+                sort,
+                min_sharpe,
+                min_fitness,
+                min_margin,
+                min_turnover,
+                status,
+                query,
+            })
+        }
         "collect-results" => Request::CollectResults(CollectRequest {
             name: name()?,
             output: a.text("output")?.map(PathBuf::from),
@@ -255,6 +279,13 @@ impl Args<'_> {
     }
     fn float(&self, key: &str) -> Result<f64, String> {
         self.value(key)?.as_f64().ok_or_else(|| self.bad(key))
+    }
+    fn optional_float(&self, key: &str) -> Result<Option<f64>, String> {
+        if matches!(self.value(key)?, CliValue::Null) {
+            Ok(None)
+        } else {
+            self.float(key).map(Some)
+        }
     }
     fn notification(&self) -> Result<NotificationOptions, String> {
         let session = self.text("notify_session_id")?;

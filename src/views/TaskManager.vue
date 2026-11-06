@@ -53,7 +53,7 @@
       </n-collapse-item>
 
       <!-- 普通 / Super 任务 -->
-      <n-collapse-item title="普通 / Super 任务" name="others">
+      <n-collapse-item :title="otherTasksCollapseTitle" name="others">
         <n-empty v-if="otherTasks.length === 0 && showTaskEmpty" description="暂无任务" />
         <n-grid
           x-gap="20"
@@ -214,7 +214,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useRoute, useRouter } from "vue-router";
 import { useTaskStore, validStopReceipt, taskStopDisplayStatus } from "../stores/taskStore";
 import { createTaskFetcher, createTaskProgressLifecycle, mutateTaskSource } from "../utils/taskProgress.js";
-import { newTaskRequestId, validOperationStage, taskRuntimeTarget, sameRuntimeIdentity, taskStartBlockReason, isCompletedTask, taskMutationIssue, taskStartOutcome, taskStartFailure, taskStartJoinEvidence, taskMatchesJoinEvidence, taskLaunchValue, taskLaunchMatches } from '../utils/taskDiagnostics.js';
+import { newTaskRequestId, validOperationStage, taskRuntimeTarget, sameRuntimeIdentity, taskStartBlockReason, isCompletedTask, taskMutationIssue, taskStartOutcome, taskStartFailure, taskStartJoinEvidence, taskMatchesJoinEvidence, taskLaunchValue, taskLaunchMatches, summarizeTaskConcurrency } from '../utils/taskDiagnostics.js';
 import { canGenerate } from '../utils/taskGeneration.js';
 import { storeToRefs } from "pinia";
 import { useMessage, useDialog } from "naive-ui";
@@ -273,6 +273,10 @@ let disposed = false;
 const taskIsEmpty = computed(() => tasks.value.length === 0);
 const priorityTasks = computed(() => (tasks.value || []).filter((t) => t.taskType === "priority"));
 const otherTasks = computed(() => (tasks.value || []).filter((t) => t.taskType !== "priority"));
+const otherTasksConcurrency = computed(() => summarizeTaskConcurrency(otherTasks.value));
+const otherTasksCollapseTitle = computed(() =>
+  `普通 / Super 任务（普通并发: ${otherTasksConcurrency.value.regular.expression} | Super并发: ${otherTasksConcurrency.value.super.expression}）`
+);
 
 // --- Data Fetching and Store Management ---
 // One latest-request owner for every refresh source; not a task operation lock.

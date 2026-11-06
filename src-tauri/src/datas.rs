@@ -38,22 +38,7 @@ where
     }
 }
 
-/// 将前端 category 值展开为数据库中可能出现的多种形式，保证筛选命中。
-/// 已知差异：
-///   - alpha pyramid 后缀用无下划线/复数形式：INSTITUTIONS / INSIDERS / SHORTINTEREST / SOCIALMEDIA / PV
-///   - dataset category.name 用展示名："Price Volume" / "Short Interest" / "Social Media" / "Institutions"
-/// 展开后的每个别名都参与大小写不敏感匹配，任一命中即算该 category 命中。
-fn category_aliases(cat: &str) -> Vec<String> {
-    let base: Vec<&str> = match cat.trim().to_uppercase().as_str() {
-        "INSIDER" | "INSIDERS" => vec!["INSIDER", "INSIDERS"],
-        "INSTITUTION" | "INSTITUTIONS" => vec!["INSTITUTION", "INSTITUTIONS"],
-        "SHORTINTEREST" | "SHORT_INTEREST" => vec!["SHORT_INTEREST", "SHORTINTEREST", "Short Interest"],
-        "SOCIALMEDIA" | "SOCIAL_MEDIA" => vec!["SOCIAL_MEDIA", "SOCIALMEDIA", "Social Media"],
-        "PV" | "PRICEVOLUME" | "PRICE_VOLUME" => vec!["PV", "Price Volume"],
-        _ => vec![cat.trim()],
-    };
-    base.into_iter().map(String::from).collect()
-}
+use quantnight_task_core::alpha_query::category_aliases;
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,23 +79,7 @@ pub struct AlphaResult {
     pub children_ids: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]  // 前端传字符串时自动匹配
-pub enum SortField {
-    DateCreated,
-    DateSubmitted,
-    Sharpe,
-    Returns,
-    Turnover,
-    Fitness,
-    Margin,
-    PnlScore,
-    Drawdown,
-    IsScore,
-    OsSharpe,
-    OsFitness,
-    SubUniverseSharpe,
-}
+pub use quantnight_task_core::alpha_query::SortField;
 
 #[derive(Deserialize)]
 pub struct AlphaQuery {
@@ -393,71 +362,7 @@ fn parse_alpha_document(doc: mongodb::bson::Document, embedding_key: Option<&str
 }
 
 
-use once_cell::sync::Lazy;
-use regex::Regex;
-
-static RE_TRUE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bTrue\b").unwrap());
-static RE_FALSE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bFalse\b").unwrap());
-static RE_NONE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bNone\b").unwrap());
-static RE_INT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:int|NumberInt)\((\d+)\)").unwrap());
-static RE_FLOAT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(?:float|NumberDecimal)\(([\d\.]+)\)").unwrap());
-static RE_KEYS: Lazy<Regex> = Lazy::new(|| Regex::new(r"([{,\[]\s*)([\$a-zA-Z_][\$a-zA-Z0-9_\.]*)\s*:").unwrap());
-static RE_COMMA: Lazy<Regex> = Lazy::new(|| Regex::new(r",\s*([\]}])").unwrap());
-
-fn parse_query_to_bson(q: &str) -> Option<mongodb::bson::Document> {
-    let q_trimmed = q.trim();
-    if q_trimmed.is_empty() {
-        return None;
-    }
-
-    println!("Incoming query: {}", q_trimmed);
-
-    // 1. Normalize smart quotes (common on macOS) and Python-style values
-    let mut normalized_q = q_trimmed
-        .replace('“', "\"")
-        .replace('”', "\"")
-        .replace('‘', "'")
-        .replace('’', "'");
-
-    normalized_q = RE_TRUE.replace_all(&normalized_q, "true").to_string();
-    normalized_q = RE_FALSE.replace_all(&normalized_q, "false").to_string();
-    normalized_q = RE_NONE.replace_all(&normalized_q, "null").to_string();
-    normalized_q = RE_INT.replace_all(&normalized_q, "$1").to_string();
-    normalized_q = RE_FLOAT.replace_all(&normalized_q, "$1").to_string();
-
-    // 2. Smart wrap: if it looks like an object (contains :) but lacks braces, wrap it
-    if !normalized_q.starts_with('{') && normalized_q.contains(':') {
-        normalized_q = format!("{{{}}}", normalized_q);
-    }
-
-    // 3. Automatically quote unquoted keys (e.g. $or -> "$or", os.sharpe -> "os.sharpe")
-    normalized_q = RE_KEYS.replace_all(&normalized_q, "$1\"$2\":").to_string();
-    normalized_q = normalized_q.replace("\"\"", "\"");
-
-    println!("Normalized query: {}", normalized_q);
-
-    // 4. Robust parsing
-    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&normalized_q) {
-        if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
-            if let Some(parsed_doc) = bson_val.as_document() {
-                return Some(parsed_doc.clone());
-            }
-        }
-    }
-
-    // 5. Fallback: Clean trailing commas
-    let cleaned_q = RE_COMMA.replace_all(&normalized_q, "$1").to_string();
-
-    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&cleaned_q) {
-        if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
-            if let Some(parsed_doc) = bson_val.as_document() {
-                return Some(parsed_doc.clone());
-            }
-        }
-    }
-
-    None
-}
+pub use quantnight_task_core::alpha_query::parse_query_to_bson;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]

@@ -221,7 +221,8 @@ impl CanonicalNamespace {
 }
 pub fn list_tasks_options() -> FindOptions {
     FindOptions::builder().projection(doc! {"name":1,"status":1,"taskType":1,
-        "auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1,"generation":1})
+        "auth_profile":1,"isRemote":1,"targetRemote":1,"templatefile":1,"lastError":1,"generation":1,
+        "startConfig":1,"mission_config":1,"config":1})
         .sort(doc! {"_id":-1}).max_time(READ_BUDGET).build()
 }
 pub fn result_items_options(limit: i64, offset: i64) -> Result<FindOptions, String> {
@@ -232,6 +233,118 @@ pub fn result_items_options(limit: i64, offset: i64) -> Result<FindOptions, Stri
         "variantId":1,"variantHash":1,"candidateHash":1,"ideaId":1,"payloadHash":1,
         "acceptance":1,"terminalStatus":1}).sort(doc! {"_id":1})
         .skip(offset as u64).limit(limit+1).max_time(READ_BUDGET).build())
+}
+
+/// Live result view over metrics the runner already persisted on task items
+/// (`result` for REGULAR, `resultMetrics` for SUPER). Read-only, bounded page.
+pub const LIVE_METRICS: [&str; 6] = ["sharpe", "fitness", "turnover", "margin", "returns", "drawdown"];
+pub const LIVE_SORT_KEYS: [&str; 5] = ["fitness", "sharpe", "margin", "turnover", "returns"];
+pub const LIVE_STATUS_VIEWS: [&str; 6] = ["success", "error", "pending", "processing", "cancelled", "all"];
+/// Same thresholds as the scheduled alpha_results ingestion (sharpe≥1, fitness≥0.5).
+pub const LIVE_PASS_SHARPE: f64 = 1.0;
+pub const LIVE_PASS_FITNESS: f64 = 0.5;
+const LIVE_ERROR_STATUSES: [&str; 4] = ["error", "permanent_error", "timeout_error", "transient_error"];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveResultsQuery {
+    pub status: String,
+    pub sort: String,
+    pub min_sharpe: Option<f64>,
+    pub min_fitness: Option<f64>,
+    pub min_margin: Option<f64>,
+    pub min_turnover: Option<f64>,
+    pub query: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+impl LiveResultsQuery {
+    pub fn validate(&self) -> Result<(), String> {
+        result_items_options(self.limit, self.offset)?;
+        if !LIVE_SORT_KEYS.contains(&self.sort.as_str()) {
+            return Err(format!("--sort must be one of {}", LIVE_SORT_KEYS.join("|")));
+        }
+        if !LIVE_STATUS_VIEWS.contains(&self.status.as_str()) {
+            return Err(format!("--status must be one of {}", LIVE_STATUS_VIEWS.join("|")));
+        }
+        for value in [self.min_sharpe, self.min_fitness, self.min_margin, self.min_turnover].into_iter().flatten() {
+            if !value.is_finite() { return Err("metric thresholds must be finite".into()); }
+        }
+        Ok(())
+    }
+    fn status_match(&self) -> Document {
+        match self.status.as_str() {
+            "all" => doc! {},
+            "error" => doc! {"status": {"$in": LIVE_ERROR_STATUSES.to_vec()}},
+            status => doc! {"status": status},
+        }
+    }
+    fn threshold_expr(&self) -> Bson {
+        let mut terms: Vec<Bson> = vec![];
+        if let Some(v) = self.min_sharpe { terms.push(Bson::Document(doc! {"$gte": ["$_m.sharpe", v]})); }
+        if let Some(v) = self.min_fitness { terms.push(Bson::Document(doc! {"$gte": ["$_m.fitness", v]})); }
+        if let Some(v) = self.min_margin { terms.push(Bson::Document(doc! {"$gte": ["$_m.margin", v]})); }
+        if let Some(v) = self.min_turnover { terms.push(Bson::Document(doc! {"$gte": ["$_m.turnover", v]})); }
+        if terms.is_empty() { Bson::Boolean(true) } else { Bson::Document(doc! {"$and": terms}) }
+    }
+}
+fn live_metric_stage() -> Document {
+    let mut metrics = Document::new();
+    for key in LIVE_METRICS {
+        metrics.insert(key, doc! {"$ifNull": [format!("$result.{key}"), format!("$resultMetrics.{key}")]});
+    }
+    doc! {"$addFields": {"_m": metrics}}
+}
+/// Filtered, sorted page. Error-like views sort by insertion order instead.
+pub fn live_results_pipeline(query: &LiveResultsQuery) -> Vec<Document> {
+    let mut pipeline = vec![doc! {"$match": query.status_match()}];
+    if let Some(q) = query.query.as_deref().filter(|s| !s.trim().is_empty()) {
+        pipeline.push(doc! {"$match": crate::alpha_query::code_or_query_filter(q)});
+    }
+    pipeline.push(live_metric_stage());
+    let mut threshold = Document::new();
+    if let Some(v) = query.min_sharpe { threshold.insert("_m.sharpe", doc! {"$gte": v}); }
+    if let Some(v) = query.min_fitness { threshold.insert("_m.fitness", doc! {"$gte": v}); }
+    if let Some(v) = query.min_margin { threshold.insert("_m.margin", doc! {"$gte": v}); }
+    if let Some(v) = query.min_turnover { threshold.insert("_m.turnover", doc! {"$gte": v}); }
+    if !threshold.is_empty() { pipeline.push(doc! {"$match": threshold}); }
+    let sort = if query.status == "success" || query.status == "all" {
+        doc! {format!("_m.{}", query.sort): -1, "_id": 1}
+    } else {
+        doc! {"_id": 1}
+    };
+    let checks = doc! {"$cond": [{"$isArray": "$refine_result.is.checks"}, "$refine_result.is.checks", []]};
+    pipeline.extend([
+        doc! {"$sort": sort},
+        doc! {"$skip": query.offset},
+        doc! {"$limit": query.limit + 1},
+        doc! {"$project": {
+            "_id": 1, "alphaId": 1, "ideaId": 1, "variantId": 1, "status": 1,
+            "regular": 1, "selection": 1, "combo": 1, "settings": 1, "errorClass": 1, "_m": 1,
+            "error": {"$cond": [{"$eq": [{"$type": "$error"}, "string"]}, {"$substrCP": ["$error", 0, 300]}, "$error"]},
+            "failedChecks": {"$map": {
+                "input": {"$filter": {"input": checks, "as": "c", "cond": {"$eq": ["$$c.result", "FAIL"]}}},
+                "as": "c", "in": {"name": "$$c.name", "value": "$$c.value", "limit": "$$c.limit"}}},
+        }},
+    ]);
+    pipeline
+}
+/// One aggregate for view count, threshold matches, ingestion-threshold passes and best metrics.
+pub fn live_stats_pipeline(query: &LiveResultsQuery) -> Vec<Document> {
+    let pass = doc! {"$and": [{"$gte": ["$_m.sharpe", LIVE_PASS_SHARPE]}, {"$gte": ["$_m.fitness", LIVE_PASS_FITNESS]}]};
+    let mut pipeline = vec![doc! {"$match": query.status_match()}];
+    if let Some(q) = query.query.as_deref().filter(|s| !s.trim().is_empty()) {
+        pipeline.push(doc! {"$match": crate::alpha_query::code_or_query_filter(q)});
+    }
+    pipeline.push(live_metric_stage());
+    pipeline.push(doc! {"$group": {
+        "_id": Bson::Null,
+        "viewCount": {"$sum": 1},
+        "matched": {"$sum": {"$cond": [query.threshold_expr(), 1, 0]}},
+        "passThreshold": {"$sum": {"$cond": [pass, 1, 0]}},
+        "bestSharpe": {"$max": "$_m.sharpe"},
+        "bestFitness": {"$max": "$_m.fitness"},
+    }});
+    pipeline
 }
 /// Metadata from listIndexes, same first-key/hidden/partial guards as Python.
 pub fn canonical_id_hint(indexes: &[Document]) -> Result<String, String> {
@@ -276,6 +389,10 @@ pub trait TaskStore: Send + Sync {
     }
     async fn canonical_results(&self, _namespace: &CanonicalNamespace, _ids: &[Bson]) -> Result<Vec<Document>, String> {
         Err("indexed canonical result page unavailable".into())
+    }
+    /// Returns (page rows up to limit+1, stats document if any item matched the view).
+    async fn live_results(&self, _host: Host, _name: &str, _query: &LiveResultsQuery) -> Result<(Vec<Document>, Option<Document>), String> {
+        Err("live task result view unavailable".into())
     }
     async fn find_items(&self, _host: Host, _name: &str, _filter: Document, _projection: Option<Document>) -> Result<Vec<Document>, String> {
         Err("filtered task item query unavailable".into())
@@ -472,6 +589,18 @@ impl TaskStore for MongoTaskStore {
             let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
             items.find(doc! {}, options).await.map_err(ReadError::from)?
                 .try_collect().await.map_err(ReadError::from)
+        }).await
+    }
+    async fn live_results(&self, host: Host, name: &str, query: &LiveResultsQuery) -> Result<(Vec<Document>, Option<Document>), String> {
+        query.validate()?;
+        bounded_read("live task result view", async {
+            let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
+            let options = AggregateOptions::builder().max_time(READ_BUDGET).allow_disk_use(true).build();
+            let rows: Vec<Document> = items.aggregate(live_results_pipeline(query), options.clone())
+                .await.map_err(ReadError::from)?.try_collect().await.map_err(ReadError::from)?;
+            let stats: Vec<Document> = items.aggregate(live_stats_pipeline(query), options)
+                .await.map_err(ReadError::from)?.try_collect().await.map_err(ReadError::from)?;
+            Ok((rows, stats.into_iter().next()))
         }).await
     }
     async fn canonical_results(&self, namespace: &CanonicalNamespace, ids: &[Bson]) -> Result<Vec<Document>, String> {

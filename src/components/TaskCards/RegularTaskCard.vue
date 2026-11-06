@@ -127,7 +127,7 @@ export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR
 
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
-import { taskMutationIssue, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason } from '../../utils/taskDiagnostics.js';
+import { taskMutationIssue, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason, taskMaxConcurrent } from '../../utils/taskDiagnostics.js';
 import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
 import { isGenerating, canGenerate, generationBusyOrUnknown, generationFailure } from '../../utils/taskGeneration.js';
 
@@ -274,6 +274,7 @@ function getNested(obj, pathArray) {
 
 const maxConcurrent = computed(() => {
   return (
+    taskMaxConcurrent(props.task) ??
     getNested(props.task, ["mission_config", "max_concurrent"]) ??
     getNested(props.task, ["config", "max_concurrent"]) ??
     "-"

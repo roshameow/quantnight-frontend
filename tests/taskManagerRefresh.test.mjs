@@ -81,7 +81,7 @@ async function harness(rows = []) {
   app.use(piniaInstance); const store = useTaskStore(piniaInstance); store.replaceTasks(rows);
   app.config.warnHandler = () => {};
   for (const name of ['n-page-header', 'n-collapse', 'n-collapse-item', 'n-grid', 'n-gi', 'n-card', 'n-tag', 'n-text', 'n-space', 'n-switch']) {
-    app.component(name, { setup: (_, { slots }) => () => h('div', [slots.title?.(), slots.header?.(), slots.extra?.(), slots.default?.()]) });
+    app.component(name, { setup: (_, { attrs, slots }) => () => h('div', [attrs.title, slots.title?.(), slots.header?.(), slots.extra?.(), slots.default?.()]) });
   }
   app.component('n-modal', { render: () => null });
   app.component('n-empty', { setup: (_, { attrs }) => () => h('p', String(attrs.description)) });
@@ -214,5 +214,19 @@ test('progress refresh failure never undoes accepted list or leaves refresh butt
     assert.doesNotMatch(h.text(), /刷新任务失败/);
     assert.deepEqual(h.hooks.errors, []);
     assert.equal(h.calls.filter(call => call.name === 'get_all_tasks').length, 1);
+  } finally { h.stop(); }
+});
+
+test('collapse header displays regular and super concurrency expression on list refresh without polling', async () => {
+  const h = await harness();
+  try {
+    await h.resolve(0, [
+      task({ _id: { $oid: '0123456789abcdef01234561' }, name: 'reg-1', status: 'running', taskType: 'regular', maxConcurrent: 1 }),
+      task({ _id: { $oid: '0123456789abcdef01234562' }, name: 'reg-2', status: 'running', taskType: 'regular', startConfig: { max_concurrent: 1 } }),
+      task({ _id: { $oid: '0123456789abcdef01234563' }, name: 'reg-3', status: 'running', taskType: 'regular', mission_config: { max_concurrent: 1 } }),
+      task({ _id: { $oid: '0123456789abcdef01234564' }, name: 'reg-paused', status: 'paused', taskType: 'regular', maxConcurrent: 8 }),
+      task({ _id: { $oid: '0123456789abcdef01234565' }, name: 'sup-1', status: 'running', taskType: 'super', maxConcurrent: 1 }),
+    ]);
+    assert.match(h.text(), /普通 \/ Super 任务（普通并发: 1\+1\+1=3 \| Super并发: 1）/);
   } finally { h.stop(); }
 });

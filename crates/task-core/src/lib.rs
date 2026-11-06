@@ -15,6 +15,7 @@ pub mod resume;
 pub mod maintenance_ops;
 pub mod inspection;
 pub mod priority_update;
+pub mod alpha_query;
 
 /// Build-step identity exported by the actual linked library. Standalone
 /// operations do not impose development GUI admission or load desktop crates.

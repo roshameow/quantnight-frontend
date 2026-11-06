@@ -79,12 +79,40 @@ impl StatusRequest {
         }
     }
 }
+/// `Canonical` = original page joined against the filtered async alpha store.
+/// `Live` = metrics the runner already wrote onto task items (no ingestion
+/// wait), server-side filtered/sorted with a bounded page plus a summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResultsSource {
+    Live,
+    #[default]
+    Canonical,
+}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResultsRequest {
     pub name: String,
     pub limit: i64,
     pub offset: i64,
     pub output: Option<PathBuf>,
+    #[serde(default)]
+    pub source: ResultsSource,
+    /// Live only: fitness | sharpe | margin | turnover | returns (descending).
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub min_sharpe: Option<f64>,
+    #[serde(default)]
+    pub min_fitness: Option<f64>,
+    #[serde(default)]
+    pub min_margin: Option<f64>,
+    #[serde(default)]
+    pub min_turnover: Option<f64>,
+    /// Live only: item status view; `error` covers all error-like states.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
 }
 impl ResultsRequest {
     pub fn new(name: impl Into<String>) -> Self {
@@ -93,6 +121,14 @@ impl ResultsRequest {
             limit: 20,
             offset: 0,
             output: None,
+            source: ResultsSource::Canonical,
+            sort: None,
+            min_sharpe: None,
+            min_fitness: None,
+            min_margin: None,
+            min_turnover: None,
+            status: None,
+            query: None,
         }
     }
 }
@@ -311,11 +347,116 @@ fn write_json(path: &Path, value: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn task_max_concurrent(task: &Document) -> Option<i64> {
+    if task.get_str("status").ok() != Some("running") {
+        return None;
+    }
+    match task.get("taskType") {
+        None | Some(Bson::Null) => (),
+        Some(Bson::String(s)) if s == "regular" || s == "super" => (),
+        _ => return None,
+    }
+    for key in ["startConfig", "mission_config", "config"] {
+        let Some(raw) = task.get(key) else { continue };
+        let value = match raw {
+            Bson::Document(d) => match d.get("max_concurrent") {
+                Some(Bson::Int32(n)) => Some(i64::from(*n)),
+                Some(Bson::Int64(n)) => Some(*n),
+                Some(Bson::Double(n)) if n.is_finite() && n.fract() == 0.0 => Some(*n as i64),
+                _ => None,
+            },
+            Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => {
+                serde_json::from_str::<Value>(s)
+                    .ok()
+                    .and_then(|v| v.get("max_concurrent").and_then(Value::as_i64))
+            }
+            _ => None,
+        };
+        if let Some(n) = value.filter(|n| *n > 0) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn wire_listed_task(row: &Document) -> Value {
+    let max_concurrent = task_max_concurrent(row);
+    let name = row.get_str("name").ok();
+    let is_remote = row.get_bool("isRemote").ok();
+    let gen_doc = row.get_document("generation").ok();
+    let gen_phase = gen_doc.and_then(|g| g.get_str("phase").ok());
+    let is_gen_failed = gen_phase == Some("generation_failed");
+    let filtered: Document = row
+        .iter()
+        .filter(|(k, v)| match k.as_str() {
+            "startConfig" | "mission_config" | "config" => false,
+            "lastError" => is_gen_failed,
+            "generation" => false,
+            "templatefile" => v.as_str() != name,
+            "targetRemote" => v.as_bool() != is_remote,
+            _ => true,
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut value = wire_document(&filtered);
+    if let Some(phase) = gen_phase.filter(|phase| *phase != "complete") {
+        value["generation"] = json!({ "phase": phase });
+    }
+    if let Some(n) = max_concurrent {
+        value["max_concurrent"] = json!(n);
+    }
+    value
+}
+
+fn concurrency_bucket(values: &[i64]) -> Value {
+    let total: i64 = values.iter().sum();
+    let expression = match values.len() {
+        0 => "0".to_string(),
+        1 => total.to_string(),
+        _ => format!(
+            "{}={total}",
+            values.iter().map(i64::to_string).collect::<Vec<_>>().join("+")
+        ),
+    };
+    json!({
+        "values": values,
+        "total": total,
+        "expression": expression,
+    })
+}
+
+pub fn summarize_concurrency(tasks: &[Value]) -> Value {
+    let mut regular = Vec::new();
+    let mut super_tasks = Vec::new();
+    for task in tasks {
+        if task.get("status").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        let Some(n) = task.get("max_concurrent").and_then(Value::as_i64).filter(|n| *n > 0) else {
+            continue;
+        };
+        match task.get("taskType").and_then(Value::as_str).unwrap_or("regular") {
+            "regular" => regular.push(n),
+            "super" => super_tasks.push(n),
+            _ => (),
+        }
+    }
+    let total: i64 = regular.iter().sum::<i64>() + super_tasks.iter().sum::<i64>();
+    json!({
+        "regular": concurrency_bucket(&regular),
+        "super": concurrency_bucket(&super_tasks),
+        "total": total,
+    })
+}
+
 pub async fn list(store: &dyn TaskStore, request: &ListRequest) -> TaskOutcome {
     let result = store
         .list_tasks(Host::from_remote(request.remote), request.include_deactive)
         .await
-        .map(|rows| json!({"tasks": rows.iter().map(wire_document).collect::<Vec<_>>()}))
+        .map(|rows| {
+            let tasks: Vec<_> = rows.iter().map(wire_listed_task).collect();
+            json!({"concurrency": summarize_concurrency(&tasks), "tasks": tasks})
+        })
         .map_err(Error::from);
     let mut result = finish("list", "", result);
     result.value["task"] = Value::Null;
@@ -332,7 +473,7 @@ pub async fn list_with_generation(root: &Path, store: &dyn TaskStore,
         let mut tasks = Vec::new();
         for row in rows {
             if !crate::create_generate::generation_refresh_candidate(&row) {
-                tasks.push(wire_document(&row)); continue;
+                tasks.push(wire_listed_task(&row)); continue;
             }
             let (task, diagnostic) = match crate::create_generate::reconcile_generation_for_list(root, store, runtime, &row).await {
                 Ok(result) => (result.task, result.diagnostic),
@@ -346,12 +487,12 @@ pub async fn list_with_generation(root: &Path, store: &dyn TaskStore,
                 // or other full reread fields leak into the list response.
                 let projection = crate::task_store::list_tasks_options().projection.unwrap();
                 let projected: Document = task.into_iter().filter(|(key, _)| key == "_id" || projection.contains_key(key)).collect();
-                let mut value = wire_document(&projected);
+                let mut value = wire_listed_task(&projected);
                 if let Some(error) = diagnostic { value["generationRefreshError"] = json!(error); }
                 tasks.push(value);
             }
         }
-        Ok::<Value, Error>(json!({"tasks":tasks}))
+        Ok::<Value, Error>(json!({"concurrency": summarize_concurrency(&tasks), "tasks": tasks}))
     }.await;
     let mut result = finish("list", "", result);
     result.value["task"] = Value::Null;
@@ -1056,11 +1197,108 @@ pub async fn results(
     runtime: &dyn InspectionRuntime,
     request: &ResultsRequest,
 ) -> TaskOutcome {
-    finish(
-        "results",
-        &request.name,
-        results_inner(root, store, runtime, request).await,
-    )
+    let result = match request.source {
+        ResultsSource::Canonical => results_inner(root, store, runtime, request).await,
+        ResultsSource::Live => live_results_inner(store, request).await,
+    };
+    finish("results", &request.name, result)
+}
+
+const LIVE_SETTING_KEYS: [&str; 6] = ["region", "universe", "delay", "neutralization", "decay", "truncation"];
+
+fn live_settings(value: Option<&Bson>) -> Option<Value> {
+    let parsed = match value? {
+        Bson::String(text) => serde_json::from_str::<Value>(text).ok()?,
+        Bson::Document(d) => wire_document(d),
+        _ => return None,
+    };
+    let object = parsed.as_object()?;
+    let picked: serde_json::Map<String, Value> = LIVE_SETTING_KEYS.iter()
+        .filter_map(|k| object.get(*k).filter(|v| !v.is_null()).map(|v| ((*k).to_string(), v.clone())))
+        .collect();
+    (!picked.is_empty()).then(|| Value::Object(picked))
+}
+
+/// Compact agent-facing row: identity, expression, key settings, metrics, failures.
+fn live_row(row: &Document) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in ["alphaId", "ideaId", "variantId", "status", "regular", "selection", "combo"] {
+        if let Some(value) = row.get(key).filter(|v| !matches!(v, Bson::Null)) {
+            out.insert(key.into(), wire(Some(value)));
+        }
+    }
+    if let Some(settings) = live_settings(row.get("settings")) {
+        out.insert("settings".into(), settings);
+    }
+    if let Ok(metrics) = row.get_document("_m") {
+        let metrics: serde_json::Map<String, Value> = metrics.iter()
+            .filter(|(_, v)| !matches!(v, Bson::Null))
+            .map(|(k, v)| (k.clone(), wire(Some(v))))
+            .collect();
+        if !metrics.is_empty() { out.insert("metrics".into(), Value::Object(metrics)); }
+    }
+    if let Ok(checks) = row.get_array("failedChecks") {
+        if !checks.is_empty() { out.insert("failedChecks".into(), wire(Some(&Bson::Array(checks.clone())))); }
+    }
+    for key in ["errorClass", "error"] {
+        if let Some(value) = row.get(key).filter(|v| !matches!(v, Bson::Null)) {
+            out.insert(key.into(), wire(Some(value)));
+        }
+    }
+    Value::Object(out)
+}
+
+async fn live_results_inner(store: &dyn TaskStore, request: &ResultsRequest) -> Result<Value, Error> {
+    let task = task(store, &request.name, true).await?;
+    let query = crate::task_store::LiveResultsQuery {
+        status: request.status.clone().unwrap_or_else(|| "success".into()),
+        sort: request.sort.clone().unwrap_or_else(|| "fitness".into()),
+        min_sharpe: request.min_sharpe,
+        min_fitness: request.min_fitness,
+        min_margin: request.min_margin,
+        min_turnover: request.min_turnover,
+        query: request.query.clone(),
+        limit: request.limit,
+        offset: request.offset,
+    };
+    query.validate().map_err(invalid)?;
+    let h = host(&task);
+    let summary = store.summary(h, &request.name).await?;
+    let (mut rows, stats) = if summary.exists {
+        store.live_results(h, &request.name, &query).await?
+    } else {
+        (vec![], None)
+    };
+    if rows.len() > query.limit as usize + 1 {
+        return Err("live result page exceeded requested bound".into());
+    }
+    let has_more = rows.len() > query.limit as usize;
+    rows.truncate(query.limit as usize);
+    let stat = |key: &str| stats.as_ref().and_then(|s| s.get(key)).map(|v| wire(Some(v))).unwrap_or(json!(0));
+    let best = |key: &str| stats.as_ref().and_then(|s| s.get(key)).map(|v| wire(Some(v))).unwrap_or(Value::Null);
+    let value = json!({
+        "source": "task_items_live", "platformFetched": false,
+        "taskStatus": wire(task.get("status")), "taskId": text_id(task.get("_id")),
+        "taskDataRemoved": task.get_str("status").ok() == Some("deactive"),
+        "view": {"status": query.status, "sort": query.sort, "minSharpe": query.min_sharpe,
+                 "minFitness": query.min_fitness, "minMargin": query.min_margin, "minTurnover": query.min_turnover,
+                 "query": query.query, "offset": query.offset, "limit": query.limit},
+        "summary": {
+            "total": summary.total, "statuses": summary.statuses,
+            "viewCount": stat("viewCount"), "matched": stat("matched"),
+            "passThreshold": {"minSharpe": crate::task_store::LIVE_PASS_SHARPE,
+                              "minFitness": crate::task_store::LIVE_PASS_FITNESS, "count": stat("passThreshold")},
+            "best": {"sharpe": best("bestSharpe"), "fitness": best("bestFitness")},
+        },
+        "hasMore": has_more,
+        "rows": rows.iter().map(live_row).collect::<Vec<_>>(),
+    });
+    if let Some(output) = &request.output {
+        write_json(output, &value)?;
+        return Ok(json!({"output": output.to_string_lossy(), "returned": rows.len(),
+            "hasMore": has_more, "summary": value["summary"].clone(), "platformFetched": false}));
+    }
+    Ok(value)
 }
 
 async fn collect_inner(

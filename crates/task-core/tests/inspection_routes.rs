@@ -401,24 +401,61 @@ fn super_task(remote: bool) -> Document {
 async fn list_projects_sorts_filters_and_uses_explicit_host() {
     let mut a = task(false);
     a.insert("secret", "not fetched");
+    a.insert("startConfig", doc! {"max_concurrent": 2, "tag": {"secret": "hidden"}});
     let m = Memory::new(a, vec![]);
+    let mut r2 = task(false);
+    r2.insert("_id", ObjectId::parse_str("0123456789abcdef01234568").unwrap());
+    r2.insert("name", "regular_two");
+    r2.insert("mission_config", doc! {"max_concurrent": 3});
+    let mut s1 = task(false);
+    s1.insert("_id", ObjectId::parse_str("0123456789abcdef01234569").unwrap());
+    s1.insert("name", "super_one");
+    s1.insert("templatefile", "super_one");
+    s1.insert("taskType", "super");
+    s1.insert("startConfig", doc! {"max_concurrent": 1});
+    s1.insert("lastError", "Traceback: huge stack trace");
+    s1.insert("generation", doc! {"id": "g1", "phase": "complete", "producerPid": 4140});
+    let mut paused = task(false);
+    paused.insert("_id", ObjectId::parse_str("0123456789abcdef01234566").unwrap());
+    paused.insert("name", "paused_regular");
+    paused.insert("status", "paused");
+    paused.insert("startConfig", doc! {"max_concurrent": 8});
+    paused.insert("generation", doc! {"id": "g2", "phase": "generation_failed", "producerPid": 4140});
     let mut old = task(false);
     old.insert(
         "_id",
         ObjectId::parse_str("000000000000000000000001").unwrap(),
     );
     old.insert("status", "deactive");
-    m.0.lock()
-        .unwrap()
-        .controls
-        .get_mut(&Host::Local)
-        .unwrap()
-        .push(old.clone());
+    {
+        let mut guard = m.0.lock().unwrap();
+        let controls = guard.controls.get_mut(&Host::Local).unwrap();
+        controls.push(r2);
+        controls.push(s1);
+        controls.push(paused);
+        controls.push(old.clone());
+    }
     let r = list(&m, &ListRequest::default()).await;
     assert!(r.value["task"].is_null());
-    assert_eq!(r.value["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(r.value["tasks"].as_array().unwrap().len(), 4);
     assert!(r.value["tasks"][0].get("secret").is_none());
     assert!(r.value["tasks"][0].get("runId").is_none());
+    assert!(r.value["tasks"][0].get("startConfig").is_none());
+    assert!(r.value["tasks"][0].get("mission_config").is_none());
+    assert!(r.value["tasks"][0].get("lastError").is_none());
+    assert!(r.value["tasks"][0].get("generation").is_none());
+    assert!(r.value["tasks"][0].get("templatefile").is_none());
+    assert!(r.value["tasks"][0].get("targetRemote").is_none());
+    assert_eq!(r.value["tasks"][0]["max_concurrent"], 1);
+    assert!(r.value["tasks"][3].get("max_concurrent").is_none());
+    assert_eq!(r.value["tasks"][3]["generation"], json!({"phase": "generation_failed"}));
+    assert_eq!(r.value["concurrency"]["regular"]["values"], json!([3, 2]));
+    assert_eq!(r.value["concurrency"]["regular"]["total"], 5);
+    assert_eq!(r.value["concurrency"]["regular"]["expression"], "3+2=5");
+    assert_eq!(r.value["concurrency"]["super"]["values"], json!([1]));
+    assert_eq!(r.value["concurrency"]["super"]["total"], 1);
+    assert_eq!(r.value["concurrency"]["super"]["expression"], "1");
+    assert_eq!(r.value["concurrency"]["total"], 6);
     m.0.lock().unwrap().controls.insert(Host::Remote, vec![old]);
     let r = list(
         &m,
@@ -429,6 +466,9 @@ async fn list_projects_sorts_filters_and_uses_explicit_host() {
     )
     .await;
     assert_eq!(r.value["tasks"][0]["status"], "deactive");
+    assert_eq!(r.value["concurrency"]["regular"]["expression"], "0");
+    assert_eq!(r.value["concurrency"]["super"]["expression"], "0");
+    assert_eq!(r.value["concurrency"]["total"], 0);
     m.no_writes();
 }
 #[tokio::test]
@@ -748,6 +788,7 @@ async fn results_bounded_page_ids_dedup_stable_fitness_sort_and_no_payload() {
             limit: 3,
             offset: 0,
             output: None,
+            ..ResultsRequest::new(NAME)
         },
     )
     .await;
@@ -783,6 +824,7 @@ async fn results_validation_missing_index_and_mapping_fail_without_scan() {
                 limit: l,
                 offset: o,
                 output: None,
+                ..ResultsRequest::new(NAME)
             },
         )
         .await;
@@ -819,6 +861,7 @@ async fn results_empty_alpha_ids_skip_canonical_and_output_is_compact() {
             limit: 1,
             offset: 0,
             output: Some(output.clone()),
+            ..ResultsRequest::new(NAME)
         },
     )
     .await;
@@ -848,6 +891,7 @@ async fn results_retains_missing_ids_and_deactive_metadata_no_global_topk() {
             limit: 1,
             offset: 1,
             output: None,
+            ..ResultsRequest::new(NAME)
         },
     )
     .await;

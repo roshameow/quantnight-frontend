@@ -71,12 +71,21 @@ pub struct Task {
     pub stop_confirmed_task_id: Option<String>,
     #[serde(default, rename = "stopConfirmationBasis")]
     pub stop_confirmation_basis: Option<String>,
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        rename = "maxConcurrent"
+    )]
+    pub max_concurrent: Option<i64>,
 }
 
 // This source is a property of the original read branch, never of stored data.
 fn listed_task(document: Document, source: TaskControlSource) -> Result<Task, bson::de::Error> {
+    let max_concurrent = crate::inspection::task_max_concurrent(&document);
     let mut task = bson::from_document::<Task>(document)?;
     task.control_source = Some(source);
+    task.max_concurrent = max_concurrent;
     Ok(task)
 }
 
@@ -291,6 +300,14 @@ pub fn decode_list(value: JsonValue) -> Result<Vec<Task>, String> {
                     v.as_str()
                         .map(str::to_owned)
                         .ok_or("invalid generation refresh diagnostic")
+                })
+                .transpose()?;
+            task.max_concurrent = row
+                .get("maxConcurrent")
+                .map(|v| {
+                    v.as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or("invalid task maxConcurrent")
                 })
                 .transpose()?;
             Ok(task)

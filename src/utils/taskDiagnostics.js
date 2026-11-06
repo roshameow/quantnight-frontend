@@ -322,3 +322,45 @@ export function taskMatchesJoinEvidence(task, evidence) {
     (task.taskType ?? 'regular') === evidence.taskType && (task.auth_profile ?? 'user1') === evidence.authProfile &&
     (task.isRemote === true) === evidence.isRemote && taskLaunchValue(task) === evidence.launchAttemptId
 }
+
+export function taskMaxConcurrent(task) {
+  const kind = task?.taskType ?? 'regular'
+  if (kind !== 'regular' && kind !== 'super') return null
+  if (Number.isSafeInteger(task?.maxConcurrent) && task.maxConcurrent > 0) return task.maxConcurrent
+  if (Number.isSafeInteger(task?.max_concurrent) && task.max_concurrent > 0) return task.max_concurrent
+  for (const key of ['startConfig', 'mission_config', 'config']) {
+    let raw = task?.[key]
+    if (typeof raw === 'string') {
+      try { raw = JSON.parse(raw) } catch { raw = null }
+    }
+    const n = raw?.max_concurrent
+    if (Number.isSafeInteger(n) && n > 0) return n
+  }
+  return null
+}
+
+function formatConcurrencyBucket(values) {
+  const total = values.reduce((sum, n) => sum + n, 0)
+  const expression = values.length === 0 ? '0' : values.length === 1 ? String(total) : `${values.join('+')}=${total}`
+  return { values, total, expression }
+}
+
+export function summarizeTaskConcurrency(tasks = []) {
+  const regular = []
+  const superTasks = []
+  for (const task of tasks || []) {
+    if (task?.status !== 'running') continue
+    const n = taskMaxConcurrent(task)
+    if (n === null) continue
+    const kind = task?.taskType ?? 'regular'
+    if (kind === 'regular') regular.push(n)
+    else if (kind === 'super') superTasks.push(n)
+  }
+  const regBucket = formatConcurrencyBucket(regular)
+  const supBucket = formatConcurrencyBucket(superTasks)
+  return {
+    regular: regBucket,
+    super: supBucket,
+    total: regBucket.total + supBucket.total,
+  }
+}
