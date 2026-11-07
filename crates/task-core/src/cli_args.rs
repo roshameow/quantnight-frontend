@@ -223,6 +223,7 @@ const EXPECTED_REMOTE: ArgSpec = arg(
 );
 struct CommandSpec {
     name: &'static str,
+    summary: &'static str,
     args: &'static [ArgSpec],
 }
 
@@ -231,6 +232,7 @@ struct CommandSpec {
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "list",
+        summary: "List registered tasks and active concurrency slots",
         args: &[
             arg(
                 "--include-deactive",
@@ -244,14 +246,17 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "verify-registration",
+        summary: "Verify task database registration and identity consistency",
         args: &[NAME, ID, EXPECTED_REMOTE],
     },
     CommandSpec {
         name: "archive-research",
+        summary: "Archive research artifacts for completed tasks",
         args: &[NAME, ID, EXPECTED_REMOTE],
     },
     CommandSpec {
         name: "create",
+        summary: "Register a new task from a template file",
         args: &[
             NAME,
             arg(
@@ -282,6 +287,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate",
+        summary: "Generate candidate alpha expression variants",
         args: &[
             NAME,
             arg(
@@ -297,10 +303,12 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "sync",
+        summary: "Synchronize task definitions between local and remote",
         args: &[NAME, TIMEOUT, ID],
     },
     CommandSpec {
         name: "start",
+        summary: "Start execution of a generated simulation task",
         args: &[
             NAME,
             arg("--config", "config", Kind::Text, DefaultValue::Null, false),
@@ -317,10 +325,12 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "observe-accepted",
+        summary: "Inspect accepted alpha observation evidence",
         args: &[NAME, ID],
     },
     CommandSpec {
         name: "watch",
+        summary: "Attach background event watcher to notify session on completion (push)",
         args: &[
             NAME,
             arg(
@@ -340,6 +350,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "status",
+        summary: "Read-only snapshot of task progress, metrics, and errors (pull)",
         args: &[
             NAME,
             arg("--watch-observation", "watch_observation", Kind::Text, DefaultValue::Null, false),
@@ -355,10 +366,12 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "pause",
+        summary: "Pause a running task (preserves progress and completed items)",
         args: &[NAME, ID, LAUNCH],
     },
     CommandSpec {
         name: "resume",
+        summary: "Resume a paused task (re-queues pending items)",
         args: &[
             NAME,
             arg(
@@ -379,6 +392,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "priority-prune",
+        summary: "Prune low-priority or unqualified candidate tasks",
         args: &[
             NAME,
             arg("--sharpe", "sharpe", Kind::Float, DefaultValue::Null, true),
@@ -401,6 +415,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "delete",
+        summary: "Safely remove task record and release runtime resources",
         args: &[
             NAME,
             arg(
@@ -416,6 +431,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "results",
+        summary: "Query simulated alpha results and evaluation metrics",
         args: &[
             NAME,
             arg(
@@ -493,6 +509,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "collect-results",
+        summary: "Sweep and collect completed items from platform",
         args: &[NAME, OUTPUT],
     },
 ];
@@ -873,14 +890,14 @@ pub fn parse_args(args: &[String]) -> Result<CliParse, CliUsageError> {
 /// Text layout is not an argparse version-specific byte compatibility promise.
 pub fn help_text(command: Option<&str>) -> Result<String, CliUsageError> {
     let mut out = String::from(
-        "taskctl: QuantNight task lifecycle arguments\n-h, --help  show help (exit 0)\n",
+        "taskctl: QuantNight task lifecycle management tool\n-h, --help  show help (exit 0)\n",
     );
     if let Some(command) = command {
         let spec = COMMANDS
             .iter()
             .find(|s| s.name == command)
             .ok_or_else(|| usage(None, format!("unknown command: {command}")))?;
-        out.push_str(&format!("command: {command}\n"));
+        out.push_str(&format!("command: {} - {}\n", command, spec.summary));
         for arg in spec.args {
             let aliases = if matches!(arg.kind, Kind::BooleanOptional) {
                 " / --no-remote"
@@ -906,7 +923,7 @@ pub fn help_text(command: Option<&str>) -> Result<String, CliUsageError> {
     } else {
         out.push_str("commands:\n");
         for spec in COMMANDS {
-            out.push_str(&format!("  {}\n", spec.name));
+            out.push_str(&format!("  {:20} {}\n", spec.name, spec.summary));
         }
     }
     Ok(out)
