@@ -55,7 +55,7 @@ async fn original_core_result_is_lossless_and_connection_loss_never_replays(){
     store.entered.notified().await;task.abort();let _=task.await;assert_eq!(state.status().active,1);
     state.drain();assert_eq!(state.status().active,1);store.gate.notify_one();state.wait_drained().await;
     assert_eq!(store.calls.load(Ordering::SeqCst),2);assert_eq!(state.status().active,0);
-    assert_eq!(state.status().accepted_by_kind["TaskById"],2);assert_eq!(state.status().accepted_by_kind["GuiTasks"],0);assert_eq!(state.status().accepted_by_kind.len(),20);
+    assert_eq!(state.status().accepted_by_kind["TaskById"],2);assert_eq!(state.status().accepted_by_kind["GuiTasks"],0);assert_eq!(state.status().accepted_by_kind.len(),crate::task_request::REQUEST_KIND_NAMES.len());
     let(context,request)=call();let result=client::RuntimeClient::exchange(admitted_pair(state.clone()).await,context,request,None).await.unwrap_err();
     assert_eq!(result.class,"host_draining");assert_eq!(result.execution,"not_executed");assert_eq!(store.calls.load(Ordering::SeqCst),2);
 }

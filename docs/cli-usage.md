@@ -86,6 +86,10 @@ TEMPLATE=my_existing_template
 | `delete` | `qn delete --name "$NAME"` | 原安全归档／退出活动列表：保留任务与候选回执、正式结果；不是直接 drop 数据库。 |
 | `results` | `qn results --name "$NAME" [--sort fitness] [--limit 20]` | 服务端实时聚合回测结果（默认 `source=live`，按指标排序/过滤，返回 Top-K、表达式与 checks 失败项）；亦可用 `--source canonical` 检查正式库入库状态。 |
 | `collect-results` | `qn collect-results --name "$NAME"` | 显式完整导出已有任务结果，默认保存到后端 `reports/missions/<任务名>.json`。 |
+| `alphas` | `qn alphas --region USA --delay 1 --include-checks --include-pnl-scores` | 只读查询 `alpha_results` 或 `alpha_submitted` 面板（支持指标过滤、代码搜索、`RA_PARENT` 子聚合、`prod` 相关性、`checks` 与 `pnl_scores` 补齐）。 |
+| `alpha-pnl` | `qn alpha-pnl --id <ALPHA_ID>` | 只读查询单条 Alpha 的 PnL 时间序列与 `pnl_scores`（支持 `RA_PARENT` 子序列聚合）。 |
+| `datasets` | `qn datasets --region USA --delay 1` | 只读查询数据集面板（支持 region/delay/universe/category/关键词过滤与覆盖率统计）。 |
+| `datafields` | `qn datafields --dataset-id anl4 --region USA --delay 1` | 只读查询数据字段面板（支持按 dataset、type、关键词、scope 覆盖率过滤）。 |
 
 GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库角色读取，不做同样的合并。`list --remote` 读取远端控制记录，不代表“筛选本地登记中所有远程执行的任务”，也不对 remote-only 记录做本机生成收尾。
 
@@ -110,6 +114,10 @@ GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库�
 | `delete` | `--confirm`（可选原任务名）、`--expected-task-id`、`--force`（兼容参数，不能绕过原停止／回执保护）。 |
 | `results` | `--source <live\|canonical>`（默认 live）、`--sort <fitness\|sharpe\|returns\|drawdown\|turnover\|margin>`（默认 fitness）、`--min-fitness <float>`、`--min-sharpe <float>`、`--min-margin <float>`、`--min-turnover <float>`、`--query <string>`（代码搜索或高级Mongo语法）、`--status <string>`（默认 success，可选 error 等）、`--limit`（默认20）、`--offset`（默认0）、`--output <路径>`。 |
 | `collect-results` | `--output <路径>`，不传时使用上表默认导出位置。 |
+| `alphas` | 无需 `--name`。`--collection`（默认 `alpha_results`）、`--id`、`--region`、`--universe`、`--delay`、`--alpha-type`、`--days-within`、`--min-sharpe`、`--min-fitness`、`--min-margin`、`--min-returns`、`--min-turnover`、`--max-turnover`、`--query`、`--exclude-query`、`--category`、`--messages-in`、`--messages-nin`、`--sort`、`--sort-order`、`--page`、`--page-size`、`--include-checks`、`--include-pnl-scores`、`--no-total`、`--output`。 |
+| `alpha-pnl` | 无需 `--name`。`--id` 必填；可选 `--output`。 |
+| `datasets` | 无需 `--name`（`--name` 作为数据集名称过滤）。`--id`、`--search`、`--field-id`、`--category`、`--region`、`--universe`、`--delay`、`--sort`、`--sort-order`、`--page`、`--page-size`、`--output`。 |
+| `datafields` | 无需 `--name`。`--dataset-id`、`--search`、`--data-type`、`--region`、`--universe`、`--delay`、`--sort`、`--sort-order`、`--page`、`--page-size`、`--output`。 |
 
 ### 身份、执行端与重试
 

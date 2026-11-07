@@ -261,6 +261,50 @@ impl TaskControl {
         let runtime = OriginalOperationsRuntime { binding: &self.binding, observer };
         cleanup_sync::delete_with_expected_host(self.root(), self.store.as_ref(), &runtime, name, expected_id, expected_remote).await
     }
+    pub async fn alphas(&self, request: &crate::data_panel::AlphaQuery) -> TaskOutcome {
+        let context = match self.runtime_context() {
+            Ok(c) => c,
+            Err(e) => return rejected("alphas", "", e),
+        };
+        let client = match context.client(false).await {
+            Ok(c) => c,
+            Err(e) => return rejected("alphas", "", e),
+        };
+        crate::data_panel::cmd_alphas(&client, context.config(), request).await
+    }
+    pub async fn alpha_pnl(&self, request: &crate::data_panel::PnlQuery) -> TaskOutcome {
+        let context = match self.runtime_context() {
+            Ok(c) => c,
+            Err(e) => return rejected("alpha-pnl", &request.id, e),
+        };
+        let client = match context.client(false).await {
+            Ok(c) => c,
+            Err(e) => return rejected("alpha-pnl", &request.id, e),
+        };
+        crate::data_panel::cmd_alpha_pnl(&client, context.config(), request).await
+    }
+    pub async fn datasets(&self, request: &crate::data_panel::DatasetQuery) -> TaskOutcome {
+        let context = match self.runtime_context() {
+            Ok(c) => c,
+            Err(e) => return rejected("datasets", "", e),
+        };
+        let client = match context.client(false).await {
+            Ok(c) => c,
+            Err(e) => return rejected("datasets", "", e),
+        };
+        crate::data_panel::cmd_datasets(&client, context.config(), request).await
+    }
+    pub async fn datafields(&self, request: &crate::data_panel::DatafieldQuery) -> TaskOutcome {
+        let context = match self.runtime_context() {
+            Ok(c) => c,
+            Err(e) => return rejected("datafields", &request.dataset_id, e),
+        };
+        let client = match context.client(false).await {
+            Ok(c) => c,
+            Err(e) => return rejected("datafields", &request.dataset_id, e),
+        };
+        crate::data_panel::cmd_datafields(&client, context.config(), request).await
+    }
 }
 fn rejected(command: &str, name: &str, error: String) -> TaskOutcome {
     TaskOutcome { exit_code: 1, value: json!({"schemaVersion":1, "command":command,

@@ -30,6 +30,10 @@ pub async fn dispatch(control:&TaskControl, request:&TaskRequest, observer:Optio
         TaskRequest::TaskById{id}=>return Ok(CallResult{value:crate::runtime::wire_document::encode(&control.task_by_id(id).await?)?,exit_code:0,confirmed_stop:None}),
         TaskRequest::GuiTasks=>return Ok(CallResult{value:crate::gui_task_queries::list(control.runtime_context()?.as_ref(),control).await?,exit_code:0,confirmed_stop:None}),
         TaskRequest::TaskDiagnostics{name,task_id,remote}=>return Ok(CallResult{value:serde_json::Value::String(crate::task_diagnostics::inspect(control.runtime_context()?.as_ref(),name,task_id.as_deref(),*remote,observer).await?),exit_code:0,confirmed_stop:None}),
+        TaskRequest::Alphas(r)=>control.alphas(r).await,
+        TaskRequest::AlphaPnl(r)=>control.alpha_pnl(r).await,
+        TaskRequest::Datasets(r)=>control.datasets(r).await,
+        TaskRequest::Datafields(r)=>control.datafields(r).await,
     };
     Ok(CallResult{value:result.value,exit_code:result.exit_code,confirmed_stop:None})
 }

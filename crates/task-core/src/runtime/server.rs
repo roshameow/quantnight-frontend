@@ -3,7 +3,7 @@ use std::{collections::HashSet,sync::{Arc,Mutex}};
 use super::{identity::{self,HostIdentity,RuntimeSelection},protocol::{Admission,HostStatus,Message,VERSION},codec,RuntimeObserver,TransportError};
 use crate::task_control::TaskControl;
 #[derive(Default)]
-struct Inflight {draining:bool,active:u64,accepted_calls:u64,kind_counts:[u64;20],progress_subscriptions:u64,ids:HashSet<String>}
+struct Inflight {draining:bool,active:u64,accepted_calls:u64,kind_counts:[u64;crate::task_request::REQUEST_KIND_NAMES.len()],progress_subscriptions:u64,ids:HashSet<String>}
 pub struct RuntimeState {pub control:Arc<TaskControl>,pub identity:HostIdentity,inflight:Mutex<Inflight>,settled:tokio::sync::Notify,progress:Option<Arc<super::progress::ProgressHub>>}
 impl RuntimeState {
     pub fn new(control:Arc<TaskControl>,identity:HostIdentity)->Arc<Self>{{let progress=control.runtime_context().ok().map(super::progress::ProgressHub::new);Arc::new(Self{control,identity,inflight:Mutex::new(Inflight::default()),settled:tokio::sync::Notify::new(),progress})}}

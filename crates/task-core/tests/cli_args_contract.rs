@@ -32,6 +32,10 @@ fn all_sixteen_commands_and_same_schema_help() {
         "delete",
         "results",
         "collect-results",
+        "alphas",
+        "alpha-pnl",
+        "datasets",
+        "datafields",
     ];
     let root = help_text(None).unwrap();
     for name in names {
@@ -42,7 +46,10 @@ fn all_sixteen_commands_and_same_schema_help() {
                 command: Some(name.into())
             }
         );
-        assert!(help_text(Some(name)).unwrap().contains("--name") || name == "list");
+        assert!(
+            help_text(Some(name)).unwrap().contains("--name")
+                || matches!(name, "list" | "alphas" | "alpha-pnl" | "datasets" | "datafields")
+        );
     }
     assert_eq!(CLI_HELP_EXIT_CODE, 0);
     assert!(help_text(Some("not-a-command")).is_err());

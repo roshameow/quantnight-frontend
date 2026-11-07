@@ -213,6 +213,123 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
             name: name()?,
             output: a.text("output")?.map(PathBuf::from),
         }),
+        "alphas" => {
+            let split_csv = |raw: Option<String>| -> Option<Vec<String>> {
+                raw.map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty())
+            };
+            let sort_field = match a.text("sort")?.as_deref() {
+                None => None,
+                Some(raw) => Some(
+                    serde_json::from_value(serde_json::Value::String(raw.to_string()))
+                        .map_err(|e| format!("invalid --sort field {raw}: {e}"))?,
+                ),
+            };
+            let page = u32::try_from(a.i64("page")?).map_err(|_| "--page must be a positive u32")?;
+            let page_size = u32::try_from(a.i64("page_size")?)
+                .map_err(|_| "--page-size must be a positive u32")?;
+            let sort_order = i32::try_from(a.i64("sort_order")?)
+                .map_err(|_| "--sort-order must fit i32")?;
+            let delay = a
+                .optional_integer("delay")?
+                .map(|d| u32::try_from(d).map_err(|_| "--delay must be a non-negative u32"))
+                .transpose()?;
+            let days_within = a
+                .optional_integer("days_within")?
+                .map(|d| u32::try_from(d).map_err(|_| "--days-within must be a positive u32"))
+                .transpose()?;
+            let no_total = a.flag("no_total")?;
+            Request::Alphas(quantnight_task_core::data_panel::AlphaQuery {
+                collection: a.text("collection")?,
+                query: a.text("query")?,
+                exclude_query: a.text("exclude_query")?,
+                id: a.text("id")?,
+                region: a.text("region")?,
+                universe: a.text("universe")?,
+                delay,
+                alpha_type: a.text("alpha_type")?,
+                days_within,
+                min_sharpe: a.optional_float("min_sharpe")?,
+                min_fitness: a.optional_float("min_fitness")?,
+                min_margin: a.optional_float("min_margin")?,
+                min_returns: a.optional_float("min_returns")?,
+                min_turnover: a.optional_float("min_turnover")?,
+                max_turnover: a.optional_float("max_turnover")?,
+                messages_in: split_csv(a.text("messages_in")?),
+                messages_nin: split_csv(a.text("messages_nin")?),
+                classifications_in: None,
+                self_categories: split_csv(a.text("category")?),
+                embedding: None,
+                page: Some(page),
+                page_size: Some(page_size),
+                include_total: Some(!no_total),
+                sort_field,
+                sort_order: Some(sort_order),
+                include_checks: Some(a.flag("include_checks")?),
+                include_pnl_scores: Some(a.flag("include_pnl_scores")?),
+                output: a.text("output")?.map(PathBuf::from),
+            })
+        }
+        "alpha-pnl" => Request::AlphaPnl(quantnight_task_core::data_panel::PnlQuery {
+            id: a.required_text("id")?,
+            collection: a.text("collection")?,
+            output: a.text("output")?.map(PathBuf::from),
+        }),
+        "datasets" => {
+            let page = u32::try_from(a.i64("page")?).map_err(|_| "--page must be a positive u32")?;
+            let page_size = u32::try_from(a.i64("page_size")?)
+                .map_err(|_| "--page-size must be a positive u32")?;
+            let sort_order = i32::try_from(a.i64("sort_order")?)
+                .map_err(|_| "--sort-order must fit i32")?;
+            let delay = a
+                .optional_integer("delay")?
+                .map(|d| i32::try_from(d).map_err(|_| "--delay must fit i32"))
+                .transpose()?;
+            Request::Datasets(quantnight_task_core::data_panel::DatasetQuery {
+                page: Some(page),
+                page_size: Some(page_size),
+                search: a.text("search")?,
+                id: a.text("id")?,
+                name: i.name.clone(),
+                field_id: a.text("field_id")?,
+                category: a.text("category")?,
+                region: a.text("region")?,
+                universe: a.text("universe")?,
+                delay,
+                sort_field: a.text("sort")?,
+                sort_order: Some(sort_order),
+                output: a.text("output")?.map(PathBuf::from),
+            })
+        }
+        "datafields" => {
+            let page = u32::try_from(a.i64("page")?).map_err(|_| "--page must be a positive u32")?;
+            let page_size = u32::try_from(a.i64("page_size")?)
+                .map_err(|_| "--page-size must be a positive u32")?;
+            let sort_order = i32::try_from(a.i64("sort_order")?)
+                .map_err(|_| "--sort-order must fit i32")?;
+            let delay = a
+                .optional_integer("delay")?
+                .map(|d| i32::try_from(d).map_err(|_| "--delay must fit i32"))
+                .transpose()?;
+            Request::Datafields(quantnight_task_core::data_panel::DatafieldQuery {
+                dataset_id: a.text("dataset_id")?.unwrap_or_default(),
+                page: Some(page),
+                page_size: Some(page_size),
+                search: a.text("search")?,
+                field_type: a.text("field_type")?,
+                region: a.text("region")?,
+                universe: a.text("universe")?,
+                delay,
+                sort_field: a.text("sort")?,
+                sort_order: Some(sort_order),
+                output: a.text("output")?.map(PathBuf::from),
+            })
+        }
         _ => return Err(format!("unsupported parsed command: {}", i.command)),
     })
 }

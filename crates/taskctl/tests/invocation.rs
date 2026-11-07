@@ -438,6 +438,92 @@ fn inspection_paths_and_numeric_values_remain_core_owned() {
         _ => panic!(),
     }
     match request(&[
+        "alphas",
+        "--region",
+        "USA",
+        "--delay",
+        "1",
+        "--alpha-type",
+        "REGULAR",
+        "--min-sharpe",
+        "1.25",
+        "--min-fitness",
+        "0.9",
+        "--category",
+        "INSIDER,ANALYST",
+        "--sort",
+        "sharpe",
+        "--include-checks",
+        "--include-pnl-scores",
+        "--output",
+        "relative/alphas.json",
+    ]) {
+        Request::Alphas(r) => {
+            assert_eq!(r.region.as_deref(), Some("USA"));
+            assert_eq!(r.delay, Some(1));
+            assert_eq!(r.alpha_type.as_deref(), Some("REGULAR"));
+            assert_eq!(r.min_sharpe, Some(1.25));
+            assert_eq!(r.min_fitness, Some(0.9));
+            assert_eq!(
+                r.self_categories,
+                Some(vec!["INSIDER".to_string(), "ANALYST".to_string()])
+            );
+            assert_eq!(r.include_checks, Some(true));
+            assert_eq!(r.include_pnl_scores, Some(true));
+            assert_eq!(r.output.unwrap().to_str(), Some("relative/alphas.json"));
+        }
+        _ => panic!(),
+    }
+    match request(&["alpha-pnl", "--id", "alpha_123", "--output", "/tmp/pnl.json"]) {
+        Request::AlphaPnl(r) => {
+            assert_eq!(r.id, "alpha_123");
+            assert_eq!(r.collection.as_deref(), Some("alpha_results"));
+            assert_eq!(r.output.unwrap().to_str(), Some("/tmp/pnl.json"));
+        }
+        _ => panic!(),
+    }
+    match request(&[
+        "datasets",
+        "--region",
+        "USA",
+        "--delay",
+        "1",
+        "--category",
+        "ANALYST",
+        "--sort",
+        "totalAlphaCount",
+        "--sort-order",
+        "-1",
+    ]) {
+        Request::Datasets(r) => {
+            assert_eq!(r.region.as_deref(), Some("USA"));
+            assert_eq!(r.delay, Some(1));
+            assert_eq!(r.category.as_deref(), Some("ANALYST"));
+            assert_eq!(r.sort_field.as_deref(), Some("totalAlphaCount"));
+            assert_eq!(r.sort_order, Some(-1));
+        }
+        _ => panic!(),
+    }
+    match request(&[
+        "datafields",
+        "--dataset-id",
+        "anl4",
+        "--type",
+        "MATRIX",
+        "--region",
+        "USA",
+        "--sort",
+        "coverage",
+    ]) {
+        Request::Datafields(r) => {
+            assert_eq!(r.dataset_id, "anl4");
+            assert_eq!(r.field_type.as_deref(), Some("MATRIX"));
+            assert_eq!(r.region.as_deref(), Some("USA"));
+            assert_eq!(r.sort_field.as_deref(), Some("coverage"));
+        }
+        _ => panic!(),
+    }
+    match request(&[
         "priority-prune",
         "--name",
         "task",
