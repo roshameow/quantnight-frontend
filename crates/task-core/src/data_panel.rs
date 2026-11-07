@@ -2213,3 +2213,629 @@ pub async fn cmd_datafields(
         Err(e) => command_error("datafields", e),
     }
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubmissionStatsQuery {
+    pub collection: Option<String>,
+    pub query: Option<String>,
+    pub region: Option<String>,
+    pub delay: Option<i32>,
+    pub since: Option<String>,
+    pub window_months: Option<u32>,
+    pub recent_days: Option<u32>,
+    #[serde(default)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmissionRegionDelayRow {
+    pub month: String,
+    pub region: String,
+    pub delay: i32,
+    pub count: i64,
+    pub super_count: i64,
+    pub avg_sharpe: Option<f64>,
+    pub avg_fitness: Option<f64>,
+    pub avg_drawdown: Option<f64>,
+    pub avg_turnover: Option<f64>,
+    pub avg_returns: Option<f64>,
+    pub avg_margin: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmissionSummaryRow {
+    pub month: String,
+    pub count: i64,
+    pub super_count: i64,
+    pub avg_sharpe: Option<f64>,
+    pub avg_fitness: Option<f64>,
+    pub avg_drawdown: Option<f64>,
+    pub avg_turnover: Option<f64>,
+    pub avg_returns: Option<f64>,
+    pub avg_margin: Option<f64>,
+    pub children: Vec<SubmissionRegionDelayRow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnSuperRegionRow {
+    pub region: String,
+    pub own_super_count: usize,
+    pub other_super_count: usize,
+    pub total_super_count: usize,
+    pub target: usize,
+    pub gap_to_target: usize,
+    pub latest_submitted_date: Option<String>,
+    pub own_super_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DailySubmissionRow {
+    pub date: String,
+    pub total_count: usize,
+    pub regular_count: usize,
+    pub super_count: usize,
+    pub own_super_count: usize,
+    pub glb_count: usize,
+    pub glb_atom_count: usize,
+    pub glb_hard_gate_pass_count: usize,
+    pub alpha_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PyramidSummaryRow {
+    pub name: String,
+    pub count: usize,
+    pub gap_to_three: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmissionStatsReport {
+    pub collection: String,
+    pub selected_window_months: Vec<String>,
+    pub all_time_summary: Option<SubmissionSummaryRow>,
+    pub window_summary: Option<SubmissionSummaryRow>,
+    pub monthly: Vec<SubmissionSummaryRow>,
+    pub own_super_by_region: Vec<OwnSuperRegionRow>,
+    pub recent_daily: Vec<DailySubmissionRow>,
+    pub pyramid_summary: JsonValue,
+}
+
+fn doc_f64(doc: &Document, key: &str) -> Option<f64> {
+    doc.get_f64(key)
+        .ok()
+        .or_else(|| doc.get_i32(key).ok().map(|v| v as f64))
+        .or_else(|| doc.get_i64(key).ok().map(|v| v as f64))
+}
+
+fn doc_i64(doc: &Document, key: &str) -> i64 {
+    doc.get_i64(key)
+        .ok()
+        .or_else(|| doc.get_i32(key).ok().map(i64::from))
+        .unwrap_or(0)
+}
+
+pub fn calculate_grouped_submission_summary(
+    docs: &[Document],
+    label: &str,
+) -> Option<SubmissionSummaryRow> {
+    if docs.is_empty() {
+        return None;
+    }
+    #[derive(Default)]
+    struct Acc {
+        region: String,
+        delay: i32,
+        count: i64,
+        super_count: i64,
+        w_sharpe: f64,
+        w_fitness: f64,
+        w_drawdown: f64,
+        w_turnover: f64,
+        w_returns: f64,
+        w_margin: f64,
+    }
+    let mut groups: BTreeMap<(String, i32), Acc> = BTreeMap::new();
+    let mut total_count = 0i64;
+    let mut total_super_count = 0i64;
+    let mut total_w_sharpe = 0.0;
+    let mut total_w_fitness = 0.0;
+    let mut total_w_drawdown = 0.0;
+    let mut total_w_turnover = 0.0;
+    let mut total_w_returns = 0.0;
+    let mut total_w_margin = 0.0;
+
+    for doc in docs {
+        let Ok(id_doc) = doc.get_document("_id") else {
+            continue;
+        };
+        let region = id_doc.get_str("region").unwrap_or("Unknown").to_string();
+        let delay = id_doc
+            .get_i32("delay")
+            .ok()
+            .or_else(|| id_doc.get_i64("delay").ok().map(|v| v as i32))
+            .unwrap_or(0);
+        let c = doc_i64(doc, "count");
+        let sc = doc_i64(doc, "super_count");
+        let wf = c as f64;
+        let sharpe = doc_f64(doc, "avg_sharpe").unwrap_or(0.0);
+        let fitness = doc_f64(doc, "avg_fitness").unwrap_or(0.0);
+        let drawdown = doc_f64(doc, "avg_drawdown").unwrap_or(0.0);
+        let turnover = doc_f64(doc, "avg_turnover").unwrap_or(0.0);
+        let returns = doc_f64(doc, "avg_returns").unwrap_or(0.0);
+        let margin = doc_f64(doc, "avg_margin").unwrap_or(0.0);
+
+        let entry = groups.entry((region.clone(), delay)).or_insert_with(|| Acc {
+            region,
+            delay,
+            ..Default::default()
+        });
+        entry.count += c;
+        entry.super_count += sc;
+        entry.w_sharpe += sharpe * wf;
+        entry.w_fitness += fitness * wf;
+        entry.w_drawdown += drawdown * wf;
+        entry.w_turnover += turnover * wf;
+        entry.w_returns += returns * wf;
+        entry.w_margin += margin * wf;
+
+        total_count += c;
+        total_super_count += sc;
+        total_w_sharpe += sharpe * wf;
+        total_w_fitness += fitness * wf;
+        total_w_drawdown += drawdown * wf;
+        total_w_turnover += turnover * wf;
+        total_w_returns += returns * wf;
+        total_w_margin += margin * wf;
+    }
+
+    if total_count == 0 && total_super_count == 0 {
+        return None;
+    }
+
+    let children = groups
+        .into_values()
+        .map(|g| {
+            let denom = if g.count > 0 { Some(g.count as f64) } else { None };
+            SubmissionRegionDelayRow {
+                month: label.to_string(),
+                region: g.region,
+                delay: g.delay,
+                count: g.count,
+                super_count: g.super_count,
+                avg_sharpe: denom.map(|d| g.w_sharpe / d),
+                avg_fitness: denom.map(|d| g.w_fitness / d),
+                avg_drawdown: denom.map(|d| g.w_drawdown / d),
+                avg_turnover: denom.map(|d| g.w_turnover / d),
+                avg_returns: denom.map(|d| g.w_returns / d),
+                avg_margin: denom.map(|d| g.w_margin / d),
+            }
+        })
+        .collect();
+
+    let denom = if total_count > 0 {
+        Some(total_count as f64)
+    } else {
+        None
+    };
+    Some(SubmissionSummaryRow {
+        month: label.to_string(),
+        count: total_count,
+        super_count: total_super_count,
+        avg_sharpe: denom.map(|d| total_w_sharpe / d),
+        avg_fitness: denom.map(|d| total_w_fitness / d),
+        avg_drawdown: denom.map(|d| total_w_drawdown / d),
+        avg_turnover: denom.map(|d| total_w_turnover / d),
+        avg_returns: denom.map(|d| total_w_returns / d),
+        avg_margin: denom.map(|d| total_w_margin / d),
+        children,
+    })
+}
+
+fn is_own_super_selection(selection_code: &str) -> bool {
+    let lower = selection_code.to_ascii_lowercase();
+    if lower.contains("!own") || lower.contains("not(own)") || lower.contains("not (own)") {
+        return false;
+    }
+    lower.contains("own")
+}
+
+pub async fn query_submission_stats_report(
+    client: &mongodb::Client,
+    config: &AppConfig,
+    params: &SubmissionStatsQuery,
+) -> Result<SubmissionStatsReport, String> {
+    let coll_name = params
+        .collection
+        .as_deref()
+        .and_then(sanitize_collection_name)
+        .unwrap_or_else(|| "alpha_submitted".to_string());
+    let db = client.database(&config.mongodb.databases.alpha);
+    let coll = db.collection::<Document>(&coll_name);
+
+    let mut filters = Vec::new();
+    if let Some(q) = params.query.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(parsed_doc) = parse_query_to_bson(q) {
+            filters.push(parsed_doc);
+        }
+    }
+    if let Some(region) = params.region.as_deref().filter(|s| !s.trim().is_empty()) {
+        filters.push(doc! { "settings.region": region });
+    }
+    if let Some(delay) = params.delay {
+        filters.push(doc! { "settings.delay": delay });
+    }
+    if let Some(since) = params.since.as_deref().filter(|s| !s.trim().is_empty()) {
+        filters.push(doc! {
+            "$or": [
+                { "dateSubmitted": { "$gte": since } },
+                { "dateCreated": { "$gte": since } },
+            ]
+        });
+    }
+
+    let filter = if filters.is_empty() {
+        doc! {}
+    } else {
+        doc! { "$and": filters }
+    };
+
+    let pipeline = vec![
+        doc! { "$match": filter.clone() },
+        doc! {
+            "$project": {
+                "region": { "$ifNull": ["$settings.region", "Unknown"] },
+                "delay": { "$ifNull": ["$settings.delay", 0] },
+                "month": { "$substr": [{ "$ifNull": ["$dateSubmitted", "$dateCreated"] }, 0, 7] },
+                "alpha_type": { "$ifNull": ["$type", "REGULAR"] },
+                "sharpe": "$is.sharpe",
+                "fitness": "$is.fitness",
+                "drawdown": "$is.drawdown",
+                "turnover": "$is.turnover",
+                "returns": "$is.returns",
+                "margin": "$is.margin",
+            }
+        },
+        doc! {
+            "$group": {
+                "_id": { "month": "$month", "region": "$region", "delay": "$delay" },
+                "count": {
+                    "$sum": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, 1, 0] }
+                },
+                "super_count": {
+                    "$sum": { "$cond": [{ "$eq": ["$alpha_type", "SUPER"] }, 1, 0] }
+                },
+                "avg_sharpe": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$sharpe", "$$REMOVE"] }
+                },
+                "avg_fitness": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$fitness", "$$REMOVE"] }
+                },
+                "avg_drawdown": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$drawdown", "$$REMOVE"] }
+                },
+                "avg_turnover": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$turnover", "$$REMOVE"] }
+                },
+                "avg_returns": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$returns", "$$REMOVE"] }
+                },
+                "avg_margin": {
+                    "$avg": { "$cond": [{ "$eq": ["$alpha_type", "REGULAR"] }, "$margin", "$$REMOVE"] }
+                },
+            }
+        },
+        doc! {
+            "$sort": { "_id.month": -1, "_id.region": 1, "_id.delay": 1 }
+        },
+    ];
+
+    let detail_opts = FindOptions::builder()
+        .projection(doc! {
+            "_id": 0,
+            "id": 1,
+            "type": 1,
+            "settings.region": 1,
+            "settings.delay": 1,
+            "dateSubmitted": 1,
+            "dateCreated": 1,
+            "selection.code": 1,
+            "is.turnover": 1,
+            "is.margin": 1,
+            "classifications": 1,
+            "is.checks": 1,
+        })
+        .sort(doc! { "dateSubmitted": -1, "dateCreated": -1 })
+        .limit(5000)
+        .build();
+
+    let (agg_res, detail_res) = join!(
+        coll.aggregate(pipeline, None),
+        coll.find(filter, detail_opts)
+    );
+
+    let mut agg_cursor = agg_res.map_err(|e| format!("submission-stats aggregate error: {e}"))?;
+    let mut raw_docs = Vec::new();
+    while let Some(doc) = agg_cursor.try_next().await.map_err(|e| e.to_string())? {
+        raw_docs.push(doc);
+    }
+
+    let mut by_month: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+    for doc in &raw_docs {
+        if let Ok(id_doc) = doc.get_document("_id") {
+            let month = id_doc.get_str("month").unwrap_or("Unknown").to_string();
+            by_month.entry(month).or_default().push(doc.clone());
+        }
+    }
+    let mut unique_months: Vec<String> = by_month.keys().cloned().collect();
+    unique_months.sort_by(|a, b| b.cmp(a));
+
+    let window_months = params.window_months.unwrap_or(3).max(1) as usize;
+    let selected_window_months: Vec<String> =
+        unique_months.iter().take(window_months).cloned().collect();
+    let window_docs: Vec<Document> = raw_docs
+        .iter()
+        .filter(|d| {
+            d.get_document("_id")
+                .ok()
+                .and_then(|id| id.get_str("month").ok())
+                .is_some_and(|m| selected_window_months.iter().any(|wm| wm == m))
+        })
+        .cloned()
+        .collect();
+
+    let all_time_summary = calculate_grouped_submission_summary(&raw_docs, "全部时间");
+    let window_summary = calculate_grouped_submission_summary(
+        &window_docs,
+        &format!("最近{}个月", window_months),
+    );
+
+    let monthly: Vec<SubmissionSummaryRow> = unique_months
+        .iter()
+        .filter_map(|m| {
+            by_month
+                .get(m)
+                .and_then(|docs| calculate_grouped_submission_summary(docs, m))
+        })
+        .collect();
+
+    // Coordinator inventory & daily/pyramid aggregation
+    let mut detail_cursor = detail_res.map_err(|e| format!("submission-stats detail error: {e}"))?;
+    let mut detail_docs = Vec::new();
+    while let Some(doc) = detail_cursor.try_next().await.map_err(|e| e.to_string())? {
+        detail_docs.push(doc);
+    }
+
+    let priority_regions = [
+        "EUR", "ASI", "JPN", "GLB", "USA", "CHN", "KOR", "TWN", "HKG", "AMR",
+    ];
+    #[derive(Default)]
+    struct RegionSuperAcc {
+        own_super_count: usize,
+        other_super_count: usize,
+        latest_submitted_date: Option<String>,
+        own_super_ids: Vec<String>,
+    }
+    let mut super_by_region: HashMap<String, RegionSuperAcc> = HashMap::new();
+    for &r in &priority_regions {
+        super_by_region.insert(r.to_string(), RegionSuperAcc::default());
+    }
+
+    let mut daily_map: BTreeMap<String, DailySubmissionRow> = BTreeMap::new();
+    let mut pyramid_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for doc in &detail_docs {
+        let id = doc.get_str("id").unwrap_or_default().to_string();
+        let alpha_type = doc.get_str("type").unwrap_or("REGULAR");
+        let region = doc
+            .get_document("settings")
+            .ok()
+            .and_then(|s| s.get_str("region").ok())
+            .unwrap_or("Unknown")
+            .to_string();
+        let date_raw = doc
+            .get_str("dateSubmitted")
+            .ok()
+            .or_else(|| doc.get_str("dateCreated").ok())
+            .unwrap_or("");
+        let day = if date_raw.len() >= 10 {
+            date_raw[..10].to_string()
+        } else {
+            "Unknown".to_string()
+        };
+
+        let sel_code = doc
+            .get_document("selection")
+            .ok()
+            .and_then(|s| s.get_str("code").ok())
+            .unwrap_or("");
+        let is_own_super = alpha_type == "SUPER" && is_own_super_selection(sel_code);
+
+        if alpha_type == "SUPER" {
+            let entry = super_by_region.entry(region.clone()).or_default();
+            if is_own_super {
+                entry.own_super_count += 1;
+                entry.own_super_ids.push(id.clone());
+                if !date_raw.is_empty()
+                    && entry
+                        .latest_submitted_date
+                        .as_deref()
+                        .is_none_or(|prev| date_raw > prev)
+                {
+                    entry.latest_submitted_date = Some(date_raw.to_string());
+                }
+            } else {
+                entry.other_super_count += 1;
+            }
+        }
+
+        let is_atom = doc
+            .get_array("classifications")
+            .ok()
+            .is_some_and(|arr| {
+                arr.iter().any(|item| {
+                    item.as_document()
+                        .and_then(|d| d.get_str("id").ok())
+                        .is_some_and(|cid| cid == "DATA_USAGE:SINGLE_DATA_SET")
+                })
+            });
+
+        let is_doc = doc.get_document("is").ok();
+        let turnover = is_doc.and_then(|d| doc_f64(d, "turnover"));
+        let margin = is_doc.and_then(|d| doc_f64(d, "margin"));
+        let glb_hard_gate_pass = region == "GLB"
+            && turnover.is_some_and(|t| t <= 0.20)
+            && margin.is_some_and(|m| m >= 0.001);
+
+        if day != "Unknown" {
+            let d_entry = daily_map.entry(day.clone()).or_insert_with(|| DailySubmissionRow {
+                date: day,
+                total_count: 0,
+                regular_count: 0,
+                super_count: 0,
+                own_super_count: 0,
+                glb_count: 0,
+                glb_atom_count: 0,
+                glb_hard_gate_pass_count: 0,
+                alpha_ids: Vec::new(),
+            });
+            d_entry.total_count += 1;
+            if alpha_type == "SUPER" {
+                d_entry.super_count += 1;
+                if is_own_super {
+                    d_entry.own_super_count += 1;
+                }
+            } else {
+                d_entry.regular_count += 1;
+            }
+            if region == "GLB" {
+                d_entry.glb_count += 1;
+                if is_atom {
+                    d_entry.glb_atom_count += 1;
+                }
+                if glb_hard_gate_pass {
+                    d_entry.glb_hard_gate_pass_count += 1;
+                }
+            }
+            d_entry.alpha_ids.push(id);
+        }
+
+        if let Some(checks) = is_doc.and_then(|d| d.get_array("checks").ok()) {
+            for check_bson in checks {
+                let Some(cdoc) = check_bson.as_document() else {
+                    continue;
+                };
+                if cdoc.get_str("name").ok() == Some("MATCHES_PYRAMID") {
+                    if let Ok(pyramids) = cdoc.get_array("pyramids") {
+                        for p in pyramids {
+                            if let Some(pname) = p
+                                .as_document()
+                                .and_then(|pd| pd.get_str("name").ok())
+                                .or_else(|| p.as_str())
+                            {
+                                *pyramid_counts.entry(pname.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ordered_regions: Vec<String> = priority_regions.iter().map(|s| (*s).to_string()).collect();
+    for r in super_by_region.keys() {
+        if !ordered_regions.contains(r) {
+            ordered_regions.push(r.clone());
+        }
+    }
+    let own_super_by_region: Vec<OwnSuperRegionRow> = ordered_regions
+        .into_iter()
+        .filter_map(|region| {
+            let acc = super_by_region.remove(&region)?;
+            let total = acc.own_super_count + acc.other_super_count;
+            Some(OwnSuperRegionRow {
+                region,
+                own_super_count: acc.own_super_count,
+                other_super_count: acc.other_super_count,
+                total_super_count: total,
+                target: 6,
+                gap_to_target: 6usize.saturating_sub(acc.own_super_count),
+                latest_submitted_date: acc.latest_submitted_date,
+                own_super_ids: acc.own_super_ids,
+            })
+        })
+        .collect();
+
+    let recent_days = params.recent_days.unwrap_or(14).max(1) as usize;
+    let recent_daily: Vec<DailySubmissionRow> = daily_map
+        .into_values()
+        .rev()
+        .take(recent_days)
+        .collect();
+
+    let mut by_pyramid: Vec<PyramidSummaryRow> = pyramid_counts
+        .into_iter()
+        .map(|(name, count)| PyramidSummaryRow {
+            name,
+            count,
+            gap_to_three: 3usize.saturating_sub(count),
+        })
+        .collect();
+    by_pyramid.sort_by(|a, b| a.gap_to_three.cmp(&b.gap_to_three).then_with(|| a.name.cmp(&b.name)));
+    let qualified_ge_3 = by_pyramid.iter().filter(|p| p.count >= 3).count();
+    let gap_1_count = by_pyramid.iter().filter(|p| p.count == 2).count();
+    let gap_2_count = by_pyramid.iter().filter(|p| p.count == 1).count();
+
+    let pyramid_summary = json!({
+        "uniquePyramidsCount": by_pyramid.len(),
+        "qualifiedGe3Count": qualified_ge_3,
+        "gap1CountEq2": gap_1_count,
+        "gap2CountEq1": gap_2_count,
+        "byPyramid": by_pyramid,
+    });
+
+    Ok(SubmissionStatsReport {
+        collection: coll_name,
+        selected_window_months,
+        all_time_summary,
+        window_summary,
+        monthly,
+        own_super_by_region,
+        recent_daily,
+        pyramid_summary,
+    })
+}
+
+pub async fn cmd_submission_stats(
+    client: &mongodb::Client,
+    config: &AppConfig,
+    params: &SubmissionStatsQuery,
+) -> TaskOutcome {
+    match query_submission_stats_report(client, config, params).await {
+        Ok(report) => {
+            let mut value = json!({
+                "schemaVersion": 1,
+                "command": "submission-stats",
+                "ok": true,
+                "collection": report.collection,
+                "selectedWindowMonths": report.selected_window_months,
+                "allTimeSummary": report.all_time_summary,
+                "windowSummary": report.window_summary,
+                "monthly": report.monthly,
+                "ownSuperByRegion": report.own_super_by_region,
+                "recentDaily": report.recent_daily,
+                "pyramidSummary": report.pyramid_summary,
+            });
+            if let Some(out) = &params.output {
+                value["output"] = json!(out.display().to_string());
+                if let Err(e) = write_optional_output(Some(out), &value) {
+                    return command_error("submission-stats", e);
+                }
+            }
+            TaskOutcome {
+                value,
+                exit_code: 0,
+            }
+        }
+        Err(e) => command_error("submission-stats", e),
+    }
+}

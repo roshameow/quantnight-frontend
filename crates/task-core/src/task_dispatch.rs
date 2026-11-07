@@ -34,6 +34,7 @@ pub async fn dispatch(control:&TaskControl, request:&TaskRequest, observer:Optio
         TaskRequest::AlphaPnl(r)=>control.alpha_pnl(r).await,
         TaskRequest::Datasets(r)=>control.datasets(r).await,
         TaskRequest::Datafields(r)=>control.datafields(r).await,
+        TaskRequest::SubmissionStats(r)=>control.submission_stats(r).await,
     };
     Ok(CallResult{value:result.value,exit_code:result.exit_code,confirmed_stop:None})
 }

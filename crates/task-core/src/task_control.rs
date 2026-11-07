@@ -305,6 +305,20 @@ impl TaskControl {
         };
         crate::data_panel::cmd_datafields(&client, context.config(), request).await
     }
+    pub async fn submission_stats(
+        &self,
+        request: &crate::data_panel::SubmissionStatsQuery,
+    ) -> TaskOutcome {
+        let context = match self.runtime_context() {
+            Ok(c) => c,
+            Err(e) => return rejected("submission-stats", "", e),
+        };
+        let client = match context.client(false).await {
+            Ok(c) => c,
+            Err(e) => return rejected("submission-stats", "", e),
+        };
+        crate::data_panel::cmd_submission_stats(&client, context.config(), request).await
+    }
 }
 fn rejected(command: &str, name: &str, error: String) -> TaskOutcome {
     TaskOutcome { exit_code: 1, value: json!({"schemaVersion":1, "command":command,

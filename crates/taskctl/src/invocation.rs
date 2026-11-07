@@ -330,6 +330,26 @@ pub fn to_request(i: &CliInvocation) -> Result<Request, String> {
                 output: a.text("output")?.map(PathBuf::from),
             })
         }
+        "submission-stats" => {
+            let window_months = u32::try_from(a.i64("window_months")?)
+                .map_err(|_| "--window-months must be a positive u32")?;
+            let recent_days = u32::try_from(a.i64("recent_days")?)
+                .map_err(|_| "--recent-days must be a positive u32")?;
+            let delay = a
+                .optional_integer("delay")?
+                .map(|d| i32::try_from(d).map_err(|_| "--delay must fit i32"))
+                .transpose()?;
+            Request::SubmissionStats(quantnight_task_core::data_panel::SubmissionStatsQuery {
+                collection: a.text("collection")?,
+                query: a.text("query")?,
+                region: a.text("region")?,
+                delay,
+                since: a.text("since")?,
+                window_months: Some(window_months),
+                recent_days: Some(recent_days),
+                output: a.text("output")?.map(PathBuf::from),
+            })
+        }
         _ => return Err(format!("unsupported parsed command: {}", i.command)),
     })
 }

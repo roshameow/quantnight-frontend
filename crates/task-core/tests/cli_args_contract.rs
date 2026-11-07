@@ -36,6 +36,7 @@ fn all_sixteen_commands_and_same_schema_help() {
         "alpha-pnl",
         "datasets",
         "datafields",
+        "submission-stats",
     ];
     let root = help_text(None).unwrap();
     for name in names {
@@ -48,7 +49,10 @@ fn all_sixteen_commands_and_same_schema_help() {
         );
         assert!(
             help_text(Some(name)).unwrap().contains("--name")
-                || matches!(name, "list" | "alphas" | "alpha-pnl" | "datasets" | "datafields")
+                || matches!(
+                    name,
+                    "list" | "alphas" | "alpha-pnl" | "datasets" | "datafields" | "submission-stats"
+                )
         );
     }
     assert_eq!(CLI_HELP_EXIT_CODE, 0);

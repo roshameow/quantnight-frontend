@@ -44,9 +44,10 @@ fn expected()->BTreeMap<String,String>{
         ("AlphaPnl","control.alpha_pnl(r).await"),
         ("Datasets","control.datasets(r).await"),
         ("Datafields","control.datafields(r).await"),
+        ("SubmissionStats","control.submission_stats(r).await"),
     ];specs.into_iter().map(|(name,body)|(name.into(),normalized(body))).collect()
 }
-fn assert_routes(source:&str){let actual=routes(source);assert_eq!(actual.len(),24);assert_eq!(actual,expected());}
+fn assert_routes(source:&str){let actual=routes(source);assert_eq!(actual.len(),25);assert_eq!(actual,expected());}
 fn assert_cli(source:&str){let f=function(source);assert_eq!(f.block.stmts.len(),1);let syn::Stmt::Expr(expr,_) =&f.block.stmts[0] else{panic!("one delegate expression")};assert_eq!(normalized(&tokens(expr)),normalized(r#"match quantnight_task_core::task_dispatch::dispatch(control,request,None).await {Ok(result)=>TaskOutcome{value:result.value,exit_code:result.exit_code},Err(error)=>TaskOutcome{value:serde_json::json!({"schemaVersion":1,"ok":false,"errorType":"RuntimeError","error":error}),exit_code:1}}"#));}
 #[test]
 fn every_route_delegates_to_the_actual_common_facade(){assert_cli(include_str!("../src/dispatch.rs"));assert_routes(include_str!("../../task-core/src/task_dispatch.rs"));}

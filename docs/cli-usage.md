@@ -90,6 +90,7 @@ TEMPLATE=my_existing_template
 | `alpha-pnl` | `qn alpha-pnl --id <ALPHA_ID>` | 只读查询单条 Alpha 的 PnL 时间序列与 `pnl_scores`（支持 `RA_PARENT` 子序列聚合）。 |
 | `datasets` | `qn datasets --region USA --delay 1` | 只读查询数据集面板（支持 region/delay/universe/category/关键词过滤与覆盖率统计）。 |
 | `datafields` | `qn datafields --dataset-id anl4 --region USA --delay 1` | 只读查询数据字段面板（支持按 dataset、type、关键词、scope 覆盖率过滤）。 |
+| `submission-stats` | `qn submission-stats --recent-days 14` | 只读查询提交统计面板（全部时间／近3个月／按月及 `region×delay` 汇总、各地区 OWN SUPER 存量与距6缺口、逐日提交统计、已提交 Pyramid 分布）。 |
 
 GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库角色读取，不做同样的合并。`list --remote` 读取远端控制记录，不代表“筛选本地登记中所有远程执行的任务”，也不对 remote-only 记录做本机生成收尾。
 
@@ -118,6 +119,7 @@ GUI 列表会合并本地与 remote-only 展示；CLI `list` 按所选数据库�
 | `alpha-pnl` | 无需 `--name`。`--id` 必填；可选 `--output`。 |
 | `datasets` | 无需 `--name`（`--name` 作为数据集名称过滤）。`--id`、`--search`、`--field-id`、`--category`、`--region`、`--universe`、`--delay`、`--sort`、`--sort-order`、`--page`、`--page-size`、`--output`。 |
 | `datafields` | 无需 `--name`。`--dataset-id`、`--search`、`--data-type`、`--region`、`--universe`、`--delay`、`--sort`、`--sort-order`、`--page`、`--page-size`、`--output`。 |
+| `submission-stats` | 无需 `--name`。`--collection`（默认 `alpha_submitted`）、`--query`、`--region`、`--delay`、`--since`、`--window-months`（默认 3）、`--recent-days`（默认 14）、`--output`。 |
 
 ### 身份、执行端与重试
 

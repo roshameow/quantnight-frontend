@@ -524,6 +524,31 @@ fn inspection_paths_and_numeric_values_remain_core_owned() {
         _ => panic!(),
     }
     match request(&[
+        "submission-stats",
+        "--collection",
+        "alpha_submitted",
+        "--region",
+        "GLB",
+        "--delay",
+        "1",
+        "--since",
+        "2026-10",
+        "--window-months",
+        "3",
+        "--recent-days",
+        "7",
+    ]) {
+        Request::SubmissionStats(r) => {
+            assert_eq!(r.collection.as_deref(), Some("alpha_submitted"));
+            assert_eq!(r.region.as_deref(), Some("GLB"));
+            assert_eq!(r.delay, Some(1));
+            assert_eq!(r.since.as_deref(), Some("2026-10"));
+            assert_eq!(r.window_months, Some(3));
+            assert_eq!(r.recent_days, Some(7));
+        }
+        _ => panic!(),
+    }
+    match request(&[
         "priority-prune",
         "--name",
         "task",

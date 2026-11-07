@@ -849,6 +849,50 @@ const COMMANDS: &[CommandSpec] = &[
             OUTPUT,
         ],
     },
+    CommandSpec {
+        name: "submission-stats",
+        summary: "Query submission statistics, OWN SUPER regional stock, daily breakdown, and Pyramid counts",
+        args: &[
+            arg(
+                "--collection",
+                "collection",
+                Kind::Text,
+                DefaultValue::Text("alpha_submitted"),
+                false,
+            ),
+            arg("--query", "query", Kind::Text, DefaultValue::Null, false),
+            arg("--region", "region", Kind::Text, DefaultValue::Null, false),
+            arg(
+                "--delay",
+                "delay",
+                Kind::Integer,
+                DefaultValue::Null,
+                false,
+            ),
+            arg(
+                "--since",
+                "since",
+                Kind::Text,
+                DefaultValue::Null,
+                false,
+            ),
+            arg(
+                "--window-months",
+                "window_months",
+                Kind::Integer,
+                DefaultValue::Integer("3"),
+                false,
+            ),
+            arg(
+                "--recent-days",
+                "recent_days",
+                Kind::Integer,
+                DefaultValue::Integer("14"),
+                false,
+            ),
+            OUTPUT,
+        ],
+    },
 ];
 
 #[derive(Clone)]

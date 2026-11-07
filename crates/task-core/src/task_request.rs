@@ -1,6 +1,6 @@
 //! Shared typed application calls, not a second business parser.
 use serde::{Serialize, Deserialize};
-use crate::{create_generate::{CreateRequest,GenerateRequest}, data_panel::{AlphaQuery,DatafieldQuery,DatasetQuery,PnlQuery},
+use crate::{create_generate::{CreateRequest,GenerateRequest}, data_panel::{AlphaQuery,DatafieldQuery,DatasetQuery,PnlQuery,SubmissionStatsQuery},
     inspection::{ListRequest,EvidenceRequest,StatusRequest,ResultsRequest,CollectRequest},
     start::StartRequest, maintenance_ops::{ObserveAcceptedRequest,WatchRequest,PriorityPruneRequest},
     resume::ResumeRequest, priority_update::UpdatePriorityRequest, pause::StopBudget};
@@ -26,6 +26,7 @@ pub enum TaskRequest {
     PriorityUpdate(UpdatePriorityRequest), TaskById { id:String },
     GuiTasks, TaskDiagnostics { name:String, task_id:Option<String>, remote:bool },
     Alphas(AlphaQuery), AlphaPnl(PnlQuery), Datasets(DatasetQuery), Datafields(DatafieldQuery),
+    SubmissionStats(SubmissionStatsQuery),
 }
 impl TaskRequest {
     pub fn resolve_output(&mut self, cwd:&std::path::Path) {
@@ -33,6 +34,7 @@ impl TaskRequest {
             Self::Results(r)=>&mut r.output, Self::CollectResults(r)=>&mut r.output,
             Self::Alphas(r)=>&mut r.output, Self::AlphaPnl(r)=>&mut r.output,
             Self::Datasets(r)=>&mut r.output, Self::Datafields(r)=>&mut r.output,
+            Self::SubmissionStats(r)=>&mut r.output,
             _=>return
         };
         if let Some(p)=path { if p.is_relative() { *p=cwd.join(&*p); } }
@@ -41,6 +43,6 @@ impl TaskRequest {
 
 #[derive(Clone,Copy,Debug)]
 #[repr(usize)]
-pub(crate) enum RequestKind {List,VerifyRegistration,ArchiveResearch,Create,Generate,Sync,Start,ObserveAccepted,Watch,Status,Pause,Resume,PriorityPrune,Delete,Results,CollectResults,PriorityUpdate,TaskById,GuiTasks,TaskDiagnostics,Alphas,AlphaPnl,Datasets,Datafields}
-pub(crate) const REQUEST_KIND_NAMES:[&str;24]=["List","VerifyRegistration","ArchiveResearch","Create","Generate","Sync","Start","ObserveAccepted","Watch","Status","Pause","Resume","PriorityPrune","Delete","Results","CollectResults","PriorityUpdate","TaskById","GuiTasks","TaskDiagnostics","Alphas","AlphaPnl","Datasets","Datafields"];
-impl TaskRequest {pub(crate) fn kind(&self)->RequestKind{match self{Self::List(_)=>RequestKind::List,Self::VerifyRegistration(_)=>RequestKind::VerifyRegistration,Self::ArchiveResearch(_)=>RequestKind::ArchiveResearch,Self::Create(_)=>RequestKind::Create,Self::Generate(_)=>RequestKind::Generate,Self::Sync(_)=>RequestKind::Sync,Self::Start(_)=>RequestKind::Start,Self::ObserveAccepted(_)=>RequestKind::ObserveAccepted,Self::Watch(_)=>RequestKind::Watch,Self::Status(_)=>RequestKind::Status,Self::Pause(_)=>RequestKind::Pause,Self::Resume(_)=>RequestKind::Resume,Self::PriorityPrune(_)=>RequestKind::PriorityPrune,Self::Delete(_)=>RequestKind::Delete,Self::Results(_)=>RequestKind::Results,Self::CollectResults(_)=>RequestKind::CollectResults,Self::PriorityUpdate(_)=>RequestKind::PriorityUpdate,Self::TaskById{..}=>RequestKind::TaskById,Self::GuiTasks=>RequestKind::GuiTasks,Self::TaskDiagnostics{..}=>RequestKind::TaskDiagnostics,Self::Alphas(_)=>RequestKind::Alphas,Self::AlphaPnl(_)=>RequestKind::AlphaPnl,Self::Datasets(_)=>RequestKind::Datasets,Self::Datafields(_)=>RequestKind::Datafields}}}
+pub(crate) enum RequestKind {List,VerifyRegistration,ArchiveResearch,Create,Generate,Sync,Start,ObserveAccepted,Watch,Status,Pause,Resume,PriorityPrune,Delete,Results,CollectResults,PriorityUpdate,TaskById,GuiTasks,TaskDiagnostics,Alphas,AlphaPnl,Datasets,Datafields,SubmissionStats}
+pub(crate) const REQUEST_KIND_NAMES:[&str;25]=["List","VerifyRegistration","ArchiveResearch","Create","Generate","Sync","Start","ObserveAccepted","Watch","Status","Pause","Resume","PriorityPrune","Delete","Results","CollectResults","PriorityUpdate","TaskById","GuiTasks","TaskDiagnostics","Alphas","AlphaPnl","Datasets","Datafields","SubmissionStats"];
+impl TaskRequest {pub(crate) fn kind(&self)->RequestKind{match self{Self::List(_)=>RequestKind::List,Self::VerifyRegistration(_)=>RequestKind::VerifyRegistration,Self::ArchiveResearch(_)=>RequestKind::ArchiveResearch,Self::Create(_)=>RequestKind::Create,Self::Generate(_)=>RequestKind::Generate,Self::Sync(_)=>RequestKind::Sync,Self::Start(_)=>RequestKind::Start,Self::ObserveAccepted(_)=>RequestKind::ObserveAccepted,Self::Watch(_)=>RequestKind::Watch,Self::Status(_)=>RequestKind::Status,Self::Pause(_)=>RequestKind::Pause,Self::Resume(_)=>RequestKind::Resume,Self::PriorityPrune(_)=>RequestKind::PriorityPrune,Self::Delete(_)=>RequestKind::Delete,Self::Results(_)=>RequestKind::Results,Self::CollectResults(_)=>RequestKind::CollectResults,Self::PriorityUpdate(_)=>RequestKind::PriorityUpdate,Self::TaskById{..}=>RequestKind::TaskById,Self::GuiTasks=>RequestKind::GuiTasks,Self::TaskDiagnostics{..}=>RequestKind::TaskDiagnostics,Self::Alphas(_)=>RequestKind::Alphas,Self::AlphaPnl(_)=>RequestKind::AlphaPnl,Self::Datasets(_)=>RequestKind::Datasets,Self::Datafields(_)=>RequestKind::Datafields,Self::SubmissionStats(_)=>RequestKind::SubmissionStats}}}
