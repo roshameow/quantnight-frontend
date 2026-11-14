@@ -58,6 +58,13 @@ pub trait PauseRuntime: Send + Sync {
         -> Result<(),String>{Ok(())}
     async fn verify_launcher_settled(&self,_root:&Path,_task:&Document,_remaining:Duration)
         -> Result<bool,String>{Ok(false)}
+    async fn inspect_generation(
+        &self,
+        _root: &Path,
+        _task: &Document,
+    ) -> Result<crate::create_generate::GenerationProcesses, String> {
+        Err("original generation process inspection unavailable".into())
+    }
     async fn stop_bounded(&self, root: &Path, task: &Document, never: bool,
         remaining: Duration) -> Result<StopOutput, String> {
         tokio::time::timeout(remaining, self.stop(root, task, never)).await
@@ -788,7 +795,16 @@ pub(crate) async fn pause_locked(
         policy::assert_observation_closed(&task)?;
         let remote = match task.get("isRemote") { None | Some(Bson::Null | Bson::Boolean(false)) => false, Some(Bson::Boolean(true)) => true, _ => return Err("invalid task execution host".into()) };
         if options.expected_remote.is_some_and(|expected| expected != remote) { return Err("task execution host changed before pause".into()); }
-        if matches!(text(task.get("status")),Some("generating"|"generation_unknown"|"syncing")) { return Err("candidate generation is not the simulation consumer; reconcile it before using pause".into()); }
+        if matches!(text(task.get("status")),Some("generating"|"syncing")) { return Err("candidate generation is not the simulation consumer; reconcile it before using pause".into()); }
+        if text(task.get("status")) == Some("generation_unknown")
+            && crate::create_generate::verify_unknown_generation_stopped_with(&task, || {
+                runtime.inspect_generation(root, &task)
+            })
+            .await
+            .is_err()
+        {
+            return Err("candidate generation is not the simulation consumer; reconcile it before using pause".into());
+        }
         let inventory = if never_started_history(&task)? {
             stage(observer,"inventory","verify complete original never-started history and all actual item evidence");
             Some(never_started_inventory(store,&task).await?)

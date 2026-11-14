@@ -633,7 +633,7 @@ impl TaskStore for MongoTaskStore {
     }
     async fn update_items(&self, host: Host, name: &str, filter: Document, update: Document) -> Result<u64, String> {
         let items = self.client(host).await?.database(&self.simulation).collection::<Document>(name);
-        bounded("task item metadata write", CONTROL_BUDGET, items.update_many(filter, update, None))
+        bounded("task item metadata write", CONTROL_BUDGET.saturating_mul(8), items.update_many(filter, update, None))
             .await.map(|result| result.matched_count)
     }
     async fn find_tasks(&self, host: Host, filter: Document) -> Result<Vec<Document>, String> {

@@ -488,9 +488,20 @@ struct Runtime {
     // Mutations deliberately bypass the advisory lock to exercise stale CAS.
     mutate_on_archive: Option<MemoryStore>,
     block_report_write_on_archive: bool,
+    inspect: Option<Result<quantnight_task_core::create_generate::GenerationProcesses, String>>,
 }
 #[async_trait]
 impl OperationsRuntime for Runtime {
+    async fn inspect_generation(
+        &self,
+        _root: &Path,
+        _task: &Document,
+    ) -> Result<quantnight_task_core::create_generate::GenerationProcesses, String> {
+        match &self.inspect {
+            Some(result) => result.clone(),
+            None => Err("original generation process inspection unavailable".into()),
+        }
+    }
     async fn assert_consumer_absent(
         &self,
         root: &Path,
@@ -2332,4 +2343,44 @@ async fn public_archive_missing_stop_automatically_uses_original_verify_only_wit
         assert_eq!(control.get_str("stopConfirmationBasis").unwrap(),"session_absent");
         assert!(!control.contains_key("simulatorRuntime"));
     }
+}
+
+#[tokio::test]
+async fn generation_unknown_allows_delete_when_writer_stopped_and_blocks_live() {
+    use quantnight_task_core::create_generate::GenerationProcesses;
+
+    for inspect in [
+        Ok(GenerationProcesses::Live("writer active".into())),
+        Ok(GenerationProcesses::Unverified("writer unverified".into())),
+        Err("probe error".into()),
+    ] {
+        let root = Root::new();
+        let store = MemoryStore::new("generation_unknown", false, terminal());
+        store.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0].insert(
+            "generation",
+            doc! {"id": "g1", "phase": "generation_unknown", "producerPid": 42000},
+        );
+        let runtime = Runtime { inspect: Some(inspect), ..Default::default() };
+        let out = delete(&store, &runtime, &root).await;
+        assert_eq!(out.exit_code, 1, "{}", out.value);
+        assert_eq!(out.value["requiredAction"], "reconcile_generation_or_sync");
+        assert_eq!(out.value["localDeleted"], false);
+    }
+
+    let root = Root::new();
+    let retained = terminal();
+    let store = MemoryStore::new("generation_unknown", false, retained.clone());
+    store.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0].insert(
+        "generation",
+        doc! {"id": "g1", "phase": "generation_unknown", "producerPid": 42000},
+    );
+    let runtime = Runtime {
+        inspect: Some(Ok(GenerationProcesses::Stopped)),
+        ..Default::default()
+    };
+    let out = delete(&store, &runtime, &root).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert_eq!(out.value["localDeleted"], true);
+    assert_eq!(store.collection(Host::Local, &archive()).unwrap(), retained);
+    assert_eq!(store.control().get_str("status").unwrap(), "deactive");
 }

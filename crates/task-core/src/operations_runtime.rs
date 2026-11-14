@@ -243,6 +243,14 @@ impl OperationsRuntime for OriginalOperationsRuntime<'_> {
         if observed["state"]!="session_absent"{return Err("original execution still live/unconfirmed after session-only stop proof".into());}
         Ok(())
     }
+    async fn inspect_generation(
+        &self,
+        root: &Path,
+        task: &Document,
+    ) -> Result<crate::create_generate::GenerationProcesses, String> {
+        <Self as crate::create_generate::GenerationRuntime>::inspect_generation(self, root, task)
+            .await
+    }
     async fn archive_research(&self, root: &Path, task: &Document, host: Host,
         evidence_collection: &str) -> Result<Value, String> {
         self.verify_root(root).await?;
@@ -525,6 +533,18 @@ impl crate::pause::PauseRuntime for OriginalPauseRuntime<'_> {
     async fn verify_stopped(&self, root: &Path, task: &Document, remaining: Duration)
         -> Result<Option<crate::pause::StopOutput>, String> {
         self.common.verify_stop_owner(root, task, remaining).await
+    }
+    async fn inspect_generation(
+        &self,
+        root: &Path,
+        task: &Document,
+    ) -> Result<crate::create_generate::GenerationProcesses, String> {
+        <OriginalOperationsRuntime<'_> as crate::create_generate::GenerationRuntime>::inspect_generation(
+            &self.common,
+            root,
+            task,
+        )
+        .await
     }
     async fn verify_launcher_settled(&self, root: &Path, task: &Document, remaining: Duration)
         -> Result<bool, String> {

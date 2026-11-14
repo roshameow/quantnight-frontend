@@ -112,10 +112,14 @@ test('real reactive card retries only on click, hides previous error during new 
   } finally { view.stop(); }
 });
 
-test('legacy failure stays visible, unknown remains distinct/disabled and no arbitrary lastError creates failure', async () => {
+test('legacy failure stays visible, unknown exposes regenerate/delete while keeping sync/pause disabled and no arbitrary lastError creates failure', async () => {
   const props = reactive({ task: task({ status: 'generation_failed', lastError: 'legacy cause' }) });
   const events = [];
-  const view = mount(() => h(card, { ...props, onGenerateList: () => events.push('generate') }));
+  const view = mount(() => h(card, {
+    ...props,
+    onGenerateList: () => events.push('generate'),
+    onDelete: () => events.push('delete'),
+  }));
   try {
     assert.match(view.text(), /生成失败（generation_failed）.*legacy cause/);
     assert.equal(view.button('重新生成').props.disabled, false);
@@ -123,14 +127,20 @@ test('legacy failure stays visible, unknown remains distinct/disabled and no arb
     await nextTick();
     assert.match(view.text(), /生成结果核验缺少最终回执/);
     assert.doesNotMatch(view.text(), /生成失败（generation_failed）/);
-    assert.equal(view.button('生成状态待核验').props.disabled, true);
-    view.click('生成状态待核验'); assert.deepEqual(events, []);
+    assert.equal(view.button('重新生成').props.disabled, false);
+    assert.equal(view.button('删除').props.disabled, false);
+    assert.equal(view.button('发送到远程').props.disabled, true);
+    assert.equal(view.button('暂停').props.disabled, true);
+    view.click('重新生成'); view.click('删除');
+    assert.deepEqual(events, ['generate', 'delete']);
+    events.length = 0;
     for (const status of ['pending', 'ready']) {
       props.task = task({ status, lastError: 'old unrelated cause' }); await nextTick();
       assert.doesNotMatch(view.text(), /generation_failed|old unrelated cause/);
     }
     props.task = failed({ controlSource: 'remote_only' }); await nextTick();
     assert.equal(view.button('重新生成').props.disabled, true); // original control-source protection
+    assert.equal(view.button('删除').props.disabled, true);
   } finally { view.stop(); }
 });
 
@@ -228,9 +238,13 @@ test('actual TaskManager generate handler refreshes persisted failure, retries o
     assert.doesNotMatch(view.text(), /generation_failed|writer exited/);
     assert.equal(module.hooks.success.length, 1);
     store.replaceTasks([failed({ status: 'generation_unknown', generation: { id: 'unknown', phase: 'generation_unknown' } })]);
-    await state.generateList(id);
-    assert.equal(commands.length, 2);
-    assert.equal(calls.filter(c => c.command === 'get_all_tasks').length, 2);
-    assert.equal(calls.filter(c => c.command === 'refresh_task_progress').length, 2);
+    const third = state.generateList(id); await nextTick();
+    assert.equal(commands.length, 3);
+    commands[2].resolve(); await flush();
+    reads[2]([failed({ status: 'ready', generation: { id: 'recovered', phase: 'complete' } })]);
+    await third; await nextTick();
+    assert.equal(store.tasks[0].status, 'ready');
+    assert.equal(calls.filter(c => c.command === 'get_all_tasks').length, 3);
+    assert.equal(calls.filter(c => c.command === 'refresh_task_progress').length, 3);
   } finally { view.stop(); module.hooks.unmount(); }
 });

@@ -427,6 +427,42 @@ pub fn generation_begin_plan(
         "$push": {"events": {"command": "generation-begin", "status": "generating", "at": at, "detail": generation}}},
     ))
 }
+
+pub(crate) async fn verify_unknown_generation_stopped_with<F, Fut>(
+    task: &Document,
+    inspect: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<GenerationProcesses, String>>,
+{
+    let generation = task
+        .get_document("generation")
+        .map_err(|_| "task is running, generating, or requires generation reconciliation".to_string())?;
+    if generation.get_str("id").map_or(true, str::is_empty) {
+        return Err("task is running, generating, or requires generation reconciliation".into());
+    }
+    let pid = generation
+        .get("producerPid")
+        .and_then(|v| match v {
+            Bson::Int32(v) => Some(i64::from(*v)),
+            Bson::Int64(v) => Some(*v),
+            _ => None,
+        })
+        .filter(|v| *v > 1 && *v <= i64::from(u32::MAX));
+    if pid.is_none() {
+        return Err("task is running, generating, or requires generation reconciliation".into());
+    }
+    match inspect().await {
+        Ok(GenerationProcesses::Stopped) => Ok(()),
+        Ok(GenerationProcesses::Live(reason) | GenerationProcesses::Unverified(reason)) => {
+            Err(format!(
+                "task is running, generating, or requires generation reconciliation: {reason}"
+            ))
+        }
+        Err(_) => Err("task is running, generating, or requires generation reconciliation".into()),
+    }
+}
 /// Original finish token CAS. `status` is the operation outcome, not always
 /// the resulting task status: a failed generation restores a captured pending
 /// or waiting task, while its phase/event keep the failure. Legacy ready and
@@ -805,15 +841,31 @@ pub async fn generate(
     if let Err(e) = identity(&task, &request.name, expected) {
         return failure("generate", &request.name, e);
     }
+    let from_unknown = task.get_str("status").ok() == Some("generation_unknown");
+    if from_unknown {
+        if let Err(e) =
+            verify_unknown_generation_stopped_with(&task, || runtime.inspect_generation(root, &task))
+                .await
+        {
+            return failure("generate", &request.name, e);
+        }
+    }
     let token = nonce();
     let hosted_owner=crate::generation_owner::current();
     let _generation_scope=match hosted_owner.as_ref().map(|owner|owner.enter(task.get_object_id("_id").unwrap(),&token)).transpose(){Ok(scope)=>scope,Err(error)=>return failure("generate",&request.name,error)};
     let stamp = now();
+    let mut plan_task = task.clone();
+    if from_unknown {
+        plan_task.insert("status", "generation_failed");
+    }
     let (mut query, mut update) =
-        match generation_begin_plan(&task, &token, "writing", std::process::id(), &stamp) {
+        match generation_begin_plan(&plan_task, &token, "writing", std::process::id(), &stamp) {
             Ok(v) => v,
             Err(e) => return failure("generate", &request.name, e),
         };
+    if from_unknown {
+        query.insert("status", "generation_unknown");
+    }
     if let Some(owner)=&hosted_owner{
         let tag=owner.tag();
         update.get_document_mut("$set").unwrap().get_document_mut("generation").unwrap().insert("controlOwner",tag.clone());

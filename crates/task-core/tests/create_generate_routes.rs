@@ -259,6 +259,7 @@ struct Runtime {
     metadata_calls: AtomicUsize,
     generate_calls: AtomicUsize,
     commands: Mutex<Vec<GenerationCommand>>,
+    inspect: Option<Result<core::GenerationProcesses, String>>,
 }
 impl Runtime {
     fn new(store: Arc<Store>) -> Self {
@@ -273,11 +274,22 @@ impl Runtime {
             metadata_calls: AtomicUsize::new(0),
             generate_calls: AtomicUsize::new(0),
             commands: Mutex::new(vec![]),
+            inspect: None,
         }
     }
 }
 #[async_trait]
 impl GenerationRuntime for Runtime {
+    async fn inspect_generation(
+        &self,
+        _: &Path,
+        _: &Document,
+    ) -> Result<core::GenerationProcesses, String> {
+        match &self.inspect {
+            Some(result) => result.clone(),
+            None => Err("original generation process inspection unavailable".into()),
+        }
+    }
     async fn creation_metadata(
         &self,
         _: &Path,
@@ -1179,4 +1191,28 @@ fn generation_plan_and_failure_classification_contract() {
     assert_eq!(fin_q.get_str("generation.id"), Ok(token));
     assert_eq!(fin_u.get_document("$set").unwrap().get_str("status"), Ok("ready"));
     assert!(generation_begin_plan(&doc! {"name": "task", "status": "pending"}, token, "writing", 1, stamp).is_err());
+}
+
+#[tokio::test]
+async fn generation_unknown_allows_regenerate_when_writer_stopped_and_blocks_live_or_unverified() {
+    for outcome in [
+        Ok(core::GenerationProcesses::Live("writer active".into())),
+        Ok(core::GenerationProcesses::Unverified("writer unverified".into())),
+        Err("probe error".into()),
+    ] {
+        let (root, store, mut runtime) = setup(Some("generation_unknown"));
+        store.mutate(doc! {"generation": {"id": "prev-gen", "phase": "generation_unknown", "producerPid": 42000}});
+        runtime.inspect = Some(outcome);
+        failed(&core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await);
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.task().get_str("status"), Ok("generation_unknown"));
+    }
+
+    let (root, store, mut runtime) = setup(Some("generation_unknown"));
+    store.mutate(doc! {"generation": {"id": "prev-gen", "phase": "generation_unknown", "producerPid": 42000}});
+    runtime.inspect = Some(Ok(core::GenerationProcesses::Stopped));
+    let out = core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.task().get_str("status"), Ok("ready"));
 }

@@ -34,6 +34,13 @@ pub trait OperationsRuntime: Send + Sync {
         _remaining: std::time::Duration) -> Result<Option<crate::pause::StopOutput>, String> { Ok(None) }
     async fn confirm_stopped_scope(&self,_root:&Path,_store:&dyn TaskStore,_task:&Document,
         _remaining:std::time::Duration)->Result<(),String>{Ok(())}
+    async fn inspect_generation(
+        &self,
+        _root: &Path,
+        _task: &Document,
+    ) -> Result<crate::create_generate::GenerationProcesses, String> {
+        Err("original generation process inspection unavailable".into())
+    }
     /// Invoke the original archive_statistics owner using the exact retained
     /// execution namespace. A null result denotes an unbound research task.
     async fn archive_research(
@@ -548,6 +555,13 @@ impl crate::pause::PauseRuntime for ArchiveStopVerifier<'_> {
         -> Result<Option<crate::pause::StopOutput>, String> {
         self.0.verify_stopped(root, task, remaining).await
     }
+    async fn inspect_generation(
+        &self,
+        root: &Path,
+        task: &Document,
+    ) -> Result<crate::create_generate::GenerationProcesses, String> {
+        self.0.inspect_generation(root, task).await
+    }
 }
 
 pub async fn delete_with_expected_host(
@@ -591,9 +605,16 @@ pub async fn delete_with_expected_host(
     if expected_remote.is_some_and(|expected| expected != host.is_remote()) {
         return failure("delete", name, "original execution host changed before locked cleanup");
     }
+    let unknown_generation_stopped = original.get_str("status").ok() == Some("generation_unknown")
+        && crate::create_generate::verify_unknown_generation_stopped_with(&original, || {
+            runtime.inspect_generation(root, &original)
+        })
+        .await
+        .is_ok();
     if original.get_str("status").ok() != Some("deactive")
         && !policy::stop_confirmation_valid(&original, host.is_remote())
-        && !matches!(original.get_str("status").ok(), Some("generating"|"generation_unknown"|"syncing"|"deleting")) {
+        && (!matches!(original.get_str("status").ok(), Some("generating"|"generation_unknown"|"syncing"|"deleting"))
+            || unknown_generation_stopped) {
         let stopped = crate::pause::pause_locked(root, store, &ArchiveStopVerifier(runtime), name,
             crate::pause::PauseOptions { expected_task_id, expected_remote: Some(host.is_remote()),
                 expected_launch_attempt_id: original.get_str("launchAttemptId").ok(), observer: None, ..Default::default() },
@@ -673,10 +694,17 @@ async fn delete_inner(
     host: Host,
     receipt: &mut Value,
 ) -> Result<(), String> {
+    let unknown_generation_live = original.get_str("status").ok() == Some("generation_unknown")
+        && crate::create_generate::verify_unknown_generation_stopped_with(original, || {
+            runtime.inspect_generation(root, original)
+        })
+        .await
+        .is_err();
     if matches!(
         original.get_str("status").ok(),
-        Some("generating" | "generation_unknown" | "launching" | "syncing" | "running")
-    ) {
+        Some("generating" | "launching" | "syncing" | "running")
+    ) || unknown_generation_live
+    {
         receipt["requiredAction"] = json!(if matches!(original.get_str("status").ok(),
             Some("generating" | "generation_unknown" | "syncing")) {
             "reconcile_generation_or_sync"

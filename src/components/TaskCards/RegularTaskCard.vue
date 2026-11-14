@@ -96,7 +96,7 @@
           :disabled="!!taskMutationIssue(task) || !canGenerate(task, generationBusy)"
           :loading="isGenerating(task, generationBusy)"
         >
-          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : task.status === 'generation_unknown' ? '生成状态待核验' : generationFailureResult ? '重新生成' : '生成list' }}
+          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : (task.status === 'generation_unknown' || generationFailureResult) ? '重新生成' : '生成list' }}
         </n-button>
         <n-button
           size="small"
@@ -112,7 +112,7 @@
         <n-button size="small" :disabled="!!taskMutationIssue(task) || generationBusyOrUnknown(task, generationBusy)" @click="$emit('pause')">
           <template #icon>| |</template>暂停
         </n-button>
-        <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || generationBusyOrUnknown(task, generationBusy)" @click="$emit('delete')">
+        <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || isGenerating(task, generationBusy)" @click="$emit('delete')">
           <template #icon>x</template>删除
         </n-button>
       </n-space>

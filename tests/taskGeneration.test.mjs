@@ -7,9 +7,11 @@ test('ordinary generation disables click immediately and across refreshed state'
   assert.equal(canGenerate({ status: 'pending' }), true);
   assert.equal(canGenerate({ status: 'pending' }, true), false);
   assert.equal(isGenerating({ status: 'pending' }, true), true);
-  for (const status of ['generating', 'generation_unknown', 'running', 'deactive', 'paused']) {
+  for (const status of ['generating', 'running', 'deactive', 'paused']) {
     assert.equal(canGenerate({ status }), false);
   }
+  assert.equal(canGenerate({ status: 'generation_unknown' }), true);
+  assert.equal(canGenerate({ status: 'generation_unknown' }, true), false);
   assert.equal(isGenerating({ status: 'generating' }), true);
   assert.equal(generationBusyOrUnknown({ status: 'generation_unknown' }), true);
   assert.equal(canGenerate({ status: 'generation_failed' }), true);
