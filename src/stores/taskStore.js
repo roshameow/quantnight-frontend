@@ -1,7 +1,7 @@
 // src/stores/taskStore.js
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { newTaskRequestId, failureKind, errorStage, validOperationStage, taskLaunchMatches } from '../utils/taskDiagnostics.js'
+import { newTaskRequestId, failureKind, errorStage, validOperationStage, taskLaunchMatches, taskLaunchValue } from '../utils/taskDiagnostics.js'
 
 const emptyProgress = (task, previous) => ({
   success: 0, error: 0, cancelled: 0, total: 0,
@@ -17,8 +17,7 @@ const validCount = (value) => typeof value === 'number' && Number.isFinite(value
 const validVersion = (value) => Number.isSafeInteger(value) && value >= 0
 const taskId = (task) => typeof task?._id === 'object' ? task._id?.$oid : task?._id
 
-// Native stop receipts and persisted BSON/JSON dates are proof only when their
-// identity and logical execution target match. A control flag alone is not proof.
+// Scope replies and local action diagnostics to their original task/host.
 const sameStopTarget = (task, target) => !!task && !!target &&
   task.name === target.name && typeof taskId(task) === 'string' && !!taskId(task) &&
   taskId(task) === taskId(target) && typeof target.isRemote === 'boolean' &&
@@ -26,42 +25,26 @@ const sameStopTarget = (task, target) => !!task && !!target &&
   (target.expectedTaskType === undefined || (task.taskType ?? 'regular') === target.expectedTaskType) &&
   (target.expectedAuthProfile === undefined || (task.auth_profile ?? 'user1') === target.expectedAuthProfile)
 
-export function stopProofMillis(value) {
-  if (value instanceof Date) value = value.getTime()
-  else if (value && typeof value === 'object' && '$date' in value) {
-    value = value.$date
-    if (value && typeof value === 'object' && typeof value.$numberLong === 'string' &&
-        /^\d+$/.test(value.$numberLong)) value = Number(value.$numberLong)
-  }
-  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) value = Date.parse(value)
-  return Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null
-}
-
-// Old native Task JSON serializes an absent optional basis as null. Both
-// null and omission retain the legacy proof rules; arbitrary values do not.
-const validStopBasis = value => value == null || ['session_absent', 'runners_exited'].includes(value)
-
+// The native adapter owns stopping and receipt verification. Historical proof
+// fields and confirmation-basis metadata are not another GUI success gate.
 export function validStopReceipt(target, receipt) {
-  return !!receipt && receipt.confirmed === true && validStopBasis(receipt.confirmationBasis) &&
-    typeof receipt.taskId === 'string' && typeof receipt.taskName === 'string' &&
-    sameStopTarget(target, { _id: receipt.taskId, name: receipt.taskName, isRemote: receipt.isRemote }) &&
-    typeof receipt.stopConfirmedAt === 'number' && stopProofMillis(receipt.stopConfirmedAt) !== null
+  return receipt?.confirmed === true && typeof receipt.taskId === 'string' &&
+    typeof receipt.taskName === 'string' &&
+    sameStopTarget(target, { _id: receipt.taskId, name: receipt.taskName, isRemote: receipt.isRemote })
 }
 
-// Diagnostic only: the original receipt/proof gates below remain authoritative.
-export function taskStopProofIssue(task) {
-  if (task?.status !== 'paused') return ''
-  const issues = []
-  if (typeof taskId(task) !== 'string' || !taskId(task)) issues.push('身份校验失败：当前任务缺少有效 ID，停止凭据绑定待核验')
-  if (task.stopConfirmedAt == null) issues.push('缺少 stopConfirmedAt 停止时间凭据')
-  else if (stopProofMillis(task.stopConfirmedAt) === null) issues.push('stopConfirmedAt 停止时间凭据格式无效')
-  if (task.stopConfirmedTaskId == null) issues.push('身份校验失败：缺少 stopConfirmedTaskId 任务身份凭据')
-  else if (task.stopConfirmedTaskId !== taskId(task)) issues.push('身份校验失败：停止凭据 stopConfirmedTaskId 的任务 ID 与当前任务存在差异')
-  if (typeof task.stopConfirmedRemote !== 'boolean') issues.push('身份校验失败：缺少有效 stopConfirmedRemote 执行主机凭据')
-  else if (task.stopConfirmedRemote !== (task.isRemote === true)) issues.push('身份校验失败：停止凭据 stopConfirmedRemote 的执行主机与当前本地/远程目标存在差异')
-  if (!validStopBasis(task.stopConfirmationBasis)) issues.push('暂停依据 stopConfirmationBasis 无效')
-  return issues.join('；')
-}
+const isRelaunchedAfterPause = (task, operation) => (
+  operation?.status === 'paused' &&
+  operation.pausedLaunchAttemptId !== undefined &&
+  taskLaunchValue(task) !== operation.pausedLaunchAttemptId
+)
+
+const isRunningOrRelaunchedAfterPause = (task, operation) => (
+  operation?.status === 'paused' && (
+    ['running', 'launching'].includes(task?.status) ||
+    isRelaunchedAfterPause(task, operation)
+  )
+)
 
 export function taskStopDisplayStatus(task, operation) {
   if (sameStopTarget(task, operation)) {
@@ -71,15 +54,11 @@ export function taskStopDisplayStatus(task, operation) {
       if (operation.failureSource === 'receipt_validation') return '停止回执校验失败'
       return operation.failureKind === 'timeout' ? '停止确认超时' : '停止执行失败'
     }
-    if (operation.status === 'paused' && validStopReceipt(task, operation.receipt)) return 'paused'
+    if (operation.status === 'paused' && !isRunningOrRelaunchedAfterPause(task, operation) &&
+        validStopReceipt(task, operation.receipt)) return 'paused'
   }
-  if (task?.status !== 'paused') return null
-  const proofMatches = typeof taskId(task) === 'string' && !!taskId(task) &&
-    task.stopConfirmedTaskId === taskId(task) &&
-    typeof task.stopConfirmedRemote === 'boolean' &&
-    task.stopConfirmedRemote === (task.isRemote === true) &&
-    stopProofMillis(task.stopConfirmedAt) !== null && validStopBasis(task.stopConfirmationBasis)
-  return proofMatches ? 'paused' : '暂停标记无有效停止凭据'
+  // List state is a snapshot, not validation of the last pause request.
+  return task?.status === 'paused' ? 'paused' : null
 }
 
 export const useTaskStore = defineStore('task', () => {
@@ -101,10 +80,8 @@ export const useTaskStore = defineStore('task', () => {
     const stopOperations = Object.fromEntries(tasksList.flatMap((task) => {
       const operation = taskStopOperationMap.value[task.name]
       if (!sameStopTarget(task, operation)) return []
-      // A later identity/host-matched persisted proof may resolve an uncertain
-      // action. Old proof from before this attempt must not hide a pending stop.
-      if (operation.status === 'stop_unconfirmed' && taskStopDisplayStatus(task) === 'paused' &&
-          stopProofMillis(task.stopConfirmedAt) >= operation.startedAt) return []
+      if (isRunningOrRelaunchedAfterPause(task, operation)) return []
+      if (taskLaunchValue(task) !== operation.observedLaunchAttemptId) return []
       return [[task.name, operation]]
     }))
     state.value = { tasks: [...tasksList], progress, stopOperations }
@@ -118,23 +95,27 @@ export const useTaskStore = defineStore('task', () => {
 
   const currentStopTask = (target) => tasks.value.find((task) => sameStopTarget(task, target))
   const beginTaskStop = (target) => {
-    if (!currentStopTask(target) || taskStopOperationMap.value[target.name]?.status === 'stopping') return null
+    const current = currentStopTask(target)
+    if (!current || taskStopOperationMap.value[target.name]?.status === 'stopping') return null
     const operation = { _id: taskId(target), name: target.name, isRemote: target.isRemote,
       ...(target.expectedLaunchAttemptId != null ? { expectedLaunchAttemptId: target.expectedLaunchAttemptId } : {}),
       ...(target.expectedLaunchAbsent === true ? { expectedLaunchAbsent: true } : {}),
       ...(target.expectedTaskType !== undefined ? { expectedTaskType: target.expectedTaskType, taskType: target.taskType } : {}),
       ...(target.expectedAuthProfile !== undefined ? { expectedAuthProfile: target.expectedAuthProfile, auth_profile: target.auth_profile } : {}),
       ...(Object.hasOwn(target, 'launchAttemptId') ? { launchAttemptId: target.launchAttemptId } : {}),
-      status: 'stopping', generation: ++stopGeneration, startedAt: Date.now(),
+      status: 'stopping', generation: ++stopGeneration, observedLaunchAttemptId: taskLaunchValue(current),
       requestId: newTaskRequestId('stop'), stage: 'native_request',
       detail: '已发起原生停止调用，等待阶段回报和最终停止凭据', error: null }
     state.value = { ...state.value,
       stopOperations: { ...taskStopOperationMap.value, [target.name]: operation } }
     return operation
   }
-  const ownsStop = (target, operation) => currentStopTask(target) && operation &&
-    sameStopTarget(target, operation) &&
-    taskStopOperationMap.value[target.name]?.generation === operation.generation
+  const ownsStop = (target, operation) => {
+    const current = currentStopTask(target)
+    return current && operation && sameStopTarget(target, operation) &&
+      taskStopOperationMap.value[target.name]?.generation === operation.generation &&
+      taskLaunchValue(current) === operation.observedLaunchAttemptId
+  }
   const updateTaskStopStage = (target, operation, event) => {
     if (!ownsStop(target, operation) || !validOperationStage(event) || event.operation !== 'stop' ||
         event.taskId !== taskId(target) || event.name !== target.name || event.isRemote !== target.isRemote ||
@@ -156,7 +137,7 @@ export const useTaskStore = defineStore('task', () => {
         failureKind: failureKind(error), failureSource, error: String(error) } } }
     return true
   }
-  // No void result, stdout claim or bare status flag can enter this commit.
+  // Only a matched native outcome can enter this action commit.
   const confirmTaskPaused = (target, receipt, operation) => {
     if (!ownsStop(target, operation) || taskStopOperationMap.value[target.name]?.status !== 'stopping' ||
         !validStopReceipt(target, receipt)) return false
@@ -164,12 +145,12 @@ export const useTaskStore = defineStore('task', () => {
     state.value = { ...state.value,
       tasks: tasks.value.map((task) => task === current ? { ...task, status: 'paused',
         stopConfirmedAt: receipt.stopConfirmedAt, stopConfirmedRemote: receipt.isRemote,
-        stopConfirmedTaskId: receipt.taskId, stopConfirmationBasis: receipt.confirmationBasis ?? 'runners_exited' } : task),
+        stopConfirmedTaskId: receipt.taskId, stopConfirmationBasis: receipt.confirmationBasis } : task),
       stopOperations: { ...taskStopOperationMap.value,
-        [target.name]: { ...taskStopOperationMap.value[target.name], status: 'paused', receipt: { ...receipt } } } }
+        [target.name]: { ...taskStopOperationMap.value[target.name], status: 'paused', pausedLaunchAttemptId: taskLaunchValue(current), receipt: { ...receipt } } } }
     return true
   }
-  // Explicit successful start invalidates old local stop proof, not real counts.
+  // Explicit successful start supersedes a locally displayed pause, not real counts.
   const clearTaskStop = (target) => {
     if (!currentStopTask(target)) return false
     const stopOperations = { ...taskStopOperationMap.value }
@@ -177,7 +158,7 @@ export const useTaskStore = defineStore('task', () => {
     const nextTasks = tasks.value.map((task) => {
       if (!sameStopTarget(task, target)) return task
       const { stopConfirmedAt, stopConfirmedRemote, stopConfirmedTaskId, stopConfirmationBasis, ...rest } = task
-      return rest
+      return rest.status === 'paused' ? { ...rest, status: 'running' } : rest
     })
     state.value = { ...state.value, tasks: nextTasks, stopOperations }
     return true

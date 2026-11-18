@@ -103,8 +103,9 @@ test('list delegates only local writing generation through original control; rem
   assert.match(projection, /append_local_listed_task[\s\S]*control.reconcile_generation_for_list\(&observed\)/);
   assert.match(projection, /merge_remote_listed_tasks/);
   const adapter = queries.slice(queries.indexOf('async fn append_local_listed_task'), queries.indexOf('/// 远程任务列表缓存'));
-  assert.match(adapter, /task.status == "generating"/);
-  assert.match(adapter, /generation.get_str\("phase"\)[\s\S]*Some\("writing"\)/);
+  assert.match(adapter, /crate::create_generate::generation_refresh_candidate\(&document\)/);
+  const createGen = read('../crates/task-core/src/create_generate.rs');
+  assert.match(createGen, /Some\("generating" \| "generation_unknown"\)/);
   assert.match(adapter, /configured_mission_database != GUI_TASK_MISSION_DATABASE/);
   assert.match(adapter, /reconcile\(document\).await/);
   assert.match(adapter, /generation_refresh_error = Some\(error\)/);
@@ -151,7 +152,7 @@ test('sync and archive send captured host into shared lock, not merely a pre-rea
   assert.match(facade, /cleanup_sync::sync_with_expected_host/);
   assert.match(facade, /cleanup_sync::delete_with_expected_host/);
   assert.match(cleanup, /original execution host changed before locked sync/);
-  assert.match(cleanup, /original execution host changed before locked cleanup/);
+  assert.match(cleanup, /task execution host changed before archive/);
 });
 
 test('read-only dependency guard distinguishes source metadata enum from control facade', () => {

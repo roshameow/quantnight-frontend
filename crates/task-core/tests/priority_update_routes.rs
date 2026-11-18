@@ -92,16 +92,21 @@ async fn config_publication_never_asserts_running_or_changes_host_or_launch() {
     }
 }
 #[tokio::test]
-async fn identity_host_observer_busy_and_validator_guards_precede_publication() {
-    for mode in ["id","host","observer","busy","validation-error","changed-before-publish","drops-user-scope"] {
+async fn identity_host_and_validator_guards_precede_publication() {
+    for mode in ["id","host","validation-error","changed-before-publish","drops-user-scope"] {
         let mut f=Fixture::new("paused");
-        match mode {"id"=>f.request.expected_task_id=Some(ObjectId::new().to_hex()),"host"=>f.request.remote=Some(true),
-            "observer"=>{f.store.row.lock().unwrap().insert("acceptedObservation",doc!{"id":"open"});},
-            "busy"=>{f.store.row.lock().unwrap().insert("status","launching");},_=>{}}
+        match mode {"id"=>f.request.expected_task_id=Some(ObjectId::new().to_hex()),"host"=>f.request.remote=Some(true),_=>{}}
         let runtime=f.runtime(mode);
         let result=update_priority(&f.root,f.store.as_ref(),&runtime,&f.request).await;
         assert_eq!(result.exit_code,1,"{mode}"); assert_eq!(runtime.published.load(Ordering::SeqCst),0,"{mode}");
         assert_eq!(f.store.writes.load(Ordering::SeqCst),0,"{mode}");
+    }
+    for (label, key, val) in [("observer", "acceptedObservation", bson::Bson::Document(doc!{"id":"open"})), ("legacy_launching", "status", bson::Bson::String("launching".into()))] {
+        let f=Fixture::new("paused");
+        f.store.row.lock().unwrap().insert(key, val);
+        let runtime=f.runtime("ok");
+        let result=update_priority(&f.root,f.store.as_ref(),&runtime,&f.request).await;
+        assert_eq!(result.exit_code,0,"{label}: {}", result.value);
     }
 }
 #[tokio::test]

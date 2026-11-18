@@ -41,20 +41,18 @@ export function errorStage(error) {
   const match = String(error).match(/(?:^\s*(?:Error:\s*)?\[|\b(?:runtime|stop) stage=)([a-z][a-z0-9_]{0,63})(?:\]|（)/)
   return match?.[1] ?? null
 }
-export function stopDiagnostic(task, operation, stopStatus, proofIssue = '') {
+export function stopDiagnostic(task, operation, stopStatus) {
   if (!stopStatus) return null
   const id = typeof task?._id === 'object' ? task._id?.$oid : task?._id
   if (!operation || operation.name !== task.name || operation.isRemote !== (task.isRemote === true) ||
       (typeof operation._id === 'object' ? operation._id?.$oid : operation._id) !== id) operation = null
   if (stopStatus === 'paused') {
-    const basis = operation?.receipt?.confirmationBasis ?? task.stopConfirmationBasis ?? 'runners_exited'
-    const evidence = basis === 'session_absent'
-      ? '已暂停（tmux会话缺失）：已核验目标主机的精确会话缺失、任务身份、执行目标及暂停记录回写。'
-      : '停止凭据已核验：任务身份、执行目标、原记录执行进程退出及控制记录写入均匹配。'
-    return { status: 'paused', detail: `${operation ? stageDetails(operation) : '凭据来源：持久化暂停核验记录'} · ${evidence}` }
+    if (operation?.status !== 'paused') return { status: 'paused', detail: '任务列表显示已暂停；不是本次停止操作的回执。' }
+    const evidence = operation.receipt?.confirmationBasis === 'session_absent'
+      ? '已暂停（tmux会话缺失）：已核验目标主机的精确会话缺失。'
+      : '原生停止操作已确认。'
+    return { status: 'paused', detail: `${stageDetails(operation)} · ${evidence}` }
   }
-  if (stopStatus === '暂停标记无有效停止凭据') return { status: stopStatus,
-    detail: `控制记录为 paused；${proofIssue || '缺少绑定当前任务身份/执行主机的有效停止凭据'}。请通过原停止入口核验。` }
   // The caller's stopStatus has already applied the store's identity/host gates.
   const status = stopStatus === 'stopping' ? '停止执行中' : stopStatus
   const evidence = /执行退出已核验/.test(`${operation?.detail || ''} ${operation?.error || ''}`)
@@ -125,8 +123,8 @@ export function runtimeDiagnostic(task, observation, now = Date.now()) {
     return { status: failureKind(cause) === 'timeout' ? '运行检查超时' : '运行检查执行失败',
       detail: context.includes(cause) ? context : `${context} · 原因：${cause}` }
   }
-  if (observation.state === 'session_absent') return { status: '已暂停（tmux会话缺失）',
-    detail: `${context} · 已核验目标主机的精确 tmux 会话缺失。` }
+  if (observation.state === 'session_absent') return { status: 'tmux会话缺失',
+    detail: `${context} · 已核验目标主机的精确 tmux 会话缺失。暂停结果以操作回执为准。` }
   if (observation.state === 'not_running') return { status: '未检测到运行消费者',
     detail: `${context} · 进程检查仅识别到 shell/sleep 或保留的已退出 pane。` }
   if (observation.state === 'running') return { status: '消费者存活', detail: `${context} · 已识别 Python/uv 消费者进程。` }
@@ -143,17 +141,19 @@ export function regularDispatchState(task, observation, now = Date.now()) {
 export function regularDisplayStatus(task, observation, stopStatus, now = Date.now()) {
   if (isCompletedTask(task) && (!stopStatus || stopStatus === 'paused') &&
       runtimeDiagnostic(task, observation, now).status === '消费者存活') return '控制记录已完成，但原消费者仍存活'
-  if (stopStatus === 'paused' && task.stopConfirmationBasis === 'session_absent') return '已暂停（tmux会话缺失）'
   if (stopStatus) return stopStatus === 'stopping' ? '停止执行中' : stopStatus
   if (isCompletedTask(task) && observation) {
     const diagnostic = runtimeDiagnostic(task, observation, now)
     return diagnostic.status === '消费者存活' ? '控制记录已完成，但原消费者仍存活' : `${task.status} · ${diagnostic.status}`
   }
+  if (['running', 'launching'].includes(task.status) && !observation) {
+    return `${task.status} · 消费者未核验`
+  }
+  if (task.status === 'launching') return runtimeDiagnostic(task, observation, now).status
   if (task.status !== 'running') {
     const historical = { unknown: '控制记录缺少执行阶段', generation_unknown: '生成结果核验缺少最终回执' }
     return historical[String(task.status).toLowerCase()] ?? task.status
   }
-  if (!observation) return task.status // business control state; not a liveness claim
   const diagnostic = runtimeDiagnostic(task, observation, now)
   if (diagnostic.status !== '消费者存活') return diagnostic.status
   const dispatch = regularDispatchState(task, observation, now)
@@ -162,8 +162,8 @@ export function regularDisplayStatus(task, observation, stopStatus, now = Date.n
   if (dispatch?.submissionState === 'ready') return '消费者存活（可派发）'
   return task.taskType === 'super' ? 'running' : '消费者存活（缺少有效派发快照）'
 }
-export function taskDiagnosticDetails(task, observation, operation, stopStatus, now = Date.now(), proofIssue = '') {
-  const stopped = stopDiagnostic(task, operation, stopStatus, proofIssue)
+export function taskDiagnosticDetails(task, observation, operation, stopStatus, now = Date.now()) {
+  const stopped = stopDiagnostic(task, operation, stopStatus)
   if (stopped) return [stopped.detail, businessDiagnostic(task, observation, now)?.detail].filter(Boolean).join(' · ')
   if (!observation) return ''
   const diagnostic = runtimeDiagnostic(task, observation, now)

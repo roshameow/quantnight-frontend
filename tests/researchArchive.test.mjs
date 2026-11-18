@@ -19,7 +19,7 @@ test('existing delete button delegates exact identity to shared safe archive bef
   assert.match(facade, /cleanup_sync::delete_with_expected_host\(self\.root\(\), self\.store\.as_ref\(\), &runtime, name, expected_id, expected_remote\)/);
   const implementation = cleanup.slice(cleanup.indexOf('async fn delete_inner('));
   assert.ok(implementation.indexOf('.archive_research(') < implementation.indexOf('"delete-begin"'));
-  for (const gate of ['stop_confirmation_valid', 'assert_consumer_absent', 'checked_unresolved_execution_row', 'validate_claim', 'remote_identity']) assert.ok(implementation.includes(gate));
+  for (const gate of ['stop_for_archive', 'assert_archive_target', 'archive_control_update', 'remote_identity']) assert.ok(implementation.includes(gate));
   assert.match(cleanup, /rename_collection/);
   assert.doesNotMatch(cleanup, /\.drop\(/);
 });

@@ -1,26 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { canGenerate, isGenerating, generationBusyOrUnknown, generationFailure } from '../src/utils/taskGeneration.js';
+import { canGenerate, isGenerating, generationFailure } from '../src/utils/taskGeneration.js';
 
-test('ordinary generation disables click immediately and across refreshed state', () => {
-  assert.equal(canGenerate({ status: 'pending' }), true);
-  assert.equal(canGenerate({ status: 'pending' }, true), false);
-  assert.equal(isGenerating({ status: 'pending' }, true), true);
-  for (const status of ['generating', 'running', 'deactive', 'paused']) {
-    assert.equal(canGenerate({ status }), false);
+test('generation admission ignores legacy projections but blocks a current local request or archived task', () => {
+  for (const status of ['pending', 'waiting', 'ready', 'generating', 'generation_unknown', 'generation_failed', 'running', 'paused']) {
+    assert.equal(canGenerate({ status }), true);
+    assert.equal(canGenerate({ status }, true), false);
   }
-  assert.equal(canGenerate({ status: 'generation_unknown' }), true);
-  assert.equal(canGenerate({ status: 'generation_unknown' }, true), false);
-  assert.equal(isGenerating({ status: 'generating' }), true);
-  assert.equal(generationBusyOrUnknown({ status: 'generation_unknown' }), true);
-  assert.equal(canGenerate({ status: 'generation_failed' }), true);
+  assert.equal(canGenerate({ status: 'deactive' }), false);
+  assert.equal(canGenerate(undefined), false);
+  assert.equal(isGenerating({ status: 'generating' }), true); // diagnostic only
 });
 
-test('card and manager bind both in-flight and persisted generation state', () => {
+test('cards gate controls only on local in-flight work and mutation identity, not cached generation status', () => {
   const card = readFileSync(new URL('../src/components/TaskCards/RegularTaskCard.vue', import.meta.url), 'utf8');
-  assert.match(card, /:disabled="!!taskMutationIssue\(task\) \|\| !canGenerate\(task, generationBusy\)"/);
-  assert.match(card, /:loading="isGenerating\(task, generationBusy\)"/);
+  assert.match(card, /:disabled="!!taskMutationIssue\(task\) \|\| !canGenerate\(task, generationBusy \|\| operationBusy\)"/);
+  assert.match(card, /:loading="generationBusy"/);
+  assert.match(card, /:disabled="!!taskMutationIssue\(task\) \|\| generationBusy" @click="\$emit\('pause'\)"/);
+  assert.match(card, /:disabled="!!taskMutationIssue\(task\) \|\| operationBusy \|\| generationBusy" @click="\$emit\('delete'\)"/);
   const manager = readFileSync(new URL('../src/views/TaskManager.vue', import.meta.url), 'utf8');
   assert.match(manager, /generationRequests\.value\[key\] = true/);
   assert.match(manager, /listen\('task-registry-changed'/);
@@ -33,7 +31,6 @@ test('generation failure is an operation result, not pending control or arbitrar
   const before = JSON.stringify(failed);
   assert.deepEqual(generationFailure(failed), { status: 'generation_failed', error: 'original writer error' });
   assert.equal(canGenerate(failed), true);
-  assert.equal(generationBusyOrUnknown(failed), false);
   assert.equal(JSON.stringify(failed), before);
   assert.deepEqual(generationFailure({ status: 'generation_failed', lastError: 'legacy error' }),
     { status: 'generation_failed', error: 'legacy error' });

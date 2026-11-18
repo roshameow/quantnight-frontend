@@ -1,7 +1,7 @@
-use quantnight_task_core::{cleanup_sync, lifecycle_policy, mission_lock, resume, task_store};
 use async_trait::async_trait;
 use bson::{doc, oid::ObjectId, Bson, Document};
 use cleanup_sync::{OperationsRuntime, TaskOutcome};
+use quantnight_task_core::{cleanup_sync, mission_lock, resume, task_store};
 use resume::ResumeRequest;
 use serde_json::{json, Value};
 use std::{
@@ -266,16 +266,20 @@ impl TaskStore for Memory {
 struct Runtime {
     store: Memory,
     error: Option<String>,
+    writer: Result<quantnight_task_core::create_generate::GenerationProcesses, String>,
     patch: Option<Document>,
     calls: Mutex<Vec<Host>>,
+    writer_checks: Mutex<u32>,
 }
 impl Runtime {
     fn new(store: &Memory) -> Self {
         Self {
             store: store.clone(),
             error: None,
+            writer: Ok(quantnight_task_core::create_generate::GenerationProcesses::Stopped),
             patch: None,
             calls: Mutex::new(vec![]),
+            writer_checks: Mutex::new(0),
         }
     }
 }
@@ -300,6 +304,16 @@ impl OperationsRuntime for Runtime {
             self.store.0.lock().unwrap().controls[0].extend(patch.clone());
         }
         Ok(())
+    }
+    async fn inspect_generation(
+        &self,
+        root: &Path,
+        task: &Document,
+    ) -> Result<quantnight_task_core::create_generate::GenerationProcesses, String> {
+        assert_eq!(task.get_str("name"), Ok(NAME));
+        assert!(mission_lock::MissionLocks::acquire(root, &[NAME], false).is_err());
+        *self.writer_checks.lock().unwrap() += 1;
+        self.writer.clone()
     }
     async fn archive_research(
         &self,
@@ -529,40 +543,109 @@ async fn receipt_race_and_missing_null_presence_are_really_fenced() {
 }
 
 #[tokio::test]
-async fn blocked_states_open_observer_bad_id_and_live_or_unknown_consumer_do_not_touch_rows() {
-    for status in [
-        "generating",
-        "generation_unknown",
-        "launching",
-        "syncing",
-        "deleting",
-    ] {
+async fn legacy_sync_and_deleting_statuses_normalize_to_ready_on_resume() {
+    for status in ["syncing", "deleting"] {
         let mut t = task(false);
         t.insert("status", status);
         let store = Memory::new(t, vec![row(1, "transient_error")]);
         let runtime = Runtime::new(&store);
-        failed(
-            run(&store, &runtime, &request(), &Root::new()).await,
-            "ownership unresolved",
-        );
-        store.no_writes();
-        assert!(runtime.calls.lock().unwrap().is_empty());
+        let out = run(&store, &runtime, &request(), &Root::new()).await;
+        assert_eq!(out.exit_code, 0, "{status}: {}", out.value);
+        assert_eq!(out.value["resumed"], 1);
+        assert_eq!(store.control().get_str("status"), Ok("ready"));
     }
-    for observer in [
-        Bson::Boolean(false),
-        Bson::Document(doc! {}),
-        Bson::Document(doc! {"finishedAt":Bson::Null}),
+}
+
+#[tokio::test]
+async fn stale_launch_generation_and_observer_claims_are_not_activity_after_inspection() {
+    for (status, resulting_status) in [
+        ("launching", "ready"),
+        ("generating", "pending"),
+        ("generation_unknown", "pending"),
     ] {
-        let mut t = task(false);
-        t.insert("acceptedObservation", observer);
-        let store = Memory::new(t, vec![row(1, "transient_error")]);
-        let runtime = Runtime::new(&store);
-        failed(
-            run(&store, &runtime, &request(), &Root::new()).await,
-            "observation is active/unconfirmed",
+        let mut t = task(true);
+        t.extend(doc! {"status":status,
+            "acceptedObservation":{"id":"old-observer","finishedAt":Bson::Null},
+            "startupBinding":{"consumer_run_id":"old-launch"},
+            "simulatorRuntime":{"consumer_run_id":"different-historical-run"},
+            "generation":{"id":"old-generation","phase":"writing","producerPid":91},
+        });
+        let unresolved =
+            doc! {"_id":2,"status":"processing","acceptance":"UNKNOWN","superSlotId":"retain"};
+        let store = Memory::new(
+            t.clone(),
+            vec![row(1, "transient_error"), unresolved.clone()],
         );
+        let mut runtime = Runtime::new(&store);
+        let root = Root::new();
+        let req = ResumeRequest {
+            recover_processing: true,
+            ..request()
+        };
+        runtime.error = Some("same task process still present".into());
+        failed(run(&store, &runtime, &req, &root).await, "still present");
+        store.no_writes();
+        assert!(store.0.lock().unwrap().queries.is_empty());
+
+        runtime.error = None;
+        let out = run(&store, &runtime, &req, &root).await;
+        assert_eq!(out.exit_code, 0, "{}", out.value);
+        assert_eq!(out.value["resumed"], 1);
+        assert_eq!(*runtime.calls.lock().unwrap(), [Host::Remote, Host::Remote]);
+        assert_eq!(*runtime.writer_checks.lock().unwrap(), 2);
+        let control = store.control();
+        assert_eq!(control.get_str("status"), Ok(resulting_status));
+        for key in [
+            "acceptedObservation",
+            "generation",
+            "simulatorRuntime",
+            "startupBinding",
+        ] {
+            assert_eq!(control.get(key), t.get(key), "{key}");
+        }
+        assert_eq!(
+            control.get_array("events").unwrap()[0]
+                .as_document()
+                .unwrap()
+                .get_str("status"),
+            Ok(resulting_status)
+        );
+        assert_eq!(store.rows(Host::Remote)[0].get_str("status"), Ok("pending"));
+        assert_eq!(store.rows(Host::Remote)[1], unresolved);
+    }
+}
+
+#[tokio::test]
+async fn remote_resume_requires_actual_local_writer_absence_and_never_treats_inspection_errors_as_absence(
+) {
+    use quantnight_task_core::create_generate::GenerationProcesses as Writer;
+    for (observed, error) in [
+        (
+            Ok(Writer::Live("writer still present".into())),
+            "generation still active",
+        ),
+        (
+            Ok(Writer::Unverified("inspection denied".into())),
+            "inspection denied",
+        ),
+        (
+            Err("local process table unavailable".into()),
+            "local process table unavailable",
+        ),
+    ] {
+        let store = Memory::new(task(true), vec![row(1, "transient_error")]);
+        let mut runtime = Runtime::new(&store);
+        runtime.writer = observed;
+        failed(run(&store, &runtime, &request(), &Root::new()).await, error);
+        assert_eq!(*runtime.writer_checks.lock().unwrap(), 1);
+        assert!(runtime.calls.lock().unwrap().is_empty());
+        assert!(store.0.lock().unwrap().queries.is_empty());
         store.no_writes();
     }
+}
+
+#[tokio::test]
+async fn bad_id_and_live_or_unknown_consumer_do_not_touch_rows() {
     let store = Memory::new(task(false), vec![row(1, "transient_error")]);
     let runtime = Runtime::new(&store);
     let mut req = request();
@@ -591,11 +674,9 @@ async fn task_replacement_launch_and_observer_changes_cannot_overwrite_new_bindi
     for point in ["runtime", "item-read"] {
         for patch in [
             doc! {"_id":ObjectId::new()},
+            doc! {"status":"running"},
             doc! {"isRemote":true},
-            doc! {"launchAttemptId":"replacement"},
-            doc! {"acceptedObservation":{"finishedAt":Bson::Null}},
-            doc! {"auth_profile":"other-profile"},
-            doc! {"taskType":"super"},
+            doc! {"updatedAt":"replacement"},
         ] {
             let store = Memory::new(task(false), vec![row(1, "transient_error")]);
             let mut runtime = Runtime::new(&store);
@@ -755,6 +836,8 @@ async fn original_lock_invalid_names_and_unknown_store_do_not_produce_fake_succe
     let store = Memory::new(task(false), vec![row(1, "transient_error")]);
     let runtime = Runtime::new(&store);
     let guard = mission_lock::MissionLocks::acquire(&root.0, &[NAME], false).unwrap();
+    // This exact lock is also held through observe-accepted's GET-only helper,
+    // regardless of whether a receipt has been published or marked finished.
     failed(
         run(&store, &runtime, &request(), &root).await,
         "another lifecycle mutator",
@@ -799,26 +882,11 @@ async fn row_and_control_cas_include_original_values_presence_and_full_scope() {
         assert_eq!(q.get(key), Some(&expected), "{key}");
     }
     let cq = &d.control_writes[0].0;
-    for field in [
-        "_id",
-        "name",
-        "status",
-        "isRemote",
-        "updatedAt",
-        "tmuxContext",
-        "launchAttemptId",
-        "launchAttemptAt",
-        "acceptedObservation",
-        "generation",
-        "startupBinding",
-        "taskType",
-        "auth_profile",
-    ] {
+    for field in ["_id", "name", "status", "isRemote", "updatedAt"] {
         assert!(cq.contains_key(field), "{field}");
     }
-    assert!(cq.get_array("$and").unwrap().contains(&Bson::Document(
-        doc! {"acceptedObservation":{"$exists":true}}
-    )));
+    assert!(!cq.contains_key("acceptedObservation"));
+    assert!(!cq.contains_key("launchAttemptId"));
     drop(d);
     let events = store.control().get_array("events").unwrap().clone();
     let event = events[0].as_document().unwrap();
@@ -899,7 +967,26 @@ async fn original_python_resume_oracle() {
             recover_processing: case["recover_processing"].as_bool().unwrap(),
         };
         let out = run(&store, &runtime, &req, &Root::new()).await;
-        let expected = &case["expected"];
+        // Retain original oracle bytes. Only the approved lifecycle deltas
+        // get new expectations; flag, receipt and error cases keep the oracle.
+        let expected = match case["label"].as_str().unwrap() {
+            "control-status:'generating'"
+            | "control-status:'generation_unknown'"
+            | "control-status:'launching'"
+            | "control-status:'syncing'"
+            | "control-status:'deleting'"
+            | "observer:False"
+            | "observer:{}"
+            | "observer:{'finishedAt': None}" => json!({
+                "exit_code":0, "resumed":1, "statuses":["transient_error","quota_deferred"],
+                "recover_processing":false, "row_statuses":["pending"],
+                "control_status": match t.get_str("status") {
+                    Ok("generating" | "generation_unknown") => "pending",
+                    _ => "ready",
+                },
+            }),
+            _ => case["expected"].clone(),
+        };
         assert_eq!(
             out.exit_code,
             expected["exit_code"].as_i64().unwrap() as i32,
@@ -996,7 +1083,7 @@ fn original_seventeen_receipt_fields_are_the_only_projection() {
 async fn replacement_after_first_row_prevents_remaining_rows_and_ready_publish() {
     for patch in [
         doc! {"_id": ObjectId::new(), "status": "pending"},
-        doc! {"acceptedObservation": {"finishedAt": Bson::Null}},
+        doc! {"updatedAt": "replacement"},
     ] {
         let store = Memory::new(
             task(false),
@@ -1023,6 +1110,132 @@ async fn replacement_after_first_row_prevents_remaining_rows_and_ready_publish()
         for (key, value) in patch {
             assert_eq!(store.control().get(&key), Some(&value));
         }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[path = "support/original_professional_runtime.rs"]
+mod original_professional_runtime;
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn production_resume_waits_for_detached_observe_helper_or_local_writer_to_exit() {
+    use original_professional_runtime::original_professional_fixture;
+    use quantnight_task_core::{
+        backend_binding::validate_backend_binding, task_control::TaskControl,
+    };
+    for remote in [false, true] {
+        let fake = original_professional_fixture(false);
+        let root = Path::new(&fake.config.env.working_dir);
+        let marker = root.join("fake-process-live");
+        let ps = root.join("bin/ps");
+        let original = std::fs::read_to_string(&ps).unwrap();
+        std::fs::write(
+            &ps,
+            format!(
+                r#"{original}
+if [[ "$*" == *comm=* && -f "{marker}" ]]; then echo '43 1 python3'; fi
+"#,
+                marker = marker.display()
+            ),
+        )
+        .unwrap();
+        let argv = if remote {
+            json!([
+                "python3",
+                "-m",
+                "backend.mongodb.mongo_datum",
+                "--alpha_filename=fixture"
+            ])
+        } else {
+            json!([
+                "python3",
+                "-m",
+                "scripts.super_alpha_simulate_param",
+                "--task",
+                NAME,
+                "--dist",
+                "local",
+                "--auth_profile",
+                "user1",
+                "--mode",
+                "observe-accepted"
+            ])
+        };
+        std::fs::write(
+            root.join("psutil.py"),
+            format!(
+                r#"
+import os
+from pathlib import Path
+STATUS_ZOMBIE='zombie'
+class Error(Exception): pass
+class NoSuchProcess(Error): pass
+class AccessDenied(Error): pass
+class Process:
+ def __init__(self,pid):
+  if pid != 43 or not Path('fake-process-live').is_file(): raise NoSuchProcess(pid)
+  self.pid = pid
+ def create_time(self): return 1700000030.0
+ def cmdline(self): return {argv}
+ def cwd(self): return os.getcwd()
+ def status(self): return 'running'
+ def is_running(self): return True
+"#
+            ),
+        )
+        .unwrap();
+
+        let observation = doc! {"id":"original-claim","finishedAt":Bson::Null};
+        let accepted = doc! {"_id":2,"status":"processing","acceptance":"ACCEPTED",
+        "progressUrl":"https://fixture.invalid/original","superSlotId":"retain"};
+        let mut task = task(remote);
+        task.extend(
+            doc! {"taskType":"super","auth_profile":"user1","status":"launching",
+            "acceptedObservation":&observation},
+        );
+        let request = ResumeRequest {
+            recover_processing: true,
+            ..request()
+        };
+        let store = Arc::new(Memory::new(
+            task,
+            vec![row(1, "transient_error"), accepted.clone()],
+        ));
+        let binding = validate_backend_binding(&fake.config).await.unwrap();
+        let control = TaskControl::with_store(binding, store.clone());
+
+        std::fs::write(&marker, "active").unwrap();
+        let refused = control.resume(&request, None).await;
+        failed(
+            refused,
+            if remote {
+                "mongo_datum writer still present"
+            } else {
+                "任务执行进程仍存在"
+            },
+        );
+        store.no_writes();
+        assert!(store.0.lock().unwrap().queries.is_empty());
+
+        std::fs::remove_file(&marker).unwrap();
+        let out = control.resume(&request, None).await;
+        assert_eq!(out.exit_code, 0, "remote={remote}: {}", out.value);
+        assert_eq!(out.value["resumed"], 1);
+        assert_eq!(
+            store.control().get_document("acceptedObservation"),
+            Ok(&observation)
+        );
+        assert_eq!(store.rows(Host::from_remote(remote))[1], accepted);
+        assert!(
+            !root.join("state").exists(),
+            "resume cannot launch a session"
+        );
+        let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+        assert!(
+            !trace.contains("if-shell") && !trace.contains("kill-session"),
+            "{trace}"
+        );
     }
 }
 

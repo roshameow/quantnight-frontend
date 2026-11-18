@@ -59,6 +59,13 @@ from test_system_tmux_context import fixture
 root=Path(sys.argv[1])
 scripts,env,binding,native=fixture(root)
 native.write_text(native.read_text().replace('|job','|fixture'))
+# Fake the process table consistently with psutil: after the owned session
+# exits, keep an unrelated OS process but do not report a dead fixture PID.
+ps = root / 'bin/ps'
+text = ps.read_text()
+old = ' echo "1001 1 bash"; echo "1002 1001 python"'
+if old in text:
+    ps.write_text(text.replace(old, ' echo "9 1 fixture"; if [[ -f "$STATE" ]]; then' + old + '; fi'))
 (root/'sitecustomize.py').write_text('import time\ntime.sleep=lambda seconds: None\n')
 "#;
         let output = std::process::Command::new(&python)

@@ -48,12 +48,38 @@ pub fn parse(args: &[String]) -> Result<Entry, CliUsageError> {
         return Err(usage("--app-config and --backend-root are mutually exclusive"));
     }
     match cli_args::parse_args(&args[index..])? {
-        CliParse::Help { command } => Ok(Entry::Help(format!(
-            "{}\nNative global (before COMMAND only):\n  --app-config PATH  Explicit existing AppConfig file.\n  --backend-root PATH  Original backend config owner; used by the Python compatibility entry.\n  --config JSON      Remains the start business configuration, NOT a file path.\nRuntime management (prefix-free): runtime-plan / runtime-status / runtime-drain / runtime-host --binding PATH.\nNo automatic configuration discovery or installation.\n",
-            cli_args::help_text(command.as_deref())?
-        ))),
+        CliParse::Help { command } => Ok(Entry::Help(native_help(command.as_deref())?)),
         CliParse::Command(invocation) => Ok(Entry::Command { app_config, backend_root, invocation }),
     }
+}
+
+fn native_help(command: Option<&str>) -> Result<String, CliUsageError> {
+    let core = cli_args::help_text(command)?;
+    let scope = command.unwrap_or("COMMAND");
+    let usage = format!("Usage: taskctl [--app-config PATH | --backend-root PATH] {scope} [OPTIONS]\n\n");
+    let details = match command {
+        None => r#"
+Run taskctl COMMAND --help for command options. Start with list, then status --name NAME
+or results --name NAME. For a new task: create -> generate -> start. Use watch to
+attach notifications without launching a consumer. start --config JSON takes a JSON value,
+not an AppConfig pathname.
+Management: runtime-plan (inspect enrollment), runtime-status (inspect host),
+runtime-drain (stop admitting new calls), runtime-host (launchd entry only).
+Run taskctl MANAGEMENT-COMMAND --help; these commands use an explicit --binding PATH.
+"#,
+        Some("list") => "\nThe default inventory is local. --remote selects the remote inventory; --include-deactive includes inactive records.\n",
+        Some("create") => "\nSupply --name NAME and --templatefile TEMPLATE. Registration does not generate candidates or start simulation.\n",
+        Some("generate") => "\nSupply --name NAME of a registered task. --timeout is in seconds. Generation prepares candidates, not simulations.\n",
+        Some("start") => "\nSupply --name NAME. --config JSON configures a launch; it is not a file path. Check the returned consumer and notification fields separately. If the consumer is running but notification attachment failed, use watch, not start.\n",
+        Some("watch") => "\nSupply --name NAME and one exact --notify-session-id or --notify-task-id. Attaches a watcher; does not start or restart a consumer. Review and watcher timeout values are in seconds.\n",
+        Some("status") => "\nSupply --name NAME. --inspect-items includes an item inspection. A read failure is not evidence that the task is missing or stopped.\n",
+        Some("pause") => "\nSupply --name NAME. --expected-task-id guards against acting on a different task with the same name. Pause preserves results and is not platform cancellation.\n",
+        Some("delete") => "\nSupply --name NAME; use --expected-task-id to bind reclamation to the original task. Task item collections are archived, not physically purged. --force does not bypass safety checks.\n",
+        Some("results") => "\nSupply --name NAME. Use --limit and --offset for a page, and --output PATH for file output. --source live selects task item results; canonical selects the canonical result source. A page is not a full-task ranking.\n",
+        Some("priority-prune") => "\n--confirm must exactly match the task name. Use --dry-run to preview.\n",
+        _ => "",
+    };
+    Ok(format!("{usage}{core}{details}\nNative globals (before COMMAND only):\n  --app-config PATH    Explicit existing AppConfig file.\n  --backend-root PATH  Explicit backend root (supplied by the compatibility entry).\nHelp exits 0; invalid syntax exits 2. Business commands return one JSON outcome.\nFor enrolled runtime failures, transport.execution distinguishes not_sent, not_executed, and unconfirmed.\nUnconfirmed is not a rejection: inspect the original task/receipts instead of blindly repeating the operation.\nNo automatic configuration discovery, installation, or fallback from an enrolled runtime.\n"))
 }
 
 fn usage(message: &str) -> CliUsageError {

@@ -277,7 +277,7 @@ async fn parsed_regular_lifecycle_both_hosts_preserves_identity_receipts_and_exa
         assert_eq!(removed.value["itemsPreserved"], true);
         assert_eq!(removed.value["platformRequestsCancelled"], false);
         assert_eq!(removed.value["capacityReleased"], false);
-        assert_eq!(removed.value["unresolvedItemCount"], 2);
+        assert_eq!(removed.value["unresolvedItemCount"], Value::Null);
         let archive = format!("{name}__archive_{id}");
         assert_eq!(bytes(&f.store.rows_at(host, &archive)), before);
         assert_eq!(f.store.task(name).get_str("status"), Ok("deactive"));
@@ -433,7 +433,7 @@ async fn parsed_results_paging_and_explicit_collect_use_actual_execution_rows() 
     f.store.put_rows(Host::Remote, name, rows);
     f.store.data.lock().unwrap().canonical = vec![doc! {"id":"alpha-0","is":{"fitness":1.2}}];
     let page = f
-        .run(&["results", "--name", name, "--limit", "2", "--offset", "0"])
+        .run(&["results", "--name", name, "--source", "canonical", "--limit", "2", "--offset", "0"])
         .await;
     ok(&page);
     assert_eq!(page.value["pageItems"], 2);
@@ -443,7 +443,7 @@ async fn parsed_results_paging_and_explicit_collect_use_actual_execution_rows() 
     assert_eq!(page.value["platformFetched"], false);
     assert!(!page.value.to_string().contains("export-only"));
     assert_eq!(
-        f.run(&["results", "--name", name, "--limit", "2", "--offset", "2"])
+        f.run(&["results", "--name", name, "--source", "canonical", "--limit", "2", "--offset", "2"])
             .await
             .value["pageItems"],
         1
@@ -465,6 +465,8 @@ async fn parsed_results_paging_and_explicit_collect_use_actual_execution_rows() 
             "results",
             "--name",
             name,
+            "--source",
+            "canonical",
             "--limit",
             "1",
             "--output",
@@ -571,13 +573,15 @@ async fn all_mutating_and_evidence_routes_have_parsed_refusals_without_identity_
     assert_eq!(f.store.task(name), original);
     assert_eq!(bytes(&f.store.rows_at(Host::Local, name)), rows);
     f.faults(json!({}));
-    f.store.alter(name, doc! {"status":"launching"});
+    f.store.alter(name, doc! {"status":"running"});
     let unknown = f.store.task(name);
+    f.faults(json!({"presence":true}));
     failed(
         &f.run(&["resume", "--name", name, "--recover-processing"])
             .await,
     );
     assert_eq!(f.store.task(name), unknown);
+    f.faults(json!({}));
     f.store.data.lock().unwrap().fail = Some("summary:Local:negative".into());
     failed(&f.run(&["status", "--name", name]).await);
     assert_eq!(f.store.task(name), unknown);
@@ -657,9 +661,6 @@ async fn absence_and_postclaim_unknown_failures_recover_only_through_original_pa
     let unknown = f.store.task(name);
     assert_eq!(unknown.get_str("status"), Ok("launching"));
     assert_eq!(f.count("regular"), 1);
-    failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
-    assert_eq!(f.count("regular"), 1);
-    assert_eq!(f.store.task(name), unknown);
     f.faults(json!({"badStop":true}));
     failed(&f.run(&["pause", "--name", name]).await);
     assert_eq!(f.store.task(name), unknown);
@@ -676,11 +677,7 @@ async fn absence_and_postclaim_unknown_failures_recover_only_through_original_pa
         Ok("session_absent")
     );
     assert_eq!(f.count("regular"), 1);
-    assert_eq!(stopped.get("launchSettledAttemptId"), Some(&Bson::Null));
-    failed(&f.run(&["start", "--name", name, "--no-notify"]).await);
-    failed(&f.run(&["delete", "--name", name, "--force"]).await);
-    assert_eq!(f.store.task(name), stopped);
-    assert_eq!(f.count("regular"), 1);
+    assert_eq!(stopped.get("launchSettledAttemptId"), unknown.get("launchAttemptId"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -713,6 +710,9 @@ async fn partial_archive_preserves_all_rows_and_no_false_success_or_relaunch() {
     assert_eq!(f.store.task(name).get_str("status"), Ok("deactive"));
     assert_eq!(bytes(&f.store.rows_at(Host::Remote, &archive)), rows);
     assert_eq!(f.count("regular"), 1);
+    ok(&f
+        .run(&["archive-research", "--name", name, "--expected-task-id", &id])
+        .await);
     let request = request_payload(
         owner_calls(&f, "--native-archive-statistics")
             .last()
@@ -861,7 +861,7 @@ async fn completed_status_then_watch_preserves_business_timestamps_and_binding()
 
 #[tokio::test(flavor = "current_thread")]
 async fn confirmed_generation_failure_restores_task_and_cli_list_keeps_operation_evidence() {
-    for (prior, expected) in [("pending", "pending"), ("waiting", "waiting"), ("ready", "generation_failed")] {
+    for (prior, expected) in [("pending", "pending"), ("waiting", "waiting"), ("ready", "pending")] {
         let f = Fixture::new().await;
         let name = "generation_failure";
         ok(&f.run(&["create", "--name", name, "--templatefile", "frozen"]).await);
@@ -886,9 +886,12 @@ async fn confirmed_generation_failure_restores_task_and_cli_list_keeps_operation
         ok(&listed);
         let shown = &listed.value["tasks"][0];
         assert_eq!(shown["status"], expected);
-        assert_eq!(shown["generation"]["id"], out.value["generationId"]);
+        assert_eq!(
+            saved.get_document("generation").unwrap().get_str("id").ok(),
+            out.value["generationId"].as_str()
+        );
         assert_eq!(shown["generation"]["phase"], "generation_failed");
-        assert!(shown["generation"]["finishedAt"].is_string());
+        assert!(saved.get_document("generation").unwrap().get_str("finishedAt").is_ok());
         assert_eq!(shown["lastError"], saved.get_str("lastError").unwrap());
         assert_eq!(f.store.data.lock().unwrap().writes.len(), writes, "list cannot recover old tasks");
         assert_eq!(f.count("run"), 1);

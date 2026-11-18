@@ -1,11 +1,11 @@
-// Ordinary task generation state shared by cards and click handlers.
+// Historical generation states are presentation only; the native writer owns admission.
 export function isGenerating(task, localPending = false) {
   return localPending || task?.status === 'generating';
 }
 export function canGenerate(task, localPending = false) {
-  return !localPending && ['pending', 'waiting', 'ready', 'generation_failed', 'generation_unknown'].includes(task?.status);
+  return !!task && task.status !== 'deactive' && !localPending;
 }
-export function generationBusyOrUnknown(task, localPending = false) {
+function generationBusyOrUnknown(task, localPending = false) {
   return isGenerating(task, localPending) || task?.status === 'generation_unknown';
 }
 

@@ -93,15 +93,15 @@
         <n-button
           size="small"
           @click="$emit('generateList')"
-          :disabled="!!taskMutationIssue(task) || !canGenerate(task, generationBusy)"
-          :loading="isGenerating(task, generationBusy)"
+          :disabled="!!taskMutationIssue(task) || !canGenerate(task, generationBusy || operationBusy)"
+          :loading="generationBusy"
         >
-          <template #icon>=</template>{{ isGenerating(task, generationBusy) ? '生成中…' : (task.status === 'generation_unknown' || generationFailureResult) ? '重新生成' : '生成list' }}
+          <template #icon>=</template>{{ generationBusy ? '生成中…' : (['generation_unknown', 'generating'].includes(task.status) || generationFailureResult) ? '重新生成' : '生成list' }}
         </n-button>
         <n-button
           size="small"
           @click="$emit('syncRemote')"
-          :disabled="!!taskMutationIssue(task) || task.status === 'running' || generationBusyOrUnknown(task, generationBusy)"
+          :disabled="!!taskMutationIssue(task) || operationBusy || generationBusy"
         >
           <template #icon>-></template>发送到远程
         </n-button>
@@ -109,10 +109,10 @@
           <template #icon>>></template>启动
         </n-button>
         <n-button size="small" :disabled="taskRuntimeStatus?.state === 'checking' || operationBusy || !!taskMutationIssue(task)" @click="$emit('checkRuntime')">运行诊断（只读，可选）</n-button>
-        <n-button size="small" :disabled="!!taskMutationIssue(task) || generationBusyOrUnknown(task, generationBusy)" @click="$emit('pause')">
+        <n-button size="small" :disabled="!!taskMutationIssue(task) || generationBusy" @click="$emit('pause')">
           <template #icon>| |</template>暂停
         </n-button>
-        <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || isGenerating(task, generationBusy)" @click="$emit('delete')">
+        <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || operationBusy || generationBusy" @click="$emit('delete')">
           <template #icon>x</template>删除
         </n-button>
       </n-space>
@@ -128,8 +128,8 @@ export { RUNTIME_MAX_AGE as REGULAR_RUNTIME_MAX_AGE, DISPATCH_MAX_AGE as REGULAR
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
 import { taskMutationIssue, RUNTIME_MAX_AGE, regularDispatchState, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry, taskStartBlockReason, taskMaxConcurrent } from '../../utils/taskDiagnostics.js';
-import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
-import { isGenerating, canGenerate, generationBusyOrUnknown, generationFailure } from '../../utils/taskGeneration.js';
+import { taskStopDisplayStatus } from '../../stores/taskStore.js';
+import { canGenerate, generationFailure } from '../../utils/taskGeneration.js';
 
 const props = defineProps({
   generationBusy: { type: Boolean, default: false },
@@ -175,10 +175,10 @@ onUnmounted(() => { mounted = false; clearTimeout(expiryTimer); stopExpiryWatch(
 const generationFailureResult = computed(() => generationFailure(props.task, props.generationBusy));
 const stopStatus = computed(() => taskStopDisplayStatus(props.task, props.stopOperation));
 const startBlockReason = computed(() => taskStartBlockReason(props.task, {
-  busy: props.operationBusy || props.generationBusy, stopping: stopStatus.value === 'stopping',
+  busy: props.operationBusy || props.generationBusy,
 }));
 const displayStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
-const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
+const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value));
 const dispatchDetails = computed(() => {
   if (!['请求结果待核验（派发暂停，消费者存活）', '等待配额恢复（派发暂停，消费者存活）', '消费者存活（可派发）'].includes(displayStatus.value)) return '';
   const d = regularDispatchState(props.task, props.taskRuntimeStatus, runtimeNow.value);

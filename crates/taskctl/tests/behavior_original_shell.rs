@@ -235,3 +235,93 @@ async fn frozen_core_owned_shell_or_dead_residue_cleanup_preserves_receipts_befo
         assert!(!f.root.join("VIOLATIONS").exists());
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn absent_execution_with_conflicting_legacy_runs_can_pause_and_resume() {
+    for (name, remote) in [("amr_stale_runs", false), ("glb_stale_runs", true)] {
+        let mut f = Fixture::new().await;
+        f.create_generate(name, "regular", remote).await;
+        let initial = f.store.task(name);
+        let id = initial.get_object_id("_id").unwrap().to_hex();
+        let rows = f.store.rows_at(Host::from_remote(remote), name);
+        f.install_original_owners(None).await;
+        f.store.alter(name, doc! {
+            "status":"running", "launchAttemptId":"old-launch",
+            "startupBinding":{"consumer_run_id":"old-startup-run"},
+            "simulatorRuntime":{"consumer_run_id":"old-runtime-run", "pid":1002},
+            "tmuxContext":{"launchAttemptId":"even-older-launch", "sessionId":"$7"},
+        });
+        ok(&f.run(&["pause", "--name", name, "--expected-task-id", &id]).await);
+        assert_eq!(f.store.task(name).get_str("status"), Ok("paused"));
+        assert_eq!(tmux_calls(&f, "if-shell"), 0);
+        assert_eq!(f.store.rows_at(Host::from_remote(remote), name), rows);
+        ok(&f.run(&["start", "--name", name, "--no-notify"]).await);
+        assert_eq!(f.store.task(name).get_object_id("_id").unwrap().to_hex(), id);
+        assert_eq!(tmux_calls(&f, "new-session"), 1);
+        assert!(!f.root.join("VIOLATIONS").exists());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_reuses_pause_stop_pipeline_despite_conflicting_legacy_runs() {
+    let mut f = Fixture::new().await;
+    let name = "remote_delete_stale_runs";
+    f.create_generate(name, "regular", true).await;
+    let id = f.store.task(name).get_object_id("_id").unwrap().to_hex();
+    let archive = format!("{name}__archive_{id}");
+    let local_rows = f.store.rows_at(Host::Local, name);
+    let mut remote_rows = f.store.rows_at(Host::Remote, name);
+    remote_rows[0].extend(doc! {"status":"processing", "acceptance":"ACCEPTED",
+        "progressUrl":"https://fixture.invalid/original", "payloadHash":"retain"});
+    f.store.put_rows(Host::Remote, name, remote_rows.clone());
+    f.install_original_owners(None).await;
+    ok(&f.run(&["start", "--name", name, "--no-notify"]).await);
+    f.store.alter(name, doc! {
+        "startupBinding": {"consumer_run_id":"old-startup-run"},
+        "simulatorRuntime": {"consumer_run_id":"different-runtime-run", "pid":1002,
+            "pidCreatedAt":1700000010.0},
+        "launchSettledAttemptId":"not-the-current-launch",
+        "stopConfirmedAt":Bson::Null,
+    });
+    {
+        // Lowest-level fake control DB: a remote registration can lack status.
+        let mut db = f.store.data.lock().unwrap();
+        if let Some(remote) = db.tasks.entry(Host::Remote).or_default()
+            .iter_mut().find(|task| task.get_str("name") == Ok(name))
+        {
+            remote.remove("status");
+        } else {
+            db.tasks.get_mut(&Host::Remote).unwrap().push(doc! {
+                "_id": bson::oid::ObjectId::parse_str(&id).unwrap(), "name":name, "isRemote":true
+            });
+        }
+    }
+
+    let args = ["delete", "--name", name, "--expected-task-id", &id];
+    f.os_faults(json!({"foreign":true}));
+    failed(&f.run(&args).await);
+    assert_eq!(tmux_calls(&f, "if-shell"), 0, "foreign current argv is not a stop target");
+    assert!(!f.store.data.lock().unwrap().calls.iter().any(|call| call.starts_with("rename:")));
+    assert_eq!(f.store.rows_at(Host::Remote, name), remote_rows);
+    assert!(f.root.join("os_state.json").exists());
+
+    f.os_faults(json!({}));
+    let deleted = f.run(&args).await;
+    ok(&deleted);
+    assert_eq!(tmux_calls(&f, "if-shell"), 1, "delete used the original scoped stop signal");
+    assert!(!f.root.join("os_state.json").exists());
+    assert_eq!(f.store.task(name).get_str("status"), Ok("deactive"));
+    assert_eq!(deleted.value["controlHidden"], true);
+    assert_eq!(deleted.value["platformRequestsCancelled"], false);
+    assert_eq!(deleted.value["capacityReleased"], false);
+    assert_eq!(f.store.rows_at(Host::Local, &archive), local_rows);
+    assert_eq!(f.store.rows_at(Host::Remote, &archive), remote_rows);
+    assert!(f.store.rows_at(Host::Local, name).is_empty());
+    assert!(f.store.rows_at(Host::Remote, name).is_empty());
+
+    let repeated = f.run(&args).await;
+    ok(&repeated);
+    assert_eq!(repeated.value["alreadyDeleted"], true);
+    assert_eq!(tmux_calls(&f, "if-shell"), 1);
+    assert_eq!(f.store.data.lock().unwrap().calls.iter().filter(|call| call.starts_with("rename:")).count(), 2);
+}

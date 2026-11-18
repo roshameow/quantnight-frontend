@@ -123,6 +123,7 @@ struct State {
     queries: Vec<ReadQuery>,
     full_reads_left: Option<usize>,
     timeout_after_write: Option<String>,
+    must_stop_before_rename: Option<PathBuf>,
 }
 #[derive(Clone, Default)]
 struct MemoryStore(Arc<Mutex<State>>);
@@ -457,6 +458,9 @@ impl TaskStore for MemoryStore {
     async fn rename_collection(&self, h: Host, old: &str, new: &str) -> Result<(), String> {
         let mut st = self.0.lock().unwrap();
         call(&mut st, format!("rename:{}", host(h)))?;
+        if let Some(state) = &st.must_stop_before_rename {
+            assert!(!state.exists(), "rename raced the active fixture consumer");
+        }
         if st.rename_lie {
             return Ok(());
         }
@@ -483,11 +487,7 @@ impl TaskStore for MemoryStore {
 struct Runtime {
     calls: Mutex<Vec<String>>,
     fail_absence: Option<Host>,
-    fail_archive: bool,
-    archive_null: bool,
-    // Mutations deliberately bypass the advisory lock to exercise stale CAS.
-    mutate_on_archive: Option<MemoryStore>,
-    block_report_write_on_archive: bool,
+    block_report_write_on_stop: bool,
     inspect: Option<Result<quantnight_task_core::create_generate::GenerationProcesses, String>>,
 }
 #[async_trait]
@@ -523,33 +523,39 @@ impl OperationsRuntime for Runtime {
             Ok(())
         }
     }
-    async fn archive_research(
+    async fn stop_for_archive(
         &self,
         root: &Path,
-        _task: &Document,
-        h: Host,
-        n: &str,
-    ) -> Result<Value, String> {
-        assert!(mission_lock::MissionLocks::acquire(root, &[NAME], false).is_err());
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("research:{}:{n}", host(h)));
-        if self.fail_archive {
-            return Err("original research archival failed".into());
+        _store: &dyn TaskStore,
+        task: &Document,
+        _guard: &mission_lock::MissionLocks,
+    ) -> Result<(), String> {
+        use quantnight_task_core::create_generate::GenerationProcesses;
+
+        let h = Host::from_remote(task.get_bool("isRemote").unwrap());
+        self.calls.lock().unwrap().push(format!("stop:{}", host(h)));
+        self.assert_consumer_absent(root, task, h).await?;
+        if self.inspect.is_some() {
+            match self.inspect_generation(root, task).await? {
+                GenerationProcesses::Stopped => (),
+                GenerationProcesses::Live(reason) | GenerationProcesses::Unverified(reason) => {
+                    return Err(reason);
+                }
+            }
         }
-        if self.block_report_write_on_archive {
+        if self.block_report_write_on_stop {
             std::fs::write(root.join("reports"), b"preserve this file").unwrap();
         }
-        if let Some(store) = &self.mutate_on_archive {
-            store.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0]
-                .insert("launchAttemptId", "concurrent-launch");
-        }
-        Ok(if self.archive_null {
-            Value::Null
-        } else {
-            json!({"archivePath":"fixture-research.json","evidenceCollection":n,"count":7})
-        })
+        Ok(())
+    }
+    async fn archive_research(
+        &self,
+        _root: &Path,
+        _task: &Document,
+        _host: Host,
+        _evidence_collection: &str,
+    ) -> Result<Value, String> {
+        panic!("delete/sync must not call the separate research archive owner")
     }
 }
 fn error(out: TaskOutcome, needle: &str) -> Value {
@@ -619,9 +625,7 @@ async fn sync_rejects_preconditions_without_writing_or_overwriting() {
         "empty",
         "ping",
         "remote-id",
-        "remote-running",
         "remote-nonempty",
-        "observation",
         "wrong-id",
     ] {
         let root = Root::new();
@@ -631,7 +635,7 @@ async fn sync_rejects_preconditions_without_writing_or_overwriting() {
             let mut st = store.0.lock().unwrap();
             match case {
                 "status" => {
-                    st.tasks.get_mut(&Host::Local).unwrap()[0].insert("status", "syncing");
+                    st.tasks.get_mut(&Host::Local).unwrap()[0].insert("status", "generating");
                 }
                 "side" => {
                     st.tasks.get_mut(&Host::Local).unwrap()[0].insert("isRemote", true);
@@ -653,17 +657,9 @@ async fn sync_rejects_preconditions_without_writing_or_overwriting() {
                     t.insert("_id", ObjectId::parse_str(OTHER).unwrap());
                     st.tasks.insert(Host::Remote, vec![t]);
                 }
-                "remote-running" => {
-                    st.tasks
-                        .insert(Host::Remote, vec![registration("running", true)]);
-                }
                 "remote-nonempty" => {
                     st.collections
                         .insert((Host::Remote, NAME.into()), terminal());
-                }
-                "observation" => {
-                    st.tasks.get_mut(&Host::Local).unwrap()[0]
-                        .insert("acceptedObservation", doc! {"finishedAt":Bson::Null});
                 }
                 _ => (),
             }
@@ -686,6 +682,44 @@ async fn sync_rejects_preconditions_without_writing_or_overwriting() {
             assert_eq!(store.collection(Host::Remote, NAME).unwrap(), terminal());
         }
     }
+}
+
+#[tokio::test]
+async fn sync_uses_current_process_scope_not_remote_or_observation_projections() {
+    let root = Root::new();
+    let runtime = Runtime::default();
+    let store = MemoryStore::new("ready", false, rows(2));
+    {
+        let mut state = store.0.lock().unwrap();
+        state.tasks.get_mut(&Host::Local).unwrap()[0]
+            .insert("acceptedObservation", doc! {"finishedAt":Bson::Null});
+        state.tasks.insert(Host::Remote, vec![registration("running", true)]);
+    }
+    let result = sync(&store, &runtime, &root).await;
+    assert_eq!(result.exit_code, 0, "{}", result.value);
+    assert_eq!(store.collection(Host::Remote, NAME), Some(rows(2)));
+}
+
+#[tokio::test]
+async fn delete_archives_syncing_task_and_sync_refuses_deleting_task() {
+    let root = Root::new();
+    let runtime = Runtime::default();
+    let syncing = MemoryStore::new("syncing", false, rows(2));
+    syncing.0.lock().unwrap().collections.insert((Host::Remote, NAME.into()), rows(1));
+    let deleted = delete(&syncing, &runtime, &root).await;
+    assert_eq!(deleted.exit_code, 0, "{}", deleted.value);
+    assert_eq!(syncing.control().get_str("status"), Ok("deactive"));
+    assert_eq!(syncing.collection(Host::Remote, NAME), None);
+    assert_eq!(syncing.collection(Host::Local, NAME), None);
+    assert_eq!(syncing.collection(Host::Remote, &archive()), Some(rows(1)));
+    assert_eq!(syncing.collection(Host::Local, &archive()), Some(rows(2)));
+    let before_sync = runtime.calls.lock().unwrap().len();
+    let deleting = MemoryStore::new("deleting", true, rows(2));
+    deleting.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0]
+        .insert("syncedDigest", "previous-copy");
+    error(sync(&deleting, &runtime, &root).await, "archive incomplete");
+    assert_eq!(runtime.calls.lock().unwrap().len(), before_sync);
+    assert_eq!(deleting.control().get_str("status"), Ok("deleting"));
 }
 
 #[tokio::test]
@@ -759,28 +793,193 @@ async fn sync_entire_source_matches_original_python_checked_policy() {
 }
 
 #[tokio::test]
-async fn sync_partial_insert_is_retained_and_cannot_be_retried_as_empty_destination() {
+async fn sync_one_explicit_retry_resumes_after_ordered_insert_failure_or_lost_first_ack() {
+    for cause in ["ordered-failure", "lost-first-ack"] {
+        let root = Root::new();
+        let source = rows(205);
+        let store = MemoryStore::new("ready", false, source.clone());
+        {
+            let mut st = store.0.lock().unwrap();
+            if cause == "ordered-failure" {
+                st.fail_insert = Some(2);
+            } else {
+                st.timeout_after_write = Some("insert:remote".into());
+            }
+        }
+        let runtime = Runtime::default();
+        error(
+            sync(&store, &runtime, &root).await,
+            if cause == "ordered-failure" {
+                "ordered insert failure"
+            } else {
+                "timeout; result unconfirmed, not retried"
+            },
+        );
+        assert_eq!(store.control().get_str("status").unwrap(), "syncing");
+        assert!(!store.control().get_bool("isRemote").unwrap());
+        assert_eq!(
+            row_bytes(&store.collection(Host::Remote, NAME).unwrap()),
+            row_bytes(&source[..100])
+        );
+        assert_eq!(
+            store.0.lock().unwrap().insert_calls,
+            if cause == "ordered-failure" { 2 } else { 1 },
+            "no internal retry before the explicit second request"
+        );
+
+        let before = store.calls().len();
+        let retry = sync(&store, &runtime, &root).await;
+        assert_eq!(retry.exit_code, 0, "{cause}: {}", retry.value);
+        let calls = store.calls();
+        assert_eq!(
+            calls[before..]
+                .iter()
+                .filter(|call| call.starts_with("insert:"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["insert:remote:100", "insert:remote:5"],
+            "append only the 105 missing rows, without replaying the first batch"
+        );
+        assert!(!calls[before..]
+            .iter()
+            .any(|call| call == "update:local:sync-begin"));
+        assert_eq!(
+            row_bytes(&store.collection(Host::Local, NAME).unwrap()),
+            row_bytes(&source)
+        );
+        assert_eq!(
+            row_bytes(&store.collection(Host::Remote, NAME).unwrap()),
+            row_bytes(&source)
+        );
+        let control = store.control();
+        assert_eq!(control.get_str("status").unwrap(), "ready");
+        assert!(control.get_bool("isRemote").unwrap());
+        assert_eq!(
+            control.get_str("syncedDigest").unwrap(),
+            retry.value["digest"].as_str().unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_rejects_populated_fresh_destination_and_nonmatching_partial_data_without_mutation() {
+    let source = rows(205);
+    for (status, mismatch) in [
+        ("ready", "none"),
+        ("syncing", "payload"),
+        ("syncing", "unexpected-id"),
+        ("syncing", "receipt"),
+    ] {
+        let root = Root::new();
+        let store = MemoryStore::new(status, false, source.clone());
+        let mut retained = source[..100].to_vec();
+        match mismatch {
+            "payload" => {
+                retained[0].insert("payload", doc! {"expression": "different", "n": 0_i64});
+            }
+            "unexpected-id" => {
+                retained[0].insert("_id", "foreign-item");
+            }
+            "receipt" => {
+                retained[0].insert("acceptance", "UNKNOWN");
+                retained[0].insert("submissionAttempts", vec![doc! {"httpStatus":Bson::Null}]);
+            }
+            _ => (),
+        }
+        store.remote(retained.clone());
+        let original = store.control();
+        error(
+            sync(&store, &Runtime::default(), &root).await,
+            if status == "ready" {
+                "destination is not empty"
+            } else {
+                "different item"
+            },
+        );
+        assert_eq!(store.control(), original, "{mismatch}");
+        assert_eq!(
+            row_bytes(&store.collection(Host::Remote, NAME).unwrap()),
+            row_bytes(&retained),
+            "{mismatch}"
+        );
+        assert_eq!(
+            row_bytes(&store.collection(Host::Local, NAME).unwrap()),
+            row_bytes(&source),
+            "{mismatch}"
+        );
+        let st = store.0.lock().unwrap();
+        assert_eq!(st.insert_calls, 0, "{mismatch}");
+        assert!(st.writes.is_empty(), "{mismatch}");
+    }
+}
+
+#[tokio::test]
+async fn sync_lost_final_reply_returns_stored_digest_without_recopying_rows() {
     let root = Root::new();
-    let store = MemoryStore::new("ready", false, rows(205));
-    store.0.lock().unwrap().fail_insert = Some(2);
+    let source = rows(2);
+    let store = MemoryStore::new("ready", false, source.clone());
+    store.0.lock().unwrap().timeout_after_write = Some("update:local:sync".into());
+    let initial = Runtime::default();
     error(
-        sync(&store, &Runtime::default(), &root).await,
-        "ordered insert failure",
+        cleanup_sync::sync_with_expected_host(
+            &root.0,
+            &store,
+            &initial,
+            NAME,
+            Some(ID),
+            Some(false),
+        )
+        .await,
+        "timeout; result unconfirmed, not retried",
     );
-    assert_eq!(store.collection(Host::Remote, NAME).unwrap().len(), 100);
-    assert_eq!(store.control().get_str("status").unwrap(), "syncing");
-    error(
-        sync(&store, &Runtime::default(), &root).await,
-        "ready/paused",
+    let control = store.control();
+    let digest = control.get_str("syncedDigest").unwrap();
+    assert!(!digest.is_empty());
+    assert_eq!(control.get_str("status").unwrap(), "ready");
+    assert!(control.get_bool("isRemote").unwrap());
+    assert_eq!(store.collection(Host::Remote, NAME).unwrap(), source);
+
+    // Between requests the execution collection may acquire evidence which
+    // must not be interpreted as an interrupted copy or ever overwritten.
+    let (before_calls, before_writes, before_queries, retained) = {
+        let mut st = store.0.lock().unwrap();
+        let remote = st
+            .collections
+            .get_mut(&(Host::Remote, NAME.into()))
+            .unwrap();
+        remote[0].insert("status", "processing");
+        remote[0].insert("acceptance", "ACCEPTED");
+        let retained = row_bytes(remote);
+        (st.calls.len(), st.writes.len(), st.queries.len(), retained)
+    };
+    let runtime = Runtime::default();
+    let retry = cleanup_sync::sync_with_expected_host(
+        &root.0,
+        &store,
+        &runtime,
+        NAME,
+        Some(ID),
+        Some(false),
+    )
+    .await;
+    assert_eq!(retry.exit_code, 0, "{}", retry.value);
+    assert_eq!(retry.value["alreadySynced"], true);
+    assert_eq!(retry.value["digest"], digest);
+    assert_eq!(store.control(), control);
+    assert!(runtime.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        row_bytes(&store.collection(Host::Remote, NAME).unwrap()),
+        retained
     );
-    assert_eq!(store.collection(Host::Remote, NAME).unwrap().len(), 100);
-    // Even an old client resetting the control state cannot authorize overwrite.
-    store.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0].insert("status", "ready");
-    error(
-        sync(&store, &Runtime::default(), &root).await,
-        "destination is not empty",
-    );
-    assert_eq!(store.collection(Host::Remote, NAME).unwrap().len(), 100);
+    assert_eq!(store.collection(Host::Local, NAME).unwrap(), source);
+
+    let st = store.0.lock().unwrap();
+    assert_eq!(st.writes.len(), before_writes);
+    assert_eq!(st.queries.len(), before_queries);
+    assert_eq!(st.insert_calls, 1);
+    assert!(!st.calls[before_calls..]
+        .iter()
+        .any(|call| call.contains(":remote")));
 }
 
 #[tokio::test]
@@ -840,49 +1039,41 @@ async fn delete_renames_remote_then_local_preserves_evidence_and_cas_receipt() {
     );
     let st = store.0.lock().unwrap();
     let (_, filter, _) = st.writes.last().unwrap();
-    for field in [
-        "_id",
-        "name",
-        "status",
-        "isRemote",
-        "updatedAt",
-        "tmuxContext",
-        "launchAttemptId",
-        "acceptedObservation",
-        "stopConfirmedAt",
-    ] {
-        assert!(filter.contains_key(field), "{field}");
-    }
-    assert_eq!(
-        filter.get_document("acceptedObservation").unwrap(),
-        &doc! {"$exists":false}
-    );
+    assert_eq!(filter.get_object_id("_id").unwrap().to_hex(), ID);
+    assert_eq!(filter.get_str("name").unwrap(), NAME);
+    assert_eq!(filter.get_bool("isRemote").unwrap(), true);
+    assert!(filter.contains_key("status"));
+    let cleanup = st.tasks[&Host::Local][0].get_document("cleanup").unwrap();
+    assert_eq!(cleanup.get_str("taskId").unwrap(), ID);
+    assert_eq!(cleanup.get_str("localArchive").unwrap(), archive());
+    assert_eq!(cleanup.get_str("remoteArchive").unwrap(), archive());
+    assert!(cleanup.get_bool("controlHidden").unwrap());
 }
 
 #[tokio::test]
-async fn local_delete_avoids_remote_and_idempotent_retry_reads_archive_not_empty_namespace() {
+async fn local_delete_avoids_remote_and_completed_retry_does_not_stop_or_rename_again() {
     let root = Root::new();
     let store = MemoryStore::new("paused", false, terminal());
     let first = delete(&store, &Runtime::default(), &root).await;
-    assert_eq!(first.exit_code, 0);
+    assert_eq!(first.exit_code, 0, "{}", first.value);
     assert!(first.value["remoteDeleted"].is_null());
     assert!(!store.calls().iter().any(|x| x.contains(":remote")));
-    let runtime = Runtime {
-        archive_null: true,
-        ..Default::default()
-    };
+    let path = root.0.join("reports/missions/fixture.cleanup.json");
+    let before = std::fs::read(&path).unwrap();
+    let n = store.calls().len();
+    let runtime = Runtime::default();
     let retry = delete(&store, &runtime, &root).await;
     assert_eq!(retry.exit_code, 0, "{}", retry.value);
-    assert!(runtime
-        .calls
-        .lock()
-        .unwrap()
-        .contains(&format!("research:local:{}", archive())));
-    assert_eq!(
-        root.receipt()["researchArchive"]["count"],
-        7,
-        "a null retry must retain previous research stats"
-    );
+    assert_eq!(retry.value["alreadyDeleted"], true);
+    assert_eq!(retry.value["localArchive"], archive());
+    assert!(runtime.calls.lock().unwrap().is_empty());
+    assert!(store.calls()[n..]
+        .iter()
+        .all(|call| !call.contains(":remote")
+            && !call.starts_with("rename:")
+            && !call.starts_with("update:")));
+    assert!(store.0.lock().unwrap().queries.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(
         store.collection(Host::Local, &archive()).unwrap(),
         terminal()
@@ -911,20 +1102,27 @@ async fn partial_remote_success_local_failure_has_receipt_and_safe_retry() {
     let runtime = Runtime::default();
     let retry = delete(&store, &runtime, &root).await;
     assert_eq!(retry.exit_code, 0, "{}", retry.value);
-    assert!(runtime
-        .calls
-        .lock()
-        .unwrap()
-        .contains(&format!("research:remote:{}", archive())));
+    assert_eq!(retry.value["remoteArchive"], archive());
+    assert_eq!(retry.value["localArchive"], archive());
+    assert_eq!(retry.value["controlHidden"], true);
+    assert_eq!(
+        store
+            .calls()
+            .iter()
+            .filter(|call| *call == "rename:remote")
+            .count(),
+        1
+    );
     assert_eq!(
         store.collection(Host::Remote, &archive()).unwrap(),
         terminal()
     );
+    assert_eq!(store.collection(Host::Local, &archive()).unwrap(), rows(2));
 }
 
 #[tokio::test]
 async fn partial_control_failures_do_not_report_hidden_and_retain_archives() {
-    for failure in ["update:remote:remote-hide", "update:local:delete"] {
+    for failure in ["update:remote:delete", "update:local:delete"] {
         let root = Root::new();
         let store = MemoryStore::new("paused", true, rows(2));
         store.remote(terminal());
@@ -945,101 +1143,96 @@ async fn partial_control_failures_do_not_report_hidden_and_retain_archives() {
 async fn historical_delete_predicate_is_unchanged_but_new_archive_retains_every_oracle_row() {
     let cases: Vec<Value> = serde_json::from_str(CHECKED_ORACLE).unwrap();
     for case in cases.into_iter().filter(|v| v["command"] == "delete") {
-        let row = Bson::try_from(case["row"].clone()).unwrap().as_document().unwrap().clone();
+        let row = Bson::try_from(case["row"].clone())
+            .unwrap()
+            .as_document()
+            .unwrap()
+            .clone();
         // HISTORICAL oracle remains authoritative for the pure predicate, not
         // the user-changed archive eligibility contract. Do not rewrite its data.
-        let assessment = quantnight_task_core::lifecycle_policy::checked_unresolved_execution_row(&row);
-        assert_eq!(assessment.clone().unwrap_or(true), case["blocked"].as_bool().unwrap(), "{}", case["label"]);
+        let assessment =
+            quantnight_task_core::lifecycle_policy::checked_unresolved_execution_row(&row);
+        assert_eq!(
+            assessment.clone().unwrap_or(true),
+            case["blocked"].as_bool().unwrap(),
+            "{}",
+            case["label"]
+        );
         if let Some(error) = case["python_error"].as_str() {
-            assert!(assessment.as_ref().unwrap_err().contains(error), "{}", case["label"]);
+            assert!(
+                assessment.as_ref().unwrap_err().contains(error),
+                "{}",
+                case["label"]
+            );
         }
         let root = Root::new();
         let original = rows(2);
         let store = MemoryStore::new("paused", true, original.clone());
         store.remote(vec![row.clone()]);
         let result = delete(&store, &Runtime::default(), &root).await;
-        // NEW archive expectation: neither unresolved nor opaque malformed
-        // receipt metadata blocks a stop-confirmed, identity-bound rename.
-        assert_eq!(result.exit_code, 0, "new archive case {}: {}", case["label"], result.value);
-        assert_eq!(result.value["unresolvedItemCount"], u64::from(assessment.clone().unwrap_or(true)));
-        assert_eq!(result.value["receiptAssessmentUnknownCount"], u64::from(assessment.is_err()));
+        // Receipt content cannot block a rename once the original stop owner
+        // confirms the current execution is absent.
+        assert_eq!(
+            result.exit_code, 0,
+            "new archive case {}: {}",
+            case["label"], result.value
+        );
         assert_eq!(store.collection(Host::Local, &archive()).unwrap(), original);
-        assert_eq!(bson::to_vec(&store.collection(Host::Remote, &archive()).unwrap()[0]).unwrap(), bson::to_vec(&row).unwrap());
+        assert_eq!(
+            bson::to_vec(&store.collection(Host::Remote, &archive()).unwrap()[0]).unwrap(),
+            bson::to_vec(&row).unwrap()
+        );
     }
 }
 
 #[tokio::test]
-async fn delete_rejects_stop_identity_observer_host_consumer_and_research_failures() {
-    for case in [
-        "stop-missing",
-        "stop-host",
-        "stop-id",
-        "stop-time",
-        "running",
-        "generating",
-        "syncing",
-        "observation",
-        "wrong-id",
-        "remote-id",
-        "consumer",
-        "ping",
-        "archive",
-        "cas-claim",
-        "changed-launch",
-    ] {
+async fn delete_blocks_on_current_identity_stop_or_control_write_failure() {
+    for case in ["wrong-id", "remote-id", "consumer", "cas-claim"] {
         let root = Root::new();
-        let store = MemoryStore::new("paused", true, rows(2));
+        let store = MemoryStore::new("running", true, rows(2));
         store.remote(terminal());
         let mut runtime = Runtime::default();
-        {
-            let mut st = store.0.lock().unwrap();
-            let t = &mut st.tasks.get_mut(&Host::Local).unwrap()[0];
-            match case {
-                "stop-missing" => {
-                    t.remove("stopConfirmedAt");
-                }
-                "stop-host" => {
-                    t.insert("stopConfirmedRemote", false);
-                }
-                "stop-id" => {
-                    t.insert("stopConfirmedTaskId", OTHER);
-                }
-                "stop-time" => {
-                    t.insert("launchAttemptAt", DateTime::from_millis(2000));
-                }
-                "running" | "generating" | "syncing" => {
-                    t.insert("status", case);
-                }
-                "observation" => {
-                    t.insert("acceptedObservation", doc! {"finishedAt":Bson::Null});
-                }
-                "remote-id" => {
-                    st.tasks.get_mut(&Host::Remote).unwrap()[0]
-                        .insert("_id", ObjectId::parse_str(OTHER).unwrap());
-                }
-                "consumer" => runtime.fail_absence = Some(Host::Remote),
-                "ping" => st.fail = Some("ping:remote".into()),
-                "archive" => runtime.fail_archive = true,
-                "cas-claim" => st.cas_fail = Some("update:local:delete-begin".into()),
-                "changed-launch" => runtime.mutate_on_archive = Some(store.clone()),
-                _ => (),
+        let (id, expected_error) = match case {
+            "wrong-id" => (OTHER, "expected task not found"),
+            "remote-id" => {
+                store
+                    .0
+                    .lock()
+                    .unwrap()
+                    .tasks
+                    .get_mut(&Host::Remote)
+                    .unwrap()[0]
+                    .insert("_id", ObjectId::parse_str(OTHER).unwrap());
+                (ID, "different identity")
             }
+            "consumer" => {
+                runtime.fail_absence = Some(Host::Remote);
+                (ID, "exact consumer live or absent check failed")
+            }
+            _ => {
+                store.0.lock().unwrap().cas_fail = Some("update:local:delete-begin".into());
+                (ID, "changed during archive")
+            }
+        };
+        error(
+            cleanup_sync::delete(&root.0, &store, &runtime, NAME, Some(id)).await,
+            expected_error,
+        );
+        if matches!(case, "wrong-id" | "remote-id") {
+            assert!(runtime.calls.lock().unwrap().is_empty(), "{case}");
+        } else {
+            assert_eq!(
+                runtime.calls.lock().unwrap().as_slice(),
+                ["stop:remote", "absence:remote"]
+            );
         }
-        let out = cleanup_sync::delete(
-            &root.0,
-            &store,
-            &runtime,
-            NAME,
-            Some(if case == "wrong-id" { OTHER } else { ID }),
-        )
-        .await;
-        assert_eq!(out.exit_code, 1, "{case}: {}", out.value);
         assert!(
             !store.calls().iter().any(|x| x.starts_with("rename:")),
             "{case}"
         );
         assert_eq!(store.collection(Host::Remote, NAME).unwrap(), terminal());
-        assert_ne!(store.control().get_str("status").unwrap(), "deactive");
+        assert_eq!(store.collection(Host::Local, NAME).unwrap(), rows(2));
+        assert_eq!(store.control().get_str("status").unwrap(), "running");
     }
 }
 
@@ -1065,6 +1258,12 @@ async fn archive_collision_or_unverified_rename_cannot_hide_control() {
         assert_eq!(out.value["controlHidden"], false);
         assert_eq!(store.collection(Host::Remote, NAME).unwrap(), terminal());
         assert_eq!(store.collection(Host::Local, NAME).unwrap(), rows(2));
+        if mode == "collision" {
+            assert_eq!(
+                store.collection(Host::Remote, &archive()).unwrap(),
+                vec![doc! {"_id":"old-evidence"}]
+            );
+        }
     }
 }
 
@@ -1098,36 +1297,59 @@ async fn real_flock_and_expected_ids_gate_before_io_and_missing_task_is_not_fals
 }
 
 #[tokio::test]
-async fn active_replacement_beats_old_deactive_record_and_never_inherits_old_expected_id() {
+async fn retry_by_archived_id_leaves_the_active_same_name_replacement_alone() {
     let root = Root::new();
-    let store = MemoryStore::new("deactive", false, terminal());
-    {
+    let store = MemoryStore::new("paused", false, terminal());
+    let first = delete(&store, &Runtime::default(), &root).await;
+    assert_eq!(first.exit_code, 0, "{}", first.value);
+    let mut replacement = registration("running", false);
+    replacement.insert("_id", ObjectId::parse_str(OTHER).unwrap());
+    let before = {
         let mut st = store.0.lock().unwrap();
-        let mut t = registration("paused", false);
-        t.insert("_id", ObjectId::parse_str(OTHER).unwrap());
-        st.tasks.get_mut(&Host::Local).unwrap().push(t);
-    }
-    error(
-        delete(&store, &Runtime::default(), &root).await,
-        "task identity changed",
+        st.tasks
+            .get_mut(&Host::Local)
+            .unwrap()
+            .push(replacement.clone());
+        st.collections.insert((Host::Local, NAME.into()), rows(2));
+        st.writes.len()
+    };
+    let path = root.0.join("reports/missions/fixture.cleanup.json");
+    let report = std::fs::read(&path).unwrap();
+    let runtime = Runtime::default();
+    let retry = delete(&store, &runtime, &root).await;
+    assert_eq!(retry.exit_code, 0, "{}", retry.value);
+    assert_eq!(retry.value["alreadyDeleted"], true);
+    assert_eq!(retry.value["taskId"], ID);
+    assert_eq!(retry.value["localArchive"], archive());
+    assert!(runtime.calls.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(path).unwrap(), report);
+    assert_eq!(store.collection(Host::Local, NAME).unwrap(), rows(2));
+    assert_eq!(
+        store.collection(Host::Local, &archive()).unwrap(),
+        terminal()
     );
-    assert!(store.0.lock().unwrap().writes.is_empty());
+    let st = store.0.lock().unwrap();
+    assert_eq!(st.writes.len(), before);
+    assert_eq!(st.tasks[&Host::Local][1], replacement);
 }
 
 #[tokio::test]
-async fn report_write_failure_is_failure_even_after_verified_archive_and_bad_old_receipt_is_retained(
-) {
+async fn report_write_failure_does_not_undo_archive_or_clobber_filesystem_evidence() {
     let root = Root::new();
     let store = MemoryStore::new("paused", false, terminal());
-    // Runtime IO changes the directory after the previous-receipt read, so
-    // this actually fails persistence AFTER rename/control-CAS, not preflight.
+    // Change the filesystem after reading the prior report so persistence
+    // fails only at the reporting step, after rename and the DB commit.
     let runtime = Runtime {
-        block_report_write_on_archive: true,
+        block_report_write_on_stop: true,
         ..Default::default()
     };
     let out = delete(&store, &runtime, &root).await;
-    assert_eq!(out.exit_code, 1);
-    assert!(out.value.to_string().contains("receipt"));
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert!(out.value["receiptWriteError"]
+        .as_str()
+        .unwrap()
+        .contains("receipt"));
+    assert!(out.value["receiptPath"].is_null());
     assert_eq!(out.value["controlHidden"], true);
     assert_eq!(store.control().get_str("status").unwrap(), "deactive");
     assert_eq!(
@@ -1138,17 +1360,28 @@ async fn report_write_failure_is_failure_even_after_verified_archive_and_bad_old
         std::fs::read(root.0.join("reports")).unwrap(),
         b"preserve this file"
     );
+    let retry = delete(&store, &Runtime::default(), &root).await;
+    assert_eq!(retry.exit_code, 0, "{}", retry.value);
+    assert_eq!(retry.value["alreadyDeleted"], true);
+    assert_eq!(retry.value["localArchive"], archive());
+
     let root = Root::new();
     std::fs::create_dir_all(root.0.join("reports/missions")).unwrap();
-    let p = root.0.join("reports/missions/fixture.cleanup.json");
-    std::fs::write(&p, b"{broken evidence").unwrap();
+    let path = root.0.join("reports/missions/fixture.cleanup.json");
+    std::fs::write(&path, b"{broken evidence").unwrap();
     let store = MemoryStore::new("paused", false, terminal());
-    error(
-        delete(&store, &Runtime::default(), &root).await,
-        "receipt invalid",
+    let out = delete(&store, &Runtime::default(), &root).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    assert!(out.value["previousReceiptWarning"]
+        .as_str()
+        .unwrap()
+        .contains("receipt invalid"));
+    assert_eq!(std::fs::read(path).unwrap(), b"{broken evidence");
+    assert_eq!(store.control().get_str("status").unwrap(), "deactive");
+    assert_eq!(
+        store.collection(Host::Local, &archive()).unwrap(),
+        terminal()
     );
-    assert!(store.0.lock().unwrap().writes.is_empty());
-    assert_eq!(std::fs::read(&p).unwrap(), b"{broken evidence");
 }
 
 #[tokio::test]
@@ -1166,7 +1399,14 @@ async fn claim_reread_cannot_adopt_a_changed_execution_host() {
         } else {
             delete(&store, &Runtime::default(), &root).await
         };
-        error(out, "claim binding changed");
+        error(
+            out,
+            if command == "sync" {
+                "claim binding changed"
+            } else {
+                "host"
+            },
+        );
         assert!(!store
             .calls()
             .iter()
@@ -1175,26 +1415,44 @@ async fn claim_reread_cannot_adopt_a_changed_execution_host() {
 }
 
 #[tokio::test]
-async fn retry_classifies_unknown_archived_evidence_without_clearing_research_summary() {
+async fn retry_preserves_unknown_archived_evidence_and_prior_research_summary_without_reading_items(
+) {
     let root = Root::new();
     let store = MemoryStore::new("paused", true, rows(2));
     store.remote(terminal());
     store.fail("rename:local");
-    error(delete(&store, &Runtime::default(), &root).await, "rename:local");
-    let previous = root.receipt()["researchArchive"].clone();
-    store.0.lock().unwrap().collections.get_mut(&(Host::Remote, archive())).unwrap()[0]
+    error(
+        delete(&store, &Runtime::default(), &root).await,
+        "rename:local",
+    );
+    // A report from before the refactor may already contain research evidence.
+    let previous =
+        json!({"archivePath":"fixture-research.json","evidenceCollection":NAME,"count":7});
+    let mut receipt = root.receipt();
+    receipt["researchArchive"] = previous.clone();
+    std::fs::write(
+        root.0.join("reports/missions/fixture.cleanup.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+    store
+        .0
+        .lock()
+        .unwrap()
+        .collections
+        .get_mut(&(Host::Remote, archive()))
+        .unwrap()[0]
         .insert("acceptance", "UNKNOWN");
     let retained = store.collection(Host::Remote, &archive()).unwrap();
-    let runtime = Runtime { archive_null: true, ..Default::default() };
-    // Historical UNKNOWN rejection is intentionally replaced by archive-only
-    // success. No clearing, reconciliation or replay of that receipt occurs.
-    let out = delete(&store, &runtime, &root).await;
+    let out = delete(&store, &Runtime::default(), &root).await;
     assert_eq!(out.exit_code, 0, "{}", out.value);
-    assert_eq!(out.value["unresolvedItemCount"], 1);
     assert_eq!(root.receipt()["researchArchive"], previous);
-    assert!(runtime.calls.lock().unwrap().contains(&format!("research:remote:{}", archive())));
+    assert!(store.0.lock().unwrap().queries.is_empty());
     assert_eq!(store.collection(Host::Local, &archive()).unwrap(), rows(2));
-    assert_eq!(store.collection(Host::Remote, &archive()).unwrap(), retained);
+    assert_eq!(
+        row_bytes(&store.collection(Host::Remote, &archive()).unwrap()),
+        row_bytes(&retained)
+    );
     assert_eq!(store.control().get_str("status").unwrap(), "deactive");
 }
 
@@ -1217,21 +1475,26 @@ async fn durable_not_posted_and_explicit_platform_terminal_remain_eligible() {
 }
 
 #[tokio::test]
-async fn no_query_error_is_interpreted_as_empty_collection_or_missing_remote_registration() {
-    for point in [
-        "find:remote",
-        "rows:remote:fixture",
-        "names:remote",
-        "names:local",
-    ] {
+async fn archive_namespace_and_registration_read_errors_are_not_reported_as_absence() {
+    for point in ["find:remote", "names:remote", "names:local"] {
         let root = Root::new();
         let store = MemoryStore::new("paused", true, rows(2));
         store.remote(terminal());
         store.fail(point);
-        let out = delete(&store, &Runtime::default(), &root).await;
-        assert_eq!(out.exit_code, 1, "{point}: {}", out.value);
-        assert!(store.0.lock().unwrap().writes.is_empty());
-        assert_eq!(store.collection(Host::Remote, NAME).unwrap(), terminal());
+        let out = error(delete(&store, &Runtime::default(), &root).await, point);
+        assert_eq!(out["controlHidden"], false);
+        assert_eq!(store.collection(Host::Local, NAME).unwrap(), rows(2));
+        if point == "find:remote" {
+            assert!(store.0.lock().unwrap().writes.is_empty());
+        }
+        if point == "names:local" {
+            assert_eq!(
+                store.collection(Host::Remote, &archive()).unwrap(),
+                terminal()
+            );
+        } else {
+            assert_eq!(store.collection(Host::Remote, NAME).unwrap(), terminal());
+        }
     }
 }
 
@@ -1303,7 +1566,7 @@ fn exact_original_receipt_projection_and_fake_projection_are_not_noops() {
 }
 
 #[tokio::test]
-async fn delete_large_payload_sentinel_allows_only_summary_and_exact_receipt_fields() {
+async fn delete_large_payload_sentinel_never_reads_or_assesses_rows() {
     let root = Root::new();
     let local = large_payload_rows(8, false);
     let execution = large_payload_rows(8, true);
@@ -1318,23 +1581,25 @@ async fn delete_large_payload_sentinel_allows_only_summary_and_exact_receipt_fie
     let result = delete(&store, &Runtime::default(), &root).await;
     assert_eq!(result.exit_code, 0, "{}", result.value);
     let queries = store.0.lock().unwrap().queries.clone();
-    let rows: Vec<_> = queries.iter().filter(|q| q.kind == "rows").collect();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].host, Host::Remote);
-    assert_eq!(rows[0].name, NAME);
-    assert_eq!(rows[0].projection, Some(task_store::receipt_projection()));
-    assert_eq!(rows[0].limit, None);
-    assert_eq!(rows[0].returned, 8);
-    assert!(queries
-        .iter()
-        .any(|q| q.kind == "aggregate" && q.pipeline == task_store::summary_pipeline()));
-    let heartbeat = queries.iter().find(|q| q.kind == "heartbeat").unwrap();
-    assert_eq!(heartbeat.projection, Some(doc! {"heartbeatAt":1,"_id":0}));
-    assert_eq!(heartbeat.filter, doc! {"heartbeatAt":{"$exists":true}});
-    assert_eq!(heartbeat.limit, Some(1));
-    assert!(queries.iter().map(|q| q.returned_bytes).sum::<usize>() < 10_000);
-    assert_eq!(root.receipt()["localBefore"]["total"], 8);
-    assert!(!root.receipt()["localBefore"]["latestHeartbeatAt"].is_null());
+    assert!(
+        queries.is_empty(),
+        "delete issued item queries: {queries:?}"
+    );
+    assert!(!store.calls().iter().any(|call| {
+        ["summary:", "aggregate:", "heartbeat:", "probe:", "rows:"]
+            .iter()
+            .any(|prefix| call.starts_with(*prefix))
+    }));
+    for key in [
+        "localBefore",
+        "unresolvedItemCount",
+        "receiptAssessmentUnknownCount",
+    ] {
+        assert!(
+            result.value[key].is_null(),
+            "unmeasured {key} must not be invented"
+        );
+    }
     assert_eq!(store.collection(Host::Local, &archive()).unwrap(), local);
     assert_eq!(
         store.collection(Host::Remote, &archive()).unwrap(),
@@ -1441,14 +1706,22 @@ async fn summary_probe_and_cursor_errors_cannot_be_successful_empty_results() {
         "summary:local:fixture",
         "aggregate:local:fixture",
         "heartbeat:local:fixture",
+        "rows:remote:fixture",
     ] {
         let root = Root::new();
         let store = MemoryStore::new("paused", true, rows(2));
         store.remote(terminal());
         store.fail(point);
-        error(delete(&store, &Runtime::default(), &root).await, point);
-        assert!(store.0.lock().unwrap().writes.is_empty());
-        assert_eq!(root.receipt()["controlHidden"], false);
+        let out = delete(&store, &Runtime::default(), &root).await;
+        assert_eq!(out.exit_code, 0, "{point}: {}", out.value);
+        assert_eq!(root.receipt()["controlHidden"], true);
+        assert!(!store.calls().iter().any(|call| call.as_str() == point));
+        assert!(store.0.lock().unwrap().queries.is_empty());
+        assert_eq!(store.collection(Host::Local, &archive()).unwrap(), rows(2));
+        assert_eq!(
+            store.collection(Host::Remote, &archive()).unwrap(),
+            terminal()
+        );
     }
 }
 
@@ -1478,7 +1751,7 @@ async fn mutation_timeout_after_apply_keeps_partial_evidence_and_never_resubmits
     }
     for point in [
         "rename:remote",
-        "update:remote:remote-hide",
+        "update:remote:delete",
         "update:local:delete",
     ] {
         let root = Root::new();
@@ -1501,6 +1774,13 @@ async fn mutation_timeout_after_apply_keeps_partial_evidence_and_never_resubmits
         );
         let retry = delete(&store, &Runtime::default(), &root).await;
         assert_eq!(retry.exit_code, 0, "{}", retry.value);
+        assert_eq!(retry.value["controlHidden"], true);
+        assert_eq!(store.control().get_str("status").unwrap(), "deactive");
+        assert_eq!(
+            store.calls().iter().filter(|c| c.as_str() == point).count(),
+            1
+        );
+        assert_eq!(store.collection(Host::Local, &archive()).unwrap(), rows(2));
         assert_eq!(
             store.collection(Host::Remote, &archive()).unwrap(),
             terminal()
@@ -2140,101 +2420,149 @@ async fn archive_retains_pending_accepted_unknown_opaque_and_holds_byte_for_byte
         let root = Root::new();
         let original = archive_evidence_rows();
         let store = MemoryStore::new("paused", remote, original.clone());
-        if remote { store.remote(original.clone()); }
+        if remote {
+            store.remote(original.clone());
+        }
         let runtime = Runtime::default();
         let out = delete(&store, &runtime, &root).await;
         assert_eq!(out.exit_code, 0, "{}", out.value);
         for receipt in [&out.value, &root.receipt()] {
             assert_eq!(receipt["taskId"], ID);
             assert_eq!(receipt["remote"], remote);
-            assert_eq!(receipt["unresolvedItemCount"], 3);
-            assert_eq!(receipt["receiptAssessmentUnknownCount"], 1);
+            assert!(receipt["unresolvedItemCount"].is_null());
+            assert!(receipt["receiptAssessmentUnknownCount"].is_null());
             assert_eq!(receipt["platformRequestsCancelled"], false);
             assert_eq!(receipt["capacityReleased"], false);
             assert_eq!(receipt["localArchive"], archive());
-            assert_eq!(receipt["remoteArchive"], if remote { json!(archive()) } else { Value::Null });
-            assert!(receipt["receiptPath"].as_str().unwrap().ends_with("fixture.cleanup.json"));
+            assert_eq!(
+                receipt["remoteArchive"],
+                if remote {
+                    json!(archive())
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(receipt["receiptPath"]
+                .as_str()
+                .unwrap()
+                .ends_with("fixture.cleanup.json"));
             assert!(!receipt.to_string().contains("original-secret"));
             assert!(!receipt.to_string().contains("submissionAttempts"));
         }
-        for h in if remote { vec![Host::Local, Host::Remote] } else { vec![Host::Local] } {
-            assert_eq!(row_bytes(&store.collection(h, &archive()).unwrap()), row_bytes(&original));
+        for h in if remote {
+            vec![Host::Local, Host::Remote]
+        } else {
+            vec![Host::Local]
+        } {
+            assert_eq!(
+                row_bytes(&store.collection(h, &archive()).unwrap()),
+                row_bytes(&original)
+            );
             assert!(store.collection(h, NAME).is_none());
         }
-        assert_eq!(runtime.calls.lock().unwrap().as_slice(), [
-            format!("absence:{}", if remote { "remote" } else { "local" }),
-            format!("research:{}:{NAME}", if remote { "remote" } else { "local" }),
-        ]);
-        // Runtime has only absence/research IO; storage operations are strictly
-        // control CAS + collection rename, never item reset/recovery or release.
-        assert!(!store.calls().iter().any(|c| c.starts_with("insert:") || c.starts_with("reset:")));
+        assert_eq!(
+            runtime.calls.lock().unwrap().as_slice(),
+            [
+                format!("stop:{}", if remote { "remote" } else { "local" }),
+                format!("absence:{}", if remote { "remote" } else { "local" }),
+            ]
+        );
+        // Stop and rename do not reset/recover items or release platform holds.
+        assert!(!store
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("insert:") || c.starts_with("reset:")));
         assert_eq!(store.control().get_str("status").unwrap(), "deactive");
         let retry = delete(&store, &Runtime::default(), &root).await;
         assert_eq!(retry.exit_code, 0, "{}", retry.value);
-        assert_eq!(retry.value["unresolvedItemCount"], 3);
-        assert_eq!(retry.value["receiptAssessmentUnknownCount"], 1);
+        assert_eq!(retry.value["alreadyDeleted"], true);
+        assert_eq!(retry.value["localArchive"], archive());
+        assert_eq!(retry.value["remoteArchive"], out.value["remoteArchive"]);
     }
 }
 #[tokio::test]
-async fn partial_retry_retains_diagnostics_and_archive_identity_even_when_next_read_fails() {
+async fn partial_retry_retains_archive_identity_even_when_next_namespace_read_fails() {
     let root = Root::new();
     let original = archive_evidence_rows();
     let store = MemoryStore::new("paused", true, original.clone());
     store.remote(original.clone());
     store.fail("rename:local");
-    let first = error(delete(&store, &Runtime::default(), &root).await, "rename:local");
-    assert_eq!(first["unresolvedItemCount"], 3);
-    store.fail("ping:remote");
-    let failed = error(delete(&store, &Runtime::default(), &root).await, "ping:remote");
-    for key in ["unresolvedItemCount", "receiptAssessmentUnknownCount", "remoteArchive", "taskId", "receiptPath"] {
+    let first = error(
+        delete(&store, &Runtime::default(), &root).await,
+        "rename:local",
+    );
+    assert_eq!(first["remoteArchive"], archive());
+    assert_eq!(first["remoteDeleted"], true);
+    store.fail("names:remote");
+    let failed = error(
+        delete(&store, &Runtime::default(), &root).await,
+        "names:remote",
+    );
+    for key in ["remoteArchive", "taskId", "receiptPath"] {
         assert_eq!(failed[key], first[key], "{key}");
         assert_eq!(root.receipt()[key], first[key], "{key}");
     }
     assert_eq!(failed["controlHidden"], false);
     let retry = delete(&store, &Runtime::default(), &root).await;
     assert_eq!(retry.exit_code, 0, "{}", retry.value);
-    assert_eq!(retry.value["unresolvedItemCount"], 3);
+    assert_eq!(retry.value["remoteArchive"], archive());
+    assert_eq!(
+        store
+            .calls()
+            .iter()
+            .filter(|call| *call == "rename:remote")
+            .count(),
+        1
+    );
     for h in [Host::Local, Host::Remote] {
-        assert_eq!(row_bytes(&store.collection(h, &archive()).unwrap()), row_bytes(&original));
+        assert_eq!(
+            row_bytes(&store.collection(h, &archive()).unwrap()),
+            row_bytes(&original)
+        );
     }
 }
 
 #[tokio::test]
-async fn unresolved_rows_do_not_bypass_control_proof_or_source_archive_failures() {
-    for case in ["generation_unknown", "launching", "stop-malformed", "host-malformed", "status-malformed", "remote-status-malformed", "source-dependency"] {
+async fn unresolved_rows_do_not_bypass_host_validation_or_original_stop_failure() {
+    for case in ["host-malformed", "stop-failed"] {
         let root = Root::new();
         let original = archive_evidence_rows();
-        let store = MemoryStore::new("paused", true, original.clone());
+        let store = MemoryStore::new("running", true, original.clone());
         store.remote(original.clone());
         let mut runtime = Runtime::default();
-        {
-            let mut st = store.0.lock().unwrap();
-            let task = &mut st.tasks.get_mut(&Host::Local).unwrap()[0];
-            match case {
-                "generation_unknown" | "launching" => { task.insert("status", case); }
-                "stop-malformed" => { task.insert("stopConfirmedAt", "invalid-proof"); }
-                "host-malformed" => { task.insert("isRemote", "true"); }
-                "status-malformed" => { task.insert("status", doc! {"not":"a status"}); }
-                "remote-status-malformed" => { st.tasks.get_mut(&Host::Remote).unwrap()[0].insert("status", Bson::Null); }
-                "source-dependency" => runtime.fail_archive = true,
-                _ => unreachable!(),
-            }
-        }
-        let out = delete(&store, &runtime, &root).await;
-        assert_eq!(out.exit_code, 1, "{case}: {}", out.value);
-        assert!(!store.calls().iter().any(|c| c.starts_with("rename:")), "{case}");
+        let expected = if case == "host-malformed" {
+            store.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0]
+                .insert("isRemote", "true");
+            "malformed task isRemote"
+        } else {
+            runtime.fail_absence = Some(Host::Remote);
+            "exact consumer live or absent check failed"
+        };
+        error(delete(&store, &runtime, &root).await, expected);
+        assert!(store.0.lock().unwrap().writes.is_empty());
+        assert!(
+            !store.calls().iter().any(|c| c.starts_with("rename:")),
+            "{case}"
+        );
         for h in [Host::Local, Host::Remote] {
-            assert_eq!(row_bytes(&store.collection(h, NAME).unwrap()), row_bytes(&original));
+            assert_eq!(
+                row_bytes(&store.collection(h, NAME).unwrap()),
+                row_bytes(&original)
+            );
         }
     }
 }
 
 #[tokio::test]
-async fn diagnostic_count_is_execution_items_not_unique_batch_or_local_plus_remote_rows() {
+async fn all_batch_items_are_archived_without_grouping_receipts_or_fetching_rows() {
     let root = Root::new();
     let mut executed = Vec::new();
     for i in 0..52 {
-        let mut row = if i < 10 { archive_evidence_rows().remove(1) } else { terminal().remove(0) };
+        let mut row = if i < 10 {
+            archive_evidence_rows().remove(1)
+        } else {
+            terminal().remove(0)
+        };
         row.insert("_id", format!("batch-item-{i}"));
         executed.push(row);
     }
@@ -2242,56 +2570,123 @@ async fn diagnostic_count_is_execution_items_not_unique_batch_or_local_plus_remo
     store.remote(executed.clone());
     let out = delete(&store, &Runtime::default(), &root).await;
     assert_eq!(out.exit_code, 0, "{}", out.value);
-    assert_eq!(out.value["unresolvedItemCount"], 10);
-    assert_eq!(out.value["receiptAssessmentUnknownCount"], 0);
-    assert_eq!(row_bytes(&store.collection(Host::Remote, &archive()).unwrap()), row_bytes(&executed));
+    assert!(store.0.lock().unwrap().queries.is_empty());
+    assert_eq!(
+        row_bytes(&store.collection(Host::Local, &archive()).unwrap()),
+        row_bytes(&rows(52))
+    );
+    assert_eq!(
+        row_bytes(&store.collection(Host::Remote, &archive()).unwrap()),
+        row_bytes(&executed)
+    );
 }
 
 
 #[tokio::test]
-async fn archive_preconditions_report_the_original_action_without_attempting_archive() {
-    for (status, action) in [
-        ("running", "pause"), ("launching", "pause"),
-        ("generating", "reconcile_generation_or_sync"),
-        ("generation_unknown", "reconcile_generation_or_sync"),
-        ("syncing", "reconcile_generation_or_sync"),
+async fn historical_status_and_proof_fields_do_not_block_archive_after_stop() {
+    for status in [
+        "running",
+        "launching",
+        "generating",
+        "generation_unknown",
+        "paused",
     ] {
         let root = Root::new();
         let store = MemoryStore::new(status, false, terminal());
-        let out = delete(&store, &Runtime::default(), &root).await;
-        assert_eq!(out.value["ok"], false);
-        assert_eq!(out.value["requiredAction"], action);
-        assert_eq!(out.value["localDeleted"], false);
-        assert_eq!(out.value["controlHidden"], false);
+        {
+            let mut st = store.0.lock().unwrap();
+            let task = &mut st.tasks.get_mut(&Host::Local).unwrap()[0];
+            task.insert("stopConfirmedAt", "invalid-proof");
+            task.insert("stopConfirmedRemote", true);
+            task.insert("stopConfirmedTaskId", OTHER);
+            task.insert("startupBinding", doc! {"runId":"old-launch"});
+            task.insert("simulatorRuntime", doc! {"runId":"other-history"});
+            task.insert("acceptedObservation", doc! {"finishedAt": Bson::Null});
+            if status == "paused" {
+                task.insert("status", doc! {"not":"a status"});
+            }
+        }
+        let runtime = Runtime::default();
+        let out = delete(&store, &runtime, &root).await;
+        assert_eq!(out.exit_code, 0, "{status}: {}", out.value);
+        assert_eq!(
+            runtime.calls.lock().unwrap().as_slice(),
+            ["stop:local", "absence:local"]
+        );
+        assert_eq!(out.value["localDeleted"], true);
+        assert_eq!(out.value["controlHidden"], true);
+        assert_eq!(
+            store.collection(Host::Local, &archive()).unwrap(),
+            terminal()
+        );
     }
 }
 
 #[tokio::test]
-async fn legacy_super_missing_enhancements_can_archive_unresolved_receipts_after_original_stop_checks() {
+async fn legacy_super_archives_remote_registration_with_no_status_and_no_stop_history() {
     for remote in [false, true] {
         let root = Root::new();
-        let retained = vec![doc! {"_id":"accepted-unknown","status":"timeout_error","acceptance":"UNKNOWN",
+        let retained = vec![
+            doc! {"_id":"accepted-unknown","status":"timeout_error","acceptance":"UNKNOWN",
             "campaign_post_attempted":true,"superSlotId":"retain-original-slot","submissionAttempts":[{"acceptance":"UNKNOWN"}],
             "payload":{"selection":"original"}},
-            doc! {"_id":"success","status":"success","alphaId":"old-alpha"}];
-        let store = MemoryStore::new("paused", remote, retained.clone());
-        if remote { store.remote(retained.clone()); }
-        { let mut d = store.0.lock().unwrap();
-          for tasks in d.tasks.values_mut() {
-              tasks[0].insert("taskType", "super");
-              for key in ["startupBinding","simulatorRuntime","tmuxContext"] { tasks[0].remove(key); }
-          }
+            doc! {"_id":"success","status":"success","alphaId":"old-alpha"},
+        ];
+        let store = MemoryStore::new("launching", remote, retained.clone());
+        if remote {
+            store.remote(retained.clone());
+        }
+        {
+            let mut st = store.0.lock().unwrap();
+            for (host, tasks) in &mut st.tasks {
+                let task = &mut tasks[0];
+                task.insert("taskType", "super");
+                for key in [
+                    "startupBinding",
+                    "simulatorRuntime",
+                    "tmuxContext",
+                    "stopConfirmedAt",
+                    "stopConfirmedRemote",
+                    "stopConfirmedTaskId",
+                    "launchAttemptAt",
+                ] {
+                    task.remove(key);
+                }
+                if *host == Host::Remote {
+                    task.remove("status");
+                }
+            }
         }
         let runtime = Runtime::default();
         let out = delete(&store, &runtime, &root).await;
-        assert_eq!(out.exit_code, 0, "{}", out.value);
+        assert_eq!(out.exit_code, 0, "{remote}: {}", out.value);
         assert_eq!(out.value["itemsPreserved"], true);
         assert_eq!(out.value["canonicalResultsDeleted"], false);
-        assert_eq!(store.collection(Host::Local, &archive()).unwrap(), retained);
-        if remote { assert_eq!(store.collection(Host::Remote, &archive()).unwrap(), retained); }
+        assert_eq!(
+            row_bytes(&store.collection(Host::Local, &archive()).unwrap()),
+            row_bytes(&retained)
+        );
+        if remote {
+            assert_eq!(
+                row_bytes(&store.collection(Host::Remote, &archive()).unwrap()),
+                row_bytes(&retained)
+            );
+            let st = store.0.lock().unwrap();
+            assert_eq!(
+                st.tasks[&Host::Remote][0].get_str("status").unwrap(),
+                "deactive"
+            );
+        }
         assert_eq!(store.control().get_str("status").unwrap(), "deactive");
-        assert!(runtime.calls.lock().unwrap().contains(&format!("absence:{}", if remote {"remote"} else {"local"})));
-        assert!(!store.control().contains_key("simulatorRuntime"), "archive cannot invent runner closure or platform terminal");
+        assert!(runtime
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&format!("stop:{}", if remote { "remote" } else { "local" })));
+        assert!(
+            !store.control().contains_key("simulatorRuntime"),
+            "archive cannot invent runner closure or platform terminal"
+        );
     }
 }
 
@@ -2299,49 +2694,111 @@ async fn legacy_super_missing_enhancements_can_archive_unresolved_receipts_after
 mod original_professional_runtime;
 
 #[tokio::test]
-async fn public_archive_missing_stop_automatically_uses_original_verify_only_without_signal() {
-    use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::OriginalOperationsRuntime};
-    struct OriginalStopUnboundResearch<'a>(OriginalOperationsRuntime<'a>);
+async fn public_delete_runs_the_original_stop_path_without_a_separate_pause() {
+    use quantnight_task_core::{
+        backend_binding::validate_backend_binding, operations_runtime::OriginalOperationsRuntime,
+    };
+
+    struct OriginalStop<'a>(OriginalOperationsRuntime<'a>);
     #[async_trait]
-    impl OperationsRuntime for OriginalStopUnboundResearch<'_> {
-        async fn assert_consumer_absent(&self,root:&Path,task:&Document,host:Host)->Result<(),String> {
-            self.0.assert_consumer_absent(root,task,host).await
+    impl OperationsRuntime for OriginalStop<'_> {
+        async fn assert_consumer_absent(
+            &self,
+            root: &Path,
+            task: &Document,
+            host: Host,
+        ) -> Result<(), String> {
+            self.0.assert_consumer_absent(root, task, host).await
         }
-        async fn verify_stopped(&self,root:&Path,task:&Document,remaining:std::time::Duration)->Result<Option<quantnight_task_core::pause::StopOutput>,String> {
-            self.0.verify_stopped(root,task,remaining).await
+        async fn stop_for_archive(
+            &self,
+            root: &Path,
+            store: &dyn TaskStore,
+            task: &Document,
+            guard: &mission_lock::MissionLocks,
+        ) -> Result<(), String> {
+            OperationsRuntime::stop_for_archive(&self.0, root, store, task, guard).await
         }
-        async fn confirm_stopped_scope(&self,r:&Path,s:&dyn TaskStore,t:&Document,d:std::time::Duration)->Result<(),String>{
-            self.0.confirm_stopped_scope(r,s,t,d).await
-        }
-        async fn archive_research(&self,_:&Path,_:&Document,_:Host,_:&str)->Result<Value,String> {
-            // Independent unbound research leaf; original stop/check shell IO is NOT mocked.
-            Ok(Value::Null)
+        async fn archive_research(
+            &self,
+            _: &Path,
+            _: &Document,
+            _: Host,
+            _: &str,
+        ) -> Result<Value, String> {
+            panic!("delete must not invoke research summary")
         }
     }
-    for remote in [false,true] {
-        let fake=original_professional_runtime::original_professional_fixture(false);
-        let root=Path::new(&fake.config.env.working_dir);
-        let binding=validate_backend_binding(&fake.config).await.unwrap();
-        let runtime=OriginalStopUnboundResearch(OriginalOperationsRuntime{binding:&binding,observer:None});
-        let retained=vec![doc!{"_id":"unknown","status":"timeout_error","acceptance":"UNKNOWN","superSlotId":"original-token"}];
-        let store=MemoryStore::new("paused",remote,retained.clone());
-        if remote {store.remote(retained.clone());}
-        {let mut d=store.0.lock().unwrap();for tasks in d.tasks.values_mut(){
-            for key in ["stopConfirmedAt","stopConfirmedRemote","stopConfirmedTaskId","startupBinding","simulatorRuntime","tmuxContext"] {tasks[0].remove(key);}
-            tasks[0].insert("taskType","super");
-            tasks[0].insert("tmuxContext",doc!{"sessionId":"$4"});
-        }}
-        let out=cleanup_sync::delete(root,&store,&runtime,NAME,Some(ID)).await;
-        assert_eq!(out.exit_code,0,"{remote}: {}",out.value);
-        assert_eq!(out.value["itemsPreserved"],true);
-        assert_eq!(out.value["unresolvedItemCount"],1);
-        assert_eq!(store.collection(Host::Local,&archive()).unwrap(),retained);
-        if remote{assert_eq!(store.collection(Host::Remote,&archive()).unwrap(),retained);}
-        let trace=std::fs::read_to_string(root.join("trace")).unwrap();
-        assert!(!trace.contains("if-shell")&&!trace.contains("new-session"));
-        let control=store.control();
-        assert_eq!(control.get_str("stopConfirmationBasis").unwrap(),"session_absent");
-        assert!(!control.contains_key("simulatorRuntime"));
+    for (remote, active) in [(false, true), (true, false)] {
+        let fake = original_professional_runtime::original_professional_fixture(false);
+        let root = Path::new(&fake.config.env.working_dir);
+        if active {
+            std::fs::write(root.join("state"), "active").unwrap();
+            original_professional_runtime::install_original_super_process(
+                root, ID, NAME, remote, "launch-1",
+            );
+        }
+        let binding = validate_backend_binding(&fake.config).await.unwrap();
+        let runtime = OriginalStop(OriginalOperationsRuntime {
+            binding: &binding,
+            observer: None,
+        });
+        let retained = vec![
+            doc! {"_id":"unknown","status":"timeout_error","acceptance":"UNKNOWN","superSlotId":"original-token"},
+        ];
+        let store = MemoryStore::new("running", remote, retained.clone());
+        if remote {
+            store.remote(retained.clone());
+        }
+        {
+            let mut st = store.0.lock().unwrap();
+            st.must_stop_before_rename = Some(root.join("state"));
+            for (host, tasks) in &mut st.tasks {
+                let task = &mut tasks[0];
+                for key in [
+                    "stopConfirmedAt",
+                    "stopConfirmedRemote",
+                    "stopConfirmedTaskId",
+                    "startupBinding",
+                    "simulatorRuntime",
+                    "tmuxContext",
+                ] {
+                    task.remove(key);
+                }
+                task.insert("taskType", "super");
+                task.insert("auth_profile", "user1");
+                task.insert("launchAttemptId", "launch-1");
+                if *host == Host::Remote {
+                    task.remove("status");
+                }
+            }
+        }
+        let out = cleanup_sync::delete(root, &store, &runtime, NAME, Some(ID)).await;
+        assert_eq!(out.exit_code, 0, "{remote}/{active}: {}", out.value);
+        assert_eq!(out.value["itemsPreserved"], true);
+        assert_eq!(
+            row_bytes(&store.collection(Host::Local, &archive()).unwrap()),
+            row_bytes(&retained)
+        );
+        if remote {
+            assert_eq!(
+                row_bytes(&store.collection(Host::Remote, &archive()).unwrap()),
+                row_bytes(&retained)
+            );
+        }
+        let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+        assert!(
+            trace.contains("list-sessions"),
+            "original tmux path was not consulted: {trace}"
+        );
+        assert_eq!(trace.contains("if-shell"), active, "{trace}");
+        assert!(!trace.contains("new-session"), "{trace}");
+        assert!(
+            !root.join("state").exists(),
+            "the original consumer must be stopped before archiving"
+        );
+        assert_eq!(store.control().get_str("status").unwrap(), "deactive");
+        assert!(!store.control().contains_key("simulatorRuntime"));
     }
 }
 
@@ -2349,10 +2806,16 @@ async fn public_archive_missing_stop_automatically_uses_original_verify_only_wit
 async fn generation_unknown_allows_delete_when_writer_stopped_and_blocks_live() {
     use quantnight_task_core::create_generate::GenerationProcesses;
 
-    for inspect in [
-        Ok(GenerationProcesses::Live("writer active".into())),
-        Ok(GenerationProcesses::Unverified("writer unverified".into())),
-        Err("probe error".into()),
+    for (inspect, reason) in [
+        (
+            Ok(GenerationProcesses::Live("writer active".into())),
+            "writer active",
+        ),
+        (
+            Ok(GenerationProcesses::Unverified("writer unverified".into())),
+            "writer unverified",
+        ),
+        (Err("probe error".into()), "probe error"),
     ] {
         let root = Root::new();
         let store = MemoryStore::new("generation_unknown", false, terminal());
@@ -2360,11 +2823,15 @@ async fn generation_unknown_allows_delete_when_writer_stopped_and_blocks_live() 
             "generation",
             doc! {"id": "g1", "phase": "generation_unknown", "producerPid": 42000},
         );
-        let runtime = Runtime { inspect: Some(inspect), ..Default::default() };
-        let out = delete(&store, &runtime, &root).await;
-        assert_eq!(out.exit_code, 1, "{}", out.value);
-        assert_eq!(out.value["requiredAction"], "reconcile_generation_or_sync");
-        assert_eq!(out.value["localDeleted"], false);
+        let runtime = Runtime {
+            inspect: Some(inspect),
+            ..Default::default()
+        };
+        let out = error(delete(&store, &runtime, &root).await, reason);
+        assert_eq!(out["localDeleted"], false);
+        assert!(store.0.lock().unwrap().writes.is_empty());
+        assert_eq!(store.collection(Host::Local, NAME).unwrap(), terminal());
+        assert!(store.collection(Host::Local, &archive()).is_none());
     }
 
     let root = Root::new();

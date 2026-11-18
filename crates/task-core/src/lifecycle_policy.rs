@@ -9,10 +9,8 @@
 //! State-changing callers must propagate these errors; the legacy bool APIs
 //! only provide conservative compatibility fallbacks.
 
-use mongodb::bson::{doc, Bson, DateTime, Document};
+use mongodb::bson::{doc, Bson, Document};
 
-const OBSERVATION_OPEN: &str =
-    "accepted observation is active/unconfirmed; retain its claim and reconcile before mutation";
 const TERMINAL_ROW_STATUSES: &[&str] = &[
     "success",
     "permanent_error",
@@ -114,13 +112,12 @@ fn fence(query: &mut Document, expected: &Document, keys: &[&str]) {
     }
 }
 
-/// Construct the exact original query; do not normalize values or validate a
-/// new name here. The Python function also accepts any present `_id` value;
-/// ObjectId validation belongs to the operations that require it.
+/// Minimal identity and version CAS query: `(_id, name, status, isRemote, updatedAt)`.
+/// Historical proof/snapshot fields must never gate or deadlock control transitions.
 pub fn task_binding_query(
     name: &str,
     expected: &Document,
-    command: &str,
+    _command: &str,
 ) -> Result<Document, String> {
     let id = expected.get("_id").ok_or_else(|| "'_id'".to_string())?;
     let mut query = doc! {
@@ -130,89 +127,6 @@ pub fn task_binding_query(
         "isRemote": expected.get("isRemote").cloned().unwrap_or(Bson::Null),
     };
     fence(&mut query, expected, &["updatedAt"]);
-    if command == "pause"
-        && checked_one_of(
-            expected.get("status"),
-            &["pending", "ready", "generation_failed"],
-        )?
-    {
-        fence(
-            &mut query,
-            expected,
-            &[
-                "generation",
-                "events",
-                "runId",
-                "createdAt",
-                "taskType",
-                "auth_profile",
-                "templatefile",
-                "launchAttemptId",
-                "launchAttemptAt",
-                "startedAt",
-                "syncedDigest",
-                "syncedAt",
-                "targetRemote",
-                "expectedCount",
-                "completedAt",
-                "pausedAt",
-                "consumer_run_id",
-                "heartbeatAt",
-                "startPreflight",
-                "stopConfirmedAt",
-                "launchHistory",
-                "launchAttempts",
-                "launchReceipt",
-                "startReceipt",
-                "consumerPid",
-                "lastError",
-            ],
-        );
-    }
-    if command == "status-terminal-reconcile" {
-        fence(
-            &mut query,
-            expected,
-            &[
-                "launchAttemptId",
-                "generation",
-                "startupBinding",
-                "taskType",
-                "auth_profile",
-            ],
-        );
-    }
-    if command == "watch-attach" {
-        fence(&mut query, expected, &["generation"]);
-    }
-    if command == "start" || command.starts_with("observe-accepted") {
-        fence(
-            &mut query,
-            expected,
-            &[
-                "taskType",
-                "auth_profile",
-                "runId",
-                "startConfig",
-                "mission_config",
-                "config",
-                "acceptedObservation",
-            ],
-        );
-    }
-    if command.starts_with("observe-accepted") {
-        fence(
-            &mut query,
-            expected,
-            &[
-                "stopConfirmedAt",
-                "stopConfirmedRemote",
-                "stopConfirmedTaskId",
-                "launchAttemptAt",
-            ],
-        );
-    }
-    fence(&mut query, expected, &["tmuxContext", "launchAttemptId"]);
     Ok(query)
 }
 
@@ -308,41 +222,29 @@ pub fn unresolved_execution_row(row: &Document) -> bool {
     checked_unresolved_execution_row(row).unwrap_or(true)
 }
 
-/// Uses BSON UTC datetimes, exactly as PyMongo's naive/aware UTC decoding does.
-/// No ISO-string coercion, status check, or new requirement on proof basis.
+/// Paused control state or matching task stop identity on the expected side
+/// suffices; historical timestamp ordering (`stopConfirmedAt > launchAttemptAt`)
+/// is never required as an admission gate.
 pub fn stop_confirmation_valid(task: &Document, remote: bool) -> bool {
-    stop_confirmation_valid_at(task, remote, DateTime::now())
-}
-
-fn stop_confirmation_valid_at(task: &Document, remote: bool, now: DateTime) -> bool {
     let id = match task.get("_id") {
         Some(Bson::ObjectId(id)) => id,
         _ => return false,
     };
-    let stamp = match task.get("stopConfirmedAt") {
-        Some(Bson::DateTime(stamp)) => stamp.timestamp_millis(),
-        _ => return false,
-    };
-    if text(task.get("stopConfirmedTaskId")) != Some(id.to_hex().as_str())
-        || task.get("stopConfirmedRemote") != Some(&Bson::Boolean(remote))
-        || truthy(task.get("isRemote")) != remote
-    {
+    if truthy(task.get("isRemote")) != remote {
         return false;
     }
-    match task.get("launchAttemptAt") {
-        None | Some(Bson::Null | Bson::Undefined) => (),
-        Some(Bson::DateTime(launch)) if stamp > launch.timestamp_millis() => (),
-        _ => return false,
+    if text(task.get("status")) == Some("paused") {
+        return true;
     }
-    stamp > 0 && stamp <= now.timestamp_millis()
+    text(task.get("stopConfirmedTaskId")) == Some(id.to_hex().as_str())
+        && (is_null(task.get("stopConfirmedRemote"))
+            || task.get("stopConfirmedRemote") == Some(&Bson::Boolean(remote)))
 }
 
-pub fn assert_observation_closed(task: &Document) -> Result<(), String> {
-    match task.get("acceptedObservation") {
-        None | Some(Bson::Null | Bson::Undefined) => Ok(()),
-        Some(Bson::Document(receipt)) if truthy(receipt.get("finishedAt")) => Ok(()),
-        _ => Err(OBSERVATION_OPEN.into()),
-    }
+/// Persisted `acceptedObservation` records never lock out control operations;
+/// live process inspection is the sole liveness authority.
+pub fn assert_observation_closed(_task: &Document) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -352,9 +254,8 @@ mod tests {
 
     fn stop_task() -> Document {
         let id = ObjectId::parse_str("0123456789abcdef01234567").unwrap();
-        doc! {"_id": id, "stopConfirmedTaskId": id.to_hex(), "isRemote": false,
-        "stopConfirmedRemote": false, "stopConfirmedAt": DateTime::from_millis(2000),
-        "launchAttemptAt": DateTime::from_millis(1000)}
+        doc! {"_id": id, "status": "paused", "stopConfirmedTaskId": id.to_hex(), "isRemote": false,
+        "stopConfirmedRemote": false}
     }
 
     #[test]
@@ -368,30 +269,24 @@ mod tests {
     }
 
     #[test]
-    fn cas_preserves_null_missing_and_same_name_replacement() {
+    fn cas_preserves_minimal_identity_and_version_fields() {
         let id = ObjectId::new();
         let old = doc! {"_id": id, "status": "ready", "isRemote": false, "updatedAt": Bson::Null};
         let query = task_binding_query("same", &old, "pause").unwrap();
         assert_eq!(query.get_object_id("_id").unwrap(), id);
         assert_ne!(query.get_object_id("_id").unwrap(), ObjectId::new());
         assert_eq!(query.get("updatedAt"), Some(&Bson::Null));
-        assert_eq!(
-            query.get_document("generation").unwrap(),
-            &doc! {"$exists": false}
-        );
-        assert_eq!(
-            query.get_document("tmuxContext").unwrap(),
-            &doc! {"$exists": false}
-        );
+        assert!(!query.contains_key("generation"));
+        assert!(!query.contains_key("tmuxContext"));
         assert!(task_binding_query("same", &doc! {}, "start").is_err());
-        // No extra ObjectId guard added to the original query builder.
         assert!(task_binding_query("same", &doc! {"_id": Bson::Null}, "start").is_ok());
+        let missing_updated = doc! {"_id": id, "status": "ready", "isRemote": false};
+        let missing_query = task_binding_query("same", &missing_updated, "pause").unwrap();
+        assert_eq!(missing_query.get_document("updatedAt").unwrap(), &doc! {"$exists": false});
     }
 
     #[test]
-    fn operation_specific_cas_fences_refuse_stale_observation_and_generation() {
-        // Minimal equality/$exists evaluator, not a Mongo substitute. This
-        // checks which immutable snapshots a future store CAS must actually use.
+    fn minimal_cas_ignores_historical_metadata_and_fences_identity_and_revision() {
         fn matches(query: &Document, row: &Document) -> bool {
             query.iter().all(|(key, value)| {
                 if value == &Bson::Document(doc! {"$exists": false}) {
@@ -405,64 +300,25 @@ mod tests {
         }
         let mut task = stop_task();
         task.extend(doc! {
-            "name": "same", "status": "paused", "updatedAt": "unchanged",
+            "name": "same", "updatedAt": "unchanged",
             "acceptedObservation": {"id": "observer-1", "finishedAt": Bson::Null},
             "launchAttemptId": "launch-1", "tmuxContext": {"sessionId": "$1"},
             "generation": {"id": "generation-1"}, "startupBinding": {"consumer_run_id": "consumer-1"},
         });
-        let query = task_binding_query("same", &task, "observe-accepted-finish").unwrap();
+        let query = task_binding_query("same", &task, "pause").unwrap();
         assert!(matches(&query, &task));
-        for key in [
-            "_id",
-            "status",
-            "isRemote",
-            "acceptedObservation",
-            "stopConfirmedAt",
-            "stopConfirmedRemote",
-            "stopConfirmedTaskId",
-            "launchAttemptAt",
-            "launchAttemptId",
-            "tmuxContext",
-            "auth_profile",
-            "runId",
-            "startConfig",
-            "mission_config",
-            "config",
-        ] {
+        for key in ["_id", "name", "status", "isRemote", "updatedAt"] {
             let mut changed = task.clone();
             changed.insert(key, "replacement");
-            assert!(!matches(&query, &changed), "unfenced observe field: {key}");
+            assert!(!matches(&query, &changed), "core CAS field must fence: {key}");
         }
-        for (command, keys) in [
-            ("watch-attach", vec!["generation"]),
-            (
-                "status-terminal-reconcile",
-                vec!["generation", "startupBinding", "taskType", "auth_profile"],
-            ),
-        ] {
-            let query = task_binding_query("same", &task, command).unwrap();
-            for key in keys {
-                let mut changed = task.clone();
-                changed.insert(key, "replacement");
-                assert!(!matches(&query, &changed), "{command}: {key}");
-            }
-        }
-        task.insert("status", "ready");
-        let query = task_binding_query("same", &task, "pause").unwrap();
         for key in [
-            "events",
-            "generation",
-            "launchHistory",
-            "launchAttempts",
-            "consumerPid",
-            "lastError",
+            "acceptedObservation", "launchAttemptId", "tmuxContext", "generation",
+            "startupBinding", "stopConfirmedAt", "launchHistory", "events",
         ] {
             let mut changed = task.clone();
-            changed.insert(key, "late-write-without-updatedAt");
-            assert!(
-                !matches(&query, &changed),
-                "unfenced never-started field: {key}"
-            );
+            changed.insert(key, "unrelated-change");
+            assert!(matches(&query, &changed), "historical field should not fence CAS: {key}");
         }
     }
 
@@ -495,17 +351,7 @@ mod tests {
         assert!(!positively_unposted(
             &doc! {"_not_posted_": true, "submissionAttempts": [Bson::Null]}
         ));
-        assert!(assert_observation_closed(
-            &doc! {"acceptedObservation": {"finishedAt": "not-a-date"}}
-        )
-        .is_ok());
-        for receipt in [
-            Bson::Boolean(false),
-            Bson::Document(doc! {}),
-            Bson::Document(doc! {"finishedAt": []}),
-        ] {
-            assert!(assert_observation_closed(&doc! {"acceptedObservation": receipt}).is_err());
-        }
+        assert!(assert_observation_closed(&doc! {"acceptedObservation": {"finishedAt": Bson::Null}}).is_ok());
     }
 
     #[test]
@@ -610,11 +456,8 @@ mod tests {
             let error = format!("unhashable type: '{kind}'");
             assert_eq!(
                 checked_receipt_evidence(&doc! {"errorClass": value.clone()}),
-                Err(error.clone())
+                Err(error)
             );
-            let task = doc! {"_id": ObjectId::new(), "status": value.clone()};
-            assert_eq!(task_binding_query("task", &task, "pause"), Err(error));
-            assert!(task_binding_query("task", &task, "start").is_ok());
             assert_eq!(
                 task_binding_query("task", &doc! {"status": value}, "pause"),
                 Err("'_id'".into())
@@ -630,24 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn stop_proof_uses_original_id_side_and_strict_time_order() {
+    fn stop_confirmation_uses_paused_status_or_matching_identity_without_timestamp_gate() {
         let mut task = stop_task();
-        let now = DateTime::from_millis(3000);
-        assert!(stop_confirmation_valid_at(&task, false, now));
-        assert!(!stop_confirmation_valid_at(&task, true, now));
-        task.insert("launchAttemptAt", DateTime::from_millis(2000));
-        assert!(!stop_confirmation_valid_at(&task, false, now));
-        task.insert("launchAttemptAt", Bson::Null);
-        assert!(stop_confirmation_valid_at(&task, false, now));
-        task.insert("stopConfirmedAt", "1970-01-01T00:00:02Z");
-        assert!(!stop_confirmation_valid_at(&task, false, now));
-        task.insert("stopConfirmedAt", DateTime::from_millis(0));
-        assert!(!stop_confirmation_valid_at(&task, false, now));
-        task.insert("stopConfirmedAt", DateTime::from_millis(3001));
-        assert!(!stop_confirmation_valid_at(&task, false, now));
-        task.insert("stopConfirmedAt", now);
-        assert!(stop_confirmation_valid_at(&task, false, now));
-        task.insert("_id", ObjectId::new());
-        assert!(!stop_confirmation_valid_at(&task, false, now));
+        assert!(stop_confirmation_valid(&task, false));
+        assert!(!stop_confirmation_valid(&task, true));
+        // Paused task stays valid even without stopConfirmedAt or with later launchAttemptAt.
+        task.insert("launchAttemptAt", bson::DateTime::from_millis(5000));
+        assert!(stop_confirmation_valid(&task, false));
+        task.remove("stopConfirmedTaskId");
+        task.remove("stopConfirmedRemote");
+        assert!(stop_confirmation_valid(&task, false));
+
+        let mut completed = doc! {
+            "_id": task.get("_id").unwrap().clone(),
+            "status": "completed_with_errors",
+            "isRemote": false,
+            "stopConfirmedTaskId": task.get_object_id("_id").unwrap().to_hex(),
+            "stopConfirmedRemote": false,
+        };
+        assert!(stop_confirmation_valid(&completed, false));
+        completed.insert("stopConfirmedTaskId", "foreign");
+        assert!(!stop_confirmation_valid(&completed, false));
     }
 }

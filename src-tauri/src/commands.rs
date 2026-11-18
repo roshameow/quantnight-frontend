@@ -364,10 +364,12 @@ pub async fn delete_task(
     }
     if receipt["taskId"].as_str() != Some(id.as_str())
         || receipt["remote"].as_bool() != Some(remote)
-        || receipt["unresolvedItemCount"].as_u64().is_none()
-        || receipt["receiptAssessmentUnknownCount"].as_u64().is_none()
-        || receipt["receiptAssessmentUnknownCount"].as_u64()
-            > receipt["unresolvedItemCount"].as_u64()
+        || (!receipt["unresolvedItemCount"].is_null() && receipt["unresolvedItemCount"].as_u64().is_none())
+        || (!receipt["receiptAssessmentUnknownCount"].is_null() && receipt["receiptAssessmentUnknownCount"].as_u64().is_none())
+        || matches!(
+            (receipt["receiptAssessmentUnknownCount"].as_u64(), receipt["unresolvedItemCount"].as_u64()),
+            (Some(unknown), Some(unresolved)) if unknown > unresolved
+        )
         || receipt["platformRequestsCancelled"] != false
         || receipt["capacityReleased"] != false
         || !receipt["receiptPath"]

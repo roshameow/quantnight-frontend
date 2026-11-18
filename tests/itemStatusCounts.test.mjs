@@ -130,7 +130,7 @@ test('single core semantic definition is called, never copied by the GUI', async
   for (const body of [rowsBody, expressionBody]) assert.doesNotMatch(body, /"CANCELLED"|"permanent_error"/);
   assert.match(pipelineBody, /in ITEM_PROGRESS_BUCKETS/);
   for (const body of [countsBody, pipelineBody]) assert.doesNotMatch(body, /"permanent_error"|"timeout_error"|"fail"/);
-  const reconciliation = inspection.slice(inspection.indexOf('let reconciliation: Result<(), Error>'));
+  const reconciliation = inspection.slice(inspection.indexOf('let reconciliation: Result<Option<(Bson, String)>, Error>'));
   assert.match(reconciliation, /let counts = crate::task_store::item_progress_counts\(&execution\.statuses\);/);
   assert.match(reconciliation, /let failures = counts\["error"\] \+ counts\["cancelled"\];/);
   assert.doesNotMatch(reconciliation, /"permanent_error"|"timeout_error"/);

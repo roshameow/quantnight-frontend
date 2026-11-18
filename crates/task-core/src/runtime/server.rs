@@ -8,6 +8,7 @@ pub struct RuntimeState {pub control:Arc<TaskControl>,pub identity:HostIdentity,
 impl RuntimeState {
     pub fn new(control:Arc<TaskControl>,identity:HostIdentity)->Arc<Self>{{let progress=control.runtime_context().ok().map(super::progress::ProgressHub::new);Arc::new(Self{control,identity,inflight:Mutex::new(Inflight::default()),settled:tokio::sync::Notify::new(),progress})}}
     pub fn status(&self)->HostStatus{let state=self.inflight.lock().unwrap_or_else(|e|e.into_inner());HostStatus{identity:self.identity.clone(),draining:state.draining,active:state.active,accepted_calls:state.accepted_calls,accepted_by_kind:crate::task_request::REQUEST_KIND_NAMES.iter().enumerate().map(|(index,name)|((*name).to_string(),state.kind_counts[index])).collect(),progress_subscriptions:state.progress_subscriptions,pools:self.control.runtime_context().map(|context|context.pool_snapshot()).unwrap_or_default()}}
+    fn is_draining(&self) -> bool { self.inflight.lock().unwrap_or_else(|e| e.into_inner()).draining }
     pub fn drain(&self){self.inflight.lock().unwrap_or_else(|e|e.into_inner()).draining=true;self.settled.notify_waiters();}
     pub async fn wait_drained(&self){loop{let notified=self.settled.notified();if self.status().active==0{return;}notified.await;}}
     fn accept(self:&Arc<Self>,id:&str,kind:crate::task_request::RequestKind)->Result<ActiveGuard,TransportError>{
@@ -19,10 +20,18 @@ impl RuntimeState {
 }
 struct ActiveGuard(Arc<RuntimeState>,String);
 impl Drop for ActiveGuard{fn drop(&mut self){let mut state=self.0.inflight.lock().unwrap_or_else(|e|e.into_inner());state.active-=1;state.ids.remove(&self.1);drop(state);self.0.settled.notify_waiters();}}
-fn business_fresh(host:&HostIdentity)->Result<(),String>{
-    host.selection.verify_current()?;identity::core_fresh(&host.selection)?;
-    identity::cli_fresh(&host.selection,&host.cli_source)?;identity::host_image(&host.selection)?;
-    identity::task_settings_fresh(&host.selection,&host.task_settings)
+fn business_fresh(host: &HostIdentity) -> Result<(), Message> {
+    host.selection.verify_current()
+        .map_err(|e| not_executed("selection_changed", e))?;
+    identity::core_fresh(&host.selection).and_then(|()| identity::cli_fresh(&host.selection, &host.cli_source))
+        .map_err(|e| not_executed("source_stale", format!("{e}; selected host requires a current build and safe adoption by its owner")))?;
+    identity::host_image(&host.selection)
+        .map_err(|e| not_executed("image_stale", format!("{e}; check the registered executable and safe host adoption")))?;
+    identity::task_settings_fresh(&host.selection, &host.task_settings)
+        .map_err(|e| not_executed("runtime_settings", e))
+}
+fn draining_rejection() -> Message {
+    not_executed("host_draining", "selected runtime is draining; accepted operations can finish, but this request was not admitted")
 }
 pub(crate) fn operation_observer()->(RuntimeObserver,tokio::sync::mpsc::Receiver<super::RuntimeEvent>,Arc<std::sync::atomic::AtomicU64>){
     let(events,receiver)=tokio::sync::mpsc::channel(64);
@@ -41,14 +50,21 @@ fn not_executed(class:&str,message:impl Into<String>)->Message{let mut error=Tra
 pub async fn serve_connection(mut stream:tokio::net::UnixStream,state:Arc<RuntimeState>)->Result<(),String>{
     identity::peer_uid(&stream)?;
     let hello=tokio::time::timeout(std::time::Duration::from_secs(10),async{
-        codec::read_preamble(&mut stream).await?;match codec::read(&mut stream).await?{Message::Hello(hello)=>Ok::<_,String>(hello),_=>Err("missing IPC hello".into())}
+        codec::read_preamble(&mut stream).await.map_err(|e| e.to_string())?;match codec::read(&mut stream).await?{Message::Hello(hello)=>Ok::<_,String>(hello),_=>Err("missing IPC hello".into())}
     }).await.map_err(|_|"hello deadline expired")??;
     codec::write_preamble(&mut stream).await?;
     if hello.protocol!=VERSION || !identity::management_selection_matches(&hello.selection,&state.identity.selection){codec::write(&mut stream,&not_executed("identity_mismatch","runtime UID/backend/selection/protocol mismatch")).await?;return Ok(());}
     if hello.mode==Admission::Business {
-        let fresh=business_fresh(&state.identity);
-        if hello.task_settings.as_ref().is_some_and(|settings|settings!=&state.identity.task_settings){return codec::write(&mut stream,&not_executed("identity_mismatch","GUI task script settings differ from selected runtime AppConfig; select the original AppConfig and safe reload, no fallback")).await;}
-        if hello.selection!=state.identity.selection || hello.core_source!=state.identity.core_source || fresh.is_err(){codec::write(&mut stream,&not_executed("source_stale","runtime business generation is stale; manage/drain original host without replay")).await?;return Ok(());}
+        let rejection = if hello.task_settings.as_ref().is_some_and(|settings| settings != &state.identity.task_settings) {
+            Some(not_executed("identity_mismatch", "GUI task settings differ from the selected runtime AppConfig; no fallback"))
+        } else if hello.selection != state.identity.selection {
+            Some(not_executed("selection_changed", "client and host use different runtime enrollment revisions; no fallback"))
+        } else if hello.core_source != state.identity.core_source {
+            Some(not_executed("source_stale", "client and selected host have different linked task-core builds; no fallback"))
+        } else {
+            business_fresh(&state.identity).err()
+        };
+        if let Some(error) = rejection { return codec::write(&mut stream, &error).await; }
     }
     let call_id=identity::nonce()?;
     codec::write(&mut stream,&Message::Ready{identity:state.identity.clone(),call_id:call_id.clone()}).await?;
@@ -58,7 +74,7 @@ pub async fn serve_connection(mut stream:tokio::net::UnixStream,state:Arc<Runtim
         return codec::write(&mut stream,&reply).await;
     }
     // Admission belongs to the complete request, not only an earlier hello.
-    if business_fresh(&state.identity).is_err(){return codec::write(&mut stream,&not_executed("source_stale","runtime generation changed before request admission; not executed")).await;}
+    if let Err(error) = business_fresh(&state.identity) { return codec::write(&mut stream, &error).await; }
     execute_bound(stream,state,message,&call_id).await
 }
 #[cfg(unix)]
@@ -68,7 +84,7 @@ pub(crate) async fn execute_bound(mut stream:tokio::net::UnixStream,state:Arc<Ru
 }
 #[cfg(unix)]
 pub(crate) async fn execute_message(mut stream:tokio::net::UnixStream,state:Arc<RuntimeState>,message:Message)->Result<(),String>{
-    if state.status().draining && matches!(message,Message::Subscribe|Message::Refresh){return codec::write(&mut stream,&not_executed("host_draining","runtime is draining; observation request not accepted")).await;}
+    if state.is_draining() && matches!(message,Message::Subscribe|Message::Refresh){return codec::write(&mut stream,&draining_rejection()).await;}
     match message {
         Message::Call{context,request}=>{
             if let Err(mut e)=context.validate(){e.execution="not_executed".into();return codec::write(&mut stream,&Message::Error(e)).await;}
@@ -175,15 +191,19 @@ pub async fn run_host(selection:RuntimeSelection,cli_source:&str)->Result<(),Str
     use std::os::{fd::AsRawFd,unix::fs::OpenOptionsExt};
     let current=std::env::current_exe().and_then(|p|p.canonicalize()).map_err(|_|"host executable unavailable")?;
     if current!=selection.executable{return Err("runtime-host must be the exact registered independent taskctl executable".into());}
-    selection.verify_current()?;identity::core_fresh(&selection)?;let image=identity::host_image(&selection)?;
+    // Source freshness is a business admission check, not a cold management
+    // startup gate. Origin, enrollment, loaded image and host lock still apply.
+    selection.verify_current()?;
+    identity::check_core_origin(&selection)?;
+    let image = identity::host_image(&selection)?;
     let paths=selection.paths()?;identity::check_directory(&paths.directory)?;identity::check_socket(&selection)?;
     if paths.lock.exists(){identity::checked_read(&paths.lock)?;}
     let lock=std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&paths.lock).map_err(|_|"runtime host lock unavailable")?;
     if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("another host owns this runtime binding".into());}
     let (listener,first)=activated_listener(&selection)?;
-    let config=identity::load_host_config(&selection).await?;
+    let config=identity::load_host_config(&selection).await.map_err(|e| format!("runtime host could not load selected configuration: {e}"))?;
     let native_owner=identity::process_identity(std::process::id())?;let instance=identity::nonce()?;
-    let mut control=TaskControl::connect(&config).await?;
+    let mut control=TaskControl::connect(&config).await.map_err(|e| format!("runtime host could not initialize task control: {e}"))?;
     control.attach_generation_owner(crate::generation_owner::HostedGenerationOwner::new(native_owner.clone(),&instance));
     let control=Arc::new(control);
     let host=HostIdentity{selection,uid:identity::uid(),owner:native_owner,generation:instance,image,core_source:crate::DEV_SOURCE_ID.into(),cli_source:cli_source.into(),mission_database:config.mongodb.databases.mission.clone(),simulation_database:config.mongodb.databases.simulation.clone(),task_settings:crate::backend_binding::task_settings_fingerprint(&config)?,ready:true};

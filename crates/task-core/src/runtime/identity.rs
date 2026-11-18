@@ -113,11 +113,26 @@ pub fn peer_uid(stream:&tokio::net::UnixStream)->Result<(),String>{
     use std::os::fd::AsRawFd;let mut credential=unsafe{std::mem::zeroed::<libc::ucred>()};let mut size=std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     if unsafe{libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_PEERCRED,(&mut credential as *mut libc::ucred).cast(),&mut size)}!=0 || credential.uid!=uid(){return Err("Unix socket peer UID mismatch".into());}Ok(())
 }
-pub fn core_fresh(selection:&RuntimeSelection)->Result<(),String>{
-    if Path::new(crate::DEV_CRATE_ROOT)!=selection.frontend_root.join("crates/task-core") || crate::DEV_TARGET!=selection.target || crate::DEV_PROFILE!=selection.profile{return Err("linked core checkout/target/profile differs from explicit runtime selection".into());}
-    source_identity::admit_linked(&selection.frontend_root.join("crates/task-core"),crate::DEV_SOURCE_ID)
+pub(crate) fn check_core_origin(selection: &RuntimeSelection) -> Result<(), String> {
+    if Path::new(crate::DEV_CRATE_ROOT) != selection.frontend_root.join("crates/task-core")
+        || crate::DEV_TARGET != selection.target || crate::DEV_PROFILE != selection.profile {
+        return Err("linked core checkout/target/profile differs from explicit runtime selection".into());
+    }
+    Ok(())
 }
-pub fn cli_fresh(selection:&RuntimeSelection,embedded:&str)->Result<(),String>{source_identity::admit_linked(&selection.frontend_root.join("crates/taskctl"),embedded)}
+pub fn core_fresh(selection: &RuntimeSelection) -> Result<(), String> {
+    check_core_origin(selection)?;
+    runtime_source_fresh(&selection.frontend_root.join("crates/task-core"), crate::DEV_SOURCE_ID, "task core")
+}
+pub fn cli_fresh(selection: &RuntimeSelection, embedded: &str) -> Result<(), String> {
+    runtime_source_fresh(&selection.frontend_root.join("crates/taskctl"), embedded, "taskctl")
+}
+fn runtime_source_fresh(root: &Path, embedded: &str, scope: &str) -> Result<(), String> {
+    let current = source_identity::crate_fingerprint(root)
+        .map_err(|e| format!("cannot verify {scope} source: {e}"))?;
+    if current != embedded { return Err(format!("linked {scope} source differs from the selected checkout")); }
+    Ok(())
+}
 #[cfg(target_os="macos")]
 pub fn peer_host(stream:&tokio::net::UnixStream,host:&HostIdentity)->Result<(),String>{if peer_pid(stream)?!=host.owner.pid{return Err("runtime socket peer PID differs from native ready owner".into());}Ok(())}
 #[cfg(all(unix,not(target_os="macos")))]

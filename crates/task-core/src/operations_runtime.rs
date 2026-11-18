@@ -66,56 +66,15 @@ impl OriginalOperationsRuntime<'_> {
                 "configurationBinding":self.binding.request()}), Duration::from_secs(30)).await?;
         crate::start::config_document(result)
     }
-    async fn execution_owner(&self, root: &Path, store: &dyn crate::task_store::TaskStore,
+    async fn execution_owner(&self, root: &Path, _store: &dyn crate::task_store::TaskStore,
         task: &Document, remote: bool, requested: Option<&Document>, allowance: Duration) -> Result<Value, String> {
         let deadline = tokio::time::Instant::now() + allowance.min(Duration::from_secs(12));
         tokio::time::timeout_at(deadline,async {
         self.verify_root(root).await?;
         let name = task.get_str("name").map_err(|_| "missing task name")?;
-        let profile = task.get_str("auth_profile").unwrap_or("user1");
         let id = task.get_object_id("_id").map_err(|_| "missing original task ID")?;
-        let side = Host::from_remote(remote);
-        let registry = {
-            let row = store.find_task(side, bson::doc! {"name":name,"status":{"$ne":"deactive"}}, true).await?;
-            if row.as_ref().is_some_and(|r| r.get("_id") != task.get("_id") || (r.contains_key("auth_profile") && task.contains_key("auth_profile") && r.get("auth_profile") != task.get("auth_profile"))
-                || r.get("isRemote").is_some_and(|value| match value { Bson::Null => remote, Bson::Boolean(value) => *value != remote, _ => true })
-                || (r.contains_key("taskType") && r.get("taskType") != task.get("taskType"))
-                || (r.contains_key("launchAttemptId") && r.get("launchAttemptId") != task.get("launchAttemptId"))) { return Err("execution registry belongs to another task/profile/host/launch".into()); }
-            row
-        };
-        if registry.as_ref().is_some_and(|r|r.get("simulatorRuntime").is_some_and(|v| !matches!(v,Bson::Null|Bson::Document(_)))) {
-            return Err("original runtime registry evidence malformed; not missing legacy metadata".into());
-        }
-        let mut evidence = registry.as_ref().and_then(|r| r.get_document("simulatorRuntime").ok()).cloned().unwrap_or_default();
-        evidence=evidence.iter().filter(|(key,_)| ["pid","pidCreatedAt","heartbeatAt","consumer_run_id","configDigestVersion","effectiveConfigDigest","launchAttemptId","startupRecovery","task","auth_profile","dist","source_task_id","source_remote"].contains(&key.as_str())).map(|(key,value)|(key.clone(),value.clone())).collect();
-        if !evidence.is_empty() { evidence.insert("registryTaskId", id.to_hex()); }
-        if task.get_str("taskType").ok() == Some("regular") && !profile.is_empty() {
-            if let Some(capability) = store.consumer_runtime(side, name, profile).await? { evidence = capability; }
-        }
-        // Do not lose independently known runs when capability replaces registry
-        // evidence. The original checker must compare every available source.
-        let mut known_runs=Vec::new();
-        for row in [Some(task),registry.as_ref()].into_iter().flatten() {
-            for key in ["startupBinding","simulatorRuntime"] {
-                if let Ok(value)=row.get_document(key) {
-                    if let Some(run)=value.get("consumer_run_id") {known_runs.push(run.clone().into_relaxed_extjson());}
-                }
-            }
-            if let Some(run)=row.get("consumer_run_id") {known_runs.push(run.clone().into_relaxed_extjson());}
-        }
-        let binding = json!({"knownConsumerRuns":known_runs,
-            "taskCreatedAt":task.get("createdAt").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "launchAttemptAt":task.get("launchAttemptAt").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "taskId":id.to_hex(),"remote":remote,"taskType":task.get_str("taskType").unwrap_or("regular"),
-            "auth_profile":profile,"launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "consumer_run_id":task.get_document("startupBinding").ok().and_then(|b| b.get_str("consumer_run_id").ok())
-                .or_else(||task.get_document("simulatorRuntime").ok().and_then(|b|b.get_str("consumer_run_id").ok()))
-                .or_else(||task.get_str("consumer_run_id").ok()),
-            "tmuxContext":task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "runtimeEvidence":Bson::Document(evidence).into_relaxed_extjson(),
-            "knownProcesses":task.get_document("observedExecutionBeforeStop").ok().and_then(|v|v.get_array("processes").ok())
-                .map(|v|Bson::Array(v.clone()).into_relaxed_extjson()),
-            "requestedConfig":requested.map(|c| crate::start::strict_json(&Bson::Document(c.clone()))).transpose()?});
+        let mut binding = process_binding(task, remote)?;
+        binding["requestedConfig"] = requested.map(|c| crate::start::strict_json(&Bson::Document(c.clone()))).transpose()?.unwrap_or(Value::Null);
         let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {return Err("original execution observation deadline exhausted".into());}
         let mut command=self.process("/bin/bash");
@@ -139,6 +98,10 @@ impl OriginalOperationsRuntime<'_> {
             _=>false,
         };
         if !coherent{return Err("original execution observation contains contradictory facts".into());}
+        if observed["explicitPauseVerified"] == true && (observed["state"] != "unverified"
+            || observed["taskId"] != id.to_hex()) {
+            return Err("scoped stop observation belongs to a different current task".into());
+        }
         // Scoped legacy evidence is solely for idempotent START, never a
         // launch/run attestation or owned-residue authority.
         if observed["consumerScopeVerified"]==true && (observed["state"]!="unverified"
@@ -162,16 +125,12 @@ impl OriginalOperationsRuntime<'_> {
         self.verify_root(root).await?;
         let name = task.get_str("name").map_err(|_| "missing exact task name")?;
         validate_name(name)?;
-        let id = task.get_object_id("_id").map_err(|_| "missing original task ObjectId")?;
         let remote = match task.get("isRemote") {
             None | Some(Bson::Null | Bson::Boolean(false)) => false,
             Some(Bson::Boolean(true)) => true, _ => return Err("invalid original task execution host".into()),
         };
-        let binding = json!({"taskId":id.to_hex(), "remote":remote,
-            "launchAttemptId":task.get("launchAttemptId").filter(|v| **v!=Bson::Null).cloned()
-                .or_else(||task.get_document("tmuxContext").ok().and_then(|c|c.get("launchAttemptId")).cloned()).unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "tmuxContext":task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-            "executionObservation":task.get("observedExecutionBeforeStop").cloned().unwrap_or(Bson::Null).into_relaxed_extjson()});
+        let mut binding = process_binding(task, remote)?;
+        binding["executionObservation"] = task.get("observedExecutionBeforeStop").cloned().unwrap_or(Bson::Null).into_relaxed_extjson();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() { return Err("original stop allowance exhausted before process invocation".into()); }
         let mut command = self.process("/bin/bash");
@@ -202,6 +161,31 @@ impl OriginalOperationsRuntime<'_> {
     }
 }
 
+/// Bind facts to the control row already selected by the caller. Observing
+/// execution is not another registry/heartbeat lookup or launch-ID quorum.
+fn process_binding(task: &Document, remote: bool) -> Result<Value, String> {
+    let id = task.get_object_id("_id").map_err(|_| "missing original task ID")?;
+    let same_host = task.get_bool("isRemote").unwrap_or(false) == remote;
+    let saved = |key| if same_host { task.get(key).cloned().unwrap_or(Bson::Null).into_relaxed_extjson() } else { Value::Null };
+    let evidence = if same_host {
+        task.get_document("simulatorRuntime").ok().map(|value| {
+            let mut row: Document = value.iter().filter(|(key, _)|
+                ["pid", "pidCreatedAt", "consumer_run_id", "configDigestVersion", "effectiveConfigDigest", "source_task_id", "source_remote"].contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone())).collect();
+            row.insert("registryTaskId", id.to_hex());
+            Bson::Document(row).into_relaxed_extjson()
+        }).unwrap_or(Value::Null)
+    } else { Value::Null };
+    Ok(json!({"taskId":id.to_hex(), "remote":remote,
+        "taskType":task.get_str("taskType").unwrap_or("regular"),
+        "auth_profile":task.get_str("auth_profile").unwrap_or("user1"),
+        "taskCreatedAt":task.get("createdAt").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
+        "launchAttemptId":saved("launchAttemptId"), "tmuxContext":saved("tmuxContext"),
+        "runtimeEvidence":evidence,
+        "knownProcesses":if same_host { task.get_document("observedExecutionBeforeStop").ok().and_then(|v|v.get_array("processes").ok())
+            .map(|v|Bson::Array(v.clone()).into_relaxed_extjson()) } else { None }}))
+}
+
 fn require_exact_absence(stdout: &str, name: &str, remote: bool) -> Result<(), String> {
     let exact = format!("❌ Session '{name}' 不存在 ({})", if remote { "remote" } else { "local" });
     if stdout.lines().filter(|line| *line == exact).count() != 1
@@ -215,17 +199,16 @@ fn require_exact_absence(stdout: &str, name: &str, remote: bool) -> Result<(), S
 #[async_trait]
 impl OperationsRuntime for OriginalOperationsRuntime<'_> {
     async fn assert_consumer_absent(&self, root: &Path, task: &Document, host: Host) -> Result<(), String> {
-        self.verify_root(root).await?;
+        if host == Host::Local {
+            crate::create_generate::require_generation_writer_stopped_with(|| {
+                <Self as crate::create_generate::GenerationRuntime>::inspect_generation(self, root, task)
+            }).await?;
+        } else {
+            self.verify_root(root).await?;
+        }
         let name = task.get_str("name").map_err(|_| "missing exact task name")?;
         validate_name(name)?;
-        let id = task.get_object_id("_id").map_err(|_| "missing original task ObjectId")?;
-        // An initial sync also checks the other host. Its absence check must
-        // not reinterpret a local session context as a remote launch identity.
-        let binding = if task.get_bool("isRemote").unwrap_or(false) == host.is_remote() {
-            json!({"taskId": id.to_hex(), "remote": host.is_remote(),
-                "launchAttemptId": task.get("launchAttemptId").cloned().unwrap_or(Bson::Null).into_relaxed_extjson(),
-                "tmuxContext": task.get("tmuxContext").cloned().unwrap_or(Bson::Null).into_relaxed_extjson()})
-        } else { json!({}) };
+        let binding = process_binding(task, host.is_remote())?;
         let mut command = self.process("/bin/bash");
         command.arg("scripts/check_tmux_python.sh").arg(name)
             .arg(if host.is_remote() { "true" } else { "false" })
@@ -250,6 +233,23 @@ impl OperationsRuntime for OriginalOperationsRuntime<'_> {
     ) -> Result<crate::create_generate::GenerationProcesses, String> {
         <Self as crate::create_generate::GenerationRuntime>::inspect_generation(self, root, task)
             .await
+    }
+    async fn stop_for_archive(
+        &self, root: &Path, store: &dyn crate::task_store::TaskStore, task: &Document,
+        guard: &crate::mission_lock::MissionLocks,
+    ) -> Result<(), String> {
+        let budget = crate::pause::StopBudget::Cli;
+        let runtime = OriginalPauseRuntime {
+            common: OriginalOperationsRuntime { binding: self.binding, observer: self.observer.clone() },
+            budget,
+        };
+        let deadline = tokio::time::Instant::now() + budget.duration();
+        let mut output = None;
+        let mut reconciled = None;
+        tokio::time::timeout_at(deadline, crate::pause::stop_activity_locked(
+            root, store, &runtime, task, guard, deadline, &None, &mut output, &mut reconciled,
+        )).await.map_err(|_| "task stop timed out; no collection was archived".to_string())??;
+        Ok(())
     }
     async fn archive_research(&self, root: &Path, task: &Document, host: Host,
         evidence_collection: &str) -> Result<Value, String> {
@@ -347,13 +347,17 @@ impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
         Ok(())
     }
     async fn assert_consumer_absent(&self, root: &Path, task: &Document, remote: bool) -> Result<(), String> {
-        self.verify_root(root).await?;
+        // A remote consumer still reads a task whose generation owner is local.
+        // A dead control process may leave its writer behind after releasing the lock.
+        crate::create_generate::require_generation_writer_stopped_with(|| {
+            <Self as crate::create_generate::GenerationRuntime>::inspect_generation(self, root, task)
+        }).await?;
         let name = task.get_str("name").map_err(|_| "missing task name")?;
         validate_name(name)?;
-        // Original start presence check does NOT adopt an older launch context.
+        let binding = process_binding(task, remote)?;
         let mut command = self.process("/bin/bash");
         command.arg("scripts/check_tmux_python.sh").arg(name)
-            .arg(if remote { "true" } else { "false" }).args(["--require-absent", "--binding", "{}"]);
+            .arg(if remote { "true" } else { "false" }).args(["--require-absent", "--binding"]).arg(binding.to_string());
         let (out, _) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
         require_exact_absence(&out, name, remote)
     }
@@ -522,10 +526,13 @@ impl crate::pause::PauseRuntime for OriginalPauseRuntime<'_> {
     }
     async fn inspect_before_stop(&self,root:&Path,store:&dyn crate::task_store::TaskStore,task:&Document,remaining:Duration)
         ->Result<Option<Value>,String>{
+        crate::create_generate::require_generation_writer_stopped_with(|| {
+            <OriginalOperationsRuntime<'_> as crate::create_generate::GenerationRuntime>::inspect_generation(&self.common, root, task)
+        }).await?;
         let observed=self.common.execution_owner(root,store,task,task.get_bool("isRemote").unwrap_or(false),None,remaining).await?;
         if observed["state"]=="session_absent" || observed["explicitPauseVerified"]==true || (observed["identityVerified"]==true
             && matches!(observed["state"].as_str(),Some("live"|"owned_residue"))){Ok(Some(observed))}
-        else{Err("original execution identity unconfirmed; refusing a stop signal to a possibly foreign consumer".into())}
+        else{Err(format!("original execution scope unconfirmed; no signal sent: {}", observed["reason"].as_str().unwrap_or("current same-name session is not bound to this task")))}
     }
     async fn confirm_stopped_scope(&self,root:&Path,store:&dyn crate::task_store::TaskStore,task:&Document,remaining:Duration)->Result<(),String>{
         OperationsRuntime::confirm_stopped_scope(&self.common,root,store,task,remaining).await
@@ -581,7 +588,7 @@ async fn generation_child(command: Command, budget: Duration, observer: Option<B
         })
 }
 
-fn generation_observation(stdout: &str, task: &Document,writer_only:bool)
+fn generation_observation(stdout: &str, task: &Document)
     -> Result<crate::create_generate::GenerationProcesses, String> {
     use crate::create_generate::GenerationProcesses;
     let prefix = "QUANTNIGHT_GENERATION_OBSERVED ";
@@ -592,20 +599,16 @@ fn generation_observation(stdout: &str, task: &Document,writer_only:bool)
     let mut packets = stdout.lines().filter_map(|line| line.strip_prefix(prefix));
     let packet: Value = serde_json::from_str(packets.next().ok_or("generation observation missing")?)
         .map_err(|_| "generation observation malformed")?;
-    let generation = task.get_document("generation").map_err(|_| "generation binding missing")?;
     if packets.next().is_some() || packet["schemaVersion"] != 1
         || packet["taskId"].as_str() != Some(task.get_object_id("_id").map_err(|_| "task id missing")?.to_hex().as_str())
         || packet["taskName"].as_str() != task.get_str("name").ok()
-        || packet["generationId"].as_str() != generation.get_str("id").ok()
-        || packet["producerPid"] != serde_json::to_value(generation.get("producerPid")).map_err(|e| e.to_string())?
         || packet["remote"] != false {
         return Err("generation observation identity/host mismatch".into());
     }
     let reason = packet["reason"].as_str().filter(|s| !s.is_empty())
         .ok_or("generation observation lacks concrete reason")?.to_string();
     match packet["state"].as_str() {
-        Some("stopped") if !writer_only => Ok(GenerationProcesses::Stopped),
-        Some("writer_absent") if writer_only => Ok(GenerationProcesses::Stopped),
+        Some("writer_absent") => Ok(GenerationProcesses::Stopped),
         Some("live") => Ok(GenerationProcesses::Live(reason)),
         Some("unverified") => Ok(GenerationProcesses::Unverified(reason)),
         _ => Err("generation observation state unrecognized".into()),
@@ -620,24 +623,31 @@ impl crate::create_generate::GenerationRuntime for OriginalOperationsRuntime<'_>
         let name = task.get_str("name").map_err(|_| "generation task name missing")?;
         validate_name(name)?;
         let id = task.get_object_id("_id").map_err(|_| "generation task ObjectId missing")?;
-        let generation = task.get_document("generation").map_err(|_| "generation binding missing")?;
-        let owner=crate::generation_owner::current();
-        let writer_only=match owner.as_ref().and_then(|owner|owner.scope_active(task)){
-            Some(true)=>return Ok(crate::create_generate::GenerationProcesses::Live("original exact generation business scope remains active".into())),
-            Some(false)=>true,None=>false,
-        };
-        let binding = json!({"taskId":id.to_hex(), "generation":generation});
+        // The caller holds the original task mutation lock. A matching active
+        // scope is affirmative evidence; a stale/missing tag or a living host
+        // PID is not. Always observe the actual local writer on the latter path.
+        let owner = crate::generation_owner::current();
+        let scope_live = || owner.as_ref().and_then(|owner| owner.scope_active(task)) == Some(true);
+        let active_scope = || crate::create_generate::GenerationProcesses::Live(
+            "original exact generation business scope remains active".into(),
+        );
+        if scope_live() {
+            return Ok(active_scope());
+        }
+        let binding = json!({"taskId": id.to_hex()});
         let mut command = self.process("/bin/bash");
         command.arg("scripts/check_tmux_python.sh").arg(name).arg("false")
-            .arg(if writer_only{"--inspect-generation-writers"}else{"--inspect-generation"}).arg("--binding").arg(binding.to_string());
+            .arg("--inspect-generation-writers").arg("--binding").arg(binding.to_string());
         // Same diagnostic transport/budget. Only the inspector is an owned
         // diagnostic child; the business generator is neither launched nor killed.
         let (out, err) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
         if !err.trim().is_empty() {
             return Err(format!("generation process inspection stderr unconfirmed: {err}"));
         }
-        let observed=generation_observation(&out,task,writer_only)?;
-        if writer_only && owner.as_ref().and_then(|owner|owner.scope_active(task))!=Some(false){return Ok(crate::create_generate::GenerationProcesses::Unverified("exact host generation scope changed while inspecting writers".into()));}
+        let observed = generation_observation(&out, task)?;
+        if scope_live() {
+            return Ok(active_scope());
+        }
         Ok(observed)
     }
 
@@ -709,7 +719,14 @@ else
 fi
 "#).unwrap();
         std::fs::set_permissions(python, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(root.join("scripts/check_tmux_python.sh"), check).unwrap();
+        let generation = r#"if [ "$3" = --inspect-generation-writers ]; then
+  [ "$1" = fixture ] && [ "$2" = false ] && [ "$4" = --binding ] &&
+    [ "$5" = '{"taskId":"0123456789abcdef01234567"}' ] || exit 29
+  printf '%s\n' 'QUANTNIGHT_GENERATION_OBSERVED {"schemaVersion":1,"taskId":"0123456789abcdef01234567","taskName":"fixture","remote":false,"state":"writer_absent","reason":"fixture"}'
+  exit 0
+fi
+"#;
+        std::fs::write(root.join("scripts/check_tmux_python.sh"), format!("{generation}{check}")).unwrap();
         fake
     }
     fn task() -> Document {
@@ -748,7 +765,7 @@ fi
         assert_eq!(request["remote"], false);
     }
     #[tokio::test]
-    async fn start_presence_ignores_old_launch_context_and_launcher_only_extracts_original_marker() {
+    async fn start_presence_uses_scoped_inventory_and_launcher_only_extracts_original_marker() {
         use crate::start::{StartRuntime, StartCommand};
         let fake = fixture("printf '%s\\n' \"$@\" > check.argv; echo \"❌ Session 'fixture' 不存在 (local)\"");
         let binding = validate_backend_binding(&fake.config).await.unwrap();
@@ -756,7 +773,13 @@ fi
         let mut original = task();
         original.insert("tmuxContext", doc! {"old": "do-not-adopt"});
         StartRuntime::assert_consumer_absent(&runtime, binding.root(), &original, false).await.unwrap();
-        assert!(std::fs::read_to_string(binding.root().join("check.argv")).unwrap().ends_with("--binding\n{}\n"));
+        let argv = std::fs::read_to_string(binding.root().join("check.argv")).unwrap();
+        let lines: Vec<_> = argv.lines().collect();
+        assert_eq!(&lines[..4], &["fixture", "false", "--require-absent", "--binding"]);
+        let sent: Value = serde_json::from_str(lines[4]).unwrap();
+        assert_eq!(sent["taskId"], "0123456789abcdef01234567");
+        assert_eq!(sent["remote"], false);
+        assert_eq!(sent["taskType"], "regular");
         let launcher = binding.root().join("scripts/start_task.sh");
         std::fs::write(&launcher, r#"echo called >> launch.count
 printf '%s' "$QUANTNIGHT_TMUX_BINDING" > launch.binding

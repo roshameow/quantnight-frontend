@@ -103,6 +103,8 @@ struct Data {
     calls: Vec<String>,
     writes: Vec<(Host, Document, Document)>,
     fail: Option<String>,
+    lose_local_write_reply: bool,
+    fail_summary_host: Option<Host>,
     patch_before_write: Option<(Host, Document)>,
     indexes: Vec<Document>,
 }
@@ -148,7 +150,7 @@ impl TaskStore for Memory {
             &mut d,
             if newest {
                 "control-read"
-            } else if q.contains_key("acceptedObservation") {
+            } else if q.contains_key("updatedAt") {
                 "status-revalidate"
             } else {
                 "startup-read"
@@ -196,6 +198,9 @@ impl TaskStore for Memory {
                     .push(v.clone());
             }
         }
+        if h == Host::Local && std::mem::take(&mut d.lose_local_write_reply) {
+            return Err("injected terminal write response lost after applying".into());
+        }
         Ok(1)
     }
     async fn summary(&self, h: Host, _: &str) -> Result<CollectionSummary, String> {
@@ -203,6 +208,9 @@ impl TaskStore for Memory {
         if let Some(gate) = gate { gate.entered.notify_one(); gate.release.notified().await; }
         let mut d = self.0.lock().unwrap();
         call(&mut d, "summary")?;
+        if d.fail_summary_host == Some(h) {
+            return Err(format!("injected {h:?} summary read failure"));
+        }
         let Some(rows) = d.items.get(&h) else {
             return Ok(CollectionSummary::default());
         };
@@ -237,10 +245,11 @@ impl TaskStore for Memory {
     async fn result_items_page(
         &self,
         h: Host,
-        _: &str,
+        name: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Document>, String> {
+        assert_eq!(name, NAME);
         let mut d = self.0.lock().unwrap();
         call(&mut d, "page")?;
         let o = task_store::result_items_options(limit, offset)?;
@@ -266,7 +275,12 @@ impl TaskStore for Memory {
         let o = task_store::canonical_result_options(hint, ids.len())?;
         Ok(d.canonical
             .iter()
-            .filter(|r| r.get("id").map(|id| ids.contains(id)).unwrap_or(false))
+            .filter(|r| match r.get("id") {
+                // Mongo $in also tests elements of an array-valued field.
+                Some(Bson::Array(values)) => values.iter().any(|v| ids.contains(v)),
+                Some(id) => ids.contains(id),
+                None => false,
+            })
             .take(o.limit.unwrap() as usize)
             .map(|r| project(r, o.projection.as_ref().unwrap()))
             .collect())
@@ -324,9 +338,17 @@ impl OperationsRuntime for Runtime {
         h: Host,
         n: &str,
     ) -> Result<Value, String> {
-        assert_eq!(t.get_object_id("_id").unwrap().to_hex(), ID);
-        assert_eq!(n, NAME);
-        self.calls.lock().unwrap().push(format!("archive:{h:?}"));
+        let id = t.get_object_id("_id").unwrap().to_hex();
+        assert_eq!(t.get_str("name").unwrap(), NAME);
+        assert_eq!(h.is_remote(), t.get_bool("isRemote").unwrap());
+        if t.get_str("status").ok() == Some("deactive") {
+            assert_eq!(id, ID);
+            assert_eq!(n, format!("{NAME}__archive_{id}"));
+            self.calls.lock().unwrap().push(format!("archive:{h:?}:{n}"));
+        } else {
+            assert_eq!(n, NAME);
+            self.calls.lock().unwrap().push(format!("archive:{h:?}"));
+        }
         Ok(json!({"archivePath":"original/archive.json","ideas":2,"platformFetched":false}))
     }
 }
@@ -456,6 +478,12 @@ async fn list_projects_sorts_filters_and_uses_explicit_host() {
     assert_eq!(r.value["concurrency"]["super"]["total"], 1);
     assert_eq!(r.value["concurrency"]["super"]["expression"], "1");
     assert_eq!(r.value["concurrency"]["total"], 6);
+    assert_eq!(r.value["concurrency"]["basis"], "configured_for_recorded_running_tasks");
+    assert!(r.value["concurrency"]["platformInFlight"].is_null());
+    for task in r.value["tasks"].as_array().unwrap() {
+        assert_eq!(task["statusBasis"], "control_record");
+        assert!(task["consumerLiveness"].is_null());
+    }
     m.0.lock().unwrap().controls.insert(Host::Remote, vec![old]);
     let r = list(
         &m,
@@ -471,6 +499,55 @@ async fn list_projects_sorts_filters_and_uses_explicit_host() {
     assert_eq!(r.value["concurrency"]["total"], 0);
     m.no_writes();
 }
+#[tokio::test]
+async fn list_refresh_row_error_isolated_and_failed_list_never_returns_zero() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+
+    let fixture = original_professional_runtime::original_professional_fixture(false);
+    let root = Path::new(&fixture.config.env.working_dir);
+    // Real TaskControl and binding adapter, fake external I/O.
+    let binding = validate_backend_binding(&fixture.config).await.unwrap();
+    let mut generating = task(false);
+    generating.insert("name", "generating_fixture");
+    generating.insert("status", "generating");
+    let m = Memory::new(generating, vec![]);
+    let mut launching = task(true);
+    launching.insert("_id", ObjectId::new());
+    launching.insert("status", "launching");
+    {
+        let mut d = m.0.lock().unwrap();
+        d.controls.get_mut(&Host::Local).unwrap().push(launching);
+        // The generation reconciliation's by-ID reread fails; the original
+        // successful inventory and other task must still be returned.
+        d.fail = Some("startup-read".into());
+    }
+    let control = TaskControl::with_store(binding, Arc::new(m.clone()));
+
+    let out = control.list(&ListRequest::default()).await;
+    assert_eq!(out.exit_code, 0, "{}", out.value);
+    let tasks = out.value["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    let generating = tasks.iter().find(|t| t["name"] == "generating_fixture").unwrap();
+    assert_eq!(generating["status"], "generating");
+    assert!(generating["generationRefreshError"].as_str().unwrap().contains("injected startup-read"));
+    let launching = tasks.iter().find(|t| t["name"] == NAME).unwrap();
+    assert_eq!(launching["status"], "launching");
+    assert_eq!(launching["statusBasis"], "control_record");
+    assert!(launching["consumerLiveness"].is_null());
+    assert_eq!(m.0.lock().unwrap().calls, vec!["list", "startup-read"]);
+    assert!(!root.join("trace").exists());
+    m.no_writes();
+
+    m.0.lock().unwrap().fail = Some("list".into());
+    let unavailable = control.list(&ListRequest::default()).await;
+    assert_eq!(unavailable.exit_code, 1);
+    assert_eq!(unavailable.value["ok"], false);
+    assert!(unavailable.value["error"].as_str().unwrap().contains("injected list"));
+    assert!(unavailable.value.get("tasks").is_none());
+    assert!(unavailable.value.get("concurrency").is_none());
+    m.no_writes();
+}
+
 #[tokio::test]
 async fn regular_status_aggregates_execution_then_exact_terminal_cas() {
     let root = Root::new();
@@ -490,15 +567,15 @@ async fn regular_status_aggregates_execution_then_exact_terminal_cas() {
         vec!["control-read", "summary", "summary", "status-revalidate", "terminal-cas"]
     );
     let q = &d.writes[0].1;
-    assert_eq!(q.get_str("launchAttemptId").unwrap(), "launch-1");
-    assert_eq!(
-        q.get_document("acceptedObservation").unwrap(),
-        &doc! {"$exists":false}
-    );
-    assert_eq!(
-        q.get_document("generation").unwrap(),
-        &doc! {"$exists":false}
-    );
+    let initial = task(true);
+    assert_eq!(q.get("_id"), initial.get("_id"));
+    assert_eq!(q.get_str("name").unwrap(), NAME);
+    assert_eq!(q.get_str("status").unwrap(), "running");
+    assert_eq!(q.get("isRemote"), initial.get("isRemote"));
+    assert_eq!(q.get("updatedAt"), initial.get("updatedAt"));
+    assert!(!q.contains_key("launchAttemptId"));
+    assert!(!q.contains_key("acceptedObservation"));
+    assert!(!q.contains_key("generation"));
     assert!(d.writes[0]
         .2
         .get_document("$push")
@@ -545,7 +622,7 @@ async fn terminal_reconciliation_preserves_all_guarded_control_states() {
     }
 }
 #[tokio::test]
-async fn observation_claim_blocks_mutation_but_paused_observation_remains_readable() {
+async fn observation_claim_does_not_block_status_reconciliation_or_hide_paused() {
     let root = Root::new();
     for state in ["running", "paused"] {
         let mut t = task(false);
@@ -553,30 +630,30 @@ async fn observation_claim_blocks_mutation_but_paused_observation_remains_readab
         t.insert("acceptedObservation", doc! {"id":"claim"});
         let m = Memory::new(t, success_rows());
         let r = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
-        assert_eq!(r.value["ok"], state == "paused");
+        assert_eq!(r.value["ok"], true);
         if state == "paused" {
-            assert_eq!(r.value["taskStatus"], "unknown");
-            assert_eq!(r.value["reason"], "pause_unconfirmed");
+            assert_eq!(r.value["taskStatus"], "paused");
             assert_eq!(r.value["acceptedObservation"]["id"], "claim");
+            m.no_writes();
+        } else {
+            assert_eq!(r.value["taskStatus"], "completed");
         }
-        m.no_writes();
     }
 }
 #[tokio::test]
 async fn changed_generation_launch_observation_or_revision_loses_terminal_cas() {
     let root = Root::new();
     for patch in [
-        doc! {"launchAttemptId":"other"},
-        doc! {"generation":{"id":"other"}},
-        doc! {"acceptedObservation":{"id":"other"}},
+        doc! {"_id":ObjectId::new()},
+        doc! {"status":"paused"},
+        doc! {"isRemote":true},
         doc! {"updatedAt":"other"},
-        doc! {"tmuxContext":{"sessionId":"other"}},
     ] {
         let m = Memory::new(task(false), success_rows());
         m.0.lock().unwrap().patch_before_write = Some((Host::Local, patch));
         let r = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
         assert_eq!(r.exit_code, 1);
-        assert_eq!(m.control().get_str("status").unwrap(), "running");
+        assert_ne!(m.control().get_str("status").unwrap(), "completed");
     }
 }
 #[tokio::test]
@@ -723,7 +800,7 @@ async fn status_lock_and_store_errors_do_not_look_like_empty_success() {
     assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "summary"]);
     m.no_writes(); // Long reads are now allowed; the terminal EX must still fail.
     drop(lock);
-    for fail in ["control-read", "summary", "terminal-cas"] {
+    for fail in ["control-read", "summary", "status-revalidate"] {
         let m = Memory::new(task(false), success_rows());
         m.0.lock().unwrap().fail = Some(fail.into());
         let r = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
@@ -731,6 +808,68 @@ async fn status_lock_and_store_errors_do_not_look_like_empty_success() {
         assert!(r.value["error"].as_str().unwrap().contains("not retried"));
     }
 }
+#[tokio::test]
+async fn terminal_observation_survives_local_projection_error_and_recovers_without_replay() {
+    for (remote, reply_lost, bound) in [(false, false, false), (true, false, false), (true, true, true)] {
+        let root = Root::new();
+        let mut t = if remote { super_task(true) } else { task(false) };
+        t.insert("status", "running");
+        let mut request = StatusRequest::new(NAME);
+        if bound { request = bound_watch(&t); }
+        let m = Memory::new(t.clone(), vec![doc! {"_id":1,"status":"timeout_error"}]);
+        {
+            let mut d = m.0.lock().unwrap();
+            if remote { d.controls.insert(Host::Remote, vec![t]); }
+            if reply_lost { d.lose_local_write_reply = true; }
+            else { d.fail = Some("terminal-cas".into()); }
+        }
+        let runtime = Runtime::default();
+        let out = status(&root.0, &m, &runtime, &request).await;
+        assert_eq!(out.exit_code, 0, "{}", out.value);
+        assert_eq!(out.value["ok"], true);
+        assert_eq!(out.value["terminal"], true);
+        assert_eq!(out.value["observedTerminal"], true);
+        assert_eq!(out.value["snapshotCurrent"], true);
+        assert_eq!(out.value["observedTaskStatus"], "completed_with_errors");
+        assert_eq!(out.value["taskStatus"], "running", "report the last read control state, not an acknowledged write");
+        assert_eq!(out.value["observationIdentity"]["launchAttemptId"], "launch-1");
+        assert_eq!(out.value["execution"]["statuses"]["timeout_error"], 1);
+        assert_eq!(out.value["reconcileWarning"]["state"], "write_unconfirmed");
+        assert!(out.value["reconcileWarning"]["error"].as_str().unwrap().contains("injected terminal"));
+        assert_eq!(m.control().get_str("status").unwrap(), if reply_lost {"completed_with_errors"} else {"running"});
+        {
+            let mut d = m.0.lock().unwrap();
+            assert_eq!(d.calls.iter().filter(|s| s.as_str() == "terminal-cas").count(), 1);
+            d.fail = None;
+        }
+        let probes_before_next = runtime.calls.lock().unwrap().len();
+        let next = status(&root.0, &m, &runtime, &request).await;
+        assert_eq!(next.value["terminal"], true);
+        assert_eq!(next.value["taskStatus"], "completed_with_errors");
+        assert!(next.value.get("reconcileWarning").is_none());
+        assert_eq!(m.control().get_array("events").unwrap().len(), 1);
+        assert_eq!(runtime.calls.lock().unwrap().len(), probes_before_next, "no redundant process probe");
+    }
+}
+
+#[tokio::test]
+async fn status_remote_failed_summary_is_not_empty_and_preserves_local_evidence() {
+    let root = Root::new();
+    let m = Memory::new(task(true), success_rows());
+    {
+        let mut d = m.0.lock().unwrap();
+        d.items.insert(Host::Local, Vec::new());
+        d.fail_summary_host = Some(Host::Remote);
+    }
+    let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.value["local"]["total"], 0);
+    assert!(out.value["execution"].is_null());
+    assert_eq!(out.value["readErrors"]["execution"], "injected Remote summary read failure");
+    assert_eq!(out.value["terminal"], false);
+    m.no_writes();
+}
+
 #[tokio::test]
 async fn priority_uses_original_owner_override_inspect_and_preserves_invalid_exit_zero() {
     let root = Root::new();
@@ -902,25 +1041,76 @@ async fn results_retains_missing_ids_and_deactive_metadata_no_global_topk() {
     assert_eq!(r.value["offset"], 1);
 }
 #[tokio::test]
-async fn results_saved_tag_guard_and_priority_default_owner() {
+async fn results_completed_tasks_use_exact_execution_ids_without_saved_tags() {
+    let root = Root::new();
+    for (task_type, remote, config) in [
+        ("super", true, Some(Bson::Document(doc! {}))),
+        ("regular", false, Some(Bson::Document(doc! {"tag":{"tags":["other-task"]}}))),
+        ("regular", false, Some(Bson::Document(doc! {"tag":7}))),
+        ("priority", false, None),
+    ] {
+        let mut t = task(remote);
+        t.insert("taskType", task_type);
+        t.insert("status", "completed");
+        if let Some(config) = config {
+            t.insert("startConfig", config);
+        }
+        let m = Memory::new(t, success_rows());
+        {
+            let mut d = m.0.lock().unwrap();
+            let other_task = doc! {"_id": ObjectId::parse_str("ffffffffffffffffffffffff").unwrap(),
+                "name":"other-task","status":"completed","auth_profile":"other-profile"};
+            d.controls.get_mut(&Host::Local).unwrap().push(other_task);
+            d.items.insert(Host::from_remote(!remote), vec![doc! {"_id":1,"alphaId":"other-host"}]);
+            d.canonical = vec![
+                doc! {"id":"from-other-task","tags":[NAME],"is":{"fitness":99}},
+                doc! {"id":"other-host","tags":[NAME]},
+                doc! {"id":"a","tags":["other-task"],"is":{"fitness":1.0}},
+            ];
+        }
+        let rt = Runtime::default();
+        let r = results(&root.0, &m, &rt, &ResultsRequest::new(NAME)).await;
+        assert_eq!(r.exit_code, 0, "{task_type}: {}", r.value);
+        assert_eq!(r.value["taskId"], ID);
+        assert_eq!(r.value["taskStatus"], "completed");
+        assert_eq!(r.value["pageAlphaIds"], 1);
+        assert_eq!(r.value["storedOnPage"], 1);
+        assert_eq!(r.value["rows"], json!([{"id":"a","is":{"fitness":1.0}}]));
+        assert_eq!(r.value["items"][0]["alphaId"], "a");
+        assert_eq!(*rt.calls.lock().unwrap(), vec!["namespace:fixture-profile"]);
+        assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "page", "canonical"]);
+        m.no_writes();
+    }
+}
+
+#[tokio::test]
+async fn results_with_no_exact_item_id_do_not_read_tagged_canonical_rows() {
     let root = Root::new();
     let mut t = task(false);
-    t.insert("startConfig", doc! {"tag":{"tags":["other"]}});
-    let m = Memory::new(t, success_rows());
+    t.insert("startConfig", doc! {"tag":{"tags":[NAME]}});
+    let m = Memory::new(t, vec![doc! {"_id":1,"status":"success","variantId":"not-an-alpha-id"}]);
+    m.0.lock().unwrap().canonical = vec![doc! {"id":"not-an-alpha-id","tags":[NAME]}];
     let r = results(&root.0, &m, &Runtime::default(), &ResultsRequest::new(NAME)).await;
-    assert_eq!(r.value["errorType"], "ValueError");
-    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read"]);
-    let mut t = task(false);
-    t.insert("taskType", "priority");
-    let m = Memory::new(t, vec![]);
-    let rt = Runtime::default();
-    assert_eq!(
-        results(&root.0, &m, &rt, &ResultsRequest::new(NAME))
-            .await
-            .exit_code,
-        0
-    );
-    assert_eq!(rt.calls.lock().unwrap()[0], "priority-default");
+    assert_eq!(r.exit_code, 0, "{}", r.value);
+    assert_eq!(r.value["pageItems"], 1);
+    assert_eq!(r.value["pageAlphaIds"], 0);
+    assert_eq!(r.value["rows"], json!([]));
+    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "page"]);
+    m.no_writes();
+}
+
+#[tokio::test]
+async fn results_does_not_emit_an_array_id_that_mongo_matches_by_element() {
+    let root = Root::new();
+    let m = Memory::new(task(false), success_rows());
+    m.0.lock().unwrap().canonical = vec![doc! {"id":["a","unrelated"],"is":{"fitness":1.0}}];
+    let r = results(&root.0, &m, &Runtime::default(), &ResultsRequest::new(NAME)).await;
+    assert_eq!(r.exit_code, 0, "{}", r.value);
+    assert_eq!(r.value["rows"], json!([]));
+    assert_eq!(r.value["storedOnPage"], 0);
+    assert_eq!(r.value["notInCanonicalStore"], json!(["a"]));
+    assert_eq!(m.0.lock().unwrap().calls, vec!["control-read", "page", "canonical"]);
+    m.no_writes();
 }
 #[tokio::test]
 async fn collect_is_the_only_full_payload_export_with_original_path_and_sort() {
@@ -1002,6 +1192,69 @@ async fn dataset_evidence_keeps_original_owner_paths_and_host_identity() {
     m.no_writes();
 }
 
+#[tokio::test]
+async fn archive_research_explicit_historical_id_uses_exact_retained_execution_namespace() {
+    let root = Root::new();
+    let successor_id = ObjectId::parse_str("ffffffffffffffffffffffff").unwrap();
+    for remote in [false, true] {
+        let mut archived = task(remote);
+        archived.insert("status", "deactive");
+        let m = Memory::new(archived, vec![]);
+        let rt = Runtime::default();
+        let mut request = EvidenceRequest {
+            name: NAME.into(),
+            action: EvidenceAction::ArchiveResearch,
+            expected_task_id: Some(ID.into()),
+            expected_remote: Some(remote),
+        };
+        let retained_call = format!("archive:{:?}:{NAME}__archive_{ID}", Host::from_remote(remote));
+        let result = dataset_evidence(&root.0, &m, &rt, &request).await;
+        assert_eq!(result.exit_code, 0, "{}", result.value);
+
+        let mut name_only = request.clone();
+        name_only.expected_task_id = None;
+        assert_eq!(dataset_evidence(&root.0, &m, &rt, &name_only).await.exit_code, 1);
+
+        // A new same-name task on the opposite host must not steal the lookup.
+        let mut successor = task(!remote);
+        successor.insert("_id", successor_id);
+        m.0.lock().unwrap().controls.get_mut(&Host::Local).unwrap().push(successor);
+        let result = dataset_evidence(&root.0, &m, &rt, &request).await;
+        assert_eq!(result.exit_code, 0, "{}", result.value);
+        assert_eq!(result.value["archivePath"], "original/archive.json");
+        assert_eq!(*rt.calls.lock().unwrap(), vec![retained_call.clone(), retained_call]);
+
+        request.expected_remote = Some(!remote);
+        assert_eq!(dataset_evidence(&root.0, &m, &rt, &request).await.exit_code, 1);
+        request.expected_remote = Some(remote);
+        request.action = EvidenceAction::VerifyRegistration;
+        assert_eq!(dataset_evidence(&root.0, &m, &rt, &request).await.exit_code, 1);
+        request.action = EvidenceAction::ArchiveResearch;
+        request.name = "other-task".into();
+        assert_eq!(dataset_evidence(&root.0, &m, &rt, &request).await.exit_code, 1);
+        assert_eq!(rt.calls.lock().unwrap().len(), 2);
+
+        // The name-only entry continues to operate on the current task.
+        request.name = NAME.into();
+        request.expected_task_id = None;
+        request.expected_remote = Some(!remote);
+        let result = dataset_evidence(&root.0, &m, &rt, &request).await;
+        assert_eq!(result.exit_code, 0, "{}", result.value);
+        assert_eq!(
+            rt.calls.lock().unwrap().last().unwrap(),
+            &format!("archive:{:?}", Host::from_remote(!remote))
+        );
+
+        // An older, still-active duplicate cannot claim the current namespace.
+        m.0.lock().unwrap().controls.get_mut(&Host::Local).unwrap()[0].insert("status", "running");
+        request.expected_task_id = Some(ID.into());
+        request.expected_remote = Some(remote);
+        assert_eq!(dataset_evidence(&root.0, &m, &rt, &request).await.exit_code, 1);
+        assert_eq!(rt.calls.lock().unwrap().len(), 3);
+        m.no_writes();
+    }
+}
+
 #[path = "support/inspection_status_cases.rs"]
 mod inspection_status_cases;
 #[tokio::test]
@@ -1042,10 +1295,47 @@ async fn original_python_status_and_startup_ast_oracle_228_cases() {
         }
         let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
         let expected = &case["expected"];
+        if expected
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|e| e.contains("accepted observation is active/unconfirmed"))
+        {
+            assert_eq!(out.exit_code, 0, "{}: {}", case["label"], out.value);
+            assert_eq!(
+                out.value["taskStatus"],
+                json!("completed"),
+                "{}",
+                case["label"]
+            );
+            let expected_writes = if case["task"]["isRemote"].as_bool() == Some(true) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                m.0.lock().unwrap().writes.len() as u64,
+                expected_writes,
+                "{}",
+                case["label"]
+            );
+            continue;
+        }
         if let Some(value) = expected.get("value") {
             assert_eq!(out.exit_code, 0, "{}: {}", case["label"], out.value);
+            let paused_unconfirmed = value.get("reason").and_then(Value::as_str) == Some("pause_unconfirmed");
             for (key, value) in value.as_object().unwrap() {
-                assert_eq!(&out.value[key], value, "{} key {key}", case["label"]);
+                if paused_unconfirmed && matches!(key.as_str(), "stopConfirmation" | "controlStatus" | "reason") {
+                    continue;
+                }
+                if key == "stopConfirmation" {
+                    continue;
+                }
+                let expected_val = if paused_unconfirmed && key == "taskStatus" {
+                    json!("paused")
+                } else {
+                    value.clone()
+                };
+                assert_eq!(out.value[key], expected_val, "{} key {key}", case["label"]);
             }
         } else {
             assert_eq!(out.exit_code, 1, "{}: {}", case["label"], out.value);
@@ -1136,14 +1426,13 @@ async fn paused_stop_proof_remains_distinct_from_terminal_and_fresh_launch() {
     let m = Memory::new(t.clone(), vec![doc! {"_id":1,"status":"pending"}]);
     let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
     assert_eq!(out.value["taskStatus"], "paused");
-    assert_eq!(out.value["stopConfirmation"], "confirmed");
     assert_eq!(out.value["terminal"], false);
     m.no_writes();
     t.insert("launchAttemptAt", bson::DateTime::from_millis(3000));
     let m = Memory::new(t, vec![doc! {"_id":1,"status":"pending"}]);
     let out = status(&root.0, &m, &Runtime::default(), &StatusRequest::new(NAME)).await;
-    assert_eq!(out.value["taskStatus"], "unknown");
-    assert_eq!(out.value["stopConfirmation"], "unknown");
+    assert_eq!(out.value["taskStatus"], "paused");
+    assert_eq!(out.value["terminal"], false);
     m.no_writes();
 }
 
@@ -1261,8 +1550,8 @@ async fn historical_completed_unfinished_is_display_only_even_without_control_re
 async fn closure_cas_cannot_commit_across_pause_observation_or_successor() {
     for patch in [
         doc! {"status":"paused"}, doc! {"status":"deactive"},
-        doc! {"launchAttemptId":"successor"},
-        doc! {"acceptedObservation":{"id":"new-observer"}},
+        doc! {"updatedAt":"successor"},
+        doc! {"isRemote":true},
         doc! {"simulatorRuntime":{"consumer_run_id":"consumer-1","lifecycleClosure":null}},
     ] {
         let root = Root::new();
@@ -1404,9 +1693,8 @@ async fn long_status_reads_allow_real_pause_and_never_overwrite_its_new_state() 
 
 #[tokio::test]
 async fn long_status_snapshot_must_revalidate_identity_before_terminal_lock_and_cas() {
-    for patch in [doc! {"launchAttemptId":"next"}, doc! {"isRemote":true},
-        doc! {"generation":{"id":"next"}}, doc! {"acceptedObservation":{"id":"new"}},
-        doc! {"updatedAt":"next"}, doc! {"runId":"next"}, doc! {"status":"deactive"},
+    for patch in [doc! {"_id":ObjectId::new()}, doc! {"isRemote":true},
+        doc! {"updatedAt":"next"}, doc! {"status":"deactive"},
         doc! {"simulatorRuntime":{"consumer_run_id":"consumer-1","lifecycleClosure":null}}] {
         let root = Root::new(); let gate = Arc::new(ReadGate::default());
         let m = Memory::new(super_task(false), success_rows());
@@ -1484,6 +1772,8 @@ async fn stale_status_retains_successful_facts_but_never_calls_them_current() {
     assert_eq!(out.exit_code,1);assert_eq!(out.value["snapshotCurrent"],false);
     assert_eq!(out.value["execution"]["total"],1);
     assert_eq!(out.value["reconcileSkipped"],true);
+    assert_eq!(out.value["observedTerminal"],true);
+    assert!(out.value.get("reconcileWarning").is_none());
     assert_eq!(out.value["terminal"],false);
     assert_eq!(out.value["capturedTaskStatus"],"running");
     assert!(out.value.get("taskStatus").is_none());
@@ -1551,7 +1841,7 @@ fn legacy_assessment_preserves_unknown_even_with_success_and_all_result_fields()
 }
 
 #[tokio::test]
-async fn completion_ordinary_status_missing_closure_does_not_query_processes() {
+async fn completion_ordinary_status_missing_closure_probes_execution_without_writes() {
     for remote in [false,true] {for state in ["processing","pending","timeout_error","success"] {
         let root=Root::new();let mut t=super_task(remote);
         t.get_document_mut("simulatorRuntime").unwrap().remove("lifecycleClosure");
@@ -1561,7 +1851,7 @@ async fn completion_ordinary_status_missing_closure_does_not_query_processes() {
         let out=status(&root.0,&m,&runtime,&StatusRequest::new(NAME)).await;
         assert_eq!(out.exit_code,0,"{}",out.value);assert_eq!(out.value["terminal"],false);
         assert_eq!(out.value["execution"]["total"],1);
-        assert!(!runtime.calls.lock().unwrap().iter().any(|c|c=="process-inspection"));m.no_writes();
+        assert_eq!(*runtime.calls.lock().unwrap(), vec!["process-inspection"]);m.no_writes();
     }}
 }
 

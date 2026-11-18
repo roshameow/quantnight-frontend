@@ -2,10 +2,9 @@
 //! only exact terminal reconciliation owns the original lifecycle EX lock.
 //! Python retains professional Priority/dataset algorithms; no taskctl callback.
 use crate::{
-    cleanup_sync::{outcome, OperationsRuntime, TaskOutcome},
+    cleanup_sync::{archive_namespace, outcome, task_host, OperationsRuntime, TaskOutcome},
     lifecycle_policy as policy,
     mission_lock::MissionLocks,
-    start::saved_start_config,
     task_store::{CanonicalNamespace, CollectionSummary, Host, TaskStore},
 };
 use async_trait::async_trait;
@@ -310,19 +309,22 @@ fn text_id(value: Option<&Bson>) -> String {
         v => v.to_string(),
     }
 }
-async fn task(
-    store: &dyn TaskStore,
-    name: &str,
-    include_deactive: bool,
-) -> Result<Document, Error> {
+async fn active_task(store: &dyn TaskStore, name: &str) -> Result<Option<Document>, Error> {
     policy::validate_name(name).map_err(invalid)?;
-    let active = store
+    Ok(store
         .find_task(
             Host::Local,
             doc! {"name":name,"status":{"$ne":"deactive"}},
             true,
         )
-        .await?;
+        .await?)
+}
+async fn task(
+    store: &dyn TaskStore,
+    name: &str,
+    include_deactive: bool,
+) -> Result<Document, Error> {
+    let active = active_task(store, name).await?;
     let found = if active.is_none() && include_deactive {
         store
             .find_task(Host::Local, doc! {"name":name}, true)
@@ -399,6 +401,10 @@ fn wire_listed_task(row: &Document) -> Value {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let mut value = wire_document(&filtered);
+    // List reads control records, not runner/SSH state. In particular, an
+    // old running or launching record is not evidence of a live consumer.
+    value["statusBasis"] = json!("control_record");
+    value["consumerLiveness"] = Value::Null;
     if let Some(phase) = gen_phase.filter(|phase| *phase != "complete") {
         value["generation"] = json!({ "phase": phase });
     }
@@ -446,6 +452,8 @@ pub fn summarize_concurrency(tasks: &[Value]) -> Value {
         "regular": concurrency_bucket(&regular),
         "super": concurrency_bucket(&super_tasks),
         "total": total,
+        "basis": "configured_for_recorded_running_tasks",
+        "platformInFlight": null,
     })
 }
 
@@ -684,10 +692,6 @@ fn original_v1_stop(task:&Document, remote:bool)->bool{
 fn status_snapshot_query(task: &Document, fence: &Document) -> Result<Document, Error> {
     let name = task.get_str("name").map_err(|e| e.to_string())?;
     let mut query = policy::task_binding_query(name, task, "status-terminal-reconcile")?;
-    for key in ["acceptedObservation", "runId", "launchAttemptAt", "startedAt"] {
-        query.insert(key, task.get(key).cloned()
-            .unwrap_or_else(|| Bson::Document(doc! {"$exists":false})));
-    }
     query.extend(fence.clone());
     Ok(query)
 }
@@ -697,12 +701,15 @@ async fn confirm_status_snapshot(store: &dyn TaskStore, query: &Document) -> Res
     }
     Ok(())
 }
+fn observation_identity(task: &Document) -> Value {
+    let identity: Document = ["_id", "name", "taskType", "isRemote", "launchAttemptId", "runId", "updatedAt"]
+        .iter().filter_map(|key| task.get(*key).map(|value| ((*key).into(), value.clone()))).collect();
+    wire_document(&identity)
+}
 fn failed_observation(task: &Document, mut facts: Value, observed_at: &str, error: Error) -> TaskOutcome {
     facts.as_object_mut().unwrap().remove("taskStatus");
     facts["capturedTaskStatus"] = wire(task.get("status"));
-    let identity: Document = ["_id", "name", "taskType", "isRemote", "launchAttemptId", "runId", "updatedAt"]
-        .iter().filter_map(|key| task.get(*key).map(|value| ((*key).into(), value.clone()))).collect();
-    facts["observationIdentity"] = wire_document(&identity);
+    facts["observationIdentity"] = observation_identity(task);
     facts["observedAt"] = json!(observed_at);
     facts["snapshotCurrent"] = json!(false);
     facts["reconcileSkipped"] = json!(true);
@@ -939,6 +946,7 @@ async fn status_inner(
             return Ok(failed_observation(&task, captured, &observed_at, error.into()));
         }
     }
+    let mut projection_warning = None;
     if terminal && !legacy_ready
         && !(old_status == "paused" && truthy(task.get("acceptedObservation")))
         && !checked_token(
@@ -955,7 +963,7 @@ async fn status_inner(
             ],
         )?
     {
-        let reconciliation: Result<(), Error> = async {
+        let reconciliation: Result<Option<(Bson, String)>, Error> = async {
         // Never hold EX/SH across item summaries or the Priority snapshot.
         // Acquiring EX alone is insufficient: a pause/new launch may have
         // completed while this exact original snapshot was being read.
@@ -970,7 +978,7 @@ async fn status_inner(
         // outcome, but is no longer presented as an expression failure.
         let counts = crate::task_store::item_progress_counts(&execution.statuses);
         let failures = counts["error"] + counts["cancelled"];
-        status = Bson::String(
+        let projected = Bson::String(
             if failures > 0 {
                 "completed_with_errors"
             } else {
@@ -1008,36 +1016,69 @@ async fn status_inner(
         }
         let command = "status-terminal-reconcile";
         let stamp = now();
-        let event = doc! {"id":ObjectId::new().to_hex(),"command":command,"status":status.clone(),"at":&stamp,"detail":summary_document(&execution)?};
-        if store.update_task(Host::Local,query,doc! {"$set":{"status":status.clone(),"completedAt":&stamp,"updatedAt":&stamp},"$push":{"events":event}}).await? != 1 {
-            return Err(if request.watch_observation.is_some() {
+        let event = doc! {"id":ObjectId::new().to_hex(),"command":command,"status":projected.clone(),"at":&stamp,"detail":summary_document(&execution)?};
+        match store.update_task(Host::Local,query,doc! {"$set":{"status":projected.clone(),"completedAt":&stamp,"updatedAt":&stamp},"$push":{"events":event}}).await {
+            Ok(1) => { status = projected; Ok(None) }
+            Ok(_) => Err(if request.watch_observation.is_some() {
                 "mission changed during terminal reconciliation".into()
-            } else { format!("active task not found: {}",request.name).into() });
+            } else { format!("active task not found: {}",request.name).into() }),
+            // Current terminal evidence has already passed the original
+            // identity and closure checks. A write error cannot negate it or
+            // tell us whether the control projection was applied. Do not retry.
+            Err(error) => Ok(Some((projected, error))),
         }
-        Ok(())
         }.await;
-        if let Err(error) = reconciliation { return Ok(failed_observation(&task, captured, &observed_at, error)); }
+        match reconciliation {
+            Ok(warning) => projection_warning = warning,
+            Err(error) => return Ok(failed_observation(&task, captured, &observed_at, error)),
+        }
     } else if let Err(error) = confirm_status_snapshot(store, &query).await {
         return Ok(failed_observation(&task, captured, &observed_at, error));
     }
     let mut value = captured;
     value["taskStatus"] = wire(Some(&status));
     value["snapshotCurrent"] = json!(true);
+    if let Some((projected, error)) = projection_warning {
+        log::warn!("Terminal status projection unconfirmed for {} ({}): {}", request.name, text_id(task.get("_id")), error);
+        value["observedTerminal"] = json!(true);
+        value["observedTaskStatus"] = wire(Some(&projected));
+        value["observationIdentity"] = observation_identity(&task);
+        value["reconcileWarning"] = json!({"state":"write_unconfirmed","error":error});
+    }
+    if request.watch_observation.is_none()
+        && ["running", "launching"].contains(&old_status)
+        && value["taskStatus"] == old_status
+        && value.get("executionObservation").is_none()
+    {
+        match runtime
+            .inspect_execution(root, store, &task, execution_host)
+            .await
+        {
+            Ok(Some(obs)) => {
+                value["statusBasis"] = json!("execution_observation");
+                value["consumerLiveness"] = obs["state"].clone();
+                if obs["state"] == "session_absent" && old_status == "launching" {
+                    value["taskStatus"] = json!("paused");
+                    value["controlStatus"] = json!("launching");
+                }
+            }
+            Ok(None) => {
+                value["statusBasis"] = json!("control_record");
+                value["consumerLiveness"] = Value::Null;
+            }
+            Err(err) => {
+                value["statusBasis"] = json!("control_record");
+                value["consumerLiveness"] = json!("unconfirmed");
+                value["observationError"] = json!(err);
+            }
+        }
+    }
     if ["completed", "completed_with_errors"].contains(&old_status) && !terminal {
         value["controlStatus"] = json!(old_status);
         value["lifecycleDiagnostic"] = json!({
             "reason":"control_terminal_execution_unconfirmed", "controlStatus":old_status,
             "unfinished":unfinished,
             "action":"inspect original run; no automatic restart or status rewrite"});
-    }
-    if status.as_str() == Some("paused") {
-        let confirmed = policy::stop_confirmation_valid(&task, execution_host.is_remote());
-        value["stopConfirmation"] = json!(if confirmed { "confirmed" } else { "unknown" });
-        if !confirmed {
-            value["taskStatus"] = json!("unknown");
-            value["controlStatus"] = json!("paused");
-            value["reason"] = json!("pause_unconfirmed");
-        }
     }
     if truthy(task.get("acceptedObservation")) {
         value["acceptedObservation"] = wire(task.get("acceptedObservation"));
@@ -1064,42 +1105,8 @@ async fn results_inner(
 ) -> Result<Value, Error> {
     let task = task(store, &request.name, true).await?;
     crate::task_store::result_items_options(request.limit, request.offset).map_err(invalid)?;
-    let config = if task.get_str("taskType").ok() == Some("priority")
-        && !["startConfig", "mission_config", "config"]
-            .iter()
-            .any(|k| task.contains_key(*k))
-    {
-        runtime.priority_default_config(root, &task).await?
-    } else {
-        saved_start_config(&task, None).map_err(invalid)?
-    };
-    let tags = match config.get("tag") {
-        None => None,
-        Some(Bson::Document(tag)) => tag.get("tags"),
-        _ => {
-            return Err(Error {
-                kind: "AttributeError",
-                message: "stored tag value has no attribute 'get'".into(),
-            })
-        }
-    };
-    let contains = match tags {
-        None => false,
-        Some(Bson::Array(tags)) => tags.contains(&Bson::String(request.name.clone())),
-        Some(Bson::String(tags)) => tags.contains(&request.name),
-        Some(Bson::Document(tags)) => tags.contains_key(&request.name),
-        _ => {
-            return Err(Error {
-                kind: "TypeError",
-                message: "stored tag tags is not iterable".into(),
-            })
-        }
-    };
-    if !contains {
-        return Err(invalid(
-            "task name absent from stored tag mapping; cannot infer result ownership",
-        ));
-    }
+    // The selected execution collection's item alphaIds bind this page to
+    // canonical results. Saved launch configuration and tags are not ownership evidence.
     let profile = match task.get("auth_profile") {
         None => "user1",
         Some(Bson::String(s)) => s,
@@ -1133,6 +1140,9 @@ async fn results_inner(
     if rows.len() > ids.len() {
         return Err("canonical result page exceeded requested bound".into());
     }
+    // Mongo's $in also matches elements of a stored array. Emit only rows
+    // whose id itself exactly matches an on-page alphaId.
+    rows.retain(|row| row.get("id").is_some_and(|id| ids.contains(id)));
     let missing: Vec<Value> = ids
         .iter()
         .filter(|id| !rows.iter().any(|row| row.get("id") == Some(*id)))
@@ -1370,28 +1380,65 @@ async fn evidence_inner(
     runtime: &dyn InspectionRuntime,
     request: &EvidenceRequest,
 ) -> Result<Value, Error> {
-    let task = task(store, &request.name, false).await?;
-    if request
-        .expected_task_id
-        .as_ref()
-        .map(|s| s != &text_id(task.get("_id")))
-        .unwrap_or(false)
+    let task = match (request.action, request.expected_task_id.as_deref()) {
+        (EvidenceAction::ArchiveResearch, Some(expected)) => {
+            let id = ObjectId::parse_str(expected)
+                .map_err(|_| invalid("invalid expected task ObjectId"))?;
+            match active_task(store, &request.name).await? {
+                Some(task)
+                    if task.get_object_id("_id").ok() == Some(id)
+                        && task.get_str("name").ok() == Some(request.name.as_str()) => task,
+                _ => {
+                    // Only deactivated history may bypass the active selection.
+                    // Another active control record cannot own the name-based namespace.
+                    store
+                        .find_task(
+                            Host::Local,
+                            doc! {"_id": id, "name": &request.name, "status": "deactive"},
+                            true,
+                        )
+                        .await?
+                        .filter(|t| {
+                            t.get_object_id("_id").ok() == Some(id)
+                                && t.get_str("name").ok() == Some(request.name.as_str())
+                                && t.get_str("status").ok() == Some("deactive")
+                        })
+                        .ok_or("expected research task not found (current or archived)")?
+                }
+            }
+        }
+        _ => task(store, &request.name, false).await?,
+    };
+    if request.action == EvidenceAction::VerifyRegistration
+        && request
+            .expected_task_id
+            .as_ref()
+            .is_some_and(|s| s != &text_id(task.get("_id")))
     {
         return Err("research task identity changed; refusing archive/verification".into());
     }
+    let archived = task.get_str("status").ok() == Some("deactive");
+    let execution = if archived { task_host(&task)? } else { host(&task) };
     if request
         .expected_remote
-        .map(|remote| remote != host(&task).is_remote())
-        .unwrap_or(false)
+        .is_some_and(|remote| remote != execution.is_remote())
     {
         return Err("research execution target changed".into());
     }
     let value = match request.action {
         EvidenceAction::VerifyRegistration => runtime.verify_registration(root, &task).await?,
         EvidenceAction::ArchiveResearch => {
-            runtime
-                .archive_research(root, &task, host(&task), &request.name)
-                .await?
+            if archived {
+                let id = task
+                    .get_object_id("_id")
+                    .map_err(|_| invalid("archived research task has no valid ObjectId"))?;
+                let retained = archive_namespace(&request.name, id);
+                runtime.archive_research(root, &task, execution, &retained).await?
+            } else {
+                runtime
+                    .archive_research(root, &task, execution, &request.name)
+                    .await?
+            }
         }
     };
     if value.is_null() || value.as_object().map(|v| v.is_empty()).unwrap_or(false) {

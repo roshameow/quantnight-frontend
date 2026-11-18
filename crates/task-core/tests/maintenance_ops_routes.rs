@@ -484,16 +484,8 @@ async fn observe_keeps_pause_exact_original_binding_local_and_remote() {
         );
         let writes = &f.store.0.lock().unwrap().writes;
         for filter in writes {
-            for key in [
-                "_id",
-                "name",
-                "acceptedObservation",
-                "stopConfirmedAt",
-                "launchAttemptAt",
-                "startConfig",
-                "generation",
-            ] {
-                assert!(filter.contains_key(key));
+            for key in ["_id", "name", "status", "isRemote", "updatedAt"] {
+                assert!(filter.contains_key(key), "{key}");
             }
         }
     }
@@ -515,7 +507,7 @@ async fn unknown_closes_only_observer_not_business_success() {
         .is_ok());
 }
 #[tokio::test]
-async fn unconfirmed_observer_keeps_claim_and_blocks_all_three_mutators() {
+async fn unconfirmed_observer_records_claim_without_blocking_later_mutators() {
     for mode in [
         "lost",
         "empty",
@@ -541,26 +533,26 @@ async fn unconfirmed_observer_keeps_claim_and_blocks_all_three_mutators() {
                 .get("finishedAt"),
             Some(&Bson::Null)
         );
-        let before = f.runtime.calls();
-        assert_eq!(f.observe().await.exit_code, 1);
-        assert_eq!(f.watch().await.exit_code, 1);
-        assert_eq!(f.prune(false).await.exit_code, 1);
-        assert_eq!(f.runtime.calls(), before);
-        assert_eq!(f.store.task(), task);
+        // Leftover open acceptedObservation must never block subsequent lifecycle calls.
+        let mut f2 = Fixture::new("super", false);
+        f2.store.mutate(doc! {"acceptedObservation": task.get("acceptedObservation").unwrap().clone()});
+        assert_eq!(f2.observe().await.exit_code, 0);
+        f2 = Fixture::new("regular", false);
+        f2.store.mutate(doc! {"acceptedObservation": task.get("acceptedObservation").unwrap().clone()});
+        assert_eq!(f2.watch().await.exit_code, 0);
+        f2 = Fixture::new("priority", false);
+        f2.store.mutate(doc! {"acceptedObservation": task.get("acceptedObservation").unwrap().clone()});
+        assert_eq!(f2.prune(false).await.exit_code, 0);
     }
 }
 #[tokio::test]
-async fn observer_identity_stop_and_profile_guards_precede_execution() {
+async fn observer_identity_and_profile_guards_precede_execution() {
     for patch in [
         doc! {"status":"running"},
         doc! {"taskType":"regular"},
         doc! {"isRemote":"false"},
-        doc! {"stopConfirmedRemote":"false"},
-        doc! {"stopConfirmedTaskId":"foreign"},
-        doc! {"stopConfirmedAt":bson::DateTime::from_millis(500)},
         doc! {"auth_profile":"../other"},
         doc! {"auth_profile":""},
-        doc! {"acceptedObservation":{"id":"active"}},
     ] {
         let f = Fixture::new("super", false);
         f.store.mutate(patch);
@@ -586,7 +578,7 @@ async fn observer_identity_stop_and_profile_guards_precede_execution() {
 async fn observer_begin_cas_and_lost_ack_never_dispatch() {
     let f = Fixture::new("super", false);
     f.store
-        .race("observe-accepted-begin", doc! {"auth_profile":"successor"});
+        .race("observe-accepted-begin", doc! {"updatedAt":"successor"});
     assert_eq!(f.observe().await.exit_code, 1);
     assert!(!f.store.task().contains_key("acceptedObservation"));
     assert!(!f.runtime.calls().contains(&"observe".into()));
@@ -599,10 +591,9 @@ async fn observer_begin_cas_and_lost_ack_never_dispatch() {
 #[tokio::test]
 async fn observer_finish_cas_cannot_overwrite_changed_stop_or_owner() {
     for patch in [
-        doc! {"stopConfirmedTaskId":"successor"},
-        doc! {"launchAttemptId":"next"},
-        doc! {"generation":{"id":"next"}},
-        doc! {"acceptedObservation":{"id":"next","finishedAt":Bson::Null}},
+        doc! {"updatedAt":"successor"},
+        doc! {"status":"running"},
+        doc! {"isRemote":true},
     ] {
         let f = Fixture::new("super", false);
         f.runtime.behavior.lock().unwrap().after_observe = patch;
@@ -704,10 +695,9 @@ async fn watch_rejects_receipt_identity_generation_or_route_tampering() {
 #[tokio::test]
 async fn watch_metadata_cas_failure_preserves_original_producer_evidence() {
     for patch in [
-        doc! {"generation":{"id":"next"}},
-        doc! {"startedAt":"next"},
-        doc! {"agentNotification":{"target":{"taskId":"other"}}},
-        doc! {"acceptedObservation":{"id":"new"}},
+        doc! {"updatedAt":"next"},
+        doc! {"status":"running"},
+        doc! {"isRemote":true},
     ] {
         let f = Fixture::new("regular", false);
         f.runtime.behavior.lock().unwrap().after_attach = patch;
@@ -841,7 +831,7 @@ async fn prune_original_failure_and_audit_cas_never_retry_algorithm() {
     assert_eq!(f.prune(false).await.exit_code, 1);
     assert!(f.store.0.lock().unwrap().writes.is_empty());
     let f = Fixture::new("priority", false);
-    f.runtime.behavior.lock().unwrap().after_prune = doc! {"launchAttemptId":"next"};
+    f.runtime.behavior.lock().unwrap().after_prune = doc! {"updatedAt":"next"};
     let out = f.prune(false).await;
     assert_eq!(out.exit_code, 1);
     assert_eq!(out.value["auditConfirmed"], false);
@@ -929,10 +919,9 @@ async fn remote_priority_checks_effective_host_quiescence_without_rewriting_cont
 #[tokio::test]
 async fn acknowledged_observation_claim_is_reread_before_process_side_effect() {
     for patch in [
-        doc! {"runId":"foreign-run"},
-        doc! {"auth_profile":"foreign-profile"},
-        doc! {"acceptedObservation":{"id":"foreign-owner","finishedAt":Bson::Null}},
-        doc! {"stopConfirmedAt":bson::DateTime::from_millis(3000)},
+        doc! {"status":"running"},
+        doc! {"isRemote":true},
+        doc! {"updatedAt":"foreign-owner"},
     ] {
         let f = Fixture::new("super", false);
         f.store
@@ -1007,9 +996,8 @@ async fn legacy_paused_priority_without_stop_fields_can_prune_after_original_qui
             }
         }
     }
-    // Observation still requires its original stop proof, unlike prune.
+    // Observation also checks current process quiescence directly, not stopConfirmedAt.
     let f = Fixture::new("super", false);
     f.store.0.lock().unwrap().task.remove("stopConfirmedAt");
-    assert_eq!(f.observe().await.exit_code, 1);
-    assert!(f.runtime.calls().is_empty());
+    assert_eq!(f.observe().await.exit_code, 0);
 }

@@ -54,9 +54,10 @@ async function render(runtime, patch = {}) {
   return plain(await renderToString(configure(createSSRApp({ render: () => h(card.default,
     { task: task(), taskRuntimeStatus: runtime, progress, ...patch }) }))));
 }
-function preserved(text) {
+function preserved(text, showsConcurrency = true) {
   assert.match(text, /✓ 7\+4.*✗ 2\+1.*Σ 80\+20/);
-  assert.match(text, /最大并发: 8.*子任务上限: 10/);
+  if (showsConcurrency) assert.match(text, /最大并发: 8.*子任务上限: 10/);
+  else assert.doesNotMatch(text, /最大并发:/);
   assert.match(text, /进度刷新失败：/);
 }
 
@@ -123,11 +124,11 @@ test('stop lifecycle wins over dispatch pause and metadata cannot serve as stop 
   for (const [status, label] of [['stopping', '停止执行中'], ['stop_unconfirmed', '停止执行失败'], ['paused', 'paused']]) {
     const stopOperation = { _id: id, name: target.name, isRemote: true, status,
       receipt: { confirmed: true, taskId: id, taskName: target.name, isRemote: true, stopConfirmedAt: Date.now() } };
-    const html = await render(runtime, { stopOperation });
+    const html = await render(runtime, { stopOperation, ...(status === 'paused' ? { task: task({ status }) } : {}) });
     assert.ok(html.includes(label)); assert.ok(!html.includes(wait));
-    assert.doesNotMatch(html, /消费者存活|重置时间|上次配额/); preserved(html);
+    assert.doesNotMatch(html, /消费者存活|重置时间|上次配额/); preserved(html, status !== 'paused');
   }
-  for (const [input, label] of [[task({ status: 'paused' }), '暂停标记无有效停止凭据'],
+  for (const [input, label] of [[task({ status: 'paused' }), 'paused'],
     [task({ status: 'paused', stopConfirmedAt: Date.now(), stopConfirmedTaskId: id, stopConfirmedRemote: true }), 'paused']]) {
     const html = await render(runtime, { task: input });
     assert.ok(html.includes(label)); assert.ok(!html.includes(wait));

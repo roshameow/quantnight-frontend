@@ -82,6 +82,77 @@ async fn stale_host_management_works_but_business_rejects_before_original_core()
     assert_eq!(store.calls.load(Ordering::SeqCst),0);
 }
 #[tokio::test]
+async fn startup_eof_is_not_an_incompatible_protocol_or_attempted_call() {
+    let (_root, state, _) = fixture().await;
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let server = tokio::spawn(async move {
+        codec::read_preamble(&mut peer).await.unwrap();
+        assert!(matches!(codec::read(&mut peer).await.unwrap(), Message::Hello(_)));
+        // Emulate an activated host that exits during initialization.
+    });
+    let hello = Hello { mode: Admission::Business, protocol: protocol::VERSION,
+        selection: state.identity.selection.clone(), core_source: state.identity.core_source.clone(), task_settings: None };
+    let error = RuntimeClient::hello(client, hello).await.unwrap_err();
+    assert_eq!((&*error.class, &*error.stage, &*error.execution), ("connection_lost", "hello", "not_sent"));
+    assert!(error.request_id.is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_knows_a_stale_hello_sent_no_call_and_original_management_still_works() {
+    let (_root, state, store) = fixture().await;
+    let hello = |mode| Hello { mode, protocol: protocol::VERSION, selection: state.identity.selection.clone(),
+        core_source: "different-linked-core".into(), task_settings: None };
+    let (client, peer) = UnixStream::pair().unwrap();
+    let rejected = tokio::spawn(server::serve_connection(peer, state.clone()));
+    let error = RuntimeClient::hello(client, hello(Admission::Business)).await.unwrap_err();
+    assert_eq!((&*error.class, &*error.execution), ("source_stale", "not_sent"));
+    assert!(error.safe_message.contains("different linked task-core builds"));
+    rejected.await.unwrap().unwrap();
+    let (client, peer) = UnixStream::pair().unwrap();
+    let managed = tokio::spawn(server::serve_connection(peer, state.clone()));
+    let (client, host, _) = RuntimeClient::hello(client, hello(Admission::Management)).await.unwrap();
+    let status = RuntimeClient::management_exchange(client, Message::Drain { expected_host_generation: host.generation }).await.unwrap();
+    assert!(status.draining);
+    assert_eq!(status.accepted_calls, 0);
+    assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+    managed.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn lost_reply_after_accepted_preserves_ownership_and_does_not_claim_rejection() {
+    for false_rejection in [false, true] {
+        let (context, request) = call();
+        let id = context.request_id.clone();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(async move {
+            assert!(matches!(codec::read(&mut peer).await.unwrap(), Message::Call { .. }));
+            codec::write(&mut peer, &Message::Accepted { id, host_generation: "accepted-host".into() }).await.unwrap();
+            if false_rejection {
+                let mut error = TransportError::new("host_draining", "admission", "contradictory rejection");
+                error.execution = "not_executed".into();
+                codec::write(&mut peer, &Message::Error(error)).await.unwrap();
+            }
+        });
+        let error = RuntimeClient::exchange(client, context, request, None).await.unwrap_err();
+        assert_eq!(error.execution, "unconfirmed");
+        assert_eq!(error.host_generation.as_deref(), Some("accepted-host"));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn management_drain_missing_reply_is_not_not_sent() {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let server = tokio::spawn(async move {
+        assert!(matches!(codec::read(&mut peer).await.unwrap(), Message::Drain { .. }));
+    });
+    let error = RuntimeClient::management_exchange(client, Message::Drain { expected_host_generation: "original".into() }).await.unwrap_err();
+    assert_eq!((&*error.class, &*error.execution), ("connection_lost", "unconfirmed"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn chunked_large_message_has_no_small_total_cap_and_bad_frame_fails(){
     let(input,mut output)=tokio::io::duplex(4096);let body="x".repeat(3*1024*1024);let expected=body.len();
     let writer=tokio::spawn(async move{codec::write(&mut output,&Message::Completed{id:"large".into(),result:CallResult{value:serde_json::json!(body),exit_code:0,confirmed_stop:None}}).await.unwrap();});

@@ -19,13 +19,7 @@ pub trait PriorityUpdateRuntime: StartRuntime {
     async fn publish_priority_config(&self, root: &Path, task: &Document, config: &Document, remote: bool) -> Result<(), String>;
 }
 fn fence(name: &str, task: &Document) -> Result<Document, String> {
-    let mut filter = lifecycle_policy::task_binding_query(name, task, "priority-update")?;
-    for key in ["taskType", "auth_profile", "targetRemote", "mission_config", "startConfig", "acceptedObservation",
-        "launchAttemptAt", "startedAt", "stopConfirmedAt", "stopConfirmedRemote", "stopConfirmedTaskId",
-        "stopConfirmationBasis", "generation", "startupBinding"] {
-        filter.insert(key, task.get(key).cloned().unwrap_or_else(|| Bson::Document(doc!{"$exists":false})));
-    }
-    Ok(filter)
+    lifecycle_policy::task_binding_query(name, task, "priority-update")
 }
 
 pub async fn update_priority(root: &Path, store: &dyn TaskStore, runtime: &dyn PriorityUpdateRuntime,
@@ -42,10 +36,6 @@ pub async fn update_priority(root: &Path, store: &dyn TaskStore, runtime: &dyn P
             return Err("Priority task identity changed before update".into());
         }
         if task.get_str("taskType").ok() != Some("priority") { return Err("configuration update requires a Priority task".into()); }
-        lifecycle_policy::assert_observation_closed(&task)?;
-        if matches!(task.get_str("status").ok(), Some("generating"|"generation_unknown"|"launching"|"syncing"|"deleting")) {
-            return Err("task mutation is in progress or unconfirmed; reconcile before config publication".into());
-        }
         let remote = match task.get("isRemote") {
             None | Some(Bson::Null | Bson::Boolean(false)) => false,
             Some(Bson::Boolean(true)) => true,

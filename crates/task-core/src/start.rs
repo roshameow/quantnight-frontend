@@ -348,7 +348,6 @@ async fn active(store: &dyn TaskStore, name: &str) -> Result<Option<Document>, S
 }
 fn identity(task: &Document, request: &StartRequest) -> Result<(), String> {
     let id = task_id(task)?;
-    task.get_str("status").map_err(|_| "invalid task status")?;
     if task.get_str("name").ok() != Some(&request.name) {
         return Err("task name changed before launch".into());
     }
@@ -367,36 +366,17 @@ fn identity(task: &Document, request: &StartRequest) -> Result<(), String> {
             return Err("launch identity changed before mutation".into());
         }
     }
-    lifecycle_policy::assert_observation_closed(task)
+    Ok(())
 }
 fn control_filter(task: &Document, command: &str) -> Result<Document, String> {
     let mut query =
         lifecycle_policy::task_binding_query(required_str(task, "name")?, task, command)?;
-    for key in [
-        "generation",
-        "targetRemote",
-        "startupBinding",
-        "acceptedObservation",
-        "taskType",
-        "auth_profile",
-        "runId",
-        "startConfig",
-        "mission_config",
-        "config",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "stopConfirmationBasis",
-        "launchAttemptAt",
-        "launchSettledAttemptId",
-    ] {
-        query.insert(
-            key,
-            task.get(key)
-                .cloned()
-                .unwrap_or_else(|| doc! {"$exists":false}.into()),
-        );
-    }
+    query.insert(
+        "launchAttemptId",
+        task.get("launchAttemptId")
+            .cloned()
+            .unwrap_or_else(|| doc! {"$exists": false}.into()),
+    );
     Ok(query)
 }
 async fn unchanged(store: &dyn TaskStore, expected: &Document) -> Result<(), String> {
@@ -456,27 +436,12 @@ fn same_claim(expected: &Document, current: &Document) -> Result<(), String> {
         "isRemote",
         "updatedAt",
         "launchAttemptId",
-        "launchAttemptAt",
-        "taskType",
-        "auth_profile",
-        "runId",
-        "startConfig",
-        "mission_config",
-        "config",
-        "acceptedObservation",
-        "generation",
-        "startupBinding",
-        "tmuxContext",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "stopConfirmationBasis",
     ] {
         if expected.get(key) != current.get(key) {
             return Err(format!("launch claim changed: {key}; do not restart"));
         }
     }
-    lifecycle_policy::assert_observation_closed(current)
+    Ok(())
 }
 async fn reread_claim(store: &dyn TaskStore, expected: &Document) -> Result<Document, String> {
     let current = active(store, required_str(expected, "name")?)
@@ -756,32 +721,11 @@ pub(crate) fn notification_receipt_bound(
 /// Only a new Priority producer may choose its recorded destination on first
 /// launch. This is positive create-event evidence, not status/pane inference.
 fn pristine_priority_target(task: &Document, remote: bool) -> Result<bool, String> {
-    if task.get_str("taskType").ok() != Some("priority") || task.get_str("status").ok() != Some("pending")
-        || task.get_bool("isRemote").ok() != Some(false) || task.get_bool("targetRemote").ok() != Some(remote) {
-        return Ok(false);
-    }
-    let name = task.get_str("name").map_err(|_| "Priority name missing")?;
-    if task.get_str("runId").ok() != Some(format!("mission:{name}").as_str()) { return Ok(false); }
-    for key in ["launchAttemptId","launchAttemptAt","startedAt","pausedAt","completedAt","consumer_run_id",
-        "consumerPid","heartbeatAt","simulatorRuntime","startupBinding","startPreflight","stopConfirmedAt",
-        "tmuxContext","launchHistory","launchAttempts","launchReceipt","startReceipt","acceptedObservation","generation"] {
-        if task.get(key).is_some_and(|value| *value != Bson::Null) { return Ok(false); }
-    }
-    let Some(created) = task.get_str("createdAt").ok().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()) else { return Ok(false); };
-    let Some(events) = task.get_array("events").ok().filter(|events| !events.is_empty()) else { return Ok(false); };
-    let mut previous = created;
-    let current = chrono::Utc::now();
-    for (index, event) in events.iter().enumerate() {
-        let Some(event) = event.as_document() else { return Ok(false); };
-        let Some(stamp) = event.get_str("at").ok().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()) else { return Ok(false); };
-        if event.get_str("command").ok() != Some("create")
-            || event.get_str("status").ok() != Some(if index == 0 {"pending"} else {"idempotent"})
-            || event.get_str("id").map_or(true, str::is_empty)
-            || event.get_document("detail").map_or(true, |value| !value.is_empty())
-            || stamp < previous || stamp > current { return Ok(false); }
-        previous = stamp;
-    }
-    Ok(true)
+    Ok(task.get_str("taskType").ok() == Some("priority")
+        && task.get_str("status").ok() == Some("pending")
+        && task.get_bool("isRemote").ok() == Some(false)
+        && task.get_bool("targetRemote").ok() == Some(remote)
+        && matches!(task.get("launchAttemptId"), None | Some(Bson::Null)))
 }
 
 async fn resolve_priority_start_config(root:&Path,runtime:&dyn StartRuntime,task:&Document,explicit:Option<&str>)->Result<Document,String>{
@@ -792,56 +736,32 @@ async fn resolve_priority_start_config(root:&Path,runtime:&dyn StartRuntime,task
     Ok(validated)
 }
 
-// Missing/null is explicit observed absence; malformed evidence is not legacy.
-fn observed_launch(task:&Document)->Result<Value,String> {
-    match task.get("launchAttemptId") {
-        None|Some(Bson::Null)=>Ok(Value::Null),
-        Some(Bson::String(value)) if !value.trim().is_empty()=>Ok(json!(value)),
-        _=>Err("original launch identity malformed".into()),
-    }
+fn observed_launch(task: &Document) -> Value {
+    task.get_str("launchAttemptId").ok().filter(|value| !value.trim().is_empty())
+        .map_or(Value::Null, |value| json!(value))
 }
 
-// Pending launch state survives absence-only pause. Original observed-consumer
-// stop can settle it; missing optional legacy metadata is not an admission gate.
-pub(crate) fn launch_attempt_unsettled(task:&Document)->bool {
-    (task.get_str("status").ok()==Some("launching") || task.contains_key("launchSettledAttemptId")) &&
-        (task.get_str("launchAttemptId").map_or(true,|v|v.trim().is_empty()) || task.get("launchSettledAttemptId")!=task.get("launchAttemptId"))
-}
-
-// Same original operation, not a second reconciliation command or registry.
-// Only launching is repaired here; terminal/paused status is not inferred
-// from liveness. Scoped legacy evidence never settles a launch or promotes
-// today's caller-echo context to historical independent proof.
+// Liveness is already known from the current host. A failed auxiliary control
+// projection must not turn an idempotent no-op into advice to launch again.
 async fn already_running(store:&dyn TaskStore,task:&Document,remote:bool,observed:Value)->Result<TaskOutcome,String> {
-    let reconcile = task.get_str("status")==Ok("launching");
-    let strong = observed["identityVerified"]==true && observed["consumerPredatesLaunch"]!=true;
-    let current = if reconcile {
-        let mut fields=doc!{"status":"running"};
-        if strong {
-            if let Some(launch)=task.get("launchAttemptId").filter(|v| **v!=Bson::Null) {
-                fields.insert("launchSettledAttemptId",launch.clone());
-            }
-        } else if launch_attempt_unsettled(task) {
-            // Preserve the pending-launch fence after correcting the control
-            // label. Later absence must not permit duplicate launch.
-            fields.insert("launchSettledAttemptId",Bson::Null);
+    let mut warning = None;
+    let mut current = task.clone();
+    let mut reconciled = false;
+    if task.get_str("status") == Ok("launching") {
+        // The live task identity is not proof that its persisted launch attempt
+        // produced this process. Do not rewrite historical settlement here.
+        match update(store, task, "start-reconciled", doc! {"status":"running"},
+            doc! {"basis":"current_consumer_scope","executionObservation":config_document(observed.clone())?,"configApplied":false}).await {
+            Ok(saved) => { current = saved; reconciled = true; }
+            Err(error) => warning = Some(error),
         }
-        update(store,task,"start-reconciled",fields,
-            doc!{"basis":if strong{"original_consumer_identity"}else{"original_consumer_scope"},
-                "taskId":task_id(task)?.to_hex(),"remote":remote,"taskType":kind(task)?,"authProfile":profile(task)?,
-                "launchAttemptId":task.get("launchAttemptId").cloned().unwrap_or(Bson::Null),
-                "launchAttemptAt":task.get("launchAttemptAt").cloned().unwrap_or(Bson::Null),
-                "executionObservation":config_document(observed.clone())?,"configApplied":false}).await?
-    } else {task.clone()};
-    // This non-launching START invocation has completed its observation/CAS.
-    // Historical launch settlement remains in launchSettledAttemptId; it must
-    // not prevent the caller from joining an explicit pause to this response.
+    }
     Ok(outcome("start",required_str(&current,"name")?,true,json!({
         "taskId":task_id(&current)?.to_hex(),"remote":remote,"taskType":kind(&current)?,"authProfile":profile(&current)?,
-        "launchAttemptId":observed_launch(&current)?,"operationSettled":true,
+        "launchAttemptId":observed_launch(&current),"operationSettled":true,
         "outcome":"already_running","startedNew":false,"consumerRunning":true,"configApplied":false,
         "configComparison":"not_compared","requestSatisfied":true,"executionObservation":observed,
-        "controlStatus":current.get_str("status").unwrap_or(""),"controlReconciled":reconcile,"error":Value::Null})))
+        "controlStatus":current.get_str("status").unwrap_or(""),"controlReconciled":reconciled,"controlWarning":warning,"error":Value::Null})))
 }
 
 struct OwnedResidueStop<'a>{runtime:&'a dyn StartRuntime,observation:&'a Value}
@@ -879,8 +799,14 @@ pub(crate) async fn start_with_deadline(root:&Path,store:&dyn TaskStore,runtime:
         Ok(v) => v,
         Err(e) => return failure("start", &request.name, e),
     };
-    match tokio::time::timeout_at(deadline,start_locked(root, store, runtime, request, &_lock, deadline)).await {
-        Ok(Ok(result)) => result,
+    let mut notification_task = None;
+    match tokio::time::timeout_at(deadline,start_locked(root, store, runtime, request, &_lock, deadline, &mut notification_task)).await {
+        Ok(Ok(mut result)) => {
+            if let Some(task) = notification_task {
+                complete_start_notification(root, store, runtime, request, &task, &mut result.value, deadline).await;
+            }
+            result
+        },
         Ok(Err(error)) => failure("start", &request.name, error),
         Err(_) => failure("start", &request.name, "original start total deadline exhausted; no retry or additional launch"),
     }
@@ -892,21 +818,12 @@ async fn start_locked(
     request: &StartRequest,
     guard: &MissionLocks,
     deadline: tokio::time::Instant,
+    notification_task: &mut Option<Document>,
 ) -> Result<TaskOutcome, String> {
     let mut task = active(store, &request.name)
         .await?
         .ok_or("task not found")?;
     identity(&task, request)?;
-    if matches!(
-        task.get_str("status").ok(),
-        Some("generating" | "generation_unknown" | "syncing" | "deleting")
-    ) {
-        return Err(
-            "generation/launch is in progress or unconfirmed; reconcile before start".into(),
-        );
-    }
-    observed_launch(&task)?;
-    let launch_unresolved = launch_attempt_unsettled(&task);
     let original_kind = kind(&task)?.to_string();
     profile(&task)?; // Existing business profile requirement; no login/config guess.
     let remote = match request.remote {
@@ -938,15 +855,14 @@ async fn start_locked(
                 return already_running(store, &task, remote, observed).await;
             }
             Some("owned_residue") if observed["identityVerified"]==true && observed["ownedResidue"]==true => {
-                if launch_unresolved {return Err("original launcher still unresolved; no automatic residue cleanup".into());}
                 let stopped=crate::pause::pause_locked(root,store,&OwnedResidueStop{runtime,observation:&observed},&request.name,
                     crate::pause::PauseOptions{expected_task_id:Some(&task_id(&task)?.to_hex()),
-                        expected_launch_attempt_id:task.get_str("launchAttemptId").ok(),expected_remote:Some(remote),observer:None,..Default::default()},
+                        expected_remote:Some(remote),observer:None,..Default::default()},
                     guard,deadline.min(tokio::time::Instant::now()+std::time::Duration::from_secs(60)),crate::pause::StopIntent::StopAllowed).await;
                 if stopped.exit_code!=0 {return Err(format!("owned residue stop unconfirmed: {}",stopped.value));}
                 let prior=task.clone();
                 task=active(store,&request.name).await?.ok_or("task disappeared after original residue stop")?;
-                if ["_id","launchAttemptId","startupBinding","isRemote","taskType","auth_profile","generation","acceptedObservation","runId","startConfig","mission_config","config","templatefile"].iter()
+                if ["_id", "name", "isRemote", "taskType", "auth_profile", "launchAttemptId"].iter()
                     .any(|key|task.get(*key)!=prior.get(*key))
                     ||task.get_str("updatedAt").ok()!=stopped.value["controlRevision"].as_str()
                     ||task.get_str("status").ok()!=Some("paused"){
@@ -959,16 +875,15 @@ async fn start_locked(
                     return Err("owned residue cleanup did not leave verified original execution absence".into());
                 }
             }
-            Some("session_absent") => {
-                if launch_unresolved {
-                    return Err("original launch attempt is unresolved; session absence does not prove launcher settlement".into());
-                }
-            },
-            _=>return Ok(outcome("start",&request.name,false,json!({"outcome":"refused","startedNew":false,"configApplied":false,
-                "requestSatisfied":false,"executionObservation":observed,"error":"original execution identity unresolved; existing read/stop remain available"}))),
+            Some("session_absent") => (),
+            _ => {
+                let reason = observed["reason"].as_str().unwrap_or("current process scope unavailable");
+                return Ok(outcome("start", &request.name, false, json!({
+                    "outcome":"refused","startedNew":false,"configApplied":false,"requestSatisfied":false,
+                    "executionObservation":observed,"error":format!("no new launch: {reason}")
+                })));
+            }
         }
-    } else if launch_unresolved {
-        return Err("generation/launch is in progress or unconfirmed; original execution observation required".into());
     }
     // Resolve/validate supplied business parameters only for an actual new launch.
     let requested = if request.config_json.is_some() {
@@ -1053,10 +968,6 @@ async fn start_locked(
     if kind == "super" {
         runtime.validate_super_config(root, &config).await?;
     }
-    let notify = notification_spec(&task, &request.notification)?;
-    if let Some(spec) = &notify {
-        runtime.preflight_notification(root, spec).await?;
-    }
     runtime.assert_consumer_absent(root, &task, remote).await?;
     if kind == "regular" {
         if let Some(continuation) = runtime.continuation(root, &task, remote).await? {
@@ -1067,6 +978,13 @@ async fn start_locked(
     // before the one launch claim. No specialist owns a control-plane write.
     unchanged(store, &task).await?;
     if deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()==0 {return Err("start deadline exhausted before launch claim".into());}
+    let prior_status = match task.get_str("status").ok() {
+        Some("launching" | "syncing" | "deleting") => "paused",
+        Some("generating" | "generation_unknown" | "generation_failed") => "ready",
+        Some(other) => other,
+        None => "ready",
+    }
+    .to_string();
     let mut launch = doc! {"launchSettledAttemptId":Bson::Null,"status":"launching","launchAttemptId":nonce(),"launchAttemptAt":bson::DateTime::now(),"isRemote":remote,
     "stopConfirmedAt":Bson::Null,"stopConfirmedRemote":Bson::Null,"stopConfirmedTaskId":Bson::Null,"stopConfirmationBasis":Bson::Null,"tmuxContext":Bson::Null};
     if kind == "super" {
@@ -1116,14 +1034,14 @@ async fn start_locked(
     if command.timeout_seconds==0 {return Err("start deadline exhausted before launcher; original attempt retained".into());}
     Ok((claimed,command))
     }.await;
-    let (mut claimed,command)=match prepared {
+    let (claimed,command)=match prepared {
         Ok(value)=>value,
         Err(error)=>{
             let settlement:Result<(),String> = async {
                 if deadline<=tokio::time::Instant::now(){return Err("original remaining budget exhausted".into());}
                 let current=reread_claim(store,&claimed).await?;
                 update(store,&current,"start-not-dispatched",
-                    doc!{"launchSettledAttemptId":current.get_str("launchAttemptId").map_err(|_|"missing original launch")?},
+                    doc!{"status": &prior_status, "launchSettledAttemptId":current.get_str("launchAttemptId").map_err(|_|"missing original launch")?},
                     doc!{"launcherInvoked":false,"basis":"not_dispatched"}).await?;
                 Ok(())
             }.await;
@@ -1151,72 +1069,89 @@ async fn start_locked(
     runtime
         .validate_execution_binding(root, &observed_binding, remote)
         .await?;
-    // A successful original synchronous launcher return settles this fresh
-    // action. Transport failure alone never does. Later original consumer/stop
-    // reconciliation may close it on its explicit evidence, not a fabricated ACK.
-    // Persist against this exact attempt, before later validation/control ACKs.
-    claimed = update(store, &claimed, "start-settled",
-        doc! {"launchSettledAttemptId":claimed.get_str("launchAttemptId").map_err(|_|"missing claimed launch")?}, Document::new()).await?;
-    let mut fields = doc! {"status":"running","isRemote":remote,"startedAt":now(),"startConfig":&config,"mission_config":&config,"tmuxContext":observed};
+    // The original launcher has already validated this task/host/attempt.
+    // Settlement is a compatibility projection, not a separate write or gate.
+    let launch_id = required_str(&claimed, "launchAttemptId")?;
+    let mut fields = doc! {"status":"running","isRemote":remote,"startedAt":now(),"startConfig":&config,
+        "mission_config":&config,"tmuxContext":observed,"launchSettledAttemptId":launch_id};
     if kind == "priority" {
         fields.insert("targetRemote", remote);
     }
     if !preflight.is_empty() {
         fields.insert("startPreflight", preflight.clone());
     }
-    let running = update(store, &claimed, "start", fields, preflight.clone()).await?;
-    let mut notification = Bson::Null;
-    if let Some(spec) = notify {
-        let attachment = async {
-            let receipt = runtime
-                .attach_watcher(root, &running, remote, &spec)
-                .await?;
-            notification_receipt(&receipt, &running, remote, &spec)?;
-            update(
-                store,
-                &running,
-                "watch-attach",
-                doc! {"agentNotification":&receipt},
-                receipt.clone(),
-            )
-            .await?;
-            Ok::<Document, String>(receipt)
-        }
-        .await;
-        match attachment {
-            Ok(receipt) => notification = Bson::Document(receipt),
-            Err(error) => {
-                let mut failed = spec;
-                failed.extend(doc! {"status":"attach_failed","error":&error});
-                let metadata_error = update(
-                    store,
-                    &running,
-                    "watch-attach-failed",
-                    doc! {"agentNotification":failed},
-                    Document::new(),
-                )
-                .await
-                .err();
-                return Ok(outcome(
-                    "start",
-                    &request.name,
-                    false,
-                    json!({"taskId":task_id(&task)?.to_hex(),"remote":remote,
-                    "taskType":kind,"authProfile":profile,"launchAttemptId":observed_launch(&running)?,"operationSettled":true,
-                    "consumerStarted":true,"outcome":"started","startedNew":true,"consumerRunning":true,"configApplied":true,
-                    "configComparison":"not_requested","requestSatisfied":false,"notificationAttached":false,"error":error,"notificationMetadataError":metadata_error,
-                    "nextAction":"use taskctl watch; do not restart or resimulate accepted work"}),
-                ));
+    let control_write = update(store, &claimed, "start", fields, preflight.clone()).await;
+    let mut fields = json!({"taskType":kind,"authProfile":profile,"launchAttemptId":launch_id,
+        "operationSettled":true,"outcome":"started","startedNew":true,"consumerStarted":true,"consumerRunning":true,
+        "configApplied":true,"configComparison":"not_requested","requestSatisfied":true,"taskId":task_id(&task)?.to_hex(),"remote":remote,
+        "counts":counts.as_ref().map(summary_value),"notification":Value::Null,"tmuxContext":wire_document(observed),
+        "stdout":tail(&output.stdout,16000),"stderr":tail(&output.stderr,4000)});
+    fields["controlProjectionConfirmed"] = json!(control_write.is_ok());
+    match control_write {
+        Ok(running) => *notification_task = Some(running),
+        Err(error) => {
+            fields["controlWarning"] = json!(error);
+            fields["nextAction"] = json!("inspect status on this task and host; the consumer was launched");
+            if !request.notification.no_notify {
+                fields["notificationAttached"] = json!(false);
+                fields["notificationWarning"] = json!({"error":"running control projection unconfirmed; watcher not invoked"});
             }
         }
     }
-    let mut fields = json!({"taskType":kind,"authProfile":profile,"launchAttemptId":observed_launch(&running)?,"operationSettled":true,"outcome":"started","startedNew":true,"consumerRunning":true,"configApplied":true,"configComparison":"not_requested","requestSatisfied":true,"taskId":task_id(&task)?.to_hex(),"remote":remote,"counts":counts.as_ref().map(summary_value),
-        "notification":notification.as_document().map(wire_document),"tmuxContext":wire_document(observed),
-        "stdout":tail(&output.stdout,16000),"stderr":tail(&output.stderr,4000)});
     if !preflight.is_empty() {
         fields["preflight"] = wire_document(&preflight);
     }
     Ok(outcome("start", &request.name, true, fields))
+}
+
+async fn complete_start_notification(
+    root: &Path, store: &dyn TaskStore, runtime: &dyn StartRuntime,
+    request: &StartRequest, running: &Document, fields: &mut Value,
+    deadline: tokio::time::Instant,
+) {
+    let remote = running.get_bool("isRemote").unwrap_or(false);
+    // Notification is a separate action, even if its receiver is invalid or
+    // its budget expires. The original launch has already been committed.
+    let deadline_error = || "original start deadline expired during notification; attachment unconfirmed".to_string();
+    let result = if deadline <= tokio::time::Instant::now() {
+        if matches!(notification_spec(running, &request.notification), Ok(None)) { return; }
+        Err(deadline_error())
+    } else {
+        let attachment = async {
+            let Some(spec) = notification_spec(running, &request.notification)? else { return Ok(None); };
+            let result = async {
+                runtime.preflight_notification(root, &spec).await?;
+                let receipt = runtime.attach_watcher(root, running, remote, &spec).await?;
+                notification_receipt(&receipt, running, remote, &spec)?;
+                update(store, running, "watch-attach", doc! {"agentNotification":&receipt}, receipt.clone()).await?;
+                Ok::<Document, String>(receipt)
+            }.await;
+            match result {
+                Ok(receipt) => Ok(Some(receipt)),
+                Err(error) => {
+                    let mut failed = spec;
+                    failed.extend(doc! {"status":"attach_failed","error":&error});
+                    if let Err(metadata) = update(store, running, "watch-attach-failed", doc! {"agentNotification":failed}, Document::new()).await {
+                        fields["notificationMetadataError"] = json!(metadata);
+                    }
+                    Err(error)
+                }
+            }
+        };
+        tokio::time::timeout_at(deadline, attachment).await.unwrap_or_else(|_| Err(deadline_error()))
+    };
+    match result {
+        Ok(Some(receipt)) => {
+            fields["notification"] = wire_document(&receipt);
+            fields["notificationAttached"] = json!(true);
+        }
+        Ok(None) => (),
+        Err(error) => {
+            fields["notificationAttached"] = json!(false);
+            fields["notificationWarning"] = json!({"error":error});
+            fields["nextAction"] = json!("use taskctl watch; do not restart or resimulate accepted work");
+        }
+    }
 }
 
 #[cfg(test)]

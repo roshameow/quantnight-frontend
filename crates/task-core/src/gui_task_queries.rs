@@ -110,13 +110,7 @@ async fn append_local_listed_task<F, Fut>(
     // Reserve the local snapshot's name even if the exact record disappears
     // during reconciliation. Never resurrect a cached remote duplicate.
     seen_names.insert(task.name.clone());
-    if task.status == "generating"
-        && document
-            .get_document("generation")
-            .ok()
-            .and_then(|generation| generation.get_str("phase").ok())
-            == Some("writing")
-    {
+    if crate::create_generate::generation_refresh_candidate(&document) {
         // TaskControlState uses this same verified config for its store. An
         // original hardcoded GUI namespace must match before any mutation.
         let result = if configured_mission_database != GUI_TASK_MISSION_DATABASE {
@@ -482,7 +476,7 @@ mod task_list_refresh_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_and_nonwriting_rows_never_initialize_or_probe_control() {
+    async fn list_probes_generating_rows_independently_of_the_saved_phase() {
         let mut tasks = Vec::new();
         let mut seen = HashSet::new();
         for status in [
@@ -494,7 +488,6 @@ mod task_list_refresh_tests {
             "completed",
             "completed_with_errors",
             "generation_failed",
-            "generation_unknown",
             "deactive",
         ] {
             let mut document = writing(status);
@@ -508,24 +501,30 @@ mod task_list_refresh_tests {
             )
             .await;
         }
-        for phase in [None, Some("complete"), Some("generation_unknown")] {
-            let mut document = row("nonwriting", "generating");
-            if let Some(phase) = phase {
-                document.insert("generation", doc! {"phase":phase});
+        for status in ["generating", "generation_unknown"] {
+            for phase in [None, Some("complete"), Some("generation_unknown")] {
+                let mut document = row(if status == "generating" { "nonwriting" } else { "legacy_unknown" }, status);
+                if let Some(phase) = phase {
+                    document.insert("generation", doc! {"phase":phase});
+                }
+                let expected_status = status;
+                append_local_listed_task(
+                    &mut tasks,
+                    &mut seen,
+                    document,
+                    GUI_TASK_MISSION_DATABASE,
+                    move |observed| async move {
+                        assert_eq!(observed.get_str("status"), Ok(expected_status));
+                        assert_eq!(observed.get_document("generation").ok().and_then(|g| g.get_str("phase").ok()), phase);
+                        Ok(result(Some(observed), false, Some("current writer check ran")))
+                    },
+                )
+                .await;
             }
-            append_local_listed_task(
-                &mut tasks,
-                &mut seen,
-                document,
-                GUI_TASK_MISSION_DATABASE,
-                |_| async { panic!("nonwriting generation must not be reconciled by list") },
-            )
-            .await;
         }
-        assert_eq!(tasks.len(), 13);
-        assert!(tasks
-            .iter()
-            .all(|task| task.generation_refresh_error.is_none()));
+        assert_eq!(tasks.len(), 15);
+        assert!(tasks[..9].iter().all(|task| task.generation_refresh_error.is_none()));
+        assert!(tasks[9..].iter().all(|task| task.generation_refresh_error.as_deref() == Some("current writer check ran")));
         append_local_listed_task(
             &mut tasks,
             &mut seen,
@@ -534,7 +533,7 @@ mod task_list_refresh_tests {
             |_| async { panic!("invalid GUI row must retain original skip behavior") },
         )
         .await;
-        assert_eq!(tasks.len(), 13);
+        assert_eq!(tasks.len(), 15);
         assert!(!seen.contains("malformed"));
     }
 

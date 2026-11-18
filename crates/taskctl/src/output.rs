@@ -14,6 +14,14 @@ pub fn rejected(invocation: &CliInvocation, error: impl AsRef<str>) -> TaskOutco
     }
 }
 
+pub(crate) fn transport_rejected(
+    invocation: &CliInvocation, error: quantnight_task_core::runtime::TransportError,
+) -> TaskOutcome {
+    let mut outcome = rejected(invocation, error.to_string());
+    outcome.value["transport"] = json!(error);
+    outcome
+}
+
 /// Serialize before writing, then one JSON document plus newline. The shared
 /// outcome (including its exit code) is opaque to this transport adapter.
 pub fn write_outcome(writer: &mut impl Write, outcome: &TaskOutcome) -> io::Result<i32> {

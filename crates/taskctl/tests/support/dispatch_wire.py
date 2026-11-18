@@ -37,8 +37,16 @@ def oid(value):
 try:
     if args[0] == 'checker':
         name, remote = args[1:3]
-        assert args[3] in ('--require-absent', '--inspect-execution') and args[4] == '--binding'
+        assert args[3] in ('--require-absent', '--inspect-execution', '--inspect-generation-writers') and args[4] == '--binding'
         bound = json.loads(args[5])
+        if args[3] == '--inspect-generation-writers':
+            assert remote == 'false'
+            exact(bound, {'taskId'})
+            assert len(bound['taskId']) == 24
+            print('QUANTNIGHT_GENERATION_OBSERVED ' + json.dumps(dict(
+                schemaVersion=1, taskName=name, taskId=bound['taskId'], remote=False,
+                state='writer_absent', reason='synthetic fixture has no generation writer')))
+            sys.exit(0)
         statepath = root / 'wire_live.json'
         live = json.loads(statepath.read_text()) if statepath.exists() else None
         if mode.get('presence'):

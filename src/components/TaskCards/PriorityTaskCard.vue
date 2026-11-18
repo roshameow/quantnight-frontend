@@ -133,7 +133,7 @@
       <n-button size="small" type="warning" :disabled="!!taskMutationIssue(task)" @click="$emit('pause')">
         <template #icon>■</template>停止
       </n-button>
-      <n-button size="small" type="error" :disabled="!!taskMutationIssue(task)" @click="$emit('delete')">
+      <n-button size="small" type="error" :disabled="!!taskMutationIssue(task) || operationBusy" @click="$emit('delete')">
         <template #icon>x</template>删除
       </n-button>
     </n-space>
@@ -198,9 +198,9 @@ export function prioritySourceGroups(runtime, configuredSources) {
 export function priorityDisplayStatus(runtime, roundEnabled, controlStatus, stopStatus) {
   // Research events cannot confirm process exit or replace an operation result.
   if (stopStatus) return stopStatus;
-  if (controlStatus === 'paused') return '暂停标记无有效停止凭据';
+  if (controlStatus === 'paused') return 'paused';
   const status = runtime?.status || runtime?.stage || (roundEnabled ? 'waiting' : controlStatus);
-  if (status === 'paused') return '暂停标记无有效停止凭据';
+  if (status === 'paused') return '研究暂停（非执行状态）';
   if (runtime && ['completed', 'done', 'success'].includes(status) &&
       (!runtime.counts || runtime.unresolved !== 0)) return 'waiting';
   return String(status).toLowerCase() === 'unknown' ? `研究状态缺少有效结果：${runtime?.reason || runtime?.last_error || '缺少阶段及原因，请刷新 root 池元数据'}` : status;
@@ -222,7 +222,7 @@ export function priorityRuntimeWarning(runtime) {
 
 export function priorityStatusType(status) {
   if (['completed', 'done', 'success'].includes(status)) return 'success';
-  if (['stopping', '停止执行中', '停止确认超时', '停止回执核验中断', '暂停标记无有效停止凭据', 'blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
+  if (['stopping', '停止执行中', '停止确认超时', '停止回执核验中断', '研究暂停（非执行状态）', 'blocked', 'waiting', 'waiting_feedback', 'waiting_slots', 'dispatching', 'running', 'initializing', 'idle', 'active'].includes(status)) return 'warning';
   if (['error', 'failed', '停止执行失败', '停止回执校验失败'].includes(status)) return 'error';
   return 'default';
 }
@@ -234,7 +234,7 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { PRIORITY_SCHEDULING_HINT } from '../../utils/taskConfig.js';
 import { taskMutationIssue, RUNTIME_MAX_AGE, regularDisplayStatus, taskDiagnosticDetails, nextRuntimeExpiry } from '../../utils/taskDiagnostics.js';
-import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
+import { taskStopDisplayStatus } from '../../stores/taskStore.js';
 
 const props = defineProps({
   task: {
@@ -249,6 +249,7 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  operationBusy: Boolean,
   stopOperation: {
     type: Object,
     default: null,
@@ -295,7 +296,7 @@ const refreshRuntimeExpiry = () => {
 };
 const stopExpiryWatch = watch(() => props.taskRuntimeStatus, refreshRuntimeExpiry, { deep: true });
 const consumerStatus = computed(() => regularDisplayStatus(props.task, props.taskRuntimeStatus, stopStatus.value, runtimeNow.value));
-const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value, taskStopProofIssue(props.task)));
+const diagnosticDetails = computed(() => taskDiagnosticDetails(props.task, props.taskRuntimeStatus, props.stopOperation, stopStatus.value, runtimeNow.value));
 const researchStatus = computed(() => priorityDisplayStatus(runtime.value, roundEnabled.value, props.task.status));
 // A research snapshot cannot mask the current operation's actual process check.
 const hasProcessDiagnostic = computed(() => props.task.status === 'running' && props.taskRuntimeStatus &&

@@ -251,7 +251,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "archive-research",
-        summary: "Archive research artifacts for completed tasks",
+        summary: "Save research summaries from the active task or a retained archive selected by --expected-task-id",
         args: &[NAME, ID, EXPECTED_REMOTE],
     },
     CommandSpec {

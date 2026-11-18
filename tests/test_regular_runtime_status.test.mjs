@@ -41,17 +41,18 @@ function configure(app) {
 async function render(props) {
   return renderToString(configure(createSSRApp({ render: () => h(card.default, props) })));
 }
-function assertPreserved(html, expectedName = 'glb_spread') {
+function assertPreserved(html, expectedName = 'glb_spread', showsConcurrency = true) {
   const text = plain(html);
   assert.match(text, /✓ 7\+4.*✗ 2\+1.*Σ 80\+20/);
   assert.match(text, /进度刷新失败：/);
-  assert.match(text, /最大并发: 3.*子任务上限: 10/);
+  if (showsConcurrency) assert.match(text, /最大并发: 3.*子任务上限: 10/);
+  else assert.doesNotMatch(text, /最大并发:/);
   assert.ok(text.includes(expectedName));
   assert.match(text, /user1/);
 }
 
 test('real regular SFC SSR: initial business running needs no PID observation; fresh positive, bash-only and unknown are distinct', async () => {
-  for (const [runtime, label] of [[null, 'running'], [observation(), '消费者存活（缺少有效派发快照）'],
+  for (const [runtime, label] of [[null, 'running · 消费者未核验'], [observation(), '消费者存活（缺少有效派发快照）'],
     [observation({ state: 'not_running', raw: '❌ Pane 0 (pid=21733) is running: bash' }), '未检测到运行消费者'],
     [observation({ state: 'unknown' }), '运行检查输出校验失败'], [observation({ state: 'checking' }), '运行检查进行中'],
     [observation({ state: 'paused' }), '运行检查输出校验失败']]) {
@@ -83,21 +84,21 @@ test('freshness and identity boundary rejects stale, future, invalid and wrong t
   assert.equal(card.regularDisplayStatus(task(), observation({ observedAt: now - card.REGULAR_RUNTIME_MAX_AGE + 1 }), null, now), '消费者存活（缺少有效派发快照）');
 });
 
-test('actual regular SFC SSR honors stop lifecycle and persisted pause proof above positive or missing consumer evidence', async () => {
+test('actual regular SFC SSR honors stop lifecycle and projected pause status above positive or missing consumer evidence', async () => {
   for (const runtime of [null, observation(), observation({ state: 'not_running' }), observation({ state: 'unknown' })]) {
     for (const [status, label] of [['stopping', '停止执行中'], ['stop_unconfirmed', '停止执行失败'], ['paused', 'paused']]) {
       const stopOperation = { _id: 'regular-id', name: 'glb_spread', isRemote: false, status,
         receipt: { confirmed: true, taskId: 'regular-id', taskName: 'glb_spread', isRemote: false, stopConfirmedAt: Date.now() } };
-      const html = await render({ task: task(), taskRuntimeStatus: runtime, progress, stopOperation });
+      const html = await render({ task: task(status === 'paused' ? { status } : {}), taskRuntimeStatus: runtime, progress, stopOperation });
       assert.match(plain(html), new RegExp(`glb_spread ${label}`));
-      assertPreserved(html);
+      assertPreserved(html, 'glb_spread', status !== 'paused');
     }
     const paused = task({ status: 'paused', stopConfirmedAt: { $date: { $numberLong: String(Date.now()) } },
       stopConfirmedTaskId: 'regular-id', stopConfirmedRemote: false });
     assert.match(plain(await render({ task: paused, taskRuntimeStatus: runtime })), /glb_spread paused/);
     for (const patch of [{}, { stopConfirmedAt: 'invalid' }, { stopConfirmedTaskId: 'wrong' }, { stopConfirmedRemote: true }]) {
       const input = Object.keys(patch).length ? { ...paused, ...patch } : task({ status: 'paused' });
-      assert.match(plain(await render({ task: input, taskRuntimeStatus: runtime })), /glb_spread 暂停标记无有效停止凭据/);
+      assert.match(plain(await render({ task: input, taskRuntimeStatus: runtime })), /glb_spread paused/);
     }
   }
 });
@@ -283,18 +284,12 @@ test('actual TaskManager -> actual Priority SFC passes structured runtime diagno
   assert.doesNotMatch(text, /glb_spread paused/);
 });
 
-test('legacy paused body identifies the actual missing, invalid or mismatched proof field', async () => {
-  const valid = task({ status: 'paused', stopConfirmedAt: Date.now(), stopConfirmedTaskId: 'regular-id', stopConfirmedRemote: false });
-  for (const [patch, reason] of [[{ stopConfirmedAt: null }, '缺少 stopConfirmedAt'],
-    [{ stopConfirmedAt: 'invalid' }, 'stopConfirmedAt 停止时间凭据格式无效'],
-    [{ stopConfirmedTaskId: null }, '缺少 stopConfirmedTaskId'],
-    [{ stopConfirmedTaskId: 'old-id' }, '身份校验失败：停止凭据 stopConfirmedTaskId 的任务 ID'],
-    [{ stopConfirmedRemote: null }, '缺少有效 stopConfirmedRemote'],
-    [{ stopConfirmedRemote: true }, '身份校验失败：停止凭据 stopConfirmedRemote 的执行主机与当前本地/远程目标存在差异']]) {
-    const text = plain(await render({ task: { ...valid, ...patch } }));
-    assert.match(text, /glb_spread 暂停标记无有效停止凭据/);
-    assert.ok(text.includes(reason)); assert.doesNotMatch(text, /glb_spread paused/);
-  }
+test('projected paused status without a current receipt does not claim proof or process exit', async () => {
+  const text = plain(await render({ task: task({ status: 'paused', stopConfirmationBasis: 'session_absent',
+    stopConfirmedTaskId: 'old-id' }) }));
+  assert.match(text, /glb_spread paused/);
+  assert.match(text, /任务列表显示已暂停；不是本次停止操作的回执/);
+  assert.doesNotMatch(text, /已核验目标主机的精确会话缺失/);
 });
 
 test('actual Regular SFC shows control_write timeout/disposal as missing final evidence, not a definitive CAS failure', async () => {
@@ -318,7 +313,7 @@ test('copy regression: local/remote checks preserve facts, raw failures, existin
     for (const [runtime, label, detail, color] of [
       [snapshot({ state: 'checking' }), '运行检查进行中', '正等待本次检查结果。', 'warning'],
       [snapshot({}), '消费者存活（缺少有效派发快照）', '已识别 Python/uv 消费者进程。', 'warning'],
-      [snapshot({ state: 'session_absent' }), '已暂停（tmux会话缺失）', '已核验目标主机的精确 tmux 会话缺失。', 'warning'],
+      [snapshot({ state: 'session_absent' }), 'tmux会话缺失', '已核验目标主机的精确 tmux 会话缺失。', 'warning'],
       [snapshot({ state: 'unknown', raw: '' }), '运行检查输出校验失败', '检查输出缺少可校验的 Python/uv 或 shell/sleep 进程行。', 'error'],
       [snapshot({ authProfile: 'other' }), '运行检查任务匹配失败', '任务登记与执行目标匹配失败：检查结果的任务 ID、名称、执行主机、账号或启动批次与当前任务存在差异', 'error'],
     ]) {

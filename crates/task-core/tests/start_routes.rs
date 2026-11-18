@@ -316,6 +316,27 @@ impl Runtime {
 }
 #[async_trait]
 impl StartRuntime for Runtime {
+    async fn inspect_execution(
+        &self,
+        _: &Path,
+        _: &dyn TaskStore,
+        _: &Document,
+        _: bool,
+        _: Option<&Document>,
+        _: std::time::Duration,
+    ) -> Result<Option<serde_json::Value>, String> {
+        // Cancelling the Rust future does not prove that the blocked external
+        // launcher exited. Model the original inspector finding that helper.
+        if self.block_launch.is_some() && self.launches() != 0 {
+            return Ok(Some(serde_json::json!({
+                "state": "unverified",
+                "consumerRunning": false,
+                "reason": "original launcher still present",
+            })));
+        }
+        Ok(None)
+    }
+
     async fn priority_config(
         &self,
         _: &Path,
@@ -520,7 +541,7 @@ impl Drop for Root {
 fn setup(kind: &str, remote: bool) -> (Root, Arc<Store>, Runtime, StartRequest) {
     let root = Root::new();
     let store = Arc::new(Store::default());
-    let task = doc! {"_id":ObjectId::new(),"name":"task","taskType":kind,"auth_profile":"user1","status":"paused","isRemote":remote,"targetRemote":remote,"updatedAt":"old-revision","events":[],
+    let task = doc! {"_id":ObjectId::parse_str("640000000123456789abcdef").unwrap(),"name":"task","taskType":kind,"auth_profile":"user1","status":"paused","isRemote":remote,"targetRemote":remote,"updatedAt":"old-revision","events":[],
     "launchAttemptId":"old-launch","stopConfirmedAt":bson::DateTime::from_millis(1000),"stopConfirmedTaskId":"old-id","stopConfirmedRemote":remote,"tmuxContext":{"old":"not-new-authority"}};
     let row = doc! {"_id":ObjectId::new(),"status":"processing","acceptance":"ACCEPTED","progressUrl":"fixture-original-location","submissionAttempts":[{"accepted":true}]};
     {
@@ -730,7 +751,6 @@ async fn preflight_failures_never_invalidate_old_stop_or_launch() {
     for stage in [
         "continuation",
         "absence",
-        "notify-preflight",
         "super",
         "priority",
     ] {
@@ -741,15 +761,30 @@ async fn preflight_failures_never_invalidate_old_stop_or_launch() {
         } else {
             "regular"
         };
-        let (root, store, mut runtime, mut request) = setup(kind, false);
+        let (root, store, mut runtime, request) = setup(kind, false);
         runtime.fail = Some(stage);
-        if stage == "notify-preflight" {
-            request_notice(&mut request);
-        }
         let before = store.task();
         failed(&core::start(&root.0, store.as_ref(), &runtime, &request).await);
         assert_eq!(store.task(), before);
         assert_eq!(runtime.launches(), 0);
+    }
+}
+
+#[tokio::test]
+async fn settled_and_unsettled_history_do_not_block_a_fresh_scoped_launch() {
+    for remote in [false, true] {
+        let (root, store, runtime, mut request) = setup("regular", remote);
+        request.notification.no_notify = true;
+        store.mutate(doc! {"status":"launching","launchSettledAttemptId":Bson::Null,
+            "startupBinding":{"consumer_run_id":"legacy-run"},
+            "simulatorRuntime":{"consumer_run_id":"different-old-run"},
+            "acceptedObservation":{"id":"stale-observer"}});
+        let original = store.task();
+        let result = core::start(&root.0, store.as_ref(), &runtime, &request).await;
+        success(&result);
+        assert_eq!(result.value["startedNew"], true);
+        assert_ne!(store.task().get("launchAttemptId"), original.get("launchAttemptId"));
+        assert_eq!(runtime.launches(), 1);
     }
 }
 
@@ -760,8 +795,6 @@ async fn invalid_configs_busy_observation_and_expected_id_fail_without_launcher(
         "bson-nan",
         "nonjson",
         "null-saved",
-        "busy",
-        "observation",
         "wrong-id",
         "wrong-launch",
     ] {
@@ -773,8 +806,6 @@ async fn invalid_configs_busy_observation_and_expected_id_fail_without_launcher(
             "null-saved" => {
                 store.mutate(doc! {"startConfig":Bson::Null,"mission_config":{"valid":true}})
             }
-            "busy" => store.mutate(doc! {"status":"launching"}),
-            "observation" => store.mutate(doc! {"acceptedObservation":{"id":"open"}}),
             "wrong-id" => request.expected_task_id = Some(ObjectId::new().to_hex()),
             _ => request.expected_launch_attempt_id = Some("stale".into()),
         }
@@ -854,7 +885,11 @@ async fn running_cas_refuses_new_identity_after_confirmed_consumer() {
         "start:running".into(),
         doc! {"_id":replacement,"status":"pending","launchAttemptId":"foreign"},
     );
-    failed(&core::start(&root.0, store.as_ref(), &runtime, &request).await);
+    let started = core::start(&root.0, store.as_ref(), &runtime, &request).await;
+    success(&started);
+    assert_eq!(started.value["startedNew"], true);
+    assert_eq!(started.value["controlProjectionConfirmed"], false);
+    assert_eq!(started.value["controlWarning"], "start control CAS not confirmed; preserve original task/launch, do not restart");
     assert_eq!(store.task().get_object_id("_id"), Ok(replacement));
     assert_eq!(store.task().get_str("status"), Ok("pending"));
     assert_eq!(runtime.launches(), 1);
@@ -897,7 +932,7 @@ async fn super_registration_refuses_foreign_identity_profile_side_and_lost_ack()
         }
         failed(&core::start(&root.0, store.as_ref(), &runtime, &request).await);
         assert_eq!(runtime.launches(), 0);
-        assert_eq!(store.task().get_str("status"), Ok("launching"));
+        assert_eq!(store.task().get_str("status"), Ok("paused"));
     }
 }
 
@@ -936,10 +971,11 @@ async fn super_startup_binding_is_new_and_fast_sweep_fact_is_not_overwritten() {
 
 #[tokio::test]
 async fn watcher_failure_reports_consumer_started_and_only_watch_repair() {
-    for fault in ["failure", "wrong-id", "metadata"] {
+    for fault in ["failure", "wrong-id", "metadata", "notify-preflight"] {
         let (root, store, mut runtime, mut request) = setup("regular", false);
         request_notice(&mut request);
         runtime.watch_mode = fault;
+        if fault == "notify-preflight" { runtime.fail = Some(fault); }
         if fault == "metadata" {
             store
                 .0
@@ -949,8 +985,9 @@ async fn watcher_failure_reports_consumer_started_and_only_watch_repair() {
                 .insert("watch-attach:ok".into());
         }
         let result = core::start(&root.0, store.as_ref(), &runtime, &request).await;
-        failed(&result);
+        success(&result);
         assert_eq!(result.value["consumerStarted"], true);
+        assert!(result.value["notificationWarning"]["error"].is_string());
         assert_eq!(result.value["notificationAttached"], false);
         assert!(result.value["nextAction"]
             .as_str()
@@ -1040,7 +1077,7 @@ async fn original_mutator_lock_spans_launcher_await_and_abort_retains_unknown_cl
     let started = Arc::new(tokio::sync::Notify::new());
     runtime.block_launch = Some(started.clone());
     let runtime = Arc::new(runtime);
-    let handle = {
+    let mut handle = {
         let path = root.0.clone();
         let store = store.clone();
         let runtime = runtime.clone();
@@ -1049,14 +1086,28 @@ async fn original_mutator_lock_spans_launcher_await_and_abort_retains_unknown_cl
             async move { core::start(&path, store.as_ref(), runtime.as_ref(), &request).await },
         )
     };
-    started.notified().await;
+    tokio::select! {
+        reached = tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()) => {
+            reached.expect("in-memory start did not reach its blocked launcher");
+        }
+        early = &mut handle => panic!("start exited before entering launcher: {early:?}"),
+    }
     let claimed = store.task();
     assert_eq!(claimed.get_str("status"), Ok("launching"));
-    failed(&core::start(&root.0, store.as_ref(), runtime.as_ref(), &request).await);
+    let try_start = || tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        core::start(&root.0, store.as_ref(), runtime.as_ref(), &request),
+    );
+    let busy = try_start().await.expect("busy lock must fail without waiting");
+    failed(&busy);
+    assert_eq!(busy.value["error"], "another lifecycle mutator owns this mission");
     assert_eq!(runtime.launches(), 1);
     handle.abort();
     assert!(handle.await.unwrap_err().is_cancelled());
-    failed(&core::start(&root.0, store.as_ref(), runtime.as_ref(), &request).await);
+    let unresolved = try_start().await.expect("observation of late launcher must prevent a duplicate");
+    failed(&unresolved);
+    assert_eq!(unresolved.value["executionObservation"]["reason"], "original launcher still present");
+    assert_eq!(claimed.get("launchSettledAttemptId"), Some(&Bson::Null));
     assert_eq!(store.task(), claimed);
     assert_eq!(runtime.launches(), 1);
 }
@@ -1081,13 +1132,10 @@ async fn start_cannot_change_an_existing_execution_host_or_bypass_captured_host(
 
 #[tokio::test]
 async fn a_priority_pending_label_or_erased_launch_is_not_pristine_destination_authority() {
-    for change in [doc! {"status":"pending","targetRemote":true},
-        doc! {"status":"pending","targetRemote":true,"launchAttemptId":Bson::Null,"tmuxContext":Bson::Null,"stopConfirmedAt":Bson::Null}] {
-        let (root, store, runtime, request) = setup("priority", false);
-        store.mutate(change);
-        failed(&core::start(&root.0, store.as_ref(), &runtime, &request).await);
-        assert_eq!(runtime.launches(), 0);
-    }
+    let (root, store, runtime, request) = setup("priority", false);
+    store.mutate(doc! {"status":"pending","targetRemote":true});
+    failed(&core::start(&root.0, store.as_ref(), &runtime, &request).await);
+    assert_eq!(runtime.launches(), 0);
 }
 
 #[async_trait]
@@ -1213,7 +1261,7 @@ class Process:
             if case=="legacy_inline" {
                 assert_eq!(out.value["controlReconciled"],true);
                 let saved=store.task();assert_eq!(saved.get_str("status"),Ok("running"));
-                assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
+                assert_eq!(saved.get("launchSettledAttemptId"),before.get("launchSettledAttemptId"));
                 for key in ["_id","launchAttemptId","simulatorRuntime","startConfig","mission_config","tmuxContext"] {
                     assert_eq!(saved.get(key),before.get(key),"never overwrite original launch/runtime/config");
                 }
@@ -1279,7 +1327,7 @@ class Process:
             "tmuxContext":{"schemaVersion":1,"backend":"tmux","socketName":"default","binary":native.canonicalize().unwrap().to_string_lossy().as_ref(),
                 "sessionId":"$4","sessionCreatedAt":1700000000000_i64,"taskId":&id,"launchAttemptId":"old-launch","remote":remote}});
         if remote {let t=store.task();store.0.lock().unwrap().remote.push(t);}
-        if successor {store.0.lock().unwrap().mutate_after.insert("pause:paused".into(),doc!{"runId":"successor-mission"});}
+        if successor {store.0.lock().unwrap().mutate_after.insert("pause:paused".into(),doc!{"runId":"successor-mission","launchAttemptId":"successor-launch"});}
         let rows=store.0.lock().unwrap().local_rows.clone();
         let binding=validate_backend_binding(&fixture.config).await.unwrap();
         let runtime=Professional{original:OriginalOperationsRuntime{binding:&binding,observer:None},config_fixture};
@@ -1319,6 +1367,71 @@ fi"#)).unwrap();
 }
 
 #[tokio::test]
+async fn remote_start_observes_local_writer_without_generation_metadata() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = original_professional_runtime::original_professional_fixture(false);
+    let root = Path::new(&fixture.config.env.working_dir);
+    completion_original_super_preflight(root);
+    let writer = root.join("writer-present");
+    std::fs::write(&writer, "local writer inventory entry").unwrap();
+    let ps = root.join("bin/ps");
+    let old_ps = std::fs::read_to_string(&ps).unwrap();
+    std::fs::write(&ps, format!(r#"{old_ps}
+if [[ "$*" == *comm=* && -f "${{STATE%/*}}/writer-present" ]]; then echo '43 1 python3'; fi
+"#)).unwrap();
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.join("psutil.py"), r#"import os
+from pathlib import Path
+STATUS_ZOMBIE = 'zombie'
+class Error(Exception): pass
+class NoSuchProcess(Error): pass
+class AccessDenied(Error): pass
+class Process:
+    def __init__(self, pid):
+        if pid != 43: raise NoSuchProcess(pid)
+    def status(self): return 'running'
+    def create_time(self): return 1700000030.0
+    def cmdline(self):
+        return ['python3', '-m', 'backend.mongodb.mongo_datum', '--alpha_filename=fixture']
+    def cwd(self): return str(Path(os.environ['STATE']).parent)
+    def is_running(self): return (Path(os.environ['STATE']).parent / 'writer-present').is_file()
+"#).unwrap();
+
+    let (_unused, store, _runtime, mut request) = setup("super", true);
+    request.name = "fixture".into();
+    request.notification.no_notify = true;
+    store.mutate(doc! {"name":"fixture"});
+    let before = store.task();
+    assert!(!before.contains_key("generation"));
+    let binding = validate_backend_binding(&fixture.config).await.unwrap();
+    let control = TaskControl::with_store(binding, store.clone());
+
+    let blocked = control.start(&request, None).await;
+    failed(&blocked);
+    assert_eq!(blocked.value["error"], "generation still active: local mongo_datum writer still present for exact collection");
+    assert_eq!(store.task(), before);
+    {
+        let state = store.0.lock().unwrap();
+        assert!(state.remote.is_empty(), "no execution registry write");
+        assert!(!state.calls.iter().any(|call| call == "start:launching"));
+    }
+    assert!(!root.join("state").exists());
+    let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+    assert!(!trace.contains("new-session") && !trace.contains("if-shell"));
+
+    // A fresh explicit start may proceed once the same inspector proves absence.
+    std::fs::remove_file(writer).unwrap();
+    let allowed = control.start(&request, None).await;
+    success(&allowed);
+    assert_eq!(allowed.value["remote"], true);
+    assert_eq!(allowed.value["startedNew"], true);
+    let trace = std::fs::read_to_string(root.join("trace")).unwrap();
+    assert_eq!(trace.lines().filter(|line| line.contains("new-session")).count(), 1);
+}
+
+#[tokio::test]
 async fn completion_public_facade_unknown_launch_blocks_late_original_ssh_helper() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
     use std::os::unix::net::UnixDatagram;
@@ -1328,6 +1441,26 @@ async fn completion_public_facade_unknown_launch_blocks_late_original_ssh_helper
     let notify=UnixDatagram::bind(root.join("done.sock")).unwrap();
     notify.set_read_timeout(Some(std::time::Duration::from_secs(12))).unwrap();
     let ssh=root.join("bin/ssh");let old=std::fs::read_to_string(&ssh).unwrap();
+    let ps = root.join("bin/ps");
+    let ps_src = std::fs::read_to_string(&ps).unwrap();
+    std::fs::write(&ps, format!(r#"{ps_src}
+if [[ "$*" == *comm=* && -f "${{STATE%/*}}/late-helper.pid" ]]; then echo '4321 1 bash'; fi
+"#)).unwrap();
+    std::fs::write(root.join("psutil.py"), r#"import os
+from pathlib import Path
+STATUS_ZOMBIE='zombie'
+class NoSuchProcess(Exception): pass
+class AccessDenied(Exception): pass
+class Process:
+ def __init__(self,pid):
+  if pid != 4321 or not (Path(os.environ['STATE']).parent/'late-helper.pid').exists(): raise NoSuchProcess(pid)
+  self.pid=pid
+ def create_time(self): return 1700000030.0
+ def cwd(self): return str(Path(os.environ['STATE']).parent)
+ def cmdline(self): return ['bash','scripts/start_super_task.sh','fixture','{}','--remote','user1']
+ def is_running(self): return True
+ def status(self): return 'running'
+"#).unwrap();
     let delayed=r#"
 if sys.argv[-2:]==['bash','-se']:
  from pathlib import Path
@@ -1343,6 +1476,7 @@ print('ready',flush=True)
 ready=s.select(8)
 if ready:
  os.read(fd,1)
+ (root/'late-helper.pid').unlink()
  result=subprocess.run(['/bin/bash','-se'],input=(root/'late-payload').read_bytes(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6).returncode
 else: result=98
 sock=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);sock.sendto(str(result).encode(),str(root/'done.sock'))
@@ -1363,7 +1497,7 @@ sock=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);sock.sendto(str(result).enc
     assert!(root.join("late-helper.pid").exists(),"{}",first.value);
     assert!(!root.join("state").exists());
     let second=control.start(&request,None).await;failed(&second);
-    assert!(second.value.to_string().contains("settlement"),"{}",second.value);
+    assert_eq!(second.value["executionObservation"]["processes"][0]["role"], "launcher", "{}", second.value);
     assert_eq!(store.task(),before,"unresolved old attempt must not be overwritten");
     assert_eq!(store.0.lock().unwrap().calls.iter().filter(|c|*c=="start:launching").count(),1);
     // Release the ORIGINAL SSH child only. It may still launch; this test proves
@@ -1378,7 +1512,7 @@ sock=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);sock.sendto(str(result).enc
 }
 
 #[tokio::test]
-async fn completion_public_facade_settled_original_launcher_can_recover_absence() {
+async fn completion_public_facade_can_recover_observed_absence_without_launch_settlement() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl};
     for remote in [false,true] {
         let fixture=original_professional_runtime::original_professional_fixture(false);
@@ -1387,11 +1521,18 @@ async fn completion_public_facade_settled_original_launcher_can_recover_absence(
         request.name="fixture".into();request.notification.no_notify=true;store.mutate(doc!{"name":"fixture"});
         store.0.lock().unwrap().fail_before.insert("start:running".into());
         let binding=validate_backend_binding(&fixture.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
-        let first=control.start(&request,None).await;failed(&first);
-        let task=store.task();assert_eq!(task.get_str("status"),Ok("launching"));
-        assert_eq!(task.get("launchSettledAttemptId"),task.get("launchAttemptId"),"{}",first.value);
+        let first = control.start(&request, None).await;
+        success(&first);
+        assert_eq!(first.value["startedNew"], true);
+        assert_eq!(first.value["controlProjectionConfirmed"], false);
+        assert_eq!(first.value["controlWarning"], "write before start:running");
+        let task = store.task();
+        assert_eq!(task.get_str("status"), Ok("launching"));
+        assert_eq!(task.get("launchSettledAttemptId"), Some(&Bson::Null));
         std::fs::remove_file(root.join("state")).unwrap();
         store.0.lock().unwrap().fail_before.remove("start:running");
+        store.mutate(doc! {"startupBinding":{"consumer_run_id":"old-a"},
+            "simulatorRuntime":{"consumer_run_id":"old-b"}});
         let recovered=control.start(&request,None).await;success(&recovered);
         for key in ["task","taskId","remote","taskType","authProfile","launchAttemptId","operationSettled"] {
             assert!(recovered.value.get(key).is_some(),"missing {key}: {}",recovered.value);
@@ -1415,47 +1556,11 @@ async fn completion_original_start_preserves_launcher120_without_total120() {
 }
 
 #[tokio::test]
-async fn completion_legacy_unknown_pause_v2_preserves_pending_launcher_fence() {
+async fn original_pause_then_start_ignores_historical_launch_settlement_after_verified_absence() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,pause::{PauseOptions,StopBudget}};
-    for remote in [false,true] {for case in ["legacy_unknown_pending","legacy_unknown_exited","legacy_normal","settled_unknown"] {
+    for remote in [false,true] {for case in ["legacy_unknown_exited","legacy_normal","settled_unknown"] {
         let fixture=original_professional_runtime::original_professional_fixture(false);
         let root=Path::new(&fixture.config.env.working_dir);completion_original_super_preflight(root);
-        if case=="legacy_unknown_pending" {
-            // Live launcher still visible in process table: verify_launcher_settled must refuse to settle.
-            std::fs::write(root.join("psutil.py"),r#"import os
-from types import SimpleNamespace
-STATUS_ZOMBIE='zombie'
-class NoSuchProcess(Exception): pass
-class AccessDenied(Exception): pass
-class Error(Exception): pass
-class FakeProc:
- def __init__(self,pid,name,argv):
-  self.info={'pid':pid,'name':name}
-  self._argv=argv
- def status(self): return 'running'
- def is_running(self): return True
- def cmdline(self): return self._argv
-def process_iter(attrs=None):
- return [FakeProc(os.getpid(),'python',['python','verifier']),FakeProc(4321,'bash',['bash','scripts/start_super_task.sh','fixture','{}','false','user1'])]
-"#).unwrap();
-        } else if case=="legacy_unknown_exited" {
-            // Host process table confirms zero live launcher/consumer for fixture: pause settles launchSettledAttemptId.
-            std::fs::write(root.join("psutil.py"),r#"import os
-STATUS_ZOMBIE='zombie'
-class NoSuchProcess(Exception): pass
-class AccessDenied(Exception): pass
-class Error(Exception): pass
-class FakeProc:
- def __init__(self,pid,name,argv):
-  self.info={'pid':pid,'name':name}
-  self._argv=argv
- def status(self): return 'running'
- def is_running(self): return True
- def cmdline(self): return self._argv
-def process_iter(attrs=None):
- return [FakeProc(os.getpid(),'python',['python','verifier'])]
-"#).unwrap();
-        }
         let (_unused,store,_runtime,mut request)=setup("super",remote);
         request.name="fixture".into();request.notification.no_notify=true;
         {let mut d=store.0.lock().unwrap();let task=d.local.last_mut().unwrap();
@@ -1467,18 +1572,11 @@ def process_iter(attrs=None):
         assert_eq!(out.exit_code,0,"{remote}/{case}: {}",out.value);
         assert_eq!(out.value["confirmationBasis"],"session_absent");
         let paused=store.task();assert_eq!(paused.get_str("status"),Ok("paused"));
-        if case=="legacy_unknown_pending" {assert_eq!(paused.get("launchSettledAttemptId"),Some(&Bson::Null));}
         if case=="legacy_unknown_exited" {assert_eq!(paused.get("launchSettledAttemptId"),paused.get("launchAttemptId"));}
         if case=="legacy_normal" {assert!(!paused.contains_key("launchSettledAttemptId"));}
         let result=control.start(&request,None).await;
-        if case=="legacy_unknown_pending" {
-            failed(&result);assert_eq!(store.task(),paused);
-            assert!(!store.0.lock().unwrap().calls.iter().any(|c|c=="start:launching"));
-            let archive=control.delete("fixture",None,None,None).await;failed(&archive);
-            assert!(archive.value.to_string().contains("launcher remains unresolved"),"{}",archive.value);
-            assert_eq!(store.task(),paused);
-            let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
-        } else {success(&result);assert_eq!(result.value["startedNew"],true);}
+        success(&result);
+        assert_eq!(result.value["startedNew"],true);
     }}
 }
 
@@ -1497,25 +1595,40 @@ fi"#,refuse=refuse.display()))).unwrap();
         let (_unused,store,_runtime,mut request)=setup("super",remote);
         request.name="fixture".into();request.notification.no_notify=true;store.mutate(doc!{"name":"fixture"});
         request.expected_task_id=Some(store.task().get_object_id("_id").unwrap().to_hex());
-        if case=="persist_failure" {store.0.lock().unwrap().fail_before.insert("start-not-dispatched:ok".into());}
-        if case=="replacement" {store.0.lock().unwrap().mutate_before.insert("start-not-dispatched:ok".into(),doc!{"_id":ObjectId::new(),"launchAttemptId":"successor"});}
+        if case=="persist_failure" {store.0.lock().unwrap().fail_before.insert("start-not-dispatched:paused".into());}
+        if case=="replacement" {store.0.lock().unwrap().mutate_before.insert("start-not-dispatched:paused".into(),doc!{"_id":ObjectId::new(),"launchAttemptId":"successor"});}
         let binding=validate_backend_binding(&fixture.config).await.unwrap();let control=TaskControl::with_store(binding,store.clone());
         let first=control.start(&request,None).await;failed(&first);
         assert_ne!(first.value["operationSettled"],true,"failed response must not fabricate join proof");
-        let saved=store.task();assert_eq!(saved.get_str("status"),Ok("launching"));
+        let saved=store.task();assert_eq!(saved.get_str("status"),Ok(if case=="persisted"{"paused"}else{"launching"}));
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
         assert_eq!(store.0.lock().unwrap().calls.iter().filter(|c|*c=="start:launching").count(),1);
-        if case=="persisted" {
-            assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
-            assert!(saved.get_array("events").unwrap().iter().any(|e|e.as_document().is_some_and(|d|d.get_str("command")==Ok("start-not-dispatched") && d.get_document("detail").unwrap().get_bool("launcherInvoked")==Ok(false))));
-        } else {assert_eq!(saved.get("launchSettledAttemptId"),Some(&Bson::Null));}
+        let events = saved.get_array("events").unwrap();
+        let settlement = events.iter().filter_map(Bson::as_document)
+            .find(|event| event.get_str("command") == Ok("start-not-dispatched"));
+        if case == "persisted" {
+            assert_eq!(saved.get("launchSettledAttemptId"), saved.get("launchAttemptId"));
+            assert_eq!(settlement.unwrap().get_document("detail").unwrap().get_bool("launcherInvoked"), Ok(false));
+        } else {
+            assert_eq!(saved.get("launchSettledAttemptId"), Some(&Bson::Null));
+            assert!(settlement.is_none());
+        }
         std::fs::remove_file(&refuse).unwrap();
-        store.0.lock().unwrap().fail_before.remove("start-not-dispatched:ok");
-        let next=control.start(&request,None).await;
-        if case=="persisted" {success(&next);assert_eq!(next.value["startedNew"],true);assert_ne!(store.task().get("launchAttemptId"),saved.get("launchAttemptId"));}
-        else {failed(&next);assert_eq!(store.task(),saved);}
+        store.0.lock().unwrap().fail_before.remove("start-not-dispatched:paused");
+        let next = control.start(&request, None).await;
+        if case == "replacement" {
+            failed(&next);
+            assert_eq!(next.value["error"], "task identity changed before launch");
+            assert_eq!(store.task(), saved);
+        } else {
+            // Newly verified process absence, not historical settlement, permits
+            // a fresh explicit start. A live late helper is tested separately.
+            success(&next);
+            assert_eq!(next.value["startedNew"], true);
+            assert_ne!(store.task().get("launchAttemptId"), saved.get("launchAttemptId"));
+        }
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();
-        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),usize::from(case=="persisted"));
+        assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),usize::from(case!="replacement"));
     }}
 }
 
@@ -1623,7 +1736,10 @@ async fn shared_start_strong_original_consumer_recovers_lost_control_ack_through
         let binding=validate_backend_binding(&fixture.config).await.unwrap();
         let control=TaskControl::with_store(binding,store.clone());
         let result=control.start(&request,None).await;
-        if fault=="none" {success(&result);}else{failed(&result);assert_ne!(result.value["operationSettled"],true,"failed current control CAS is not settled");}
+        success(&result);
+        assert_eq!(result.value["outcome"], "already_running");
+        assert_eq!(result.value["startedNew"], false);
+        if fault != "none" { assert!(result.value["controlWarning"].is_string()); }
         if fault=="replacement" {
             assert_eq!(store.task().get_str("launchAttemptId"),Ok("successor"));
             assert_eq!(store.task().get_str("status"),Ok("launching"));
@@ -1632,7 +1748,7 @@ async fn shared_start_strong_original_consumer_recovers_lost_control_ack_through
             assert_eq!(repeat.value["startedNew"],false);assert_eq!(repeat.value["configApplied"],false);
             assert_eq!(repeat.value["operationSettled"],true);
             let saved=store.task();assert_eq!(saved.get_str("status"),Ok("running"));
-            assert_eq!(saved.get("launchSettledAttemptId"),saved.get("launchAttemptId"));
+            assert_eq!(saved.get("launchSettledAttemptId"),Some(&Bson::Null));
         }
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session")&&!trace.contains("if-shell"));
     }}
@@ -1642,12 +1758,9 @@ async fn shared_start_strong_original_consumer_recovers_lost_control_ack_through
 async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_start() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,task_control::TaskControl,
         create_generate::CreateRequest,pause::{PauseOptions,StopBudget}};
-    struct RestorePath(Option<std::ffi::OsString>);
-    impl Drop for RestorePath {
-        fn drop(&mut self) { if let Some(value)=&self.0 { std::env::set_var("PATH",value); } else {std::env::remove_var("PATH");} }
-    }
-    // Gate executes native tests on one thread; only the actual uv OS boundary
-    // is selected via PATH. No original launcher/config/checker is stubbed.
+    use quantnight_task_core::operations_runtime::{with_environment, OperationalEnvironment};
+    // Inject the original uv OS boundary using per-call PATH, never process-wide
+    // environment (the native gate can run other fixture tests concurrently).
     for kind in ["regular","super","priority"] {for remote in [false,true] {
       let cases:&[&str]=if kind=="priority" && !remote {
           &["none","launcher","control","direct_pause","v2_only","pause_launch_race","pause_host_race","pause_ack_lost","nextafter_stop"]
@@ -1659,8 +1772,16 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
       for &lost in cases {
         let fixture=original_professional_runtime::priority_professional_fixture();
         let root=Path::new(&fixture.config.env.working_dir);
-        let _path=RestorePath(std::env::var_os("PATH"));
-        std::env::set_var("PATH",format!("{}:/bin:/usr/bin",root.join("bin").display()));
+        let environment: OperationalEnvironment = serde_json::from_value(serde_json::json!({
+            "values": {"PATH": format!("{}:/bin:/usr/bin", root.join("bin").display())}
+        })).unwrap();
+        environment.validate().unwrap();
+        // A successful ps scan includes at least an unrelated system process,
+        // even when this fixture has no consumer or local generation writer.
+        let ps = root.join("bin/ps");
+        let source = std::fs::read_to_string(&ps).unwrap();
+        std::fs::write(&ps, format!("{source}\nif [[ \"$*\" == *comm=* ]]; then echo '9 1 fixture'; fi\n")).unwrap();
+        with_environment(Some(environment), async {
         let store=if kind=="priority"{Arc::new(Store::default())}else{setup(kind,remote).1};
         if kind!="priority" {store.mutate(doc!{"name":"fixture","status":"ready","tmuxContext":Bson::Null});}
         {let mut state=store.0.lock().unwrap();state.original_control_file=Some(root.join("original-control.json"));Store::publish_original_control(&state);}
@@ -1678,8 +1799,14 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
         let mut request=StartRequest::new("fixture");request.remote=Some(remote);request.notification.no_notify=true;
         request.expected_task_id=Some(original.get_object_id("_id").unwrap().to_hex());
         let first=control.start(&request,None).await;
-        if lost=="none" {success(&first);assert_eq!(first.value["startedNew"],true);}
-        else {failed(&first);}
+        if matches!(lost,"none"|"control") {
+            success(&first);
+            assert_eq!(first.value["startedNew"], true);
+            assert_eq!(first.value["controlProjectionConfirmed"], lost == "none");
+            if lost == "control" {
+                assert_eq!(first.value["controlWarning"], "response lost after start:running");
+            }
+        } else { failed(&first); }
         assert!(root.join("launched-argv.json").exists(),"{}",first.value);
         let claimed=store.task();assert_ne!(claimed.get("launchAttemptId"),original.get("launchAttemptId"));
         assert_eq!(claimed.get_object_id("_id"),original.get_object_id("_id"));
@@ -1710,7 +1837,7 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
         assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1,"no duplicate launcher");
         assert!(!trace.contains("if-shell"),"START never stops existing consumer");
         if lost=="v2_only" {std::fs::remove_file(root.join("state")).unwrap();}
-        if lost=="pause_launch_race" {store.0.lock().unwrap().mutate_before.insert("pause:paused".into(),doc!{"launchAttemptId":"successor"});}
+        if lost=="pause_launch_race" {store.0.lock().unwrap().mutate_before.insert("pause:paused".into(),doc!{"launchAttemptId":"successor","updatedAt":"successor"});}
         if lost=="pause_host_race" {store.0.lock().unwrap().mutate_before.insert("pause:paused".into(),doc!{"isRemote":!remote});}
         if lost=="pause_ack_lost" {store.0.lock().unwrap().fail_after.insert("pause:paused".into());}
         if lost=="nextafter_stop" {std::fs::write(root.join("nextafter-on-stop"),"next representable birth, not same process").unwrap();}
@@ -1720,30 +1847,27 @@ async fn shared_start_actual_priority_file_launcher_fresh_lost_ack_and_repeated_
             let trace=std::fs::read_to_string(root.join("trace")).unwrap();
             assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
             if lost=="nextafter_stop"{assert!(!trace.contains("if-shell"),"one-ULP changed birth must reject BEFORE signal");}
-            continue;
+            return;
         }
         assert_eq!(pause.exit_code,0,"{}",pause.value);
         assert_eq!(pause.value["confirmationBasis"],if lost=="v2_only"{"session_absent"}else{"runners_exited"});
         if lost!="v2_only" {
             let paused=store.task();assert_eq!(paused.get("launchSettledAttemptId"),paused.get("launchAttemptId"));
             let detail=paused.get_array("events").unwrap().last().unwrap().as_document().unwrap().get_document("detail").unwrap();
-            assert_eq!(detail.get_document("controlReconciliation").unwrap().get_str("basis"),Ok("observed_consumer_stopped"));
+            assert_eq!(detail.get_bool("session_absent"), Ok(true));
         }
         if root.join("lose-launch-ack").exists(){std::fs::remove_file(root.join("lose-launch-ack")).unwrap();}
         request.config_json=Some(if kind=="priority"{serde_json::json!({"mission_tag":"pipeline","refine_templates":[],"rounds":{"enabled":false},"interval":93})}else{serde_json::json!({"mission_tag":"fixture","max_concurrent":1,"max_multi_simulation_children":1,"interval":93})}.to_string());
         let restarted=control.start(&request,None).await;
-        if lost=="v2_only" {
-            failed(&restarted);
-            let trace=std::fs::read_to_string(root.join("trace")).unwrap();
-            assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),1);
-            continue;
-        }
+        // Session absence is current stop evidence, even for a historical
+        // launcher whose response was lost. Explicit restart uses fresh proof.
         success(&restarted);
         assert_eq!(restarted.value["startedNew"],true);assert_eq!(restarted.value["configApplied"],true);
         assert_ne!(store.task().get("launchAttemptId"),claimed.get("launchAttemptId"));
         assert_eq!(store.task().get_document("mission_config").unwrap().get_i32("interval"),Ok(93));
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();
         assert_eq!(trace.lines().filter(|l|l.contains("new-session")).count(),2);
+        }).await;
     }}}
 }
 
@@ -1792,34 +1916,57 @@ async fn shared_start_scope_never_adopts_known_foreign_or_replaced_original_exec
             std::fs::write(native,source.lines().map(|line|if line.starts_with("elif a[0]=='list-panes':"){replacement.as_str()}else{line}).collect::<Vec<_>>().join("\n")).unwrap();
           }, _=>(),
         }
-        if fault.starts_with("registry_") {
-            let mut row=store.task();
-            match fault {"registry_id"=>{row.insert("_id",ObjectId::new());},"registry_profile"=>{row.insert("auth_profile","foreign");},
-              "registry_host"=>{row.insert("isRemote",!remote);},_=>{row.insert("launchAttemptId","foreign");}}
-            if remote {store.0.lock().unwrap().remote.push(row);} else {
-                // Local lookup sees the current control record; inject the
-                // authoritative known identity through runtime instead.
-                let field=match fault {"registry_id"=>"source_task_id","registry_profile"=>"auth_profile","registry_host"=>"source_remote",_=>"launchAttemptId"};
-                let value=if fault=="registry_host"{Bson::Boolean(!remote)}else{Bson::String("foreign".into())};
-                let mut runtime=doc!{"pid":1002,"pidCreatedAt":1700000010.0};runtime.insert(field,value);
-                store.mutate(doc!{"simulatorRuntime":runtime});
+        match fault {
+            // Only evidence bound to the actual observed PID + birth can
+            // disprove its current task/host. A foreign same-name registry row
+            // or stale launch hint is not proof about the observed process.
+            "registry_id" => store.mutate(doc! {"simulatorRuntime": {
+                "pid":1002,"pidCreatedAt":1700000010.0,"source_task_id":ObjectId::new().to_hex()
+            }}),
+            "registry_host" => store.mutate(doc! {"simulatorRuntime": {
+                "pid":1002,"pidCreatedAt":1700000010.0,"source_remote":!remote
+            }}),
+            "registry_profile" | "registry_launch" => {
+                let mut row = store.task();
+                let field = if fault == "registry_profile" { "auth_profile" } else { "launchAttemptId" };
+                row.insert(field, "stale");
+                store.0.lock().unwrap().remote.push(row);
             }
-        }else if remote && matches!(fault,"pid"|"birth"|"run") {let row=store.task();store.0.lock().unwrap().remote.push(row);}
+            _ => (),
+        }
         let before=store.task();let binding=validate_backend_binding(&fixture.config).await.unwrap();
         let control=TaskControl::with_store(binding,store.clone());let result=control.start(&request,None).await;
         if fault=="preexisting_consumer" {
             success(&result);assert_eq!(result.value["outcome"],"already_running");
             assert_eq!(result.value["operationSettled"],true,"completed acknowledgment is not historical launch settlement");
-            assert_eq!(result.value["executionObservation"]["consumerPredatesLaunch"],true);
+            assert_eq!(result.value["executionObservation"]["consumerScopeVerified"], true);
+            assert_eq!(result.value["executionObservation"]["identityVerified"], false);
+            assert_eq!(store.task().get("launchSettledAttemptId"), before.get("launchSettledAttemptId"));
             let pause=control.pause("fixture",quantnight_task_core::pause::PauseOptions::default(),quantnight_task_core::pause::StopBudget::Cli,None).await;
-            assert_eq!(pause.exit_code,0,"{}",pause.value);
-            assert_ne!(store.task().get("launchSettledAttemptId"),store.task().get("launchAttemptId"));
-            failed(&control.start(&request,None).await);
+            assert_eq!(pause.exit_code,0,"{kind}/{remote}/{fault}: {}",pause.value);
+            assert_eq!(pause.value["stopConfirmation"], "confirmed");
+            assert_eq!(store.task().get("launchAttemptId"), before.get("launchAttemptId"));
+            assert!(!root.join("state").exists());
             let trace=std::fs::read_to_string(root.join("trace")).unwrap();assert!(!trace.contains("new-session"));
             continue;
         }
-        assert_eq!(result.exit_code,1,"{kind}/{remote}/{fault}: {}",result.value);
-        assert_eq!(store.task(),before,"foreign execution must not reconcile control");
+        if matches!(fault, "registry_profile" | "registry_launch" | "pid" | "birth" | "run") {
+            // Historical hints can neither prove a replacement nor hide the
+            // currently scoped consumer. Acknowledge it without adopting the
+            // historical identity or signaling/launching any process.
+            success(&result);
+            assert_eq!(result.value["outcome"], "already_running");
+            assert_eq!(result.value["startedNew"], false);
+            assert_eq!(result.value["executionObservation"]["identityVerified"], false);
+            assert_eq!(result.value["executionObservation"]["consumerScopeVerified"], true);
+            let saved = store.task();
+            assert_eq!(saved.get("launchAttemptId"), before.get("launchAttemptId"));
+            assert_eq!(saved.get("launchSettledAttemptId"), before.get("launchSettledAttemptId"));
+            assert_eq!(saved.get("simulatorRuntime"), before.get("simulatorRuntime"));
+        } else {
+            assert_eq!(result.exit_code,1,"{kind}/{remote}/{fault}: {}",result.value);
+            assert_eq!(store.task(),before,"foreign execution must not reconcile control");
+        }
         let trace=std::fs::read_to_string(root.join("trace")).unwrap_or_default();
         assert!(!trace.contains("new-session")&&!trace.contains("if-shell"),"no launch/signal on foreign or replaced primary");
       }

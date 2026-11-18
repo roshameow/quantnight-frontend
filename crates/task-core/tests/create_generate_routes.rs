@@ -513,9 +513,8 @@ async fn create_cas_refuses_changed_state_even_without_updated_at() {
     for change in [
         doc! {"status":"running"},
         doc! {"_id":ObjectId::new()},
-        doc! {"generation":{"id":"new"}},
-        doc! {"mission_config":{"late":true}},
-        doc! {"acceptedObservation":{"id":"active"}},
+        doc! {"isRemote":true},
+        doc! {"updatedAt":"changed"},
     ] {
         let (root, store, runtime) = setup(Some("pending"));
         store
@@ -604,16 +603,11 @@ async fn super_replace_and_already_equal_runid_are_not_confused_with_failed_writ
 async fn generation_failure_classification_and_empty_exit0_match_original() {
     for (kind, rows, summary_fails, expected) in [
         (Some(Kind::Ordinary), 1, false, "generation_failed"),
-        (Some(Kind::Timeout), 0, false, "generation_unknown"),
-        (
-            Some(Kind::DatabaseUncertain),
-            0,
-            false,
-            "generation_unknown",
-        ),
+        (Some(Kind::Timeout), 0, false, "generation_failed"),
+        (Some(Kind::DatabaseUncertain), 0, false, "generation_failed"),
         (Some(Kind::Interrupted), 0, false, "generation_failed"),
-        (Some(Kind::Interrupted), 1, false, "generation_unknown"),
-        (Some(Kind::Interrupted), 0, true, "generation_unknown"),
+        (Some(Kind::Interrupted), 1, false, "generation_failed"),
+        (Some(Kind::Interrupted), 0, true, "generation_failed"),
         (None, 0, false, "generation_failed"),
     ] {
         let (root, store, mut runtime) = setup(Some("pending"));
@@ -630,7 +624,7 @@ async fn generation_failure_classification_and_empty_exit0_match_original() {
         )
         .await;
         failed(&result);
-        assert_eq!(store.task().get_str("status"), Ok(if expected == "generation_failed" { "pending" } else { expected }));
+        assert_eq!(store.task().get_str("status"), Ok("pending"));
         assert_eq!(result.value["generationStatus"], expected);
         assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
         assert!(core::gui_generated(&result).is_err());
@@ -655,21 +649,17 @@ async fn db_summary_and_runid_failures_reconcile_unknown_never_ready() {
             )
             .await,
         );
-        assert_eq!(store.task().get_str("status"), Ok("generation_unknown"));
+        assert_eq!(store.task().get_str("status"), Ok("pending"));
+        assert_eq!(
+            store.task().get_document("generation").unwrap().get_str("phase"),
+            Ok("generation_failed")
+        );
     }
 }
 
 #[tokio::test]
 async fn begin_busy_observer_expected_id_and_flock_block_before_writer() {
-    for status in [
-        "running",
-        "generating",
-        "generation_unknown",
-        "launching",
-        "syncing",
-        "deleting",
-        "paused",
-    ] {
+    for status in ["running", "deactive"] {
         let (root, store, runtime) = setup(Some(status));
         failed(
             &core::generate(
@@ -683,18 +673,15 @@ async fn begin_busy_observer_expected_id_and_flock_block_before_writer() {
         assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 0);
         assert_eq!(store.task().get_str("status"), Ok(status));
     }
+    for status in ["generating", "generation_unknown", "launching", "syncing", "deleting", "paused"] {
+        let (root, store, mut runtime) = setup(Some(status));
+        runtime.inspect = Some(Ok(core::GenerationProcesses::Stopped));
+        ok(&core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await);
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+    }
     let (root, store, runtime) = setup(Some("pending"));
     store.mutate(doc! {"acceptedObservation":{"id":"open"}});
-    failed(
-        &core::generate(
-            &root.0,
-            store.as_ref(),
-            &runtime,
-            &GenerateRequest::new("task"),
-        )
-        .await,
-    );
-    assert!(store.0.lock().unwrap().writes.is_empty());
+    ok(&core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await);
     let (root, store, runtime) = setup(Some("pending"));
     let mut request = GenerateRequest::new("task");
     request.expected_task_id = Some(ObjectId::new().to_hex());
@@ -726,9 +713,8 @@ async fn stale_claim_before_dispatch_or_after_writer_does_not_write_new_identity
     for change in [
         doc! {"_id":ObjectId::new()},
         doc! {"status":"running"},
-        doc! {"generation":{"id":"other","phase":"writing"}},
         doc! {"isRemote":true},
-        doc! {"auth_profile":"other"},
+        doc! {"updatedAt":"changed"},
     ] {
         let (root, store, mut runtime) = setup(Some("pending"));
         runtime.mutation = Some(change.clone());
@@ -773,7 +759,7 @@ async fn stale_cas_and_lost_begin_finish_ack_never_redispatch() {
     let (root, store, runtime) = setup(Some("pending"));
     store.0.lock().unwrap().mutate_before.insert(
         "generation-begin:generating".into(),
-        doc! {"generation":{"id":"foreign"}},
+        doc! {"updatedAt":"foreign"},
     );
     failed(
         &core::generate(
@@ -862,7 +848,7 @@ async fn finish_race_and_reconciliation_failure_preserve_original_evidence() {
         .lock()
         .unwrap()
         .fail_before
-        .insert("generation-finish:generation_unknown".into());
+        .insert("generation-finish:generation_failed".into());
     let result = core::generate(
         &root.0,
         store.as_ref(),
@@ -915,6 +901,7 @@ async fn original_create_failed_generate_idempotent_retry_history_is_retained() 
     .await);
     assert_eq!(store.task().get_str("status"), Ok("pending"));
     runtime.failure = None;
+    runtime.inspect = Some(Ok(core::GenerationProcesses::Stopped));
     ok(&core::generate(
         &root.0,
         store.as_ref(),
@@ -1108,7 +1095,7 @@ async fn legacy_missing_runid_uses_original_fallback_without_overwriting_explici
 #[tokio::test]
 async fn failed_operation_restores_only_captured_pending_waiting_and_preserves_rows() {
     for (before, after) in [("pending", "pending"), ("waiting", "waiting"),
-                            ("ready", "generation_failed"), ("generation_failed", "generation_failed")] {
+                            ("ready", "pending"), ("generation_failed", "pending")] {
         let (root, store, mut runtime) = setup(Some(before));
         runtime.failure = Some(Kind::Ordinary);
         runtime.rows[0].insert("opaque", doc! {"retained": true});
@@ -1163,11 +1150,11 @@ fn generation_plan_and_failure_classification_contract() {
     for (kind, total, expected) in [
         (GenerationErrorKind::Ordinary, None, "generation_failed"),
         (GenerationErrorKind::Ordinary, Some(0), "generation_failed"),
-        (GenerationErrorKind::Timeout, Some(5), "generation_unknown"),
-        (GenerationErrorKind::DatabaseUncertain, Some(5), "generation_unknown"),
+        (GenerationErrorKind::Timeout, Some(5), "generation_failed"),
+        (GenerationErrorKind::DatabaseUncertain, Some(5), "generation_failed"),
         (GenerationErrorKind::Interrupted, Some(0), "generation_failed"),
-        (GenerationErrorKind::Interrupted, Some(5), "generation_unknown"),
-        (GenerationErrorKind::Interrupted, None, "generation_unknown"),
+        (GenerationErrorKind::Interrupted, Some(5), "generation_failed"),
+        (GenerationErrorKind::Interrupted, None, "generation_failed"),
     ] {
         assert_eq!(generation_failure_status(&kind, total), expected);
     }
@@ -1206,6 +1193,10 @@ async fn generation_unknown_allows_regenerate_when_writer_stopped_and_blocks_liv
         failed(&core::generate(&root.0, store.as_ref(), &runtime, &GenerateRequest::new("task")).await);
         assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 0);
         assert_eq!(store.task().get_str("status"), Ok("generation_unknown"));
+        assert_eq!(
+            store.task().get_document("generation").unwrap().get_str("phase"),
+            Ok("generation_unknown")
+        );
     }
 
     let (root, store, mut runtime) = setup(Some("generation_unknown"));

@@ -1,40 +1,79 @@
 //! All adapters use this client. No business replay, service spawn, or database fallback.
-use super::{identity::{self,RuntimeSelection},protocol::{Admission,CallContext,Hello,HostStatus,Message,VERSION},codec,CallResult,RuntimeObserver,TransportError};
+use super::{identity::{self,RuntimeSelection},protocol::{Admission,CallContext,HostStatus,Message},codec,CallResult,RuntimeObserver,TransportError};
 #[derive(Clone)]
 pub struct RuntimeClient {selection:RuntimeSelection,mode:Admission,task_settings:Option<String>}
 pub struct ProgressSubscription { pub(crate) task:Option<tokio::task::JoinHandle<()>> }
 impl ProgressSubscription {pub fn is_alive(&self)->bool{self.task.as_ref().is_some_and(|task|!task.is_finished())}}
 impl Drop for ProgressSubscription {fn drop(&mut self){if let Some(task)=self.task.take(){task.abort();}}}
 impl RuntimeClient {
-    pub async fn connect(selection:&RuntimeSelection)->Result<Self,TransportError>{Self::connect_mode(selection,Admission::Business).await}
-    pub async fn connect_gui(selection:&RuntimeSelection,task_settings:&str)->Result<Self,TransportError>{
-        #[cfg(not(target_os="macos"))] return Err(TransportError::new("unsupported_platform","connect","runtime enrollment requires macOS; legacy GUI remains available"));
-        #[cfg(target_os="macos")]
-        {let client=Self{selection:selection.clone(),mode:Admission::Business,task_settings:Some(task_settings.into())};
-        #[cfg(unix)] client.open().await?;
-        #[cfg(not(unix))] return Err(TransportError::new("unsupported_platform","connect","runtime requires macOS"));
-        Ok(client)}
+    /// Construct a client for the explicit selection. The operation itself opens and
+    /// attests its one connection; a discarded probe cannot admit a later Call.
+    pub fn business(selection: &RuntimeSelection) -> Self {
+        Self { selection: selection.clone(), mode: Admission::Business, task_settings: None }
     }
-    pub async fn connect_management(selection:&RuntimeSelection)->Result<Self,TransportError>{Self::connect_mode(selection,Admission::Management).await}
-    async fn connect_mode(selection:&RuntimeSelection,mode:Admission)->Result<Self,TransportError>{
-        #[cfg(not(target_os="macos"))] return Err(TransportError::new("unsupported_platform","connect","runtime enrollment requires macOS; legacy mode is unchanged"));
-        #[cfg(target_os="macos")] {let client=Self{selection:selection.clone(),mode,task_settings:None};client.open().await?;Ok(client)}
+    pub fn management(selection: &RuntimeSelection) -> Self {
+        Self { mode: Admission::Management, ..Self::business(selection) }
+    }
+    pub async fn connect_gui(selection: &RuntimeSelection, task_settings: &str) -> Result<Self, TransportError> {
+        let client = Self { task_settings: Some(task_settings.into()), ..Self::business(selection) };
+        #[cfg(target_os = "macos")]
+        { client.open().await?; Ok(client) }
+        #[cfg(not(target_os = "macos"))]
+        { let _ = client; Err(Self::unsupported()) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn unsupported() -> TransportError {
+        TransportError::new("unsupported_platform", "connect", "runtime enrollment requires macOS; legacy mode is unchanged")
     }
     #[cfg(unix)]
-    async fn open(&self)->Result<(tokio::net::UnixStream,String),TransportError>{
-        // The only startup deadline. Never applies to an accepted business call.
-        tokio::time::timeout(std::time::Duration::from_secs(10),async{
-            identity::check_socket(&self.selection).map_err(identity::error)?;
-            let mut stream=tokio::net::UnixStream::connect(self.selection.paths().map_err(identity::error)?.socket).await.map_err(|_|TransportError::new("connect","connect","registered runtime socket connection failed; no direct fallback"))?;
-            let admission=identity::client_preflight(&stream,&self.selection).map_err(|e|TransportError::new("peer_uid","hello",e))?;
-            codec::write_preamble(&mut stream).await.map_err(|e|TransportError::new("protocol_mismatch","hello",e))?;
-            codec::write(&mut stream,&Message::Hello(Hello{mode:self.mode.clone(),protocol:VERSION,selection:self.selection.clone(),core_source:crate::DEV_SOURCE_ID.into(),task_settings:self.task_settings.clone()})).await.map_err(|e|TransportError::new("codec","hello",e))?;
-            codec::read_preamble(&mut stream).await.map_err(|e|TransportError::new("protocol_mismatch","hello",e))?;
-            let call_id=match codec::read(&mut stream).await.map_err(|e|TransportError::new("connection_lost","hello",e))?{
-                Message::Ready{identity:host,call_id}=>{identity::client_postflight(&stream,&self.selection,&host,&admission,self.mode==Admission::Business).map_err(identity::error)?;call_id},
-                Message::Error(e)=>return Err(e),_=>return Err(TransportError::new("protocol_mismatch","hello","runtime did not return checked ready identity")),
-            };Ok((stream,call_id))
-        }).await.map_err(|_|TransportError::new("startup_timeout","hello","runtime startup/hello exceeded 10s; no business request sent"))?
+    async fn open(&self) -> Result<(tokio::net::UnixStream, String), TransportError> {
+        #[cfg(not(target_os = "macos"))]
+        { Err(Self::unsupported()) }
+        #[cfg(target_os = "macos")]
+        {
+            use super::protocol::{Hello, VERSION};
+            use std::time::Duration;
+            use tokio::{net::UnixStream, time::{timeout_at, Instant}};
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let paths = self.selection.paths().map_err(identity::error)?;
+            identity::check_socket(&self.selection)
+                .map_err(|e| TransportError::new("runtime_socket", "connect", e))?;
+            let stream = timeout_at(deadline, UnixStream::connect(paths.socket)).await
+                .map_err(|_| TransportError::new("startup_timeout", "connect", "registered runtime socket connection exceeded the 10s startup budget; no request sent"))?
+                .map_err(|e| TransportError::new("connect", "connect", format!("registered runtime socket connection failed: {e}; no direct fallback")))?;
+            let admission = identity::client_preflight(&stream, &self.selection)
+                .map_err(|e| TransportError::new("identity_mismatch", "hello", e))?;
+            let hello = Hello { mode: self.mode.clone(), protocol: VERSION, selection: self.selection.clone(),
+                core_source: crate::DEV_SOURCE_ID.into(), task_settings: self.task_settings.clone() };
+            let (stream, host, call_id) = timeout_at(deadline, Self::hello(stream, hello)).await
+                .map_err(|_| TransportError::new("startup_timeout", "hello", "registered runtime did not finish its handshake within the 10s startup budget; no request sent"))??;
+            identity::client_postflight(&stream, &self.selection, &host, &admission, self.mode == Admission::Business)
+                .map_err(identity::error)?;
+            Ok((stream, call_id))
+        }
+    }
+    #[cfg(any(target_os = "macos", all(test, unix, feature = "test-support")))]
+    pub(crate) async fn hello(mut stream: tokio::net::UnixStream, hello: super::protocol::Hello)
+        -> Result<(tokio::net::UnixStream, super::HostIdentity, String), TransportError>
+    {
+        let lost = |e| TransportError::new("connection_lost", "hello", e);
+        codec::write_preamble(&mut stream).await.map_err(lost)?;
+        codec::write(&mut stream, &Message::Hello(hello)).await.map_err(lost)?;
+        codec::read_preamble(&mut stream).await.map_err(|e| match e {
+            codec::PreambleError::Unavailable => lost("registered runtime ended the connection before its handshake; host startup or exit not confirmed".into()),
+            codec::PreambleError::Mismatch => TransportError::new("protocol_mismatch", "hello", e.to_string()),
+        })?;
+        match codec::read(&mut stream).await.map_err(lost)? {
+            Message::Ready { identity, call_id } => Ok((stream, identity, call_id)),
+            Message::Error(mut e) => {
+                // No Call was sent and this connection has not attested a Ready peer.
+                e.execution = "not_sent".into();
+                e.request_id = None;
+                e.host_generation = None;
+                Err(e)
+            }
+            _ => Err(TransportError::new("protocol_mismatch", "hello", "runtime did not return checked ready identity")),
+        }
     }
     #[cfg(unix)]
     pub async fn call(&self,mut context:CallContext,mut request:crate::task_request::TaskRequest,observer:Option<RuntimeObserver>)->Result<CallResult,TransportError>{
@@ -54,15 +93,40 @@ impl RuntimeClient {
     /// One admitted socket is the lowest transport seam; production and tests use the same exchange.
     #[cfg(unix)]
     pub(crate) async fn exchange(mut stream:tokio::net::UnixStream,context:CallContext,request:crate::task_request::TaskRequest,observer:Option<RuntimeObserver>)->Result<CallResult,TransportError>{
-        let uncertain=|class:&str,message:String|{let mut e=TransportError::new(class,"call",message);e.execution="unconfirmed".into();e.request_id=Some(context.request_id.clone());e};
-        codec::write_owned(&mut stream,Message::Call{context:context.clone(),request}).await.map_err(|e|uncertain("connection_lost",e))?;
-        loop {match codec::read(&mut stream).await.map_err(|e|uncertain("connection_lost",e))? {
-            Message::Accepted{id,..} if id==context.request_id=>{},
-            Message::Event(event)=>{if let Some(callback)=&observer{callback(event);}else if let super::RuntimeEvent::ProgressGap{dropped}=event{eprintln!("taskctl: {dropped} process updates coalesced; original completion receipt remains authoritative");}},
-            Message::Completed{id,result} if id==context.request_id=>return Ok(result),
-            Message::Error(mut e)=>{if e.execution!="not_executed"{e.execution="unconfirmed".into();}e.request_id=Some(context.request_id.clone());return Err(e);},
-            _=>return Err(uncertain("protocol_mismatch","unexpected runtime response; operation result unconfirmed".into())),
-        }}
+        let uncertain = |class: &str, message: String, generation: Option<String>| {
+            let mut e = TransportError::new(class, "call", message);
+            e.execution = "unconfirmed".into();
+            e.request_id = Some(context.request_id.clone());
+            e.host_generation = generation;
+            e
+        };
+        let mut accepted_generation = None;
+        codec::write_owned(&mut stream, Message::Call { context: context.clone(), request }).await
+            .map_err(|e| uncertain("connection_lost", e, None))?;
+        loop {
+            match codec::read(&mut stream).await
+                .map_err(|e| uncertain("connection_lost", e, accepted_generation.clone()))? {
+                Message::Accepted { id, host_generation } if id == context.request_id => {
+                    accepted_generation = Some(host_generation);
+                }
+                Message::Event(event) => {
+                    if let Some(callback) = &observer { callback(event); }
+                    else if let super::RuntimeEvent::ProgressGap { dropped } = event {
+                        eprintln!("taskctl: {dropped} process updates coalesced; original completion receipt remains authoritative");
+                    }
+                }
+                Message::Completed { id, result } if id == context.request_id => return Ok(result),
+                Message::Error(mut e) => {
+                    if accepted_generation.is_some() || e.execution != "not_executed" {
+                        e.execution = "unconfirmed".into();
+                    }
+                    e.request_id = Some(context.request_id.clone());
+                    e.host_generation = accepted_generation;
+                    return Err(e);
+                }
+                _ => return Err(uncertain("protocol_mismatch", "unexpected runtime response; operation result unconfirmed".into(), accepted_generation)),
+            }
+        }
     }
     #[cfg(unix)]
     pub async fn management_status(&self)->Result<HostStatus,TransportError>{self.manage(Message::ManagementStatus).await}
@@ -71,8 +135,22 @@ impl RuntimeClient {
     #[cfg(unix)]
     async fn manage(&self,message:Message)->Result<HostStatus,TransportError>{
         if self.mode!=Admission::Management{return Err(TransportError::new("identity_mismatch","management","management admission required"));}
-        let(mut stream,_)=self.open().await?;codec::write(&mut stream,&message).await.map_err(|e|TransportError::new("connection_lost","management",e))?;
-        match codec::read(&mut stream).await.map_err(|e|TransportError::new("connection_lost","management",e))?{Message::HostStatus(status)=>Ok(status),Message::Error(e)=>Err(e),_=>Err(TransportError::new("protocol_mismatch","management","unexpected management reply"))}
+        let (stream, _) = self.open().await?;
+        Self::management_exchange(stream, message).await
+    }
+    #[cfg(unix)]
+    pub(crate) async fn management_exchange(mut stream: tokio::net::UnixStream, message: Message) -> Result<HostStatus, TransportError> {
+        let unconfirmed = |class: &str, message| {
+            let mut e = TransportError::new(class, "management", message);
+            e.execution = "unconfirmed".into();
+            e
+        };
+        codec::write(&mut stream, &message).await.map_err(|e| unconfirmed("connection_lost", e))?;
+        match codec::read(&mut stream).await.map_err(|e| unconfirmed("connection_lost", e))? {
+            Message::HostStatus(status) => Ok(status),
+            Message::Error(e) => Err(e),
+            _ => Err(unconfirmed("protocol_mismatch", "unexpected management reply".into())),
+        }
     }
     #[cfg(unix)]
     pub async fn subscribe_progress(&self,sink:RuntimeObserver)->Result<ProgressSubscription,TransportError>{

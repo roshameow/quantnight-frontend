@@ -7,11 +7,10 @@ use crate::{
 };
 use async_trait::async_trait;
 use bson::{doc, oid::ObjectId, Bson, Document};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 #[derive(Debug)]
 pub struct StopOutput {
@@ -204,474 +203,6 @@ pub fn verified_stop_proof(
     }
 }
 
-fn null(value: Option<&Bson>) -> bool {
-    matches!(value, None | Some(Bson::Null | Bson::Undefined))
-}
-fn text(value: Option<&Bson>) -> Option<&str> {
-    match value {
-        Some(Bson::String(v) | Bson::Symbol(v)) => Some(v),
-        _ => None,
-    }
-}
-fn string_instance(value: Option<&Bson>) -> Option<&str> {
-    match value {
-        Some(Bson::String(v) | Bson::Symbol(v) | Bson::JavaScriptCode(v)) => Some(v),
-        Some(Bson::JavaScriptCodeWithScope(v)) => Some(&v.code),
-        _ => None,
-    }
-}
-// PyMongo decodes BSON Int64 as bson.int64.Int64, not exact builtin int.
-// The original producerPid/expectedCount gates explicitly use type(x) is int.
-fn integer(value: Option<&Bson>) -> Option<i64> {
-    match value {
-        Some(Bson::Int32(v)) => Some(*v as i64),
-        _ => None,
-    }
-}
-fn member(value: Option<&Bson>, choices: &[&str]) -> Result<bool, String> {
-    // Original history's initial set lookups occur OUTSIDE its try/except.
-    match value {
-        Some(Bson::Array(_)) => Err("unhashable type: 'list'".into()),
-        Some(Bson::Document(_)) => Err("unhashable type: 'dict'".into()),
-        Some(Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_)) => {
-            Err("unhashable type: 'Code'".into())
-        }
-        Some(Bson::RegularExpression(_)) => Err("unhashable type: 'Regex'".into()),
-        Some(Bson::Decimal128(_)) => Err("unhashable type: 'Decimal128'".into()),
-        _ => Ok(text(value).is_some_and(|v| choices.contains(&v))),
-    }
-}
-fn iso(value: Option<&Bson>) -> Option<DateTime<FixedOffset>> {
-    let s = string_instance(value)?;
-    // Python rejects lowercase z and leap seconds even though RFC3339 accepts
-    // them. Preserve its aware ISO producer forms (including basic date/time).
-    if s.ends_with('z') {
-        return None;
-    }
-    let parsed = DateTime::parse_from_rfc3339(s).ok().or_else(|| {
-        [
-            "%Y-%m-%d %H:%M:%S%.f%:z",
-            "%Y%m%dT%H%M%S%.f%z",
-            "%Y-%m-%dT%H:%M%:z",
-        ]
-        .iter()
-        .find_map(|format| DateTime::parse_from_str(s, format).ok())
-    })?;
-    (parsed.timestamp_subsec_nanos() < 1_000_000_000).then_some(parsed)
-}
-fn id_text(value: Option<&Bson>) -> Option<String> {
-    match value {
-        Some(Bson::ObjectId(v)) => Some(v.to_hex()),
-        Some(Bson::String(v)) => Some(v.clone()),
-        _ => None,
-    }
-}
-
-/// Original positive create/generate/sync/watch replay, never READY inference.
-/// Err models an original initial set/key failure; malformed records inside the
-/// original try/except return false (normal captured-process stop, not no-launch).
-pub fn never_started_history(task: &Document) -> Result<bool, String> {
-    if !member(
-        task.get("status"),
-        &["pending", "ready", "generation_failed"],
-    )? || !member(task.get("taskType"), &["regular", "super"])?
-    {
-        return Ok(false);
-    }
-    let (Ok(remote), Ok(target)) = (task.get_bool("isRemote"), task.get_bool("targetRemote"))
-    else {
-        return Ok(false);
-    };
-    if (remote && !target)
-        || string_instance(task.get("auth_profile")).map_or(true, str::is_empty)
-        || string_instance(task.get("templatefile")).map_or(true, str::is_empty)
-    {
-        return Ok(false);
-    }
-    let name = task.get_str("name").map_err(|_| "'name'".to_string())?;
-    if text(task.get("runId")) != Some(format!("mission:{name}").as_str()) {
-        return Ok(false);
-    }
-    for key in [
-        "launchAttemptId",
-        "launchAttemptAt",
-        "launchSettledAttemptId",
-        "startedAt",
-        "completedAt",
-        "pausedAt",
-        "consumer_run_id",
-        "heartbeatAt",
-        "startPreflight",
-        "stopConfirmedAt",
-        "launchHistory",
-        "launchAttempts",
-        "launchReceipt",
-        "startReceipt",
-        "consumerPid",
-    ] {
-        if !null(task.get(key)) {
-            return Ok(false);
-        }
-    }
-    if !remote && (!null(task.get("syncedAt")) || !null(task.get("syncedDigest"))) {
-        return Ok(false);
-    }
-    Ok(replay_history(task, remote).unwrap_or(false))
-}
-fn replay_history(task: &Document, remote: bool) -> Option<bool> {
-    let created = iso(task.get("createdAt"))?;
-    let events = task.get_array("events").ok()?;
-    let first = events.first()?.as_document()?;
-    if text(first.get("command"))? != "create"
-        || text(first.get("status"))? != "pending"
-        || !first.get_document("detail").ok()?.is_empty()
-        || string_instance(first.get("id"))?.is_empty()
-    {
-        return Some(false);
-    }
-    let (mut state, mut replay_remote) = ("pending", false);
-    let mut active: Option<(String, String)> = None;
-    let mut finished: Option<(String, &'static str)> = None;
-    let mut last_begin: Option<&Document> = None;
-    let mut last_finish = None;
-    let mut previous = created;
-    let mut seen = HashSet::new();
-    let now = Utc::now();
-    for (index, event) in events.iter().enumerate() {
-        let row = event.as_document()?;
-        let stamp = iso(row.get("at"))?;
-        if stamp < previous || stamp > now {
-            return Some(false);
-        }
-        let previous_stamp = previous;
-        previous = stamp;
-        let command = text(row.get("command"))?;
-        let status = text(row.get("status"))?;
-        if index == 0 {
-            continue;
-        }
-        let detail = row.get_document("detail").ok();
-        if command == "create"
-            && status == "idempotent"
-            && detail.is_some_and(Document::is_empty)
-            && ["pending", "ready", "generating", "generation_failed"].contains(&state)
-        {
-            continue;
-        }
-        if command == "generation-begin"
-            && status == "generating"
-            && ["pending", "ready", "generation_failed"].contains(&state)
-        {
-            let detail = detail?;
-            let token = text(detail.get("id"))?;
-            let phase = text(detail.get("phase"))?;
-            let began = iso(detail.get("startedAt"))?;
-            if token.is_empty()
-                || seen.contains(token)
-                || !["preparing", "writing"].contains(&phase)
-                || integer(detail.get("producerPid"))? <= 1
-                || began < previous_stamp
-                || began > stamp
-            {
-                return Some(false);
-            }
-            seen.insert(token.to_string());
-            active = Some((token.into(), phase.into()));
-            state = "generating";
-            last_begin = Some(detail);
-        } else if command == "generation-finish" && state == "generating" && active.is_some() {
-            let detail = detail?;
-            let (token, phase) = active.as_ref()?;
-            if text(detail.get("generationId")) != Some(token.as_str())
-                || ![
-                    ("pending", "preparing"),
-                    ("ready", "writing"),
-                    ("generation_failed", "writing"),
-                ]
-                .contains(&(status, phase.as_str()))
-            {
-                return Some(false);
-            }
-            state = status;
-            finished = Some((
-                token.clone(),
-                if status == "pending" {
-                    "prepared"
-                } else if status == "generation_failed" {
-                    "generation_failed"
-                } else {
-                    "complete"
-                },
-            ));
-            active = None;
-            last_finish = Some(stamp);
-        } else if command == "watch-attach" && status == "ok" {
-            let detail = detail?;
-            if text(detail.get("missionId")) != Some(id_text(task.get("_id"))?.as_str())
-                || detail.get_bool("remote").ok()? != replay_remote
-                || text(detail.get("launchId")) != Some("legacy")
-            {
-                return Some(false);
-            }
-        } else if command == "sync-begin"
-            && status == "syncing"
-            && state == "ready"
-            && !replay_remote
-        {
-            state = "syncing";
-        } else if command == "sync" && status == "ready" && state == "syncing" {
-            let digest = string_instance(task.get("syncedDigest"))?;
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
-                || !truthy(task.get("syncedAt"))
-            {
-                return Some(false);
-            }
-            state = "ready";
-            replay_remote = true;
-        } else {
-            return Some(false);
-        }
-    }
-    if Some(state) != text(task.get("status")) || replay_remote != remote || active.is_some() {
-        return Some(false);
-    }
-    let Some((token, phase)) = finished else {
-        return Some(null(task.get("generation")) && state == "pending" && !remote);
-    };
-    let generation = task.get_document("generation").ok()?;
-    let begin = last_begin?;
-    let began = iso(begin.get("startedAt"))?;
-    let ended = iso(generation.get("finishedAt"))?;
-    Some(
-        text(generation.get("id")) == Some(token.as_str())
-            && text(generation.get("phase")) == Some(phase)
-            && generation.get("startedAt") == begin.get("startedAt")
-            && integer(generation.get("producerPid")) == integer(begin.get("producerPid"))
-            && integer(generation.get("producerPid"))? > 1
-            && created <= began
-            && began <= ended
-            && ended <= last_finish?,
-    )
-}
-fn truthy(value: Option<&Bson>) -> bool {
-    match value {
-        None | Some(Bson::Null | Bson::Undefined) => false,
-        Some(Bson::Boolean(v)) => *v,
-        Some(Bson::Int32(v)) => *v != 0,
-        Some(Bson::Int64(v)) => *v != 0,
-        Some(Bson::Double(v)) => *v != 0.0,
-        Some(Bson::String(v) | Bson::Symbol(v) | Bson::JavaScriptCode(v)) => !v.is_empty(),
-        Some(Bson::JavaScriptCodeWithScope(v)) => !v.code.is_empty(),
-        Some(Bson::Binary(v)) => !v.bytes.is_empty(),
-        Some(Bson::Array(v)) => !v.is_empty(),
-        Some(Bson::Document(v)) => !v.is_empty(),
-        _ => true,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Inventory {
-    pub host: Host,
-    pub exists: bool,
-    pub count: usize,
-    pub digest: String,
-}
-fn canonical_bson(value: &Bson) -> Bson {
-    match value {
-        Bson::Document(doc) => Bson::Document(canonical_document(doc)),
-        Bson::Array(values) => Bson::Array(values.iter().map(canonical_bson).collect()),
-        Bson::JavaScriptCodeWithScope(code) => {
-            Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
-                code: code.code.clone(),
-                scope: canonical_document(&code.scope),
-            })
-        }
-        other => other.clone(),
-    }
-}
-fn canonical_document(row: &Document) -> Document {
-    let mut entries: Vec<_> = row.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.clone(), canonical_bson(value)))
-        .collect()
-}
-async fn full_digest(rows: &mut [Document]) -> Result<String, String> {
-    // IDs have already been checked below, but never let an incomplete sort
-    // accidentally manufacture equal evidence when a future caller skips it.
-    for row in rows.iter() {
-        row.get_object_id("_id")
-            .map_err(|_| "item ObjectId required for inventory digest".to_string())?;
-    }
-    rows.sort_by_key(|row| row.get_object_id("_id").unwrap());
-    let mut digest = Sha256::new();
-    for row in rows {
-        let bytes = bson::to_vec(&canonical_document(row)).map_err(|e| e.to_string())?;
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
-        // Cooperate with the existing inventory deadline/UI executor between
-        // complete rows; never truncate the candidate set or spawn a collector.
-        tokio::task::yield_now().await;
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-fn empty_history_value(value: Option<&Bson>) -> bool {
-    match value {
-        None | Some(Bson::Null | Bson::Undefined) => true,
-        Some(Bson::String(v) | Bson::Symbol(v)) => v.is_empty(),
-        Some(Bson::Array(v)) => v.is_empty(),
-        Some(Bson::Document(v)) => v.is_empty(),
-        _ => false,
-    }
-}
-fn initial_item(row: &Document, task: &Document) -> Result<(), String> {
-    let id = row
-        .get_object_id("_id")
-        .map_err(|_| "item ObjectId unavailable; never-started proof refused".to_string())?;
-    if text(row.get("status")) != Some("pending")
-        || text(row.get("runId")) != text(task.get("runId"))
-        || policy::checked_receipt_evidence(row)?
-        || !(null(row.get("acceptance")) || text(row.get("acceptance")) == Some("NOT_POSTED"))
-        || !null(row.get("terminalStatus"))
-        || !(null(row.get("_not_posted_")) || row.get_bool("_not_posted_").ok() == Some(true))
-    {
-        return Err(format!(
-            "item {id} has dispatch/consumer evidence or illegal initial state"
-        ));
-    }
-    for key in [
-        "heartbeatAt",
-        "finishedAt",
-        "simulationCompletedAt",
-        "startedAt",
-        "attemptCounter",
-        "batchBackendIds",
-        "batchChildCount",
-        "alpha_id",
-        "alpha_ids",
-        "simulationId",
-        "submissionId",
-        "simulation_id",
-        "platformSimulationId",
-        "responseCode",
-        "retryAfter",
-        "firstResponse",
-        "responseJson",
-        "responseBody",
-        "errorClass",
-        "error",
-        "errorMessage",
-        "result",
-        "refine_result",
-        "receipt",
-        "receipts",
-        "submission",
-        "simulation",
-        "requestId",
-        "request_id",
-        "terminal_status",
-        "alpha",
-        "simulated_at",
-        "simulatedAt",
-        "submissionReceipt",
-        "refine_campaign_id",
-        "borrowed",
-        "continuationSources",
-    ] {
-        if !empty_history_value(row.get(key)) {
-            return Err(format!("item {id} has dispatch/consumer evidence in {key}"));
-        }
-    }
-    Ok(())
-}
-pub async fn never_started_inventory(
-    store: &dyn TaskStore,
-    task: &Document,
-) -> Result<Vec<Inventory>, String> {
-    if !never_started_history(task)? {
-        return Err("complete original never-started lifecycle evidence unavailable".into());
-    }
-    let name = task.get_str("name").map_err(|e| e.to_string())?;
-    let remote = task.get_bool("isRemote").map_err(|e| e.to_string())?;
-    let hosts = if remote {
-        vec![Host::Local, Host::Remote]
-    } else {
-        vec![Host::Local]
-    };
-    let mut inventory = Vec::new();
-    for host in hosts {
-        let entry = tokio::time::timeout(Duration::from_secs(20), async {
-            store.ping(host).await?;
-            let controls = store
-                .find_tasks(host, doc! {"name": name, "status": {"$ne": "deactive"}})
-                .await?;
-            if host == Host::Remote {
-                if !controls.is_empty()
-                    && (controls.len() != 1
-                        || controls[0].get("_id") != task.get("_id")
-                        || !never_started_history(&controls[0])?)
-                {
-                    return Err("remote task identity/history uncertain".into());
-                }
-            } else if controls != [task.clone()] {
-                return Err("original task identity/history changed or ambiguous".into());
-            }
-            if store.consumer_capability_exists(host, name).await? {
-                return Err(
-                    "consumer capability history exists; never-started proof refused".into(),
-                );
-            }
-            let exists = store
-                .collection_names(host)
-                .await?
-                .iter()
-                .any(|v| v == name);
-            // Intentionally full rows: this positive no-launch proof compares
-            // arbitrary item fields across OS verification, not just status/IDs.
-            let mut rows = store.rows(host, name, None).await?;
-            for row in &rows {
-                initial_item(row, task)?;
-            }
-            let count = rows.len();
-            if text(task.get("status")) == Some("ready")
-                && (!exists
-                    || count == 0
-                    || integer(task.get("expectedCount")) != Some(count as i64))
-            {
-                return Err("ready generation count is not positively verified".into());
-            }
-            if text(task.get("status")) == Some("generation_failed") && count != 0 {
-                return Err(
-                    "failed generation has items; pre-registration no-launch proof unavailable"
-                        .into(),
-                );
-            }
-            Ok::<Inventory, String>(Inventory {
-                host,
-                exists,
-                count,
-                digest: full_digest(&mut rows).await?,
-            })
-        })
-        .await
-        .map_err(|_| {
-            "never-started inventory timeout (original per-host budget20s); proof unavailable"
-                .to_string()
-        })??;
-        inventory.push(entry);
-    }
-    if remote
-        && (inventory[0].count != inventory[1].count || inventory[0].digest != inventory[1].digest)
-    {
-        return Err("never-started local/remote inventory mismatch".into());
-    }
-    Ok(inventory)
-}
-
 fn stage(observer: &Option<PauseObserver>, id: &'static str, message: impl Into<String>) {
     if let Some(observer) = observer {
         observer(PauseStage {
@@ -704,35 +235,7 @@ async fn active_task(store: &dyn TaskStore, name: &str) -> Result<Document, Stri
         .ok_or_else(|| "task not found".into())
 }
 fn pause_filter(name: &str, task: &Document) -> Result<Document, String> {
-    let mut filter = policy::task_binding_query(name, task, "pause")?;
-    for key in [
-        "status",
-        "isRemote",
-        "updatedAt",
-        "launchAttemptId",
-        "launchAttemptAt",
-        "launchSettledAttemptId",
-        "taskType",
-        "auth_profile",
-        "runId",
-        "startedAt",
-        "generation",
-        "startupBinding",
-        "tmuxContext",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "stopConfirmationBasis",
-        "acceptedObservation",
-    ] {
-        filter.insert(
-            key,
-            task.get(key)
-                .cloned()
-                .unwrap_or_else(|| Bson::Document(doc! {"$exists":false})),
-        );
-    }
-    Ok(filter)
+    policy::task_binding_query(name, task, "pause-control")
 }
 fn remaining(deadline: tokio::time::Instant) -> Result<Duration, String> {
     let value = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -740,7 +243,7 @@ fn remaining(deadline: tokio::time::Instant) -> Result<Duration, String> {
     else { Ok(value) }
 }
 #[derive(Clone, Copy)]
-pub(crate) enum StopIntent { StopAllowed, VerifyOnly }
+pub(crate) enum StopIntent { StopAllowed }
 fn early_failure(name: &str, observer: &Option<PauseObserver>, error: String) -> PauseOutcome {
     stage(observer, "failed", error.clone());
     let mut value = envelope(name, false);
@@ -765,6 +268,71 @@ pub(crate) async fn pause_with_deadline(root:&Path,store:&dyn TaskStore,runtime:
     };
     pause_locked(root, store, runtime, name, options, &guard, deadline, StopIntent::StopAllowed).await
 }
+/// Stop the selected task's current activity without writing its control row.
+/// Callers keep the same exclusive mission lock through their own pause CAS
+/// or collection rename, and bound the whole operation by `deadline`.
+/// `observe-accepted` takes this lock too; its saved claim is not a liveness
+/// test. Both callers use the runtime's current process/writer observations.
+pub(crate) async fn stop_activity_locked(
+    root: &Path,
+    store: &dyn TaskStore,
+    runtime: &dyn PauseRuntime,
+    task: &Document,
+    _guard: &MissionLocks,
+    deadline: tokio::time::Instant,
+    observer: &Option<PauseObserver>,
+    output: &mut Option<StopOutput>,
+    reconciled_reason: &mut Option<String>,
+) -> Result<StopConfirmationBasis, String> {
+    let name = task.get_str("name").map_err(|_| "missing exact task name")?;
+    policy::validate_name(name)?;
+    let remote = crate::cleanup_sync::task_host(task)?.is_remote();
+    let filter = pause_filter(name, task)?;
+    let mut verification_task = task.clone();
+    verification_task.remove("observedExecutionBeforeStop");
+    stage(observer, "stop", "inspect the current execution scope; signal at most once");
+    let observation = runtime.inspect_before_stop(
+        root, store, task, remaining(deadline)?.min(Duration::from_secs(12)),
+    ).await?;
+    if let Some(observation) = observation {
+        let observed = crate::start::config_document(observation)?;
+        if observed.get_bool("identityVerified") == Ok(true) || observed.get_bool("explicitPauseVerified") == Ok(true) {
+            if let Ok(context) = observed.get_document("tmuxContext") {
+                verification_task.insert("tmuxContext", context.clone());
+            }
+        }
+        verification_task.insert("observedExecutionBeforeStop", observed);
+    }
+    let current = active_task(store, name).await?;
+    if filter.keys().any(|key| task.get(key) != current.get(key)) {
+        return Err("current task/host/operation changed before stop; no signal sent".into());
+    }
+    let attempt = runtime.stop_bounded(root, &verification_task, false, remaining(deadline)?).await
+        .and_then(|out| verified_stop_proof(&out.stdout, name, remote).map(|basis| (out, basis)));
+    let (response, basis, used_recovery) = match attempt {
+        Ok((out, basis)) => (out, basis, false),
+        Err(first) => {
+            // An unconfirmed reply never authorizes another signal. Do
+            // not erase explicit evidence of a live or replaced scope.
+            if first.contains("known_original_runners_still_live") {
+                return Err(first);
+            }
+            let proof = runtime.verify_stopped(root, &verification_task, remaining(deadline)?.min(Duration::from_secs(12))).await
+                .map_err(|next| format!("{first}; original read-only recovery: {next}"))?
+                .ok_or_else(|| format!("{first}; original read-only recovery did not confirm stop"))?;
+            let basis = verified_stop_proof(&proof.stdout, name, remote)?;
+            *reconciled_reason = Some(first);
+            (proof, basis, true)
+        }
+    };
+    *output = Some(response);
+    if used_recovery {
+        stage(observer, "receipt_validate", "check current execution scope after stop");
+        runtime.confirm_stopped_scope(root, store, &verification_task, remaining(deadline)?.min(Duration::from_secs(12))).await?;
+    }
+    Ok(basis)
+}
+
 /// Private composition requires an already-owned guard, not an external skip-lock flag.
 pub(crate) async fn pause_locked(
     root: &Path, store: &dyn TaskStore, runtime: &dyn PauseRuntime, name: &str,
@@ -775,7 +343,8 @@ pub(crate) async fn pause_locked(
     let mut output: Option<StopOutput> = None;
     let observer = &options.observer;
     let mut reconciled_reason: Option<String> = None;
-    let result: Result<(ConfirmedTaskStop,String),String> = tokio::time::timeout_at(deadline, async {
+    let mut execution_confirmed = false;
+    let result: Result<(ConfirmedTaskStop,String,String),String> = tokio::time::timeout_at(deadline, async {
         policy::validate_name(name)?;
         stage(observer,"identity","verify original control task and launch binding");
         let task = active_task(store,name).await?;
@@ -786,153 +355,50 @@ pub(crate) async fn pause_locked(
             (options.expected_launch_absent && options.expected_launch_attempt_id.is_some()) {
             return Err("exact launch must be nonempty and mutually exclusive with absent expectation".into());
         }
-        match task.get("launchAttemptId") {
-            None|Some(Bson::Null) if options.expected_launch_attempt_id.is_none()=>(),
-            Some(Bson::String(actual)) if !actual.trim().is_empty() && !options.expected_launch_absent &&
-                options.expected_launch_attempt_id.map_or(true,|expected|expected==actual)=>(),
-            _=>return Err("launch identity changed or malformed before mutation".into()),
+        let launch = task.get("launchAttemptId");
+        if options.expected_launch_attempt_id.is_some_and(|expected| launch != Some(&Bson::String(expected.into())))
+            || (options.expected_launch_absent && !matches!(launch, None | Some(Bson::Null))) {
+            return Err("launch identity changed before mutation".into());
         }
-        policy::assert_observation_closed(&task)?;
         let remote = match task.get("isRemote") { None | Some(Bson::Null | Bson::Boolean(false)) => false, Some(Bson::Boolean(true)) => true, _ => return Err("invalid task execution host".into()) };
         if options.expected_remote.is_some_and(|expected| expected != remote) { return Err("task execution host changed before pause".into()); }
-        if matches!(text(task.get("status")),Some("generating"|"syncing")) { return Err("candidate generation is not the simulation consumer; reconcile it before using pause".into()); }
-        if text(task.get("status")) == Some("generation_unknown")
-            && crate::create_generate::verify_unknown_generation_stopped_with(&task, || {
-                runtime.inspect_generation(root, &task)
-            })
-            .await
-            .is_err()
-        {
-            return Err("candidate generation is not the simulation consumer; reconcile it before using pause".into());
-        }
-        let inventory = if never_started_history(&task)? {
-            stage(observer,"inventory","verify complete original never-started history and all actual item evidence");
-            Some(never_started_inventory(store,&task).await?)
-        } else { None };
-        stage(observer,"stop","read original stop facts; signal at most once within remaining allowance");
-        let observed = if inventory.is_some() && matches!(intent, StopIntent::StopAllowed) { None } else {
-            runtime.verify_stopped(root, &task, remaining(deadline)?.min(Duration::from_secs(12))).await?
-        };
-        let mut verification_task=task.clone();
-        verification_task.remove("observedExecutionBeforeStop");
-        output = if let Some(proof) = observed { Some(proof) } else {
-            if matches!(intent, StopIntent::VerifyOnly) {
-                return Err("original verify-only did not prove stopped; explicit stop intent required".into());
-            }
-            if inventory.is_none() {
-                if let Some(observation)=runtime.inspect_before_stop(root,store,&task,
-                        remaining(deadline)?.min(Duration::from_secs(12))).await? {
-                    let observed=crate::start::config_document(observation)?;
-                    if observed.get_bool("identityVerified").ok()==Some(true) || observed.get_bool("explicitPauseVerified").ok()==Some(true){
-                        if let Ok(context)=observed.get_document("tmuxContext"){verification_task.insert("tmuxContext",context.clone());}
-                    }
-                    verification_task.insert("observedExecutionBeforeStop",observed);
-                }
-            }
-            let attempt = runtime.stop_bounded(root, &verification_task, inventory.is_some(), remaining(deadline)?).await;
-            let attempt = attempt.and_then(|out| {
-                verified_stop_proof(&out.stdout, name, remote).map(|_| out)
-            });
-            match attempt {
-                Ok(out) => Some(out),
-                Err(first) => {
-                    // Explicit counter-evidence from the original captured tree
-                    // cannot be erased by a weaker session-only observation.
-                    if first.contains("known_original_runners_still_live") { return Err(first); }
-                    // Exactly one read-only recovery, never another stop signal.
-                    let proof = runtime.verify_stopped(root, &verification_task,
-                        remaining(deadline)?.min(Duration::from_secs(12))).await
-                        .map_err(|next| format!("{first}; original read-only recovery: {next}"))?
-                        .ok_or_else(|| format!("{first}; original read-only recovery did not confirm stop"))?;
-                    reconciled_reason = Some(first);
-                    Some(proof)
-                }
-            }
-        };
-        let result = output.as_ref().unwrap();
-        stage(observer,"receipt_validate","validate unique final V1/V2 receipt and exact task/host");
-        let basis = verified_stop_proof(&result.stdout,name,remote)?;
-        // A fresh contradictory process observation cannot be overridden by
-        // either receipt version; never send a second stop to "fix" it.
-        runtime.confirm_stopped_scope(root,store,&verification_task,
-            remaining(deadline)?.min(Duration::from_secs(12))).await?;
-        if let Some(before) = inventory {
-            stage(observer,"inventory_recheck","re-read original task and all items after process verification");
-            let current = active_task(store,name).await?;
-            if current != task || never_started_inventory(store,&current).await? != before {
-                return Err("never-started task/token/history/items changed during process verification".into());
-            }
-        }
+        let filter = pause_filter(name, &task)?;
+        let StopIntent::StopAllowed = intent;
+        let basis = stop_activity_locked(root, store, runtime, &task, _guard, deadline,
+            observer, &mut output, &mut reconciled_reason).await?;
+        execution_confirmed = true;
         let at = bson::DateTime::now(); let now = Utc::now().to_rfc3339();
-        let mut proof = match basis {
+        let proof = match basis {
             StopConfirmationBasis::RunnersExited => doc! {"schema_version":1,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":true},
             StopConfirmationBasis::SessionAbsent => doc! {"schema_version":2,"task_name":name,"target_remote":remote,"session_absent":true,"runners_exited":Bson::Null,"confirmation_basis":"session_absent"},
         };
-        let mut fields = doc! {"status":"paused","pausedAt":&now,"updatedAt":&now,"stopConfirmedAt":at,
+        // Normalize interrupted generation back to pending (recording failed
+        // generation phase); all other stopped states converge to paused.
+        let is_gen_interrupted = matches!(
+            task.get_str("status").ok(),
+            Some("generating" | "generation_unknown")
+        );
+        let task_status = if is_gen_interrupted {
+            "pending"
+        } else {
+            "paused"
+        };
+        let mut fields = doc! {"status":task_status,"pausedAt":&now,"updatedAt":&now,"stopConfirmedAt":at,
             "stopConfirmedRemote":remote,"stopConfirmedTaskId":id.to_hex(),"stopConfirmationBasis":basis.as_str()};
-        let observed_consumer = verification_task.get_document("observedExecutionBeforeStop").ok()
-            .filter(|observed| observed.get_bool("consumerRunning")==Ok(true)
-                && (observed.get_bool("identityVerified")==Ok(true) || observed.get_bool("consumerScopeVerified")==Ok(true))
-                && observed.get_bool("consumerPredatesLaunch")!=Ok(true)
-                && observed.get_str("taskId").ok()==Some(id.to_hex().as_str())
-                && observed.get_bool("remote")==Ok(remote));
-        let any_launch = task.get_str("launchAttemptId").ok().filter(|v| !v.is_empty());
-        let unsettled_fence_launch = any_launch.filter(|launch| {
-            (task.get_str("status").ok() == Some("launching")
-                || task.contains_key("launchSettledAttemptId"))
-                && task.get_str("launchSettledAttemptId").ok() != Some(*launch)
-        });
-        if let (StopConfirmationBasis::RunnersExited, Some(observed), Some(launch)) =
-            (basis, observed_consumer, any_launch) {
-            // Original launchers are one-shot: after the actual consumer is
-            // observed they only check/report. This invocation captured and
-            // confirmed that process scope exited. Close the control lifecycle
-            // in the SAME exact task/host/launch CAS, without inventing an ACK
-            // or requiring a prior START/audit event on legacy tasks.
-            fields.insert("launchSettledAttemptId",launch);
-            proof.insert("controlReconciliation",doc!{"basis":"observed_consumer_stopped",
-                "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
-                "launcherAckRecovered":false,"executionObservation":observed});
-        } else if let (StopConfirmationBasis::SessionAbsent, Some(launch)) = (basis, unsettled_fence_launch) {
-            let observed_residue = verification_task.get_document("observedExecutionBeforeStop").ok()
-                .filter(|observed| observed.get_str("state").ok()==Some("owned_residue")
-                    && observed.get_bool("identityVerified")==Ok(true)
-                    && observed.get_str("taskId").ok()==Some(id.to_hex().as_str())
-                    && observed.get_str("launchAttemptId").ok()==Some(launch)
-                    && observed.get_bool("remote")==Ok(remote))
-                .cloned();
-            let runtime_recorded_launch = task.get_document("simulatorRuntime").ok().is_some_and(|rt| {
-                rt.get_str("launchAttemptId").ok() == Some(launch)
-                    || rt.get_document("startupRecovery").ok().and_then(|s| s.get_str("launchAttemptId").ok()) == Some(launch)
-                    || rt.get_document("lifecycleClosure").ok().and_then(|c| c.get_str("launchAttemptId").ok()) == Some(launch)
-            });
-            if let Some(observed) = observed_residue {
+        if is_gen_interrupted {
+            let mut gen_doc = task.get_document("generation").cloned().unwrap_or_default();
+            gen_doc.insert("phase", "generation_failed");
+            fields.insert("generation", gen_doc);
+        }
+        // Compatibility projection only: current scoped stop completed. No
+        // persisted launch settlement is consulted as an admission condition.
+        if task.contains_key("launchSettledAttemptId") || task.get_str("status") == Ok("launching") {
+            if let Ok(launch) = task.get_str("launchAttemptId") {
                 fields.insert("launchSettledAttemptId", launch);
-                proof.insert("controlReconciliation", doc!{"basis":"observed_owned_residue_stopped",
-                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
-                    "launcherAckRecovered":false,"executionObservation":observed});
-            } else if runtime_recorded_launch {
-                fields.insert("launchSettledAttemptId", launch);
-                proof.insert("controlReconciliation", doc!{"basis":"confirmed_absent_after_runtime_launch",
-                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
-                    "launcherAckRecovered":false});
-            } else if runtime.verify_launcher_settled(root, &verification_task,
-                remaining(deadline)?.min(Duration::from_secs(12))).await? {
-                fields.insert("launchSettledAttemptId", launch);
-                proof.insert("controlReconciliation", doc!{"basis":"confirmed_absent_no_live_launcher",
-                    "taskId":id.to_hex(),"remote":remote,"launchAttemptId":launch,
-                    "launcherAckRecovered":false});
-            } else if task.get_str("status").ok()==Some("launching") && !task.contains_key("launchSettledAttemptId") {
-                fields.insert("launchSettledAttemptId",Bson::Null);
             }
-        } else if task.get_str("status").ok()==Some("launching") && !task.contains_key("launchSettledAttemptId") {
-            // No observed live consumer + full captured exit: V2/absence or a
-            // label alone cannot settle a helper that may not have launched yet.
-            fields.insert("launchSettledAttemptId",Bson::Null);
         }
         let event = doc! {"id":ObjectId::new().to_hex(),"command":"pause","status":"paused","at":&now,"detail":proof};
-        stage(observer,"control_write","CAS original task/launch/stop/observer snapshot; never name-only update");
-        let filter = pause_filter(name,&task)?;
+        stage(observer,"control_write","update original task and operation; never a name-only write");
         let write = store.update_task(Host::Local, filter.clone(),
             doc! {"$set":fields.clone(),"$push":{"events":event.clone()}}).await;
         if !matches!(write, Ok(1)) {
@@ -949,7 +415,7 @@ pub(crate) async fn pause_locked(
         }
         stage(observer,"completed","verified stop evidence and control CAS confirmed; not platform cancellation");
         Ok((ConfirmedTaskStop {confirmed:true,task_id:id.to_hex(),task_name:name.into(),is_remote:remote,
-            stop_confirmed_at:at.timestamp_millis(),confirmation_basis:basis},now))
+            stop_confirmed_at:at.timestamp_millis(),confirmation_basis:basis},now,task_status.to_string()))
     }).await.unwrap_or_else(|_| Err("original pause total deadline exhausted; stop not repeated".into()));
     let mut value = envelope(name, result.is_ok());
     if let Some(reason) = reconciled_reason {
@@ -962,9 +428,9 @@ pub(crate) async fn pause_locked(
         value["stderr"] = json!(tail(&output.stderr));
     }
     match result {
-        Ok((stop,control_revision)) => {
+        Ok((stop,control_revision,task_status)) => {
             value["controlRevision"] = json!(control_revision);
-            value["taskStatus"] = json!("paused");
+            value["taskStatus"] = json!(task_status);
             value["stopConfirmation"] = json!("confirmed");
             value["confirmationBasis"] = json!(stop.confirmation_basis.as_str());
             value["taskId"] = json!(stop.task_id);
@@ -979,6 +445,7 @@ pub(crate) async fn pause_locked(
             stage(observer, "failed", error.clone());
             value["reason"] = json!("pause_unconfirmed");
             value["stopConfirmation"] = json!("unknown");
+            value["executionStopConfirmed"] = json!(execution_confirmed);
             value["error"] = json!(error);
             if script_returned_success {
                 value["returncode"] = json!(0);

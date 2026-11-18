@@ -389,10 +389,10 @@ is inactive. The original inspector's internal `--inspect-generation-writers`
 mode still checks actual writer argv/target/birth, orphan/older writers and races;
 `writer_absent` asserts writer absence only, never owner death or task stop.
 Both business-scope absence and original writer absence are required before the
-original task lock/reread/empty-output/previous-status/full-CAS/readback recovery
-conditions may settle anything. Legacy/untagged/wrong-instance/birth/malformed,
-nonempty or live-writer cases remain conservative; no metadata migration,
-request replay or automatic generate/start. This is original business recovery,
+original task lock/reread/empty-output/minimal-identity-CAS (`_id`, `name`,
+`status`, `isRemote`, `updatedAt`)/readback recovery conditions may settle an
+interrupted generation to `pending` (`generation.phase="generation_failed"`). Legacy/untagged/wrong-instance/birth/malformed,
+nonempty or live-writer cases remain conservative for automatic list refresh; explicit `generate`/`pause`/`delete` check live writer absence directly without blocking on historical proof fields, and `delete` archives any active state (including interrupted `syncing`/`deleting`/`generating`). This is original business recovery,
 not a new queue/state machine or public CLI command. Original Python watch
 producerPid remains the real independent watcher child.
 See [the business scope owner](../task-core/src/generation_owner.rs); detailed

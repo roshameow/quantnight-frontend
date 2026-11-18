@@ -3,9 +3,19 @@ use tokio::io::{AsyncRead,AsyncWrite,AsyncReadExt,AsyncWriteExt};
 use super::protocol::{Message,MAGIC};
 pub const CHUNK:usize=64*1024;
 pub async fn write_preamble<W:AsyncWrite+Unpin>(out:&mut W)->Result<(),String>{out.write_all(MAGIC).await.map_err(|_|"IPC preamble write failed".into())}
-pub async fn read_preamble<R:AsyncRead+Unpin>(input:&mut R)->Result<(),String>{
-    let mut magic=[0;8];input.read_exact(&mut magic).await.map_err(|_|"IPC preamble unavailable")?;
-    if &magic!=MAGIC{return Err("IPC protocol preamble mismatch".into());}Ok(())
+#[derive(Debug)]
+pub enum PreambleError { Unavailable, Mismatch }
+impl std::fmt::Display for PreambleError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::Unavailable => "IPC preamble unavailable",
+            Self::Mismatch => "IPC protocol preamble mismatch",
+        })
+    }
+}
+pub async fn read_preamble<R:AsyncRead+Unpin>(input:&mut R)->Result<(),PreambleError>{
+    let mut magic=[0;8];input.read_exact(&mut magic).await.map_err(|_|PreambleError::Unavailable)?;
+    if &magic!=MAGIC{return Err(PreambleError::Mismatch);}Ok(())
 }
 pub async fn write<W:AsyncWrite+Unpin>(out:&mut W,message:&Message)->Result<(),String>{
     let bytes=serde_json::to_vec(message).map_err(|_|"IPC message encoding failed")?;

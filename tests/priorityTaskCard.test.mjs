@@ -629,14 +629,14 @@ test('research status is explicitly not liveness; paused-only precedence preserv
   assert.match(plainText(html), /研究状态：active/);
   assert.equal(card.priorityDisplayStatus(event(), true, 'error'), 'blocked');
   assert.equal(card.priorityDisplayStatus(saved, true, 'error'), 'active');
-  assert.equal(card.priorityDisplayStatus(null, true, 'paused'), '暂停标记无有效停止凭据');
-  assert.equal(card.priorityDisplayStatus(null, false, 'paused'), '暂停标记无有效停止凭据');
-  assert.equal(card.priorityDisplayStatus(saved, true, 'paused'), '暂停标记无有效停止凭据');
+  assert.equal(card.priorityDisplayStatus(null, true, 'paused'), 'paused');
+  assert.equal(card.priorityDisplayStatus(null, false, 'paused'), 'paused');
+  assert.equal(card.priorityDisplayStatus(saved, true, 'paused'), 'paused');
   assert.equal(card.priorityDisplayStatus(saved, true, 'paused', 'paused'), 'paused');
 });
 
 
-test('actual SFC SSR requires stop proof, never mistakes legacy paused control or active research for stopped process', async () => {
+test('actual SFC shows projected paused state, never mistakes it or research for a native receipt', async () => {
   for (const payload of [groupedEvent(), groupedEvent({ status: 'blocked' }),
     groupedEvent({ stale: true, last_error: 'metadata timeout' }), null]) {
     for (const extra of [{}, { stopConfirmedAt: 'invalid', stopConfirmedTaskId: 'id-a', stopConfirmedRemote: true },
@@ -646,9 +646,9 @@ test('actual SFC SSR requires stop proof, never mistakes legacy paused control o
         progress: { stale: false, priority_campaign: payload } });
       const { main } = sections(html);
       const text = plainText(main);
-      assert.match(text, /pipeline__priority\s*暂停标记无有效停止凭据/);
-      assert.match(text, /任务状态：暂停标记无有效停止凭据/);
-      assert.doesNotMatch(text, /任务状态：paused|任务状态：active/);
+      assert.match(text, /pipeline__priority\s*paused/);
+      assert.match(text, /任务状态：paused/);
+      assert.doesNotMatch(text, /任务状态：active|原生停止操作已确认/);
       if (payload?.counts) { assert.match(text, /✓ 50/); assert.match(text, /Σ 240/); }
     }
   }
@@ -684,13 +684,13 @@ test('real SFC SSR and late events keep stopping/unconfirmed above all research 
   }
 });
 
-test('actual card operation prop is identity/host-fenced; persisted proof confirms remount only on current target', async () => {
+test('actual card operation prop is identity/host-fenced; list status remains a projection', async () => {
   for (const extra of [{ _id: 'other' }, { name: 'other' }, { isRemote: false }]) {
     const html = await render({ task: { ...task, status: 'paused' }, stopOperation: {
       _id: 'id-a', name: task.name, isRemote: true, status: 'stopping', ...extra },
       progress: { stale: false, priority_campaign: groupedEvent() } });
-    assert.match(plainText(html), /任务状态：暂停标记无有效停止凭据/);
-    assert.doesNotMatch(plainText(html), /任务状态：stopping/);
+    assert.match(plainText(html), /任务状态：paused/);
+    assert.doesNotMatch(plainText(html), /任务状态：停止执行中/);
   }
   const persisted = { ...task, status: 'paused', stopConfirmedAt: { $date: { $numberLong: String(Date.now()) } },
     stopConfirmedRemote: true, stopConfirmedTaskId: 'id-a' };
@@ -703,7 +703,7 @@ test('actual card operation prop is identity/host-fenced; persisted proof confir
 test('research-only paused metadata cannot produce a confirmed paused badge without proof', async () => {
   const html = await render({ task: { ...task, status: 'running' }, taskRuntimeStatus: 'paused',
     progress: { stale: false, priority_campaign: groupedEvent({ status: 'paused' }) } });
-  assert.match(plainText(html), /pipeline__priority\s*暂停标记无有效停止凭据/);
+  assert.match(plainText(html), /pipeline__priority\s*研究暂停（非执行状态）/);
   assert.doesNotMatch(plainText(html), /pipeline__priority\s*paused/);
 });
 
@@ -720,7 +720,7 @@ test('same-ID BSON object list reload retains real cached runtime counts while p
   props.task = { ...saved, _id: { $oid: 'id-b' } };
   await nextTick();
   assert.equal(state.runtime.value, null);
-  assert.equal(state.displayStatus.value, '暂停标记无有效停止凭据');
+  assert.equal(state.displayStatus.value, 'paused');
 });
 
 test('actual Priority SFC receives structured consumer diagnostics and displays full stages/failure causes above research details', async () => {

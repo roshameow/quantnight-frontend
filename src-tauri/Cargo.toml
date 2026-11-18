@@ -59,3 +59,17 @@ disposable-admission-fixture = []
 tauri = { version = "2", features = ["test"] }
 async-trait = "0.1"
 quantnight-task-core = { path = "../crates/task-core", features = ["test-support"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "off"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "off"
+
+[profile.test.package."*"]
+debug = false

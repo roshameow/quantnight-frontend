@@ -147,34 +147,7 @@ async fn active(store: &dyn TaskStore, name: &str) -> Result<Document, String> {
 /// used across awaited specialist calls even for legacy writers without updatedAt.
 fn binding(task: &Document, command: &str) -> Result<Document, String> {
     let name = task.get_str("name").map_err(|_| "missing task name")?;
-    let mut query = policy::task_binding_query(name, task, command)?;
-    for key in [
-        "acceptedObservation",
-        "taskType",
-        "auth_profile",
-        "targetRemote",
-        "generation",
-        "startupBinding",
-        "startedAt",
-        "launchAttemptAt",
-        "runId",
-        "startConfig",
-        "mission_config",
-        "config",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "stopConfirmationBasis",
-        "agentNotification",
-    ] {
-        query.insert(
-            key,
-            task.get(key)
-                .cloned()
-                .unwrap_or_else(|| doc! {"$exists":false}.into()),
-        );
-    }
-    Ok(query)
+    policy::task_binding_query(name, task, command)
 }
 async fn unchanged(
     store: &dyn TaskStore,
@@ -348,12 +321,6 @@ async fn observe_locked(
     {
         return Err("observation task ID mismatch".into());
     }
-    policy::assert_observation_closed(&task)?;
-    if !policy::stop_confirmation_valid(&task, remote) {
-        return Err(
-            "observe-accepted requires confirmed stopped execution for this task/side".into(),
-        );
-    }
     runtime.assert_consumer_absent(root, &task, remote).await?;
     let profile = task
         .get_str("auth_profile")
@@ -392,7 +359,7 @@ async fn observe_locked(
     let config_json = start::strict_json(&Bson::Document(config))?.to_string();
     let mut claim = observation.clone();
     claim.extend(doc! {"startedAt":now(),"finishedAt":Bson::Null});
-    update(
+    let begun = update(
         store,
         &task,
         "observe-accepted-begin",
@@ -402,17 +369,14 @@ async fn observe_locked(
     .await?;
     // Re-read the durable claim instead of trusting an acknowledged local copy.
     let claimed = active(store, &request.name).await?;
-    let mut expected = task.clone();
-    expected.insert("acceptedObservation", claim.clone());
-    for key in binding(&expected, "observe-accepted-begin")?
+    if binding(&begun, "observe-accepted-begin")?
         .keys()
-        .filter(|key| *key != "updatedAt")
+        .any(|key| claimed.get(key) != begun.get(key))
+        || claimed.get("acceptedObservation") != begun.get("acceptedObservation")
     {
-        if claimed.get(key) != expected.get(key) {
-            return Err(
-                "observation claim/identity changed before execution; claim retained".into(),
-            );
-        }
+        return Err(
+            "observation claim/identity changed before execution; claim retained".into(),
+        );
     }
     let command = ObservationCommand {
         argv: vec![

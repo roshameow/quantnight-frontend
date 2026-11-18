@@ -2,6 +2,7 @@
 //! This operation never starts/stops a consumer or touches the platform.
 use crate::{
     cleanup_sync::{outcome, OperationsRuntime, TaskOutcome},
+    create_generate::require_generation_writer_stopped_with,
     lifecycle_policy as policy,
     mission_lock::MissionLocks,
     task_store::{receipt_projection, Host, TaskStore},
@@ -54,8 +55,7 @@ fn retry_statuses(request: &ResumeRequest) -> Vec<&'static str> {
     }
     retry
 }
-fn blocked_status(task: &Document) -> Result<bool, ResumeError> {
-    // This is the original command's status-set lookup, not a new schema gate.
+fn resume_status(task: &Document) -> Result<&str, ResumeError> {
     let unhashable = match task.get("status") {
         Some(Bson::Array(_)) => Some("list"),
         Some(Bson::Document(_)) => Some("dict"),
@@ -67,10 +67,13 @@ fn blocked_status(task: &Document) -> Result<bool, ResumeError> {
     if let Some(kind) = unhashable {
         return Err(policy_error(format!("unhashable type: '{kind}'")));
     }
-    Ok(
-        matches!(task.get("status"), Some(Bson::String(status) | Bson::Symbol(status))
-        if ["generating", "generation_unknown", "launching", "syncing", "deleting"].contains(&status.as_str())),
-    )
+    match task.get("status") {
+        Some(Bson::String(status) | Bson::Symbol(status)) => match status.as_str() {
+            "generating" | "generation_unknown" => Ok("pending"),
+            _ => Ok("ready"),
+        },
+        _ => Ok("ready"),
+    }
 }
 fn task_id_text(id: &Bson) -> Option<String> {
     match id {
@@ -99,21 +102,7 @@ async fn active_task(store: &dyn TaskStore, name: &str) -> Result<Document, Resu
         .await?
         .ok_or_else(|| "task not found".into())
 }
-const CONTROL_FENCES: &[&str] = &[
-    "_id",
-    "name",
-    "status",
-    "isRemote",
-    "updatedAt",
-    "tmuxContext",
-    "launchAttemptId",
-    "launchAttemptAt",
-    "acceptedObservation",
-    "generation",
-    "startupBinding",
-    "taskType",
-    "auth_profile",
-];
+const CONTROL_FENCES: &[&str] = &["_id", "name", "status", "isRemote", "updatedAt"];
 async fn bound_task(
     store: &dyn TaskStore,
     name: &str,
@@ -128,7 +117,6 @@ async fn bound_task(
             "task identity/state/launch/observer binding changed before resume mutation".into(),
         );
     }
-    policy::assert_observation_closed(&current)?;
     Ok(())
 }
 fn snapshot_fields(query: &mut Document, row: &Document, keys: impl Iterator<Item = String>) {
@@ -214,11 +202,16 @@ async fn resume_inner(
     {
         return Err("task identity changed before mutation".into());
     }
-    policy::assert_observation_closed(&task)?;
-    if blocked_status(&task)? {
-        return Err("generation/launch ownership unresolved; resume cannot reconcile it".into());
-    }
+    let status = resume_status(&task)?;
     let host = task_host(&task)?;
+    // The original observer, generator and launcher share this mission lock.
+    // The process owner also checks scoped processes that can outlive it,
+    // including an observe-accepted helper. An unchanged stored claim is
+    // not process evidence. The local absence adapter includes the local
+    // writer check; remote execution also needs that *local* writer check.
+    if host == Host::Remote {
+        require_generation_writer_stopped_with(|| runtime.inspect_generation(root, &task)).await?;
+    }
     runtime.assert_consumer_absent(root, &task, host).await?;
     let retry = retry_statuses(request);
     bound_task(store, name, &task).await?;
@@ -259,13 +252,14 @@ async fn resume_inner(
     let at = now();
     let modified_count =
         i64::try_from(changed).map_err(|_| "resume audit count cannot be represented")?;
-    let event = doc! {"id":bson::oid::ObjectId::new().to_hex(),"command":"resume","status":"ready","at":&at,
+    let event = doc! {"id":bson::oid::ObjectId::new().to_hex(),"command":"resume","status":status,"at":&at,
     "detail":{"rows":modified_count,"from":retry.clone()}};
+    let fields = doc! {"updatedAt": at, "status": status};
     let matched = store
         .update_task(
             Host::Local,
             control_query(name, &task)?,
-            doc! {"$set":{"status":"ready","updatedAt":at},"$push":{"events":event}},
+            doc! {"$set":fields,"$push":{"events":event}},
         )
         .await?;
     if matched != 1 {

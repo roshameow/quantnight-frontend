@@ -24,11 +24,11 @@
 <script setup>
 import { computed } from 'vue';
 import { taskControlLabel, regularDisplayStatus, taskDiagnosticDetails } from '../../utils/taskDiagnostics.js';
-import { taskStopDisplayStatus, taskStopProofIssue } from '../../stores/taskStore.js';
+import { taskStopDisplayStatus } from '../../stores/taskStore.js';
 const props = defineProps({ taskId: String, task: Object, progress: Object, runtime: Object, stopOperation: Object });
 defineEmits(['browseAlphaLibrary']);
 const diagnostic = computed(() => props.task ? taskDiagnosticDetails(props.task, props.runtime, props.stopOperation,
-  taskStopDisplayStatus(props.task, props.stopOperation), Date.now(), taskStopProofIssue(props.task)) : '');
+  taskStopDisplayStatus(props.task, props.stopOperation), Date.now()) : '');
 const observationTime = computed(() => Number.isSafeInteger(props.runtime?.observedAt) && props.runtime.observedAt > 0 && props.runtime.observedAt <= 8640000000000000
   ? new Date(props.runtime.observedAt).toISOString() : '未提供有效观察时间');
 const count = (key) => {

@@ -26,8 +26,8 @@ fn matches(d:&Document,q:&Document)->bool { q.iter().all(|(k,v)| { let a=field(d
     Bson::Document(op) if op.contains_key("$exists") => a.is_some()==op.get_bool("$exists").unwrap(),
     Bson::Document(op) if op.contains_key("$ne") => a!=op.get("$ne"),
     Bson::Null => a.is_none() || a==Some(v), _=>a==Some(v) } }) }
-struct Store { extra_rows:Mutex<Vec<Document>>, row:Mutex<Option<Document>>, writes:Mutex<Vec<Document>>, calls:Mutex<Vec<String>>, has:Result<bool,String>, cas_patch:Mutex<Option<Document>>, after_probe:Mutex<Option<Document>>, ack_loss:bool, reject_finish:AtomicBool }
-impl Store { fn new() -> Self { Self {extra_rows:Mutex::new(vec![]),row:Mutex::new(Some(task())),writes:Mutex::new(vec![]),calls:Mutex::new(vec![]),has:Ok(false),cas_patch:Mutex::new(None),after_probe:Mutex::new(None),ack_loss:false,reject_finish:AtomicBool::new(false)} }
+struct Store { extra_rows:Mutex<Vec<Document>>, row:Mutex<Option<Document>>, writes:Mutex<Vec<Document>>, calls:Mutex<Vec<String>>, has:Result<bool,String>, summary_error:Mutex<Option<String>>, generation_total:Option<u64>, cas_patch:Mutex<Option<Document>>, after_probe:Mutex<Option<Document>>, ack_loss:bool, reject_finish:AtomicBool }
+impl Store { fn new() -> Self { Self {extra_rows:Mutex::new(vec![]),row:Mutex::new(Some(task())),writes:Mutex::new(vec![]),calls:Mutex::new(vec![]),has:Ok(false),summary_error:Mutex::new(None),generation_total:None,cas_patch:Mutex::new(None),after_probe:Mutex::new(None),ack_loss:false,reject_finish:AtomicBool::new(false)} }
 fn row(&self)->Document {self.row.lock().unwrap().clone().unwrap()} }
 #[async_trait] impl TaskStore for Store {
  async fn list_tasks(&self,host:Host,_:bool)->Result<Vec<Document>,String> {self.calls.lock().unwrap().push(format!("list:{host:?}"));let mut rows:Vec<_>=self.row.lock().unwrap().clone().into_iter().collect();rows.extend(self.extra_rows.lock().unwrap().clone());Ok(rows)}
@@ -36,7 +36,18 @@ fn row(&self)->Document {self.row.lock().unwrap().clone().unwrap()} }
  for(k,v)in u.get_document("$set").unwrap(){set(row,k,v.clone());}if !row.contains_key("events"){row.insert("events",Vec::<Bson>::new());}row.get_array_mut("events").unwrap().push(u.get_document("$push").unwrap().get("events").unwrap().clone());if self.ack_loss{Err("ack lost".into())}else{Ok(1)}}
  async fn has_rows(&self,host:Host,name:&str)->Result<bool,String>{assert_eq!(host,Host::Local);assert_eq!(name,"fixture");self.calls.lock().unwrap().push("has_rows".into());if let Some(p)=self.after_probe.lock().unwrap().take(){self.row.lock().unwrap().as_mut().unwrap().extend(p);}self.has.clone()}
  async fn collection_names(&self,_:Host)->Result<Vec<String>,String>{panic!("no inventory scan")}
- async fn summary(&self,_:Host,_:&str)->Result<CollectionSummary,String>{panic!("no candidate summary")}
+ async fn summary(&self,host:Host,name:&str)->Result<CollectionSummary,String>{
+  assert_eq!(host,Host::Local);assert_eq!(name,"fixture");
+  if let Some(e)=self.summary_error.lock().unwrap().clone(){return Err(e);}
+  let total=self.generation_total.expect("no candidate summary");
+  Ok(CollectionSummary{exists:true,total,..Default::default()})
+ }
+ async fn update_items(&self,host:Host,name:&str,filter:Document,update:Document)->Result<u64,String>{
+  assert_eq!(host,Host::Local);assert_eq!(name,"fixture");assert!(filter.is_empty());
+  assert_eq!(update,doc!{"$set":{"runId":"mission:fixture"}});
+  self.calls.lock().unwrap().push("update_items".into());
+  Ok(self.generation_total.expect("no item update"))
+ }
  async fn rows(&self,_:Host,_:&str,_:Option<Document>)->Result<Vec<Document>,String>{panic!("no rows")}
  async fn insert_rows(&self,_:Host,_:&str,_:Vec<Document>)->Result<(),String>{panic!("no item write")}
  async fn rename_collection(&self,_:Host,_:&str,_:&str)->Result<(),String>{panic!("no rename")}
@@ -53,7 +64,7 @@ impl Runtime {fn stopped()->Self{Self{observed:Ok(GenerationProcesses::Stopped),
  let root=Root::new();let s=Store::new();let r=Runtime::stopped();let old=s.row();
  let result=core::reconcile_generation_for_list(&root.0,&s,&r,&old).await.unwrap();assert!(result.changed);assert!(result.diagnostic.is_none());
  let row=result.task.unwrap();assert_eq!(row.get_str("status").unwrap(),"pending");let g=row.get_document("generation").unwrap();assert_eq!(g.get_str("phase").unwrap(),"generation_failed");assert_eq!(g.get_str("id").unwrap(),"g1");assert!(g.contains_key("finishedAt"));
- let writes=s.writes.lock().unwrap();assert_eq!(writes.len(),1);let q=&writes[0];for k in ["_id","name","generation","events","targetRemote","auth_profile","updatedAt"]{assert_eq!(q.get(k),old.get(k),"{k}");}assert_eq!(q.get_document("acceptedObservation").unwrap().get_bool("$exists").unwrap(),false);drop(writes);
+ let writes=s.writes.lock().unwrap();assert_eq!(writes.len(),1);let q=&writes[0];for k in ["_id","name","status","isRemote","updatedAt"]{assert_eq!(q.get(k),old.get(k),"{k}");}assert_eq!(q.get_str("generation.id"),Ok("g1"));drop(writes);
  let again=core::reconcile_generation_for_list(&root.0,&s,&r,&row).await.unwrap();assert!(!again.changed);assert_eq!(s.writes.lock().unwrap().len(),1);assert_eq!(r.calls.load(Ordering::Relaxed),1);
  let stale=core::reconcile_generation_for_list(&root.0,&s,&r,&old).await.unwrap();assert!(!stale.changed);assert_eq!(stale.task.unwrap().get_str("status").unwrap(),"pending");assert_eq!(s.writes.lock().unwrap().len(),1);
 }
@@ -65,8 +76,8 @@ impl Runtime {fn stopped()->Self{Self{observed:Ok(GenerationProcesses::Stopped),
 #[tokio::test] async fn live_orphan_owner_uncertainty_and_probe_error_never_write(){
  for observed in [Ok(GenerationProcesses::Live("orphan writer present".into())),Ok(GenerationProcesses::Unverified("owner PID alive without birth".into())),Err("AccessDenied".into())]{let root=Root::new();let s=Store::new();let old=s.row();let r=Runtime{observed,calls:AtomicUsize::new(0)};let out=core::reconcile_generation_for_list(&root.0,&s,&r,&old).await;if let Ok(v)=out{assert!(!v.changed);assert!(v.diagnostic.is_some());}assert_eq!(s.row(),old);assert!(s.writes.lock().unwrap().is_empty());assert!(!s.calls.lock().unwrap().iter().any(|c|c=="has_rows"));}
 }
-#[tokio::test] async fn nonempty_uncertain_and_missing_history_are_explicit_unknown(){
- for mode in 0..3{let root=Root::new();let mut s=Store::new();if mode==0{s.has=Ok(true)}else if mode==1{s.has=Err("DB probe unavailable".into())}else{s.row.lock().unwrap().as_mut().unwrap().remove("events");}let r=Runtime::stopped();let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(out.changed);let row=s.row();assert_eq!(row.get_str("status").unwrap(),"generation_unknown");assert_eq!(row.get_document("generation").unwrap().get_str("phase").unwrap(),"generation_unknown");assert!(row.get_str("lastError").unwrap().contains(["nonempty","DB probe unavailable","previous_status_unverified"][mode]));}
+#[tokio::test] async fn nonempty_uncertain_and_missing_history_are_normalized_to_pending(){
+ for mode in 0..3{let root=Root::new();let mut s=Store::new();if mode==0{s.has=Ok(true)}else if mode==1{s.has=Err("DB probe unavailable".into())}else{s.row.lock().unwrap().as_mut().unwrap().remove("events");}let r=Runtime::stopped();let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(out.changed);let row=s.row();assert_eq!(row.get_str("status").unwrap(),"pending");assert_eq!(row.get_document("generation").unwrap().get_str("phase").unwrap(),"generation_failed");}
 }
 #[tokio::test] async fn superseded_token_and_deleted_identity_are_not_adopted(){
  let root=Root::new();let s=Store::new();let r=Runtime::stopped();let old=s.row();s.row.lock().unwrap().as_mut().unwrap().get_document_mut("generation").unwrap().insert("id","next");let out=core::reconcile_generation_for_list(&root.0,&s,&r,&old).await.unwrap();assert!(!out.changed);assert!(out.diagnostic.unwrap().contains("changed"));assert_eq!(r.calls.load(Ordering::Relaxed),0);
@@ -76,7 +87,20 @@ impl Runtime {fn stopped()->Self{Self{observed:Ok(GenerationProcesses::Stopped),
  for pre_finish in [false,true]{let root=Root::new();let s=Store::new();let r=Runtime::stopped();let patch=if pre_finish{doc!{"events":[]}}else{doc!{"status":"paused","launchAttemptId":"new"}};if pre_finish{*s.after_probe.lock().unwrap()=Some(patch)}else{*s.cas_patch.lock().unwrap()=Some(patch)}let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(!out.changed);assert!(out.diagnostic.is_some());assert!(!s.row().get_document("generation").unwrap().contains_key("finishedAt"));}
 }
 #[tokio::test] async fn lost_ack_is_confirmed_by_exact_finish_readback_without_retry(){let root=Root::new();let mut s=Store::new();s.ack_loss=true;let r=Runtime::stopped();let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(out.changed);assert_eq!(s.writes.lock().unwrap().len(),1);}
-#[tokio::test] async fn malformed_phase_pid_or_token_never_dispatches_probe(){for mode in 0..4{let root=Root::new();let s=Store::new();let r=Runtime::stopped();let mut row=s.row();if mode==0{row.remove("generation");}else{let g=row.get_document_mut("generation").unwrap();match mode{1=>{g.insert("phase","preparing");},2=>{g.insert("producerPid",0);},_=>{g.insert("id","");}}}*s.row.lock().unwrap()=Some(row.clone());let out=core::reconcile_generation_for_list(&root.0,&s,&r,&row).await;assert!(out.is_err() || out.unwrap().diagnostic.is_some());assert_eq!(r.calls.load(Ordering::Relaxed),0);assert!(s.writes.lock().unwrap().is_empty());}}
+#[tokio::test] async fn stale_phase_or_missing_owner_metadata_still_observes_the_writer() {
+ for mode in 0..4 {
+  let root=Root::new();let s=Store::new();let r=Runtime::stopped();let mut row=s.row();
+  if mode==0 {row.remove("generation");} else {
+   let g=row.get_document_mut("generation").unwrap();
+   match mode {1=>{g.insert("phase","preparing");},2=>{g.remove("producerPid");},_=>{g.insert("id","");}}
+  }
+  *s.row.lock().unwrap()=Some(row.clone());
+  let out=core::reconcile_generation_for_list(&root.0,&s,&r,&row).await.unwrap();
+  assert_eq!(r.calls.load(Ordering::Relaxed),1);
+  assert_eq!(out.task.unwrap().get_str("status").unwrap(),"pending");
+  assert_eq!(s.writes.lock().unwrap().len(),usize::from(mode==1||mode==2));
+ }
+}
 #[tokio::test] async fn cli_list_uses_same_coordinator_projects_and_isolates_row_error(){let root=Root::new();let s=Store::new();let r=Runtime::stopped();let out=list_with_generation(&root.0,&s,&r,&ListRequest::default()).await;assert_eq!(out.value["ok"],true);assert_eq!(out.value["tasks"][0]["status"],"pending");assert!(out.value["tasks"][0].get("events").is_none());assert_eq!(s.writes.lock().unwrap().len(),1);
  let s=Store::new();s.extra_rows.lock().unwrap().push(doc!{"_id":ObjectId::new(),"name":"unrelated","status":"ready"});let r=Runtime{observed:Err("argv unverified".into()),calls:AtomicUsize::new(0)};let out=list_with_generation(&root.0,&s,&r,&ListRequest::default()).await;assert_eq!(out.value["ok"],true);assert_eq!(out.value["tasks"][0]["generationRefreshError"],"argv unverified");assert_eq!(out.value["tasks"][1]["name"],"unrelated");assert!(out.value["tasks"][1].get("generationRefreshError").is_none());assert!(s.writes.lock().unwrap().is_empty());
  let out=list_with_generation(&root.0,&s,&r,&ListRequest{remote:true,include_deactive:false}).await;assert_eq!(out.value["ok"],true);assert_eq!(r.calls.load(Ordering::Relaxed),1);}
@@ -92,11 +116,11 @@ mod facade_route {
   let python=root.join(".venv/bin/python");std::fs::write(&python,"#!/bin/sh\n[ \"$3\" = backend.mongodb.mongo_config ] || exit 97\necho '{\"schemaVersion\":1,\"command\":\"validate-task-control-binding\",\"ok\":true}'\n").unwrap();std::fs::set_permissions(&python,std::fs::Permissions::from_mode(0o700)).unwrap();
   std::fs::write(root.join("scripts/check_tmux_python.sh"),body).unwrap();fake
  }
- fn observation(state:&str)->String {format!("printf '%s\\n' \"$@\" > observed.argv\nprintf '%s\\n' 'QUANTNIGHT_GENERATION_OBSERVED {{\"schemaVersion\":1,\"taskId\":\"{ID}\",\"taskName\":\"fixture\",\"generationId\":\"g1\",\"producerPid\":42000,\"remote\":false,\"state\":\"{state}\",\"reason\":\"fixture process fact\"}}'\n")}
+ fn observation(state:&str)->String {format!("printf '%s\\n' \"$@\" > observed.argv\nprintf '%s\\n' 'QUANTNIGHT_GENERATION_OBSERVED {{\"schemaVersion\":1,\"taskId\":\"{ID}\",\"taskName\":\"fixture\",\"remote\":false,\"state\":\"{state}\",\"reason\":\"fixture process fact\"}}'\n")}
  #[tokio::test] async fn shared_facade_and_native_cli_reach_original_runtime_local_mode_and_finish(){
-  for cli in [false,true]{let fake=fixture(&observation("stopped"));let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());s.row.lock().unwrap().as_mut().unwrap().insert("isRemote",true);let controller=TaskControl::with_store(binding,s.clone());
+  for cli in [false,true]{let fake=fixture(&observation("writer_absent"));let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());s.row.lock().unwrap().as_mut().unwrap().insert("isRemote",true);let controller=TaskControl::with_store(binding,s.clone());
    if cli{assert_eq!(controller.list(&ListRequest::default()).await.value["tasks"][0]["status"],"pending");}else{assert!(controller.reconcile_generation_for_list(&s.row()).await.unwrap().changed);}
-   assert_eq!(s.writes.lock().unwrap().len(),1);let argv=std::fs::read_to_string(Path::new(&fake.config.env.working_dir).join("observed.argv")).unwrap();let args:Vec<_>=argv.lines().collect();assert_eq!(&args[..4],&["fixture","false","--inspect-generation","--binding"]);let request:serde_json::Value=serde_json::from_str(args[4]).unwrap();assert_eq!(request["taskId"],ID);assert_eq!(request["generation"]["id"],"g1");
+   assert_eq!(s.writes.lock().unwrap().len(),1);let argv=std::fs::read_to_string(Path::new(&fake.config.env.working_dir).join("observed.argv")).unwrap();let args:Vec<_>=argv.lines().collect();assert_eq!(&args[..4],&["fixture","false","--inspect-generation-writers","--binding"]);let request:serde_json::Value=serde_json::from_str(args[4]).unwrap();assert_eq!(request,serde_json::json!({"taskId":ID}));
   }
  }
  fn actual_checker_fixture()->FakeBash {
@@ -113,19 +137,81 @@ if [ "$3" = backend.mongodb.mongo_config ]; then
  echo '{{"schemaVersion":1,"command":"validate-task-control-binding","ok":true}}'
 else
  export PATH="$PWD/bin:$PATH"
+ export PYTHONPATH="$PWD"
  exec '{python}' "$@"
 fi
 "#)).unwrap();
   std::fs::create_dir_all(root.join("bin")).unwrap();
   std::fs::write(root.join("psutil.py"),"class Error(Exception): pass\nclass NoSuchProcess(Error): pass\ndef Process(pid): raise NoSuchProcess(pid)\n").unwrap();
-  std::fs::write(root.join("bin/ps"),"#!/bin/sh\necho '1 0 launchd'\n").unwrap();
-  for file in ["ps","tmux","ssh","uv"] {let path=root.join("bin").join(file);if file!="ps" {std::fs::write(&path,"#!/bin/sh\necho forbidden_leaf >&2\nexit 97\n").unwrap();}std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+  std::fs::write(root.join("fixture-ps-stdout"),"1 0 launchd\n").unwrap();
+  // Exact OS leaf fake inside the real embedded checker interpreter; never
+  // consult the real process inventory even if the test leaf fails to import.
+  std::fs::write(root.join("sitecustomize.py"), r#"
+from pathlib import Path
+import subprocess
+original_run = subprocess.run
+def run(args, *pos, **kw):
+    if args[0] == 'ps':
+        assert args == ['ps', '-axo', 'pid=,ppid=,comm=']
+        with open('os-scan', 'a') as trace:
+            trace.write('scanned\n')
+        return subprocess.CompletedProcess(args, 0, Path('fixture-ps-stdout').read_text(), '')
+    return original_run(args, *pos, **kw)
+subprocess.run = run
+"#).unwrap();
+  for file in ["ps","tmux","ssh","uv"] {let path=root.join("bin").join(file);std::fs::write(&path,"#!/bin/sh\necho forbidden_leaf >&2\nexit 97\n").unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
   let config_path=root.join("scripts/script_config.py");
   let config_source=std::fs::read_to_string(&config_path).unwrap().replace(
       "NATIVE_TMUX_CANDIDATES = (\"/opt/homebrew/bin/tmux\", \"/usr/local/bin/tmux\", \"/usr/bin/tmux\", \"/bin/tmux\")",
       &format!("NATIVE_TMUX_CANDIDATES = ({:?},)",root.join("bin/tmux").to_str().unwrap()));
   std::fs::write(config_path,config_source).unwrap();
   fake
+ }
+ #[tokio::test]
+ async fn pause_and_archive_ports_observe_real_writer_without_generation_metadata() {
+  use quantnight_task_core::{
+   cleanup_sync::OperationsRuntime,
+   operations_runtime::{OriginalOperationsRuntime, OriginalPauseRuntime},
+   pause::{PauseRuntime, StopBudget},
+  };
+  let fake=actual_checker_fixture();
+  let binding=validate_backend_binding(&fake.config).await.unwrap();
+  let root=binding.root();
+  let _guard=MissionLocks::acquire(root,&["fixture"],false).unwrap();
+  // Ordinary non-generation state, no metadata, and a remote consumer.
+  // The generation writer remains local and must be observed by either port.
+  let row=doc! {"_id":ObjectId::parse_str(ID).unwrap(),"name":"fixture",
+      "status":"paused","isRemote":true};
+  let archive=OriginalOperationsRuntime{binding:&binding,observer:None};
+  let pause=OriginalPauseRuntime{
+    common:OriginalOperationsRuntime{binding:&binding,observer:None},
+    budget:StopBudget::Cli,
+  };
+  let snapshot=root.join("fixture-ps-stdout");
+  for (inventory,state) in [("1 0 launchd\n","stopped"),
+        ("43 1 python3\n","live"), ("malformed inventory\n","error")] {
+   std::fs::write(&snapshot,inventory).unwrap();
+   std::fs::write(root.join("psutil.py"),r#"
+class Error(Exception): pass
+class NoSuchProcess(Error): pass
+class Process:
+    def __init__(self, pid): assert pid == 43
+    def create_time(self): return 10.0
+    def cmdline(self): return ['python3', '-m', 'backend.mongodb.mongo_datum', '--alpha_filename=fixture']
+    def is_running(self): return True
+"#).unwrap();
+   for observed in [
+       PauseRuntime::inspect_generation(&pause,root,&row).await,
+       OperationsRuntime::inspect_generation(&archive,root,&row).await,
+   ] {
+    match (state,observed) {
+     ("stopped",Ok(GenerationProcesses::Stopped)) => (),
+     ("live",Ok(GenerationProcesses::Live(reason))) => assert!(reason.contains("exact collection")),
+     ("error",Err(error)) => assert!(error.contains("inventory malformed"),"{error}"),
+     (expected,actual) => panic!("expected {expected}, got {actual:?}"),
+    }
+   }
+  }
  }
  #[tokio::test] async fn real_facade_original_checker_early_mode_and_leaf_fake_os_close_empty_generation(){
   let fake=actual_checker_fixture();
@@ -134,15 +220,58 @@ fi
   let result=controller.reconcile_generation_for_list(&s.row()).await.unwrap();assert!(result.changed,"{:?}",result.diagnostic);
   assert_eq!(s.row().get_str("status").unwrap(),"pending");assert_eq!(s.writes.lock().unwrap().len(),1);
  }
+ #[tokio::test]
+ async fn unknown_from_real_generate_then_explicit_retry_through_original_checker() {
+  let fake=actual_checker_fixture();
+  let root=Path::new(&fake.config.env.working_dir);
+  let bin=root.join("bin");
+  let writer=bin.join("uv");
+  // Only writer process effects are faked. The first attempt writes its claim,
+  // then the final summary fails (ambiguous/partial collection).
+  std::fs::write(&writer,"#!/bin/sh\nprintf '%s\\n' \"$@\" >> writer.argv\n").unwrap();
+  let environment:quantnight_task_core::operations_runtime::OperationalEnvironment=serde_json::from_value(serde_json::json!({"values":{"PATH":format!("{}:/usr/bin:/bin",bin.display())}})).unwrap();
+  let binding=validate_backend_binding(&fake.config).await.unwrap();
+  let mut partial=Store::new();partial.generation_total=Some(3);let mut row=partial.row();row.insert("status","pending");row.remove("generation");
+  *partial.row.lock().unwrap()=Some(row);
+  *partial.summary_error.lock().unwrap()=Some("database disconnected after partial write".into());
+  let partial=Arc::new(partial);
+  let controller=TaskControl::with_store(binding,partial.clone());
+  let mut request=GenerateRequest::new("fixture");request.expected_task_id=Some(ID.into());
+  let failed=quantnight_task_core::operations_runtime::with_environment(Some(environment.clone()),controller.generate(&request,None)).await;
+  assert_eq!(failed.value["generationStatus"],"generation_failed","{}",failed.value);
+  let old=partial.row();
+  assert_eq!(old.get_document("generation").unwrap().get_str("phase"),Ok("generation_failed"));
+  assert!(!partial.calls.lock().unwrap().iter().any(|c|c=="update_items"));
+  assert!(!old.contains_key("generatedAt"));
+  assert_eq!(std::fs::read_to_string(root.join("writer.argv")).unwrap().lines().filter(|l|*l=="backend.mongodb.mongo_datum").count(),1);
+  // A late visible orphan keeps the same generation and must launch nothing.
+  std::fs::write(root.join("fixture-ps-stdout"),"43 1 python3\n").unwrap();
+  std::fs::write(root.join("psutil.py"),"class Error(Exception): pass\nclass NoSuchProcess(Error): pass\nclass Process:\n def __init__(self,pid): assert pid==43\n def create_time(self): return 10.0\n def cmdline(self): return ['python3','-m','backend.mongodb.mongo_datum','--alpha_filename','fixture']\n def is_running(self): return True\n").unwrap();
+  let blocked=quantnight_task_core::operations_runtime::with_environment(Some(environment.clone()),controller.generate(&request,None)).await;
+  assert!(blocked.value["error"].as_str().unwrap().contains("still present"),"{}",blocked.value);
+  assert_eq!(partial.row(),old);
+  assert_eq!(partial.writes.lock().unwrap().len(),2);
+  // Next explicit attempt after the orphan exits observes no writer. Preserve
+  // the same task ID, retain the old rows via the default non-replace argv.
+  std::fs::write(root.join("fixture-ps-stdout"),"1 0 launchd\n").unwrap();
+  *partial.summary_error.lock().unwrap()=None;
+  let out=quantnight_task_core::operations_runtime::with_environment(Some(environment),controller.generate(&request,None)).await;
+  assert_eq!(out.exit_code,0,"{}",out.value);
+  let row=partial.row();assert_eq!(row.get("_id"),old.get("_id"));
+  assert_eq!(row.get_str("status"),Ok("ready"));
+  assert_ne!(row.get("generation"),old.get("generation"));
+  let writer_argv=std::fs::read_to_string(root.join("writer.argv")).unwrap();
+  assert_eq!(writer_argv.lines().filter(|l|*l=="backend.mongodb.mongo_datum").count(),2);
+  assert!(!writer_argv.contains("--replace"));
+ }
  #[tokio::test] async fn adapter_rejects_foreign_duplicate_malformed_and_nonzero_observation(){
-  for output in [observation("stopped").replace(ID,"1123456789abcdef01234567"),observation("stopped").replace("g1","foreign"),observation("stopped").replace("42000","42001"),observation("stopped").replace("false","true"),observation("unknown-state"),format!("{}{}",observation("stopped"),observation("stopped")),"echo malformed".into(),format!("{}\necho unverified >&2",observation("stopped")),format!("{}\nexit 23",observation("stopped"))]{let fake=fixture(&output);let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());let controller=TaskControl::with_store(binding,s.clone());assert!(controller.reconcile_generation_for_list(&s.row()).await.is_err());assert!(s.writes.lock().unwrap().is_empty());assert!(!s.calls.lock().unwrap().iter().any(|c|c=="has_rows"));}
+  for output in [observation("writer_absent").replace(ID,"1123456789abcdef01234567"),observation("writer_absent").replace("fixture\"","foreign\""),observation("writer_absent").replace("false","true"),observation("unknown-state"),format!("{}{}",observation("writer_absent"),observation("writer_absent")),"echo malformed".into(),format!("{}\necho unverified >&2",observation("writer_absent")),format!("{}\nexit 23",observation("writer_absent"))]{let fake=fixture(&output);let binding=validate_backend_binding(&fake.config).await.unwrap();let s=Arc::new(Store::new());let controller=TaskControl::with_store(binding,s.clone());assert!(controller.reconcile_generation_for_list(&s.row()).await.is_err());assert!(s.writes.lock().unwrap().is_empty());assert!(!s.calls.lock().unwrap().iter().any(|c|c=="has_rows"));}
  }
  #[cfg(target_os="macos")]
  #[tokio::test]
  async fn same_live_host_generation_ended_after_failed_final_cas_recovers_only_with_original_empty_writer_proof(){
-  let pid=std::process::id();
-  for (process_state,nonempty,expected,tag_fault) in [("writer_absent",false,"pending","none"),("writer_absent",true,"generation_unknown","none"),("live",false,"generating","none"),("unverified",false,"generating","none"),("unverified",false,"generating","legacy"),("unverified",false,"generating","birth"),("unverified",false,"generating","instance")] {
-   let body=format!("printf '%s\\n' \"$@\" > observed.argv\nprintf '%s\\n' 'QUANTNIGHT_GENERATION_OBSERVED {{\"schemaVersion\":1,\"taskId\":\"{ID}\",\"taskName\":\"fixture\",\"generationId\":\"TOKEN\",\"producerPid\":{pid},\"remote\":false,\"state\":\"{process_state}\",\"reason\":\"original writer inventory fact\"}}'\n");
+  for (process_state,nonempty,expected,tag_fault) in [("writer_absent",false,"pending","none"),("writer_absent",true,"pending","none"),("live",false,"generating","none"),("unverified",false,"generating","none"),("writer_absent",false,"pending","legacy"),("writer_absent",false,"pending","birth"),("writer_absent",false,"pending","instance")] {
+   let body=format!("printf '%s\\n' \"$@\" > observed.argv\nprintf '%s\\n' 'QUANTNIGHT_GENERATION_OBSERVED {{\"schemaVersion\":1,\"taskId\":\"{ID}\",\"taskName\":\"fixture\",\"remote\":false,\"state\":\"{process_state}\",\"reason\":\"original writer inventory fact\"}}'\n");
    let fake=fixture(&body);let root=Path::new(&fake.config.env.working_dir);let binding=validate_backend_binding(&fake.config).await.unwrap();
    let mut memory=Store::new();memory.reject_finish.store(true,Ordering::Relaxed);memory.has=Ok(nonempty);let mut row=memory.row();row.insert("status","pending");row.remove("generation");row.insert("events",vec![doc!{"id":"created","command":"create","status":"pending","at":"2026-10-01T00:00:00+00:00","detail":{}}]);*memory.row.lock().unwrap()=Some(row);
    let memory=Arc::new(memory);let mut controller=TaskControl::with_store(binding,memory.clone());
@@ -153,13 +282,12 @@ fi
    assert_eq!(result.value["generationReconciliationUnconfirmed"],true);let mut observed=memory.row();assert_eq!(observed.get_str("status").unwrap(),"generating");
    assert_eq!(observed.get_document("generation").unwrap().get_document("controlOwner").unwrap(),&tag);
    if tag_fault!="none"{let generation=observed.get_document_mut("generation").unwrap();match tag_fault{"legacy"=>{generation.remove("controlOwner");},"birth"=>{generation.get_document_mut("controlOwner").unwrap().insert("startedMicros",-1);},_=>{generation.get_document_mut("controlOwner").unwrap().insert("instanceId","other");}}*memory.row.lock().unwrap()=Some(observed.clone());}
-   let token=observed.get_document("generation").unwrap().get_str("id").unwrap();std::fs::write(root.join("scripts/check_tmux_python.sh"),body.replace("TOKEN",token)).unwrap();
    memory.reject_finish.store(false,Ordering::Relaxed);let before=memory.writes.lock().unwrap().len();
    let recovered=&memory;
    let refresh=controller.reconcile_generation_for_list(&observed).await.unwrap();assert_eq!(recovered.row().get_str("status").unwrap(),expected);
    assert_eq!(refresh.changed,process_state=="writer_absent");
-   let args=std::fs::read_to_string(root.join("observed.argv")).unwrap();if tag_fault=="none"{assert!(args.contains("--inspect-generation-writers"));}else{assert!(!args.contains("--inspect-generation-writers"));assert!(args.contains("--inspect-generation"));}
-   if process_state=="writer_absent"{assert_eq!(recovered.writes.lock().unwrap().len(),before+1);assert_eq!(recovered.writes.lock().unwrap().last().unwrap().get("generation"),observed.get("generation"));}
+   let args=std::fs::read_to_string(root.join("observed.argv")).unwrap();assert!(args.contains("--inspect-generation-writers"));
+   if process_state=="writer_absent"{assert_eq!(recovered.writes.lock().unwrap().len(),before+1);assert_eq!(recovered.writes.lock().unwrap().last().unwrap().get_str("generation.id"),observed.get_document("generation").unwrap().get_str("id"));}
   }
  }
  #[cfg(target_os="macos")]
@@ -169,7 +297,6 @@ fi
   // The original producer PID is present, not assumed dead. The actual
   // writer-only original checker must not conflate that host with a writer.
   std::fs::write(root.join("psutil.py"),format!("class Error(Exception): pass\nclass NoSuchProcess(Error): pass\nclass Process:\n def __init__(self,pid):\n  if pid!={}: raise NoSuchProcess(pid)\n def status(self): return 'running'\n",std::process::id())).unwrap();
-  std::fs::write(root.join("bin/ps"),"#!/bin/sh\necho scanned >> os-scan\necho '1 0 launchd'\n").unwrap();
   std::fs::write(root.join("bin/uv"),"#!/bin/sh\necho unexpected > writer-launched\nexit 97\n").unwrap();
   let python=std::env::var("QUANTNIGHT_TEST_PYTHON").expect("original prepared interpreter required");
   std::fs::write(root.join(".venv/bin/python"),format!(r#"#!/bin/sh
@@ -178,6 +305,7 @@ if [ "$3" = backend.mongodb.mongo_config ]; then
 else
  for arg in "$@"; do [ "$arg" != --inspect-generation-writers ] || echo writer_only >> checker-mode; done
  export PATH="$PWD/bin:$PATH"
+ export PYTHONPATH="$PWD"
  exec '{python}' "$@"
 fi
 "#)).unwrap();
@@ -188,7 +316,7 @@ fi
   let observed=memory.row();assert_eq!(observed.get_str("status").unwrap(),"generating");assert_eq!(quantnight_task_core::task_control::hosted_generation_test_support::scope_active(&controller,&observed),Some(false));
   assert_eq!(observed.get_document("generation").unwrap().get("producerPid"),Some(&Bson::Int32(std::process::id() as i32)));
   let result=controller.reconcile_generation_for_list(&observed).await.unwrap();assert!(result.changed,"{:?}",result.diagnostic);assert_eq!(memory.row().get_str("status").unwrap(),"pending");
-  assert_eq!(memory.writes.lock().unwrap().len(),2);assert_eq!(memory.writes.lock().unwrap().last().unwrap().get("generation"),observed.get("generation"));
+  assert_eq!(memory.writes.lock().unwrap().len(),2);assert_eq!(memory.writes.lock().unwrap().last().unwrap().get_str("generation.id"),observed.get_document("generation").unwrap().get_str("id"));
   assert_eq!(std::fs::read_to_string(root.join("checker-mode")).unwrap(),"writer_only\n");assert_eq!(std::fs::read_to_string(root.join("os-scan")).unwrap(),"scanned\n");assert!(!root.join("writer-launched").exists());
  }
 
@@ -203,7 +331,7 @@ fi
    2=>{events[0].as_document_mut().unwrap().insert("at","2026-10-02T00:00:00+00:00");},
    _=>{events.insert(1,Bson::Document(doc!{"command":"generation-finish","status":"generation_failed","at":"2026-10-01T00:00:00+00:00","detail":{"generationId":"old"}}));}
   }
- }let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(out.changed);assert_eq!(s.row().get_str("status").unwrap(),"generation_unknown");assert!(s.row().get_str("lastError").unwrap().contains("previous_status_unverified"));}
+ }let out=core::reconcile_generation_for_list(&root.0,&s,&r,&s.row()).await.unwrap();assert!(out.changed);assert_eq!(s.row().get_str("status").unwrap(),"pending");assert_eq!(s.row().get_document("generation").unwrap().get_str("phase"),Ok("generation_failed"));}
 }
 
 // Sanitized history is emitted by the actual watch coordinator/update writer,
@@ -289,8 +417,8 @@ mod watch_history_review {
               }
             }
             let out=core::reconcile_generation_for_list(&root.0,&store,&Runtime::stopped(),&store.row()).await.unwrap();
-            assert!(out.changed);let row=out.task.unwrap();assert_eq!(row.get_str("status"),Ok("generation_unknown"),"mode {mode}");
-            assert!(row.get_str("lastError").unwrap().contains("previous_status_unverified"));
+            assert!(out.changed);let row=out.task.unwrap();assert_eq!(row.get_str("status"),Ok("pending"),"mode {mode}");
+            assert_eq!(row.get_document("generation").unwrap().get_str("phase"),Ok("generation_failed"),"mode {mode}");
         }
     }
 

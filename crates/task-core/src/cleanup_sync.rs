@@ -3,7 +3,7 @@
 use crate::{
     lifecycle_policy as policy,
     mission_lock::MissionLocks,
-    task_store::{id_projection, receipt_projection, CollectionSummary, Host, TaskStore},
+    task_store::{id_projection, CollectionSummary, Host, TaskStore},
 };
 use async_trait::async_trait;
 use bson::{doc, oid::ObjectId, Bson, Document};
@@ -29,6 +29,11 @@ pub trait OperationsRuntime: Send + Sync {
         task: &Document,
         host: Host,
     ) -> Result<(), String>;
+    /// Stop the exact task's current activity using the same owner as pause.
+    /// The caller holds the mission lock through the subsequent archive.
+    async fn stop_for_archive(
+        &self, _root: &Path, _store: &dyn TaskStore, _task: &Document, _guard: &MissionLocks,
+    ) -> Result<(), String> { Err("task stop is unavailable on this runtime".into()) }
     /// Original stop owner's read-only reconciliation; never sends stop signals.
     async fn verify_stopped(&self, _root: &Path, _task: &Document,
         _remaining: std::time::Duration) -> Result<Option<crate::pause::StopOutput>, String> { Ok(None) }
@@ -100,7 +105,10 @@ fn task_id(task: &Document) -> Result<ObjectId, String> {
     task.get_object_id("_id")
         .map_err(|_| "task must retain its original ObjectId".into())
 }
-fn task_host(task: &Document) -> Result<Host, String> {
+pub(crate) fn archive_namespace(name: &str, id: ObjectId) -> String {
+    format!("{name}__archive_{}", id.to_hex())
+}
+pub(crate) fn task_host(task: &Document) -> Result<Host, String> {
     match task.get("isRemote") {
         None | Some(Bson::Null) | Some(Bson::Boolean(false)) => Ok(Host::Local),
         Some(Bson::Boolean(true)) => Ok(Host::Remote),
@@ -122,7 +130,7 @@ fn validate_task(task: &Document, name: &str, expected: Option<&str>) -> Result<
             return Err("task identity changed before mutation".into());
         }
     }
-    policy::assert_observation_closed(task)
+    Ok(())
 }
 async fn task(
     store: &dyn TaskStore,
@@ -143,69 +151,30 @@ async fn task(
         .find_task(Host::Local, doc! {"name": name}, true)
         .await
 }
-// Additional snapshot fences protect malformed/legacy writers that forget to
-// advance updatedAt. They only reject stale mutations; no new state is invented.
 fn binding(name: &str, expected: &Document, command: &str) -> Result<Document, String> {
-    let mut query = policy::task_binding_query(name, expected, command)?;
-    for field in [
-        "acceptedObservation",
-        "targetRemote",
-        "generation",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "stopConfirmationBasis",
-        "launchAttemptAt",
-        "launchSettledAttemptId",
-    ] {
-        query.insert(
-            field,
-            expected
-                .get(field)
-                .cloned()
-                .unwrap_or_else(|| Bson::Document(doc! {"$exists": false})),
-        );
-    }
-    Ok(query)
+    policy::task_binding_query(name, expected, command)
 }
 async fn bound(store: &dyn TaskStore, name: &str, expected: &Document) -> Result<(), String> {
     let current = task(store, name, true)
         .await?
         .ok_or("task disappeared before mutation")?;
-    for field in [
-        "_id",
-        "status",
-        "isRemote",
-        "updatedAt",
-        "tmuxContext",
-        "launchAttemptId",
-        "acceptedObservation",
-        "stopConfirmedAt",
-        "stopConfirmedRemote",
-        "stopConfirmedTaskId",
-        "launchAttemptAt",
-        "launchSettledAttemptId",
-    ] {
+    for field in binding(name, expected, "sync")?.keys() {
         if current.get(field) != expected.get(field) {
             return Err("task identity/state changed before mutation".into());
         }
     }
-    policy::assert_observation_closed(&current)
+    Ok(())
 }
 fn validate_claim(original: &Document, claimed: &Document, status: &str) -> Result<(), String> {
     if claimed.get_str("status").ok() != Some(status) {
         return Err("task claim status changed before mutation".into());
     }
-    for field in original.keys().chain(claimed.keys()) {
-        if !["status", "updatedAt", "events"].contains(&field.as_str())
-            && original.get(field) != claimed.get(field)
-        {
-            return Err(format!(
-                "task claim binding changed before mutation: {field}"
-            ));
+    for field in ["_id", "name", "isRemote", "targetRemote", "generation", "launchAttemptId"] {
+        if original.get(field) != claimed.get(field) {
+            return Err(format!("task claim binding changed before mutation: {field}"));
         }
     }
-    policy::assert_observation_closed(claimed)
+    Ok(())
 }
 fn event(command: &str, status: &str, detail: &Value) -> Result<Document, String> {
     Ok(
@@ -267,7 +236,6 @@ async fn remote_identity(
     store: &dyn TaskStore,
     name: &str,
     expected: &Document,
-    reject_running: bool,
 ) -> Result<Option<Document>, String> {
     let other = store
         .find_task(
@@ -280,13 +248,6 @@ async fn remote_identity(
         if other.get("_id") != expected.get("_id") {
             return Err("same-name remote task has different identity; refusing mutation".into());
         }
-        other
-            .get_str("status")
-            .map_err(|_| "malformed remote task status".to_string())?;
-        if reject_running && other.get_str("status").ok() == Some("running") {
-            return Err("remote task state conflicts with initial sync".into());
-        }
-        policy::assert_observation_closed(other)?;
     }
     Ok(other)
 }
@@ -332,13 +293,27 @@ async fn sync_inner(
         .await?
         .ok_or("sync requires a ready/paused task")?;
     validate_task(&original, name, expected_task_id)?;
+    if original.get_str("status").ok() == Some("deleting") {
+        return Err("archive incomplete; repeat delete for this task ID".into());
+    }
+    // A committed initial sync moved this exact ID from local to remote.
+    // Read back its outcome even if the original request still expects local;
+    // this exception never authorizes writes on a stale host selection.
+    if original.get_bool("isRemote") == Ok(true)
+        && original.get_bool("targetRemote") == Ok(true)
+        && original.get_str("syncedAt").is_ok_and(|stamp| !stamp.is_empty())
+        && (expected_remote != Some(false) || expected_task_id.is_some())
+    {
+        if let Some(digest) = original.get_str("syncedDigest").ok().filter(|digest| !digest.is_empty()) {
+            return Ok(json!({"alreadySynced":true, "taskId":task_id(&original)?.to_hex(), "remote":true, "digest":digest}));
+        }
+    }
     if expected_remote.is_some_and(|expected| Some(expected) != original.get_bool("isRemote").ok()) {
         return Err("original execution host changed before locked sync".into());
     }
-    if !matches!(original.get_str("status").ok(), Some("ready" | "paused")) {
-        return Err(
-            "sync requires a ready/paused task; reconcile generation or launch first".into(),
-        );
+    let continuing = original.get_str("status").ok() == Some("syncing");
+    if !continuing && !matches!(original.get_str("status").ok(), Some("ready" | "paused")) {
+        return Err("sync needs prepared local data; generate the task first".into());
     }
     if original.get_bool("isRemote").ok() != Some(false)
         || original.get_bool("targetRemote").ok() != Some(true)
@@ -357,8 +332,9 @@ async fn sync_inner(
     }
     let local = summary_value(&local_summary);
     store.ping(Host::Remote).await?;
-    remote_identity(store, name, &original, true).await?;
-    if store.has_rows(Host::Remote, name).await? {
+    remote_identity(store, name, &original).await?;
+    let populated = store.has_rows(Host::Remote, name).await?;
+    if populated && !continuing {
         return Err("execution destination is not empty; resume in place, never overwrite".into());
     }
     // The only full-payload read: these exact rows are the actual copy source.
@@ -374,27 +350,38 @@ async fn sync_inner(
         }
     }
     let source_digest = digest(&source)?;
-    bound(store, name, &original).await?;
-    update(
-        store,
-        name,
-        &original,
-        "sync-begin",
-        doc! {"status": "syncing"},
-        json!({}),
-    )
-    .await?;
-    let claimed = task(store, name, false)
-        .await?
-        .ok_or("sync claim missing before copy")?;
-    validate_claim(&original, &claimed, "syncing")?;
-    validate_task(&claimed, name, expected_task_id)?;
-    for batch in source.chunks(100) {
+    let mut missing = source.iter().map(|row| Ok((id_text(row)?, row)))
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
+    if missing.len() != source.len() {
+        return Err("local sync source has ambiguous item IDs".into());
+    }
+    if populated {
+        // Only an interrupted copy can reach this path. Read every already
+        // copied row and compare its full value; never overwrite a row or
+        // infer a match from a count. A lost insert reply is thus reentrant.
+        for row in store.rows(Host::Remote, name, None).await? {
+            let key = id_text(&row)?;
+            if missing.remove(&key) != Some(&row) {
+                return Err("remote copy contains a different item; nothing was overwritten".into());
+            }
+        }
+    }
+    let claimed = if continuing {
+        original.clone()
+    } else {
+        bound(store, name, &original).await?;
+        update(store, name, &original, "sync-begin", doc! {"status": "syncing"}, json!({})).await?;
+        let claimed = task(store, name, false).await?.ok_or("sync claim missing before copy")?;
+        validate_claim(&original, &claimed, "syncing")?;
+        validate_task(&claimed, name, expected_task_id)?;
+        claimed
+    };
+    let to_copy = source.iter().filter(|row| id_text(row).is_ok_and(|id| missing.contains_key(&id)))
+        .cloned().collect::<Vec<_>>();
+    for batch in to_copy.chunks(100) {
         bound(store, name, &claimed).await?;
-        remote_identity(store, name, &claimed, true).await?;
-        store
-            .insert_rows(Host::Remote, name, batch.to_vec())
-            .await?;
+        remote_identity(store, name, &claimed).await?;
+        store.insert_rows(Host::Remote, name, batch.to_vec()).await?;
     }
     let remote_summary = store.summary(Host::Remote, name).await?;
     let remote = summary_value(&remote_summary);
@@ -414,7 +401,7 @@ async fn sync_inner(
             "remote verification failed: local={local} remote={remote}"
         ));
     }
-    remote_identity(store, name, &claimed, true).await?;
+    remote_identity(store, name, &claimed).await?;
     update(
         store,
         name,
@@ -452,8 +439,8 @@ fn new_receipt(name: &str, task: &Document, remote: bool) -> Result<Value, Strin
         json!({"schemaVersion": 1, "task": name, "taskId": task_id(task)?.to_hex(), "at": now(), "remote": remote,
         "localDeleted": false, "remoteDeleted": if remote { Value::Bool(false) } else { Value::Null },
         "controlHidden": false, "canonicalResultsDeleted": false, "itemsPreserved": true,
-        "localArchive": null, "remoteArchive": null, "unresolvedItemCount": 0,
-        "receiptAssessmentUnknownCount": 0, "platformRequestsCancelled": false,
+        "localArchive": null, "remoteArchive": null, "unresolvedItemCount": null,
+        "receiptAssessmentUnknownCount": null, "platformRequestsCancelled": false,
         "capacityReleased": false, "taskConfig": wire_document(&config)}),
     )
 }
@@ -542,278 +529,159 @@ pub async fn delete(
     delete_with_expected_host(root, store, runtime, name, expected_task_id, None).await
 }
 
-struct ArchiveStopVerifier<'a>(&'a dyn OperationsRuntime);
-#[async_trait]
-impl crate::pause::PauseRuntime for ArchiveStopVerifier<'_> {
-    async fn stop(&self, _: &Path, _: &Document, _: bool) -> Result<crate::pause::StopOutput, String> {
-        Err("archive verify-only cannot send stop signals".into())
+fn archive_target(name: &str, record: &Document) -> Result<Document, String> {
+    Ok(doc! {
+        "name": name,
+        "_id": task_id(record)?,
+        "isRemote": record.get("isRemote").cloned().unwrap_or(Bson::Null),
+        "status": {"$ne": "deactive"},
+    })
+}
+
+async fn assert_archive_target(store: &dyn TaskStore, name: &str, original: &Document) -> Result<(), String> {
+    let current = task(store, name, false).await?.ok_or("task disappeared before archive")?;
+    if task_id(&current)? != task_id(original)? || task_host(&current)? != task_host(original)? {
+        return Err("task execution host or identity changed before archive; no rename on the new target".into());
     }
-    async fn confirm_stopped_scope(&self,root:&Path,store:&dyn TaskStore,task:&Document,remaining:std::time::Duration)->Result<(),String>{
-        self.0.confirm_stopped_scope(root,store,task,remaining).await
+    Ok(())
+}
+
+async fn archive_control_update(
+    store: &dyn TaskStore, host: Host, name: &str, original: &Document,
+    fields: Document, command: &str, detail: &Value,
+) -> Result<(), String> {
+    let status = fields.get_str("status").unwrap_or("ok");
+    let audit = event(command, status, detail)?;
+    let matched = store.update_task(host, archive_target(name, original)?,
+        doc! {"$set": fields, "$push": {"events": audit}}).await?;
+    if matched != 1 {
+        return Err("task or execution host changed during archive; retry delete for the original task".into());
     }
-    async fn verify_stopped(&self, root: &Path, task: &Document, remaining: std::time::Duration)
-        -> Result<Option<crate::pause::StopOutput>, String> {
-        self.0.verify_stopped(root, task, remaining).await
-    }
-    async fn inspect_generation(
-        &self,
-        root: &Path,
-        task: &Document,
-    ) -> Result<crate::create_generate::GenerationProcesses, String> {
-        self.0.inspect_generation(root, task).await
-    }
+    Ok(())
 }
 
 pub async fn delete_with_expected_host(
     root: &Path, store: &dyn TaskStore, runtime: &dyn OperationsRuntime,
     name: &str, expected_task_id: Option<&str>, expected_remote: Option<bool>,
 ) -> TaskOutcome {
-    if let Err(error) = policy::validate_name(name) {
-        return outcome(
-            "delete",
-            name,
-            false,
-            json!({"errorType": "ValueError", "error": error}),
-        );
-    }
-    let _lock = match MissionLocks::acquire(root, &[name], false) {
-        Ok(lock) => lock,
-        Err(error) => return failure("delete", name, error),
-    };
-    let mut original = match task(store, name, true).await {
-        Ok(Some(task)) => task,
-        Ok(None) if expected_task_id.is_none() => {
-            return outcome("delete", name, true, json!({"alreadyDeleted": true}))
-        }
-        Ok(None) => {
-            return failure(
-                "delete",
-                name,
-                "expected task not found; cannot confirm deletion",
-            )
-        }
-        Err(error) => return failure("delete", name, error),
-    };
-    // Invalid identity must not overwrite a same-name task's receipt file.
-    if let Err(error) = validate_task(&original, name, expected_task_id) {
-        return failure("delete", name, error);
-    }
-    let host = match task_host(&original) {
-        Ok(host) => host,
-        Err(error) => return failure("delete", name, error),
-    };
-    if expected_remote.is_some_and(|expected| expected != host.is_remote()) {
-        return failure("delete", name, "original execution host changed before locked cleanup");
-    }
-    let unknown_generation_stopped = original.get_str("status").ok() == Some("generation_unknown")
-        && crate::create_generate::verify_unknown_generation_stopped_with(&original, || {
-            runtime.inspect_generation(root, &original)
-        })
-        .await
-        .is_ok();
-    if original.get_str("status").ok() != Some("deactive")
-        && !policy::stop_confirmation_valid(&original, host.is_remote())
-        && (!matches!(original.get_str("status").ok(), Some("generating"|"generation_unknown"|"syncing"|"deleting"))
-            || unknown_generation_stopped) {
-        let stopped = crate::pause::pause_locked(root, store, &ArchiveStopVerifier(runtime), name,
-            crate::pause::PauseOptions { expected_task_id, expected_remote: Some(host.is_remote()),
-                expected_launch_attempt_id: original.get_str("launchAttemptId").ok(), observer: None, ..Default::default() },
-            &_lock, tokio::time::Instant::now() + std::time::Duration::from_secs(12),
-            crate::pause::StopIntent::VerifyOnly).await;
-        if stopped.exit_code != 0 {
-            return outcome("delete", name, false, json!({"errorType":"RuntimeError",
-                "error":"current valid stop confirmation unavailable after original verify-only",
-                "stopReconciliation":stopped.value,"requiredAction":"inspect_original_stop_result"}));
-        }
-        let prior=original.clone();
-        original = match task(store, name, false).await {
-            Ok(Some(current)) => current,
-            Ok(None) => return failure("delete", name, "task disappeared after stop verification"),
-            Err(error) => return failure("delete", name, error),
-        };
-        if ["_id","launchAttemptId","startupBinding","isRemote","taskType","auth_profile","generation","acceptedObservation","runId","startConfig","mission_config","config","templatefile"].iter()
-            .any(|key|original.get(*key)!=prior.get(*key))
-            || original.get_str("updatedAt").ok()!=stopped.value["controlRevision"].as_str()
-            || original.get_str("status").ok()!=Some("paused") {
-            return failure("delete",name,"original stop snapshot replaced before archive; successor not adopted");
-        }
-        if let Err(error) = validate_task(&original, name, expected_task_id) { return failure("delete", name, error); }
-        if task_host(&original).ok() != Some(host) { return failure("delete", name, "host changed after stop verification"); }
-    }
-    let path = receipt_path(root, name);
-    let mut receipt = match new_receipt(name, &original, host.is_remote()) {
-        Ok(receipt) => receipt,
-        Err(error) => return failure("delete", name, error),
-    };
-    if let Err(error) = preserve_previous_receipt(&path, &mut receipt) {
-        return failure("delete", name, error);
-    }
-    receipt["receiptPath"] = json!(path.to_string_lossy());
-    let result = delete_inner(root, store, runtime, name, &original, host, &mut receipt).await;
+    let result = delete_locked_entry(root, store, runtime, name, expected_task_id, expected_remote).await;
     match result {
-        Ok(()) => receipt["ok"] = json!(true),
-        Err(error) => {
-            receipt["ok"] = json!(false);
-            receipt["errorType"] = json!("RuntimeError");
-            receipt["error"] = json!(error);
-        }
-    }
-    if let Err(error) = persist_receipt(&path, &receipt) {
-        receipt["ok"] = json!(false);
-        receipt["errorType"] = json!("RuntimeError");
-        if receipt.get("error").is_none() {
-            receipt["error"] = json!(error);
-        }
-        receipt["receiptWriteError"] = json!(error);
-    }
-    let ok = receipt["ok"] == true;
-    receipt["receiptPath"] = json!(path.to_string_lossy());
-    if ok {
-        outcome(
-            "delete",
-            name,
-            true,
-            json!({"receiptPath": path.to_string_lossy(), "localDeleted": true,
-            "remoteDeleted": receipt["remoteDeleted"], "controlHidden": true, "canonicalResultsDeleted": false, "itemsPreserved": true,
-            "taskId": receipt["taskId"], "remote": receipt["remote"],
-            "localArchive": receipt["localArchive"], "remoteArchive": receipt["remoteArchive"],
-            "unresolvedItemCount": receipt["unresolvedItemCount"],
-            "receiptAssessmentUnknownCount": receipt["receiptAssessmentUnknownCount"],
-            "platformRequestsCancelled": false, "capacityReleased": false}),
-        )
-    } else {
-        outcome("delete", name, false, receipt)
+        Ok((ok, fields)) => outcome("delete", name, ok, fields),
+        Err(error) => failure("delete", name, error),
     }
 }
-async fn delete_inner(
-    root: &Path,
-    store: &dyn TaskStore,
-    runtime: &dyn OperationsRuntime,
-    name: &str,
-    original: &Document,
-    host: Host,
-    receipt: &mut Value,
-) -> Result<(), String> {
-    let unknown_generation_live = original.get_str("status").ok() == Some("generation_unknown")
-        && crate::create_generate::verify_unknown_generation_stopped_with(original, || {
-            runtime.inspect_generation(root, original)
-        })
-        .await
-        .is_err();
-    if matches!(
-        original.get_str("status").ok(),
-        Some("generating" | "launching" | "syncing" | "running")
-    ) || unknown_generation_live
-    {
-        receipt["requiredAction"] = json!(if matches!(original.get_str("status").ok(),
-            Some("generating" | "generation_unknown" | "syncing")) {
-            "reconcile_generation_or_sync"
-        } else { "pause" });
-        return Err(
-            "pause/reconcile generation or running/unconfirmed consumer before delete".into(),
-        );
-    }
-    if crate::start::launch_attempt_unsettled(original) {
-        receipt["requiredAction"]=json!("reconcile_original_launcher");
-        return Err("original launcher remains unresolved after pause; preserve active items and attempt".into());
-    }
-    if !policy::stop_confirmation_valid(original, host.is_remote()) {
-        receipt["requiredAction"] = json!("pause");
-        return Err("current valid stop confirmation required before delete".into());
-    }
-    runtime.assert_consumer_absent(root, original, host).await?;
-    bound(store, name, original).await?;
-    receipt["localBefore"] = summary_value(&store.summary(Host::Local, name).await?);
-    store.ping(host).await?;
-    if host == Host::Remote {
-        remote_identity(store, name, original, false).await?;
-    }
-    let archive = format!("{name}__archive_{}", task_id(original)?.to_hex());
-    let names = store.collection_names(host).await?;
-    let active_exists = names.iter().any(|n| n == name);
-    let archived_exists = names.iter().any(|n| n == &archive);
-    if active_exists && archived_exists {
-        return Err("both active and archived collections exist; reconcile before cleanup".into());
-    }
-    let evidence_name = if !active_exists && archived_exists {
-        archive.as_str()
+
+async fn delete_locked_entry(
+    root: &Path, store: &dyn TaskStore, runtime: &dyn OperationsRuntime,
+    name: &str, expected_task_id: Option<&str>, expected_remote: Option<bool>,
+) -> Result<(bool, Value), String> {
+    policy::validate_name(name)?;
+    let guard = MissionLocks::acquire(root, &[name], false)?;
+    let expected_id = expected_task_id.map(ObjectId::parse_str).transpose()
+        .map_err(|_| "invalid expected task ObjectId")?;
+    // An explicit old identity may return its archive without targeting a new
+    // live same-name task. A name-only call continues to resolve the active task.
+    let original = if let Some(id) = expected_id {
+        store.find_task(Host::Local, doc! {"_id": id, "name": name}, true).await?
     } else {
-        name
+        task(store, name, true).await?
     };
-    let rows = store
-        .rows(host, evidence_name, Some(receipt_projection()))
-        .await?;
-    // Archive is a namespace rename, not request resolution. Count execution
-    // items (not distinct platform simulations); malformed receipt metadata is
-    // retained as opaque unresolved evidence. Only this diagnostic assessment
-    // tolerates classification errors: control/IO/identity gates still fail.
-    let mut unresolved = 0_u64;
-    let mut assessment_unknown = 0_u64;
-    for row in &rows {
-        match policy::checked_unresolved_execution_row(row) {
-            Ok(false) => (),
-            Ok(true) => unresolved += 1,
-            Err(_) => {
-                unresolved += 1;
-                assessment_unknown += 1;
-            }
+    let original = match original {
+        Some(record) => record,
+        None if expected_id.is_none() => return Ok((true, json!({"alreadyDeleted": true}))),
+        None => return Err("expected task not found; no task was stopped or archived".into()),
+    };
+    if original.get_str("name").ok() != Some(name)
+        || expected_id.is_some_and(|id| task_id(&original).ok() != Some(id))
+    {
+        return Err("task identity changed before archive".into());
+    }
+    let host = task_host(&original)?;
+    if expected_remote.is_some_and(|expected| expected != host.is_remote()) {
+        return Err("task execution host changed before archive".into());
+    }
+    if original.get_str("status").ok() == Some("deactive") {
+        // A committed archive is the result of a previous delete, not a
+        // precondition to run pause again (possibly against a successor).
+        let mut fields = original.get_document("cleanup").map(wire_document).unwrap_or_else(|_| {
+            json!({"taskId":task_id(&original).map(|id| id.to_hex()).ok(), "remote":host.is_remote(), "controlHidden":true})
+        });
+        fields["alreadyDeleted"] = json!(true);
+        return Ok((true, fields));
+    }
+    let path = receipt_path(root, name);
+    let mut receipt = new_receipt(name, &original, host.is_remote())?;
+    // A prior report is optional context, never an archive prerequisite.
+    let preserve_report = match preserve_previous_receipt(&path, &mut receipt) {
+        Ok(()) => true,
+        Err(error) => {
+            receipt["previousReceiptWarning"] = json!(error);
+            false
+        }
+    };
+    receipt["receiptPath"] = if preserve_report { json!(path.to_string_lossy()) } else { Value::Null };
+    let result = delete_inner(root, store, runtime, name, &original, host, &guard, &mut receipt).await;
+    let ok = result.is_ok();
+    receipt["ok"] = json!(ok);
+    if let Err(error) = result {
+        receipt["errorType"] = json!("RuntimeError");
+        receipt["error"] = json!(error);
+    }
+    // If the final task update succeeded, loss of a redundant file does not
+    // turn a completed rename into a failure (the DB holds the same receipt).
+    if preserve_report {
+        if let Err(error) = persist_receipt(&path, &receipt) {
+            receipt["receiptWriteError"] = json!(error);
+            receipt["receiptPath"] = Value::Null;
         }
     }
-    receipt["unresolvedItemCount"] = json!(unresolved);
-    receipt["receiptAssessmentUnknownCount"] = json!(assessment_unknown);
-    let research = runtime
-        .archive_research(root, original, host, evidence_name)
-        .await?;
-    if !research.is_null() || receipt.get("researchArchive").is_none() {
-        receipt["researchArchive"] = research;
+    Ok((ok, receipt))
+}
+
+async fn delete_inner(
+    root: &Path, store: &dyn TaskStore, runtime: &dyn OperationsRuntime,
+    name: &str, original: &Document, host: Host, guard: &MissionLocks, receipt: &mut Value,
+) -> Result<(), String> {
+    let touch_remote = host == Host::Remote || original.get_str("status").ok() == Some("syncing");
+    let archive = archive_namespace(name, task_id(original)?);
+    // Guard the intended namespaces before signalling anything. An absent
+    // remote registration is fine; a same-name different task is not ours.
+    if touch_remote {
+        remote_identity(store, name, original).await?;
     }
-    update(
-        store,
-        name,
-        original,
-        "delete-begin",
-        doc! {"status": "deleting"},
-        json!({}),
-    )
-    .await?;
-    let claimed = task(store, name, true)
-        .await?
-        .ok_or("cleanup claim missing before archive")?;
-    validate_claim(original, &claimed, "deleting")?;
-    if host == Host::Remote {
-        let other = remote_identity(store, name, &claimed, false).await?;
-        bound(store, name, &claimed).await?;
-        receipt["remoteArchive"] =
-            json!(archive_collection(store, Host::Remote, name, &archive).await?);
-        receipt["remoteDeleted"] = json!(true);
-        if let Some(other) = other {
-            let matched = store
-                .update_task(
-                    Host::Remote,
-                    binding(name, &other, "delete")?,
-                    doc! {"$set": {"status": "deactive", "deletedAt": now(), "updatedAt": now()}},
-                )
-                .await?;
-            if matched != 1 {
-                return Err("remote control changed; archive retained, cleanup incomplete".into());
-            }
+    runtime.stop_for_archive(root, store, original, guard).await?;
+    // Keep partial cleanup intent recoverable through the original delete.
+    // This is set only after stopping and doesn't depend on a historical phase.
+    if original.get_str("status").ok() != Some("deleting") {
+        archive_control_update(store, Host::Local, name, original,
+            doc! {"status":"deleting", "updatedAt": now()}, "delete-begin", &json!({})).await?;
+    }
+    assert_archive_target(store, name, original).await?;
+    if touch_remote {
+        let current_remote = remote_identity(store, name, original).await?;
+        // A remote archive in an earlier call can leave no active control row.
+        // Use the current exact row, not the snapshot read before stopping.
+        let archived_remote = archive_collection(store, Host::Remote, name, &archive).await?;
+        let had_remote_control = current_remote.is_some();
+        receipt["remoteArchive"] = json!(archived_remote);
+        if let Some(other) = current_remote {
+            archive_control_update(store, Host::Remote, name, &other,
+                doc! {"status":"deactive", "deletedAt":now(), "updatedAt":now()}, "delete", &json!({})).await?;
         }
+        if host == Host::Remote || archived_remote.is_some() || had_remote_control {
+            receipt["remoteDeleted"] = json!(true);
+        }
+        assert_archive_target(store, name, original).await?;
     }
-    bound(store, name, &claimed).await?;
     receipt["localArchive"] = json!(archive_collection(store, Host::Local, name, &archive).await?);
     receipt["localDeleted"] = json!(true);
+    // No full item scan or research callback on delete. The retained namespace
+    // and task identity support explicit archive-research independently.
     let mut complete = receipt.clone();
     complete["controlHidden"] = json!(true);
     let cleanup = bson::to_bson(&complete).map_err(|e| e.to_string())?;
-    update(
-        store,
-        name,
-        &claimed,
-        "delete",
-        doc! {"status": "deactive", "deletedAt": now(), "cleanup": cleanup},
-        complete,
-    )
-    .await?;
+    archive_control_update(store, Host::Local, name, original,
+        doc! {"status":"deactive", "deletedAt":now(), "updatedAt":now(), "cleanup":cleanup}, "delete", &complete).await?;
     receipt["controlHidden"] = json!(true);
     Ok(())
 }

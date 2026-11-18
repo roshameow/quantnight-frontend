@@ -148,5 +148,5 @@ test('session absent card keeps long historical business error inside the closed
   assert.doesNotMatch(html, /<details[^>]*\sopen(?:[=>\s])/);
   assert.match(html.slice(html.indexOf('</summary>')), /simulation_task_error/);
   assert.match(html.slice(html.indexOf('</summary>')), /ValueError during operation/);
-  assert.match(html.slice(0, html.indexOf('<details')), /已暂停/);
+  assert.match(html.slice(0, html.indexOf('<details')), /tmux会话缺失/);
 });

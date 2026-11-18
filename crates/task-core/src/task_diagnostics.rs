@@ -1223,9 +1223,11 @@ printf '%s\n' '{"schemaVersion":1,"command":"validate-task-control-binding","ok"
         "state":"unverified","consumerRunning":true,"identityVerified":false,"ownedResidue":false,"explicitPauseVerified":true});
         let absent = serde_json::json!({"schemaVersion":1,"taskName":name,"remote":remote,
         "state":"session_absent","consumerRunning":false,"identityVerified":false,"ownedResidue":false});
+        let gen_absent = serde_json::json!({"schemaVersion":1,"taskId":task.get_object_id("_id").unwrap().to_hex(),"taskName":name,"remote":false,"state":"writer_absent","reason":"fixture"});
         fs::write(root.join("scripts/check_tmux_python.sh"), format!(
-        "set -eu\n[ \"$1\" = {name} ] && [ \"$2\" = {host} ] && [ \"$3\" = --inspect-execution ] && [ \"$4\" = --binding ] || {{ echo wrong-inspect-route >> VIOLATIONS; exit 97; }}\necho inspect >> stop-calls\nif [ -e stopped ]; then printf '%s\\n' {absent}; else printf '%s\\n' {active}; fi\n",
+        "set -eu\nif [ \"${{3-}}\" = --inspect-generation-writers ]; then\n  [ \"$1\" = {name} ] && [ \"$2\" = false ] && [ \"$4\" = --binding ] || {{ echo wrong-gen-route >> VIOLATIONS; exit 97; }}\n  printf '%s\\n' {gen_absent}\n  exit 0\nfi\n[ \"$1\" = {name} ] && [ \"$2\" = {host} ] && [ \"$3\" = --inspect-execution ] && [ \"$4\" = --binding ] || {{ echo wrong-inspect-route >> VIOLATIONS; exit 97; }}\necho inspect >> stop-calls\nif [ -e stopped ]; then printf '%s\\n' {absent}; else printf '%s\\n' {active}; fi\n",
         name=quote(name),host=quote(if remote {"true"} else {"false"}),
+        gen_absent=quote(&format!("QUANTNIGHT_GENERATION_OBSERVED {gen_absent}")),
         active=quote(&format!("QUANTNIGHT_EXECUTION_OBSERVED {active}")),
         absent=quote(&format!("QUANTNIGHT_EXECUTION_OBSERVED {absent}")))).unwrap();
         let binding = validate_backend_binding(&fake.config).await.unwrap();
@@ -2039,10 +2041,7 @@ mod task_stage_diagnostics_tests {
                 filter.get_document("updatedAt").unwrap(),
                 &doc! {"$exists":false}
             );
-            assert_eq!(
-                filter.get_document("acceptedObservation").unwrap(),
-                &doc! {"$exists":false}
-            );
+            assert!(!filter.contains_key("acceptedObservation"));
             assert_eq!(
                 update
                     .get_document("$set")
@@ -2249,10 +2248,7 @@ mod session_absent_v2_tests {
                         filter.get_str("updatedAt").unwrap(),
                         "original-control-revision"
                     );
-                    assert_eq!(
-                        filter.get_str("launchAttemptId").unwrap(),
-                        "original-launch"
-                    );
+                    assert!(!filter.contains_key("launchAttemptId"));
                     assert_eq!(filter.get_bool("isRemote").unwrap(), remote);
                     let set = update.get_document("$set").unwrap();
                     assert_eq!(
@@ -2421,23 +2417,19 @@ mod session_absent_v2_tests {
         )
         .await;
         let (filter, update) = &route.writes[0];
-        for key in [
-            "status",
-            "isRemote",
-            "updatedAt",
-            "launchAttemptId",
-            "generation",
-            "stopConfirmedAt",
-        ] {
+        for key in ["_id", "name", "status", "isRemote", "updatedAt"] {
             assert_eq!(filter.get(key), original.get(key));
         }
         for key in [
+            "launchAttemptId",
+            "generation",
+            "stopConfirmedAt",
             "startedAt",
             "stopConfirmationBasis",
             "stopConfirmedTaskId",
             "acceptedObservation",
         ] {
-            assert_eq!(filter.get_document(key).unwrap(), &doc! {"$exists":false});
+            assert!(!filter.contains_key(key), "unexpected CAS key {key}");
         }
         let set = update.get_document("$set").unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(set.get_str("updatedAt").unwrap()).is_ok());

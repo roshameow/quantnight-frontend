@@ -101,7 +101,7 @@ test('real reactive card retries only on click, hides previous error during new 
     view.click('生成中'); assert.equal(events.length, 1);
     props.task = failed({ status: 'generating', generation: { id: 'attempt-new', phase: 'writing' } });
     props.generationBusy = false; await nextTick();
-    assert.equal(view.button('生成中').props.disabled, true);
+    assert.equal(view.button('重新生成').props.disabled, false);
     assert.doesNotMatch(view.text(), /generation_failed|writer exited/);
     props.task = failed({ status: 'ready', generation: { id: 'attempt-new', phase: 'complete' } });
     await nextTick();
@@ -112,13 +112,15 @@ test('real reactive card retries only on click, hides previous error during new 
   } finally { view.stop(); }
 });
 
-test('legacy failure stays visible, unknown exposes regenerate/delete while keeping sync/pause disabled and no arbitrary lastError creates failure', async () => {
+test('legacy failure stays visible, unknown exposes native regenerate/delete/sync/pause and no arbitrary lastError creates failure', async () => {
   const props = reactive({ task: task({ status: 'generation_failed', lastError: 'legacy cause' }) });
   const events = [];
   const view = mount(() => h(card, {
     ...props,
     onGenerateList: () => events.push('generate'),
     onDelete: () => events.push('delete'),
+    onPause: () => events.push('pause'),
+    onSyncRemote: () => events.push('sync'),
   }));
   try {
     assert.match(view.text(), /生成失败（generation_failed）.*legacy cause/);
@@ -129,10 +131,10 @@ test('legacy failure stays visible, unknown exposes regenerate/delete while keep
     assert.doesNotMatch(view.text(), /生成失败（generation_failed）/);
     assert.equal(view.button('重新生成').props.disabled, false);
     assert.equal(view.button('删除').props.disabled, false);
-    assert.equal(view.button('发送到远程').props.disabled, true);
-    assert.equal(view.button('暂停').props.disabled, true);
-    view.click('重新生成'); view.click('删除');
-    assert.deepEqual(events, ['generate', 'delete']);
+    assert.equal(view.button('发送到远程').props.disabled, false);
+    assert.equal(view.button('暂停').props.disabled, false);
+    view.click('重新生成'); view.click('删除'); view.click('发送到远程'); view.click('暂停');
+    assert.deepEqual(events, ['generate', 'delete', 'sync', 'pause']);
     events.length = 0;
     for (const status of ['pending', 'ready']) {
       props.task = task({ status, lastError: 'old unrelated cause' }); await nextTick();

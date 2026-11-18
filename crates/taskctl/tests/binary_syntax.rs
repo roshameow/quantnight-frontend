@@ -30,6 +30,11 @@ fn actual_binary_all_command_help_needs_no_config_runtime_or_python() {
         "delete",
         "results",
         "collect-results",
+        "alphas",
+        "alpha-pnl",
+        "datasets",
+        "datafields",
+        "submission-stats",
     ] {
         let out = run(&[
             "--app-config",
@@ -162,4 +167,92 @@ fn qn_shim_prefix_management_help_needs_no_binding_or_admission(){
 fn stopped_observation_is_status_only_readonly_flag_and_help_stays_early(){
     let help=run(&["runtime-status","--stopped-observation","--binding","/nonexistent/fixture","--help"]);assert!(help.status.success());assert!(String::from_utf8(help.stdout).unwrap().contains("--stopped-observation"));
     for args in [vec!["runtime-status","--stopped-observation"],vec!["runtime-status","--binding","/fixture/binding","--stopped-observation","--stopped-observation"],vec!["runtime-drain","--binding","/fixture/binding","--stopped-observation"],vec!["runtime-host","--binding","/fixture/binding","--stopped-observation"]]{let output=run(&args);assert_eq!(output.status.code(),Some(2));let value:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value["ok"],false);}
+}
+
+#[test]
+fn business_and_management_help_explain_intent_and_failure_without_opening_a_runtime() {
+    for (args, fragments) in [
+        (vec!["--help"], vec!["Usage: taskctl", "create -> generate -> start", "unconfirmed"]),
+        (vec!["start", "--help"], vec!["--config JSON", "use watch, not start"]),
+        (vec!["delete", "--help"], vec!["--expected-task-id", "archived, not physically purged"]),
+        (vec!["runtime-drain", "--help"], vec!["--generation EXACT", "Accepted operations finish"]),
+        (vec!["runtime-plan", "--help"], vec!["--metadata-only", "Does not write or activate enrollment"]),
+        (vec!["runtime-host", "--help"], vec!["Internal launchd entry point"]),
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stderr.is_empty());
+        let help = String::from_utf8(output.stdout).unwrap();
+        for fragment in fragments { assert!(help.contains(fragment), "{help}"); }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn enrolled_runtime_status_reports_missing_and_refused_socket_without_fallback() {
+    use quantnight_task_core::runtime::{identity, RuntimeSelection};
+    use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::Path};
+
+    let root = Path::new("/private/tmp").join(format!("qnr-{}", &identity::nonce().unwrap()[..8]));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    fs::create_dir(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let binding_path = root.join("binding.json");
+    let frontend = root.join("frontend");
+    let backend = root.join("backend");
+    let home = root.clone(); // Keep the Unix socket pathname below the macOS limit.
+    fs::create_dir_all(frontend.join("crates/target/debug")).unwrap();
+    let write = |path: &Path, value: serde_json::Value| {
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    for checkout in [&frontend, &backend] {
+        fs::create_dir_all(checkout.join(".quantnight")).unwrap();
+        write(&checkout.join(".quantnight/taskctl-selection.json"), serde_json::json!({
+            "schema_version": 1, "mode": "dev", "binding": binding_path
+        }));
+    }
+    write(&binding_path, serde_json::json!({
+        "schema_version": 2, "frontend_root": frontend, "backend_root": backend,
+        "executable": frontend.join("unused-gui"), "target": "aarch64-apple-darwin", "profile": "debug",
+        "runtime": {
+            "executable": frontend.join("crates/target/debug/taskctl"), "protocol_version": 1,
+            "configuration": {"kind": "backend_root", "path": backend}
+        }
+    }));
+    let child = || {
+        Command::new(env!("CARGO_BIN_EXE_taskctl"))
+            .args(["runtime-status", "--binding"]).arg(&binding_path)
+            .env_clear().env("HOME", &home).env("PATH", "/nonexistent-taskctl-fixture")
+            .output().unwrap()
+    };
+    let assert_failure = |out: Output, class: &str, stage: &str| {
+        assert_eq!(out.status.code(), Some(1), "{:?}", out.stderr);
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["transport"]["class"], class, "{value}");
+        assert_eq!(value["transport"]["stage"], stage);
+        assert_eq!(value["transport"]["execution"], "not_sent");
+    };
+    assert_failure(child(), "runtime_socket", "connect");
+    let selected = RuntimeSelection::from_binding(&binding_path).unwrap();
+    // Use the original planner to derive the slot in the child's private HOME,
+    // avoiding any path copy/guess or writes to the user's enrollment.
+    let plan = Command::new(env!("CARGO_BIN_EXE_taskctl"))
+        .args(["runtime-plan", "--metadata-only", "--binding"]).arg(&binding_path)
+        .env_clear().env("HOME", &home)
+        .output().unwrap();
+    assert!(plan.status.success(), "{:?}", plan.stderr);
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan["selection"]["binding_revision"], selected.binding_revision);
+    let socket = std::path::PathBuf::from(plan["paths"]["socket"].as_str().unwrap());
+    assert!(socket.starts_with(&home), "test must never touch the real runtime slot");
+    let dir = socket.parent().unwrap();
+    fs::create_dir_all(dir).unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(listener); // Native pathname exists, but no process is listening.
+    assert_failure(child(), "connect", "connect");
 }

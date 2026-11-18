@@ -553,23 +553,7 @@ async fn normal_stop_preserves_cli_gui_fields_stage_hook_and_native_cas_fences()
         let d = store.0.lock().unwrap();
         assert_eq!(d.writes.len(), 1);
         let (q, _) = &d.writes[0];
-        for field in [
-            "_id",
-            "status",
-            "isRemote",
-            "updatedAt",
-            "launchAttemptId",
-            "launchAttemptAt",
-            "startedAt",
-            "generation",
-            "startupBinding",
-            "tmuxContext",
-            "stopConfirmedAt",
-            "stopConfirmedRemote",
-            "stopConfirmedTaskId",
-            "stopConfirmationBasis",
-            "acceptedObservation",
-        ] {
+        for field in ["_id", "name", "status", "isRemote", "updatedAt"] {
             assert!(q.contains_key(field), "{field}");
         }
         assert!(
@@ -601,23 +585,10 @@ async fn ready_without_full_history_never_claims_never_started() {
 
 #[tokio::test]
 async fn guard_failures_prevent_stop_and_original_flock_is_shared() {
-    for status in ["generating", "generation_unknown", "syncing"] {
-        let mut t = normal();
-        t.insert("status", status);
-        let s = Memory::new(t, None);
-        let r = Runtime::new(&s, false);
-        failed(run(&s, &r, &Root::new()).await, "candidate generation");
-        assert!(r.calls.lock().unwrap().is_empty());
-        s.no_write();
-    }
-    for field in ["id", "launch", "host", "observer"] {
+    for field in ["id", "launch", "host"] {
         let s = Memory::new(normal(), None);
         let r = Runtime::new(&s, false);
         let root = Root::new();
-        if field == "observer" {
-            s.0.lock().unwrap().tasks.get_mut(&Host::Local).unwrap()[0]
-                .insert("acceptedObservation", doc! {"finishedAt":Bson::Null});
-        }
         let out = pause::pause(
             &root.0,
             &s,
@@ -655,9 +626,6 @@ async fn script_receipt_and_cas_errors_never_confirm_or_retry() {
         "cas",
         "write-timeout",
         "task-id",
-        "launch",
-        "startup",
-        "observer",
     ] {
         let s = Memory::new(normal(), None);
         let mut r = Runtime::new(&s, false);
@@ -678,296 +646,76 @@ async fn script_receipt_and_cas_errors_never_confirm_or_retry() {
 }
 
 #[tokio::test]
-async fn positive_history_runs_two_complete_inventories_on_each_relevant_host() {
+async fn explicit_stop_ignores_stale_history_and_preserves_receipts_on_both_hosts() {
     for remote in [false, true] {
-        let s = Memory::new(generated("ready", remote), Some(items()));
-        let r = Runtime::new(&s, remote);
-        let out = run(&s, &r, &Root::new()).await;
-        assert_eq!(out.exit_code, 0, "{}", out.value);
-        assert_eq!(*r.calls.lock().unwrap(), vec![true]);
-        let d = s.0.lock().unwrap();
-        for host in if remote {
-            vec!["local", "remote"]
-        } else {
-            vec!["local"]
-        } {
-            assert_eq!(
-                d.calls
-                    .iter()
-                    .filter(|v| v.as_str() == format!("items:{host}"))
-                    .count(),
-                2
-            );
-            assert_eq!(
-                d.calls
-                    .iter()
-                    .filter(|v| v.as_str() == format!("controls:{host}"))
-                    .count(),
-                2
-            );
-            assert_eq!(
-                d.calls
-                    .iter()
-                    .filter(|v| v.as_str() == format!("capability:{host}"))
-                    .count(),
-                2
-            );
-        }
-        for q in &d.queries {
-            match q.get_str("op").unwrap() {
-                "controls" => {
-                    assert_eq!(q.get_i32("limit").unwrap(), 2);
-                    assert_eq!(q.get("projection"), Some(&Bson::Null));
-                }
-                "capability" => {
-                    assert_eq!(q.get_document("projection").unwrap(), &doc! {"_id":1});
-                    assert_eq!(q.get_document("filter").unwrap(), &doc! {"task":NAME});
-                }
-                "items" => {
-                    assert_eq!(q.get("limit"), Some(&Bson::Null));
-                    assert_eq!(q.get("projection"), Some(&Bson::Null));
-                    assert_eq!(q.get_i64("returned").unwrap(), 2);
-                }
-                _ => panic!(),
-            }
+        for status in ["pending", "ready", "running", "launching", "generating", "generation_unknown", "syncing"] {
+            let mut task = generated("ready", remote);
+            task.extend(doc! {"status":status,"startupBinding":{"consumer_run_id":"old-binding"},
+                "simulatorRuntime":{"consumer_run_id":"different-old-run"},"launchAttemptId":"old-launch",
+                "launchSettledAttemptId":Bson::Null,"stopConfirmedAt":"stale","acceptedObservation":{"id":"abandoned"}});
+            let rows = vec![doc! {"_id":"accepted","status":"processing","acceptance":"ACCEPTED","progressUrl":"retained"}];
+            let store = Memory::new(task, Some(rows.clone()));
+            let runtime = Runtime::new(&store, remote);
+            let root = Root::new();
+            let out = run(&store, &runtime, &root).await;
+            assert_eq!(out.exit_code, 0, "{remote}/{status}: {}", out.value);
+            let first_expected = if matches!(status, "generating" | "generation_unknown") {
+                "pending"
+            } else {
+                "paused"
+            };
+            assert_eq!(out.value["taskStatus"], first_expected);
+            assert_eq!(store.task().get_str("status"), Ok(first_expected));
+            let again = run(&store, &runtime, &root).await;
+            assert_eq!(again.exit_code, 0, "{remote}/{status}: {}", again.value);
+            assert_eq!(*runtime.calls.lock().unwrap(), vec![false, false]);
+            let d = store.0.lock().unwrap();
+            assert!(d.queries.is_empty(), "no historical inventory gates");
+            assert_eq!(d.items[&Host::from_remote(remote)], rows);
+            assert_eq!(d.tasks[&Host::Local][0].get_str("status"), Ok("paused"));
         }
     }
 }
 
 #[tokio::test]
-async fn pending_prepared_and_failed_history_require_actual_inventory_not_status() {
-    for task in [
-        pending(),
-        generated("pending", false),
-        generated("generation_failed", false),
-    ] {
-        let s = Memory::new(task, None);
-        let r = Runtime::new(&s, false);
-        let out = run(&s, &r, &Root::new()).await;
-        assert_eq!(out.exit_code, 0, "{}", out.value);
-        assert_eq!(*r.calls.lock().unwrap(), vec![true]);
-        assert_eq!(
-            s.0.lock()
-                .unwrap()
-                .calls
-                .iter()
-                .filter(|v| v.as_str() == "items:local")
-                .count(),
-            2
-        );
-    }
-    let s = Memory::new(generated("generation_failed", false), Some(items()));
-    let r = Runtime::new(&s, false);
-    failed(
-        run(&s, &r, &Root::new()).await,
-        "failed generation has items",
-    );
-    assert!(r.calls.lock().unwrap().is_empty());
-    for rows in [None, Some(vec![]), Some(vec![items()[0].clone()])] {
-        let s = Memory::new(generated("ready", false), rows);
-        let r = Runtime::new(&s, false);
-        failed(
-            run(&s, &r, &Root::new()).await,
-            "count is not positively verified",
-        );
-        assert!(r.calls.lock().unwrap().is_empty());
-    }
-}
-
-#[tokio::test]
-async fn both_host_control_ambiguity_capability_and_io_fail_closed_before_script() {
-    for side in [Host::Local, Host::Remote] {
-        for fault in [
-            "duplicate",
-            "wrong-id",
-            "bad-history",
-            "capability",
-            "ping",
-            "controls",
-            "capability-io",
-            "names",
-            "items",
-        ] {
-            let s = Memory::new(generated("ready", true), Some(items()));
-            {
-                let mut d = s.0.lock().unwrap();
-                match fault {
-                    "duplicate" => {
-                        let mut t = d.tasks[&side][0].clone();
-                        t.insert(
-                            "_id",
-                            ObjectId::parse_str("000000000000000000000000").unwrap(),
-                        );
-                        d.tasks.get_mut(&side).unwrap().extend([t.clone(), t]);
-                    }
-                    "wrong-id" if side == Host::Remote => {
-                        d.tasks.get_mut(&side).unwrap()[0].insert("_id", ObjectId::new());
-                    }
-                    "bad-history" if side == Host::Remote => {
-                        d.tasks.get_mut(&side).unwrap()[0].insert("events", Bson::Array(vec![]));
-                    }
-                    "wrong-id" => {
-                        d.control_patch.insert(side, doc! {"_id":ObjectId::new()});
-                    }
-                    "bad-history" => {
-                        d.control_patch.insert(side, doc! {"events":[]});
-                    }
-                    "capability" => {
-                        d.caps.insert(side,vec![doc!{"_id":"old","task":NAME,"heartbeatAt":DateTime::from_millis(1),"payload":"must not project"}]);
-                    }
-                    "capability-io" => d.fail = Some(format!("capability:{}", label(side))),
-                    _ => d.fail = Some(format!("{fault}:{}", label(side))),
-                }
-            }
-            let r = Runtime::new(&s, true);
-            let out = run(&s, &r, &Root::new()).await;
-            assert_eq!(out.exit_code, 1, "{side:?}:{fault}:{}", out.value);
-            assert!(r.calls.lock().unwrap().is_empty(), "{fault}");
-            s.no_write();
-            if fault == "capability" {
-                let d = s.0.lock().unwrap();
-                let q = d
-                    .queries
-                    .iter()
-                    .find(|q| {
-                        q.get_str("op").ok() == Some("capability")
-                            && q.get_str("host").ok() == Some(label(side))
-                    })
-                    .unwrap();
-                assert_eq!(q.get_document("result").unwrap(), &doc! {"_id":"old"});
-            }
+async fn live_or_uninspectable_scope_refuses_before_signalling() {
+    use quantnight_task_core::pause::PauseRuntime;
+    struct ScopeError(&'static str);
+    #[async_trait]
+    impl PauseRuntime for ScopeError {
+        async fn inspect_before_stop(&self, _: &Path, _: &dyn TaskStore, _: &Document, _: std::time::Duration)
+            -> Result<Option<serde_json::Value>, String> {
+            Err(self.0.into())
+        }
+        async fn stop(&self, _: &Path, _: &Document, _: bool) -> Result<StopOutput, String> {
+            panic!("must not send stop to an unconfirmed scope or active writer")
         }
     }
-    let s = Memory::new(generated("ready", true), Some(items()));
-    s.0.lock().unwrap().tasks.remove(&Host::Remote);
-    let r = Runtime::new(&s, true);
-    assert_eq!(
-        run(&s, &r, &Root::new()).await.exit_code,
-        0,
-        "original permits absent remote registration if all actual items match"
-    );
-}
-
-#[tokio::test]
-async fn illegal_initial_or_receipt_evidence_rejects_before_stop_not_fallback() {
-    let patches = [
-        doc! {"_id":"string-id"},
-        doc! {"status":"processing"},
-        doc! {"runId":"other"},
-        doc! {"acceptance":"UNKNOWN"},
-        doc! {"_not_posted_":true,"progressUrl":"accepted"},
-        doc! {"terminalStatus":""},
-        doc! {"_not_posted_":1},
-        doc! {"errorClass":[]},
-        doc! {"heartbeatAt":0},
-        doc! {"attemptCounter":0},
-        doc! {"borrowed":false},
-        doc! {"continuationSources":[{}]},
-        doc! {"responseBody":"prior"},
-        doc! {"refine_campaign_id":"old"},
-        doc! {"result":{"fitness":2}},
-        doc! {"submissionAttempts":[{}]},
-    ];
-    for patch in patches {
-        let mut rows = items();
-        rows[1].extend(patch.clone());
-        let s = Memory::new(generated("ready", false), Some(rows));
-        let r = Runtime::new(&s, false);
-        let out = run(&s, &r, &Root::new()).await;
-        assert_eq!(out.exit_code, 1, "{patch:?}:{}", out.value);
-        assert!(r.calls.lock().unwrap().is_empty());
-        s.no_write();
+    for reason in ["active generation writer", "SSH inspection failed", "foreign current task"] {
+        let store = Memory::new(normal(), None);
+        let out = pause::pause(&Root::new().0, &store, &ScopeError(reason), NAME, PauseOptions::default()).await;
+        failed(out, reason);
+        store.no_write();
     }
 }
 
 #[tokio::test]
-async fn complete_second_snapshot_rejects_control_receipt_payload_and_capability_changes() {
-    for change in [
-        "task-id",
-        "launch",
-        "observer",
-        "token",
-        "old-event",
-        "capability",
-        "ambiguous",
-        "item-add",
-        "item-remove",
-        "receipt",
-        "payload",
-        "type",
-        "empty-type",
-        "nested",
-        "array",
-        "items-error",
-    ] {
+async fn stop_cas_fences_task_identity_but_not_stale_metadata_or_item_updates() {
+    for change in ["task-id", "launch", "observer", "token", "old-event", "capability", "ambiguous",
+        "item-add", "item-remove", "receipt", "payload", "type", "empty-type", "nested", "array", "reorder", "items-error"] {
         let s = Memory::new(generated("ready", false), Some(items()));
         let mut r = Runtime::new(&s, false);
         r.mutate = Some(change);
         let out = run(&s, &r, &Root::new()).await;
-        assert_eq!(out.exit_code, 1, "{change}:{}", out.value);
-        assert_eq!(*r.calls.lock().unwrap(), vec![true]);
-        s.no_write();
+        let changed_execution_target = change == "task-id";
+        assert_eq!(out.exit_code, i32::from(changed_execution_target), "{change}: {}", out.value);
+        assert_eq!(*r.calls.lock().unwrap(), vec![false]);
+        assert!(s.0.lock().unwrap().queries.is_empty());
     }
     let s = Memory::new(generated("ready", true), Some(items()));
     let mut r = Runtime::new(&s, true);
     r.mutate = Some("remote-payload");
-    failed(run(&s, &r, &Root::new()).await, "inventory mismatch");
-    s.no_write();
-    let s = Memory::new(generated("ready", false), Some(items()));
-    let mut r = Runtime::new(&s, false);
-    r.mutate = Some("reorder");
-    let out = run(&s, &r, &Root::new()).await;
-    assert_eq!(
-        out.exit_code, 0,
-        "BSON key/row order is not semantic change:{}",
-        out.value
-    );
-}
-
-#[tokio::test]
-async fn full_digest_preserves_bson_types_bytes_scopes_and_expression_whitespace() {
-    use bson::{spec::BinarySubtype, Binary, JavaScriptCodeWithScope, Timestamp};
-    let mut baseline = items();
-    baseline[0].insert("opaque",doc!{"binary":Bson::Binary(Binary{subtype:BinarySubtype::Generic,bytes:vec![0,1,255]}),"date":DateTime::from_millis(7),"ts":Timestamp{time:1,increment:2},"code":Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope{code:" x ".into(),scope:doc!{"b":2,"a":1}}),"float":0.0});
-    let s = Memory::new(generated("ready", false), Some(baseline.clone()));
-    let task = s.task();
-    let first = pause::never_started_inventory(&s, &task).await.unwrap();
-    for (key, value) in [
-        (
-            "binary",
-            Bson::Binary(Binary {
-                subtype: BinarySubtype::UserDefined(128),
-                bytes: vec![0, 1, 255],
-            }),
-        ),
-        ("date", Bson::DateTime(DateTime::from_millis(8))),
-        (
-            "ts",
-            Bson::Timestamp(Timestamp {
-                time: 1,
-                increment: 3,
-            }),
-        ),
-        (
-            "code",
-            Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
-                code: "x".into(),
-                scope: doc! {"a":1,"b":2},
-            }),
-        ),
-        ("float", Bson::Double(-0.0)),
-    ] {
-        let mut changed = baseline.clone();
-        if let Some(Bson::Document(d)) = changed[0].get_mut("opaque") {
-            d.insert(key, value);
-        }
-        s.0.lock().unwrap().items.insert(Host::Local, changed);
-        assert_ne!(
-            pause::never_started_inventory(&s, &task).await.unwrap(),
-            first,
-            "lost BSON {key}"
-        );
-    }
+    assert_eq!(run(&s, &r, &Root::new()).await.exit_code, 0);
 }
 
 #[test]
@@ -983,90 +731,6 @@ fn task_store_additions_use_original_control_limit_and_capability_projection() {
     assert_eq!(options.max_time, Some(std::time::Duration::from_secs(30)));
     assert_eq!(StopBudget::Cli.seconds(), 60);
     assert_eq!(StopBudget::Gui.seconds(), 75);
-}
-
-#[tokio::test]
-async fn exact_integer_count_and_generation_proof_cannot_be_inferred_from_labels() {
-    for count in [
-        Bson::Int64(2),
-        Bson::Double(2.0),
-        Bson::Boolean(true),
-        Bson::String("2".into()),
-    ] {
-        let mut t = generated("ready", false);
-        t.insert("expectedCount", count);
-        let s = Memory::new(t, Some(items()));
-        let r = Runtime::new(&s, false);
-        failed(
-            run(&s, &r, &Root::new()).await,
-            "count is not positively verified",
-        );
-        assert!(r.calls.lock().unwrap().is_empty());
-    }
-    let mut t = generated("ready", false);
-    // Saved final token cannot erase an unfinished earlier token in event history.
-    let new_begin = doc! {"id":"gen-2","phase":"writing","startedAt":at(4),"producerPid":37};
-    if let Some(Bson::Array(events)) = t.get_mut("events") {
-        events.remove(2);
-        events.push(Bson::Document(event(
-            "generation-begin",
-            "generating",
-            5,
-            new_begin,
-        )));
-        events.push(Bson::Document(event(
-            "generation-finish",
-            "ready",
-            6,
-            doc! {"generationId":"gen-2"},
-        )));
-    }
-    t.insert("generation",doc!{"id":"gen-2","phase":"complete","startedAt":at(4),"finishedAt":at(6),"producerPid":37});
-    assert_eq!(pause::never_started_history(&t), Ok(false));
-    let s = Memory::new(t, Some(items()));
-    let r = Runtime::new(&s, false);
-    assert_eq!(run(&s, &r, &Root::new()).await.exit_code, 0);
-    assert_eq!(*r.calls.lock().unwrap(), vec![false]);
-    assert!(s.0.lock().unwrap().queries.is_empty());
-}
-
-#[tokio::test]
-async fn all_items_are_examined_and_unrelated_old_capability_is_not_a_false_match() {
-    let mut rows = items();
-    for n in 3..=205 {
-        let mut row = rows[0].clone();
-        row.insert("_id", ObjectId::parse_str(&format!("{n:024x}")).unwrap());
-        rows.push(row);
-    }
-    let mut t = generated("ready", false);
-    t.insert("expectedCount", 205);
-    let s = Memory::new(t.clone(), Some(rows.clone()));
-    s.0.lock().unwrap().caps.insert(
-        Host::Local,
-        vec![doc! {"_id":"old","task":"another-task","heartbeatAt":DateTime::from_millis(1)}],
-    );
-    let r = Runtime::new(&s, false);
-    assert_eq!(run(&s, &r, &Root::new()).await.exit_code, 0);
-    let d = s.0.lock().unwrap();
-    let queries: Vec<_> = d
-        .queries
-        .iter()
-        .filter(|q| q.get_str("op").ok() == Some("items"))
-        .collect();
-    assert_eq!(queries.len(), 2);
-    assert!(queries
-        .iter()
-        .all(|q| q.get_i64("returned").unwrap() == 205));
-    drop(d);
-    rows[204].insert("submissionId", "late-accepted");
-    let s = Memory::new(t, Some(rows));
-    let r = Runtime::new(&s, false);
-    failed(
-        run(&s, &r, &Root::new()).await,
-        "dispatch/consumer evidence",
-    );
-    assert!(r.calls.lock().unwrap().is_empty());
-    s.no_write();
 }
 
 #[tokio::test]
@@ -1093,7 +757,23 @@ async fn missing_or_invalid_identity_and_bad_names_do_not_call_runtime() {
 }
 
 #[tokio::test]
-async fn malformed_history_set_values_error_before_stop_but_original_short_circuit_is_retained() {
+async fn pause_normalizes_legacy_intermediate_statuses_after_stop() {
+    for status in ["deleting", "syncing", "launching"] {
+        let root = Root::new();
+        let mut task = normal();
+        task.insert("status", status);
+        let store = Memory::new(task, Some(items()));
+        let runtime = Runtime::new(&store, false);
+        let result = run(&store, &runtime, &root).await;
+        assert_eq!(result.exit_code, 0, "{}", result.value);
+        assert!(result.confirmed_stop.is_some());
+        assert_eq!(result.value["taskStatus"], "paused");
+        assert_eq!(store.task().get_str("status"), Ok("paused"));
+    }
+}
+
+#[tokio::test]
+async fn malformed_historical_labels_are_not_pause_admission_gates() {
     for (field, value) in [
         ("status", Bson::Array(vec![])),
         ("taskType", Bson::Document(doc! {})),
@@ -1102,12 +782,11 @@ async fn malformed_history_set_values_error_before_stop_but_original_short_circu
         task.insert(field, value);
         let store = Memory::new(task, Some(items()));
         let runtime = Runtime::new(&store, false);
-        failed(run(&store, &runtime, &Root::new()).await, "unhashable type");
-        assert!(runtime.calls.lock().unwrap().is_empty());
-        store.no_write();
+        assert_eq!(run(&store, &runtime, &Root::new()).await.exit_code, 0);
+        assert_eq!(*runtime.calls.lock().unwrap(), vec![false]);
     }
-    // Running is ineligible at the first original history check, so the later
-    // malformed taskType is not evaluated or promoted into no-launch proof.
+    // A core fixture whose current runtime can establish scope does not need
+    // historical eligibility. Production still refuses an uninspectable scope.
     let mut task = normal();
     task.insert("taskType", doc! {});
     let store = Memory::new(task, None);
@@ -1196,6 +875,9 @@ async fn public_pause_original_runtime_and_shell_recover_missing_proof_and_lost_
             let runtime = OriginalPauseRuntime { common: OriginalOperationsRuntime { binding:&binding, observer:None }, budget:StopBudget::Cli };
             let mut t=normal(); t.insert("isRemote",remote); t.remove("tmuxContext");t.remove("startupBinding");
             t.insert("taskType","super");t.insert("auth_profile","user1");
+            if !lose_receipt { t.extend(doc! {"status":"launching","launchSettledAttemptId":Bson::Null,
+                "startupBinding":{"consumer_run_id":"older-startup"},"simulatorRuntime":{"consumer_run_id":"older-run"},
+                "acceptedObservation":{"id":"old-observation","finishedAt":Bson::Null}}); }
             original_professional_runtime::install_original_super_process(root,ID,NAME,remote,"launch-1");
             if lose_receipt {t.insert("tmuxContext",doc!{"sessionId":"$4"});}
             let evidence=vec![doc! {"_id":"unresolved","acceptance":"UNKNOWN","superSlotId":"kept","status":"timeout_error"}];
@@ -1216,9 +898,42 @@ async fn public_pause_original_runtime_and_shell_recover_missing_proof_and_lost_
 }
 
 #[tokio::test]
+async fn public_pause_refuses_actual_local_writer_even_for_remote_task_without_generation_metadata() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
+    let fake = original_professional_fixture(false);
+    let root = Path::new(&fake.config.env.working_dir);
+    let ps = root.join("bin/ps");
+    let original = std::fs::read_to_string(&ps).unwrap();
+    std::fs::write(&ps, format!(r#"{original}
+if [[ "$*" == *comm=* ]]; then echo '43 1 python3'; fi
+"#)).unwrap();
+    std::fs::write(root.join("psutil.py"), r#"
+class Error(Exception): pass
+class NoSuchProcess(Error): pass
+class Process:
+ def __init__(self,pid):
+  if pid != 43: raise NoSuchProcess(pid)
+ def create_time(self): return 1700000030.0
+ def cmdline(self): return ['python3','-m','backend.mongodb.mongo_datum','--alpha_filename=fixture']
+ def is_running(self): return True
+"#).unwrap();
+    let mut task = normal();
+    task.insert("isRemote", true);
+    task.remove("generation");
+    let store = Arc::new(Memory::new(task.clone(), Some(items())));
+    let binding = validate_backend_binding(&fake.config).await.unwrap();
+    let control = TaskControl::with_store(binding, store.clone());
+    let out = control.pause(NAME, PauseOptions::default(), StopBudget::Cli, None).await;
+    failed(out, "mongo_datum writer still present");
+    assert_eq!(store.task(), task);
+    store.no_write();
+    assert!(!root.join("trace").exists(), "stop cannot inspect or signal tmux before the live writer is fenced");
+}
+
+#[tokio::test]
 async fn original_pause_never_signals_foreign_identity_or_confirms_known_live_orphan() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::{OriginalOperationsRuntime,OriginalPauseRuntime}};
-    for case in ["foreign_task","wrong_birth","known_live_after_stop"] {
+    for case in ["foreign_task","stale_saved_birth","known_live_after_stop"] {
         let fake=original_professional_fixture(false);let root=Path::new(&fake.config.env.working_dir);
         std::fs::write(root.join("state"),"active").unwrap();
         original_professional_runtime::install_original_super_process(root,if case=="foreign_task"{"ffffffffffffffffffffffff"}else{ID},NAME,false,"launch-1");
@@ -1229,15 +944,21 @@ async fn original_pause_never_signals_foreign_identity_or_confirms_known_live_or
             std::fs::write(p,s).unwrap();
         }
         let mut t=normal();t.remove("tmuxContext");t.remove("startupBinding");t.insert("taskType","super");t.insert("auth_profile","user1");
-        if case=="wrong_birth" {t.insert("simulatorRuntime",doc!{"pid":1002,"pidCreatedAt":1700000999.0,"consumer_run_id":"original-run"});}
+        if case=="stale_saved_birth" {t.insert("simulatorRuntime",doc!{"pid":1002,"pidCreatedAt":1700000999.0,"consumer_run_id":"original-run"});}
         let store=Memory::new(t.clone(),Some(items()));
         let binding=validate_backend_binding(&fake.config).await.unwrap();
         let runtime=OriginalPauseRuntime{common:OriginalOperationsRuntime{binding:&binding,observer:None},budget:StopBudget::Cli};
         let out=pause::pause(root,&store,&runtime,NAME,PauseOptions::default()).await;
-        assert_eq!(out.exit_code,1,"{case}: {}",out.value);
-        assert!(out.confirmed_stop.is_none());store.no_write();assert_eq!(store.task(),t);
+        let stopped = case == "stale_saved_birth";
+        assert_eq!(out.exit_code, i32::from(!stopped), "{case}: {}", out.value);
+        if stopped {
+            assert!(out.confirmed_stop.is_some());
+            assert_eq!(store.task().get_str("status"), Ok("paused"));
+        } else {
+            assert!(out.confirmed_stop.is_none());store.no_write();assert_eq!(store.task(),t);
+        }
         let trace=std::fs::read_to_string(root.join("trace")).unwrap();
-        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(),usize::from(case=="known_live_after_stop"));
+        assert_eq!(trace.lines().filter(|l|l.contains("if-shell")).count(), usize::from(case != "foreign_task"));
         assert!(!trace.contains("new-session"));
     }
 }
@@ -1458,7 +1179,7 @@ explicit_pause_descendant_case!(generic_explicit_pause_priority_local, "priority
 explicit_pause_descendant_case!(generic_explicit_pause_priority_remote, "priority", true);
 
 #[tokio::test]
-async fn generic_explicit_pause_rejects_wrong_requested_and_saved_identity_without_signal() {
+async fn generic_explicit_pause_keeps_exact_caller_identity_but_accepts_fresh_process_scope() {
     use quantnight_task_core::{backend_binding::validate_backend_binding, task_control::TaskControl};
     const ALL_CASES: &[&str] = &["request_task", "request_host", "request_launch", "context_task", "context_host", "context_launch", "session_id", "session_birth"];
     const REP_CASES: &[&str] = &["request_task", "context_host", "session_id"];
@@ -1487,22 +1208,34 @@ async fn generic_explicit_pause_rejects_wrong_requested_and_saved_identity_witho
                 expected_launch_attempt_id:Some(if case=="request_launch" {"replacement-launch"} else {"launch-1"}),
                 ..Default::default()
             }, StopBudget::Cli, None).await;
-            assert_eq!(out.exit_code, 1, "{kind}/{remote}/{case}: {}", out.value);
-            let expected = match case {
-                "request_task" => "task identity changed",
-                "request_host" => "task execution host changed",
-                "request_launch" => "launch identity changed",
-                "session_id" | "session_birth" => "saved context conflicts with observed session",
-                _ => "conflicting saved context",
-            };
-            assert!(out.value["error"].as_str().unwrap().contains(expected), "{case}: {}", out.value);
-            assert!(out.confirmed_stop.is_none());
-            store.no_write();
-            assert_eq!(store.task(), task);
+            // SUPER fixture has a task/host identity in the actual argv,
+            // which supersedes an old saved context. Legacy regular/priority
+            // argv alone cannot adopt a replacement. Explicit caller
+            // mismatches always fail before inspecting/signalling.
+            let refused = case.starts_with("request_") || (kind != "super" && case != "context_launch");
+            assert_eq!(out.exit_code, i32::from(refused), "{kind}/{remote}/{case}: {}", out.value);
             assert_eq!(store.0.lock().unwrap().items[&Host::from_remote(remote)], evidence);
-            assert_eq!(std::fs::read_to_string(root.join("state")).unwrap(), "active");
             let trace = std::fs::read_to_string(root.join("trace")).unwrap_or_default();
-            assert!(!trace.contains("if-shell") && !trace.contains("kill-session") && !trace.contains("new-session"), "{case}: {trace}");
+            if refused {
+                let expected = match case {
+                    "request_task" => "task identity changed",
+                    "request_host" => "task execution host changed",
+                    "request_launch" => "launch identity changed",
+                    "session_id" | "session_birth" => "saved context conflicts with observed session",
+                    _ => "conflicting saved context",
+                };
+                assert!(out.value["error"].as_str().unwrap().contains(expected), "{case}: {}", out.value);
+                assert!(out.confirmed_stop.is_none());
+                store.no_write();
+                assert_eq!(store.task(), task);
+                assert_eq!(std::fs::read_to_string(root.join("state")).unwrap(), "active");
+                assert!(!trace.contains("if-shell") && !trace.contains("kill-session") && !trace.contains("new-session"), "{case}: {trace}");
+            } else {
+                assert!(out.confirmed_stop.is_some());
+                assert_eq!(store.task().get_str("status"), Ok("paused"));
+                assert!(!root.join("state").exists(), "fresh task process scope was stopped");
+                assert_eq!(trace.lines().filter(|line| line.contains("if-shell")).count(), 1);
+            }
         }
     }}
 }
@@ -1552,27 +1285,6 @@ async fn generic_explicit_pause_captured_pane_replacement_and_live_descendant_ne
             assert!(!trace.contains("kill-session") && !trace.contains("new-session"));
         }
     }}
-}
-
-#[test]
-fn never_started_history_contract() {
-    assert_eq!(pause::never_started_history(&pending()), Ok(true));
-    assert_eq!(pause::never_started_history(&generated("ready", false)), Ok(true));
-    assert_eq!(pause::never_started_history(&generated("ready", true)), Ok(true));
-    assert_eq!(pause::never_started_history(&generated("generation_failed", false)), Ok(true));
-    assert_eq!(pause::never_started_history(&normal()), Ok(false));
-
-    let mut started_once = generated("ready", false);
-    started_once.insert("launchAttemptId", "attempt-1");
-    assert_eq!(pause::never_started_history(&started_once), Ok(false));
-
-    let mut non_array_events = pending();
-    non_array_events.insert("events", "not-an-array");
-    assert_eq!(pause::never_started_history(&non_array_events), Ok(false));
-
-    let mut unhashable_status = pending();
-    unhashable_status.insert("status", Bson::Array(vec![]));
-    assert!(pause::never_started_history(&unhashable_status).is_err());
 }
 
 #[tokio::test]
@@ -1643,7 +1355,7 @@ class Process:
             assert!(!root.join("state").exists(), "tmux session must be stopped");
         } else {
             assert_eq!(out.exit_code, 1, "plain interactive shell without tmuxContext must fail closed: {}", out.value);
-            assert!(out.value["error"].as_str().unwrap_or_default().contains("original execution identity unconfirmed"));
+            assert!(out.value["error"].as_str().unwrap_or_default().contains("execution scope unconfirmed"));
             store.no_write();
             task.insert("status", "completed_with_errors");
             assert!(root.join("state").exists(), "foreign session must not be signaled");

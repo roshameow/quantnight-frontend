@@ -7,13 +7,13 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { devInputs, tauriInputIgnore } from '../scripts/dev-inputs.mjs';
 import { enrollmentPlan, writeEnrollment } from '../scripts/dev-registration.mjs';
 
 test('real Tauri 2.4.1 accepts stamp and kills/waits/restarts for Vite external add/change/unlink', { timeout: 55000 }, async () => {
-  const cli = process.env.QUANTNIGHT_TEST_TAURI_CLI;
-  const vite = process.env.QUANTNIGHT_TEST_VITE;
+  const cli = process.env.QUANTNIGHT_TEST_TAURI_CLI || fileURLToPath(new URL('../node_modules/@tauri-apps/cli/tauri.js', import.meta.url));
+  const vite = process.env.QUANTNIGHT_TEST_VITE || fileURLToPath(new URL('../node_modules/vite/dist/node/index.js', import.meta.url));
   assert.ok(cli && path.isAbsolute(cli), 'explicit installed CLI path required');
   assert.ok(vite && path.isAbsolute(vite), 'explicit existing Vite module path required');
   const pkg = JSON.parse(readFileSync(path.join(path.dirname(cli), 'package.json'), 'utf8'));
