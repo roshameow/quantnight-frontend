@@ -130,6 +130,25 @@ fn empty_optional_filters_do_not_add_predicates() {
 }
 
 #[test]
+fn upper_bounds_language_and_classifications_match_former_mcp_history_filters() {
+    let params = query(json!({
+        "max_sharpe": 3.5, "max_fitness": 2.5, "language": " FASTEXPR ",
+        "classifications_in": ["POWER_POOL"]
+    }));
+    assert_eq!(
+        build_alpha_filter(&params),
+        doc! { "$and": [
+            { "classifications": { "$elemMatch": { "id": { "$in": ["POWER_POOL"] } } } },
+            { "is.sharpe": { "$lte": 3.5 } },
+            { "is.fitness": { "$lte": 2.5 } },
+            { "settings.language": "FASTEXPR" },
+        ] }
+    );
+    let ra = query(json!({"alpha_type": "RA", "max_sharpe": 3.5, "max_fitness": 2.5, "language": "  "}));
+    assert_eq!(build_alpha_filter(&ra), doc! { "$and": [{ "type": "RA_PARENT" }] });
+}
+
+#[test]
 fn category_aliases_keep_and_between_categories_and_or_within_aliases() {
     let params =
         query(json!({"self_categories": [" INSTITUTION ", "SHORT_INTEREST", "PV", "A+B"]}));

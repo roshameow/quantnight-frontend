@@ -370,10 +370,16 @@ pub struct AlphaQuery {
     pub min_sharpe: Option<f64>,
     #[serde(default)]
     pub min_fitness: Option<f64>,
+    #[serde(default)]
+    pub max_sharpe: Option<f64>,
+    #[serde(default)]
+    pub max_fitness: Option<f64>,
     pub min_turnover: Option<f64>,
     pub max_turnover: Option<f64>,
     pub min_margin: Option<f64>,
     pub delay: Option<u32>,
+    #[serde(default)]
+    pub language: Option<String>,
     pub min_returns: Option<f64>,
     pub alpha_type: Option<String>,
     pub self_categories: Option<Vec<String>>,
@@ -1313,6 +1319,21 @@ pub fn build_alpha_filter(params: &AlphaQuery) -> Document {
     if let Some(min_fitness) = params.min_fitness {
         if !is_ra_query {
             filters.push(doc! { "is.fitness": { "$gte": min_fitness } });
+        }
+    }
+    if let Some(max_sharpe) = params.max_sharpe {
+        if !is_ra_query {
+            filters.push(doc! { "is.sharpe": { "$lte": max_sharpe } });
+        }
+    }
+    if let Some(max_fitness) = params.max_fitness {
+        if !is_ra_query {
+            filters.push(doc! { "is.fitness": { "$lte": max_fitness } });
+        }
+    }
+    if let Some(language) = &params.language {
+        if !language.trim().is_empty() {
+            filters.push(doc! { "settings.language": language.trim() });
         }
     }
     if let Some(min) = params.min_turnover {

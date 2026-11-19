@@ -449,6 +449,16 @@ fn inspection_paths_and_numeric_values_remain_core_owned() {
         "1.25",
         "--min-fitness",
         "0.9",
+        "--max-sharpe",
+        "3.5",
+        "--max-fitness",
+        "2.5",
+        "--language",
+        "FASTEXPR",
+        "--classifications",
+        "POWER_POOL,ATOM",
+        "--embedding",
+        "umap_code",
         "--category",
         "INSIDER,ANALYST",
         "--sort",
@@ -464,6 +474,14 @@ fn inspection_paths_and_numeric_values_remain_core_owned() {
             assert_eq!(r.alpha_type.as_deref(), Some("REGULAR"));
             assert_eq!(r.min_sharpe, Some(1.25));
             assert_eq!(r.min_fitness, Some(0.9));
+            assert_eq!(r.max_sharpe, Some(3.5));
+            assert_eq!(r.max_fitness, Some(2.5));
+            assert_eq!(r.language.as_deref(), Some("FASTEXPR"));
+            assert_eq!(
+                r.classifications_in,
+                Some(vec!["POWER_POOL".to_string(), "ATOM".to_string()])
+            );
+            assert_eq!(r.embedding.as_deref(), Some("umap_code"));
             assert_eq!(
                 r.self_categories,
                 Some(vec!["INSIDER".to_string(), "ANALYST".to_string()])
