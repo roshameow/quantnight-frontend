@@ -137,7 +137,13 @@ fn runtime_source_fresh(root: &Path, embedded: &str, scope: &str) -> Result<(), 
 pub fn peer_host(stream:&tokio::net::UnixStream,host:&HostIdentity)->Result<(),String>{if peer_pid(stream)?!=host.owner.pid{return Err("runtime socket peer PID differs from native ready owner".into());}Ok(())}
 #[cfg(all(unix,not(target_os="macos")))]
 pub fn peer_host(_: &tokio::net::UnixStream,_:&HostIdentity)->Result<(),String>{Err("runtime native peer process check requires macOS".into())}
-pub fn host_image(selection:&RuntimeSelection)->Result<[u8;16],String>{image::ensure_current(&selection.executable)}
+pub fn host_image(selection:&RuntimeSelection)->Result<[u8;16],String>{
+    let loaded=image::loaded()?;
+    if image::disk(&selection.executable)?!=loaded{
+        return Err("loaded runtime-host image differs from on-disk taskctl; rebuild '--bin taskctl' (note: 'cargo test -p quantnight-taskctl' overwrites it) and reload via 'register-dev-host.mjs --runtime-action reload --write' instead of rerunning 'npm run tauri dev'".into());
+    }
+    Ok(loaded)
+}
 pub fn management_selection_matches(a:&RuntimeSelection,b:&RuntimeSelection)->bool{a.binding_path==b.binding_path && a.backend_root==b.backend_root && a.frontend_root==b.frontend_root && a.configuration==b.configuration && a.protocol_version==b.protocol_version}
 pub fn validate_host(identity:&HostIdentity,selection:&RuntimeSelection,business:bool)->Result<(),String>{
     if (if business { &identity.selection!=selection } else { !management_selection_matches(&identity.selection,selection) }) || identity.uid!=uid() || !identity.ready || process_identity(identity.owner.pid)?!=identity.owner{return Err("runtime ready identity/owner/selection mismatch".into());}
@@ -453,6 +459,69 @@ mod activation_tests {
         }
         let oversized=root.join("s".repeat(104-root.as_os_str().as_bytes().len()-1));assert_eq!(oversized.as_os_str().as_bytes().len(),104);
         for invalid in [oversized,PathBuf::new(),PathBuf::from(std::ffi::OsStr::from_bytes(b"/private/tmp/ss01\0suffix"))]{assert!(refused_socket_without_bytes(&invalid).unwrap_err().contains("invalid selected Unix observation pathname"));}
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_image_mismatch_reports_bin_rebuild_and_reload_without_tauri_dev() {
+        let root = Path::new("/tmp").join(format!("qn-host-img-{}", &nonce().unwrap()[..10]));
+        fs::create_dir_all(root.join("front/crates/target/debug")).unwrap();
+        fs::create_dir_all(root.join("front/.quantnight")).unwrap();
+        fs::create_dir_all(root.join("back/.quantnight")).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let _clean = Cleanup(root.clone());
+        let root = root.canonicalize().unwrap();
+        let front = root.join("front");
+        let back = root.join("back");
+        let exe = front.join("crates/target/debug/taskctl");
+        let self_exe = std::env::current_exe().unwrap();
+        fs::copy(&self_exe, &exe).unwrap();
+
+        let binding_path = root.join("binding.json");
+        let binding = Binding {
+            schema_version: 2,
+            frontend_root: front.clone(),
+            backend_root: back.clone(),
+            executable: front.join("src-tauri/target/debug/gui"),
+            target: crate::DEV_TARGET.into(),
+            profile: "debug".into(),
+            runtime: Some(RuntimeEnrollment {
+                executable: exe.clone(),
+                configuration: ConfigurationSelector { kind: "backend_root".into(), path: back.clone() },
+                protocol_version: 1,
+            }),
+        };
+        fs::write(&binding_path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        for dir in [&front, &back] {
+            fs::write(
+                dir.join(".quantnight/taskctl-selection.json"),
+                serde_json::to_vec(&serde_json::json!({"schema_version": 1, "mode": "dev", "binding": binding_path})).unwrap(),
+            ).unwrap();
+        }
+        let selection = RuntimeSelection::from_binding(&binding_path).unwrap();
+        assert_eq!(host_image(&selection).unwrap(), image::loaded().unwrap());
+
+        let mut bytes = fs::read(&exe).unwrap();
+        let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let mut offset = 32_usize;
+        let mut patched = false;
+        for _ in 0..ncmds {
+            let kind = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if kind == 0x1b {
+                bytes[offset + 8] ^= 0xff;
+                patched = true;
+                break;
+            }
+            offset += size;
+        }
+        assert!(patched);
+        fs::write(&exe, &bytes).unwrap();
+        let err = host_image(&selection).unwrap_err();
+        assert!(err.contains("register-dev-host.mjs --runtime-action reload --write"), "{err}");
+        assert!(err.contains("cargo test -p quantnight-taskctl"), "{err}");
+        assert!(err.contains("instead of rerunning 'npm run tauri dev'"), "{err}");
     }
 
 }

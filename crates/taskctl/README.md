@@ -109,6 +109,14 @@ Standalone CLI-only tests:
 cargo test --offline --locked --manifest-path crates/Cargo.toml -p quantnight-taskctl
 ```
 
+> **Important build interaction (`image_stale`):** Because `crates/taskctl/Cargo.toml` enables `quantnight-task-core/test-support` in `[dev-dependencies]` and integration tests reference `CARGO_BIN_EXE_taskctl`, running `cargo test -p quantnight-taskctl` overwrites `crates/target/debug/taskctl` on disk with a `test-support`-unified binary whose Mach-O UUID differs from the regular `--bin taskctl` build. Whenever a dev runtime is enrolled (or after running `cargo test -p quantnight-taskctl`), rebuild the regular binary:
+>
+> ```sh
+> cargo build --locked --manifest-path crates/Cargo.toml -p quantnight-taskctl --bin taskctl
+> ```
+>
+> If an already-running `taskctl runtime-host` reports `image_stale`, reload it explicitly (`node scripts/register-dev-host.mjs --binding "$BINDING" --runtime-action reload --write`); rerunning `npm run tauri dev` does **not** rebuild or reload the independent `taskctl runtime-host`.
+
 Parser integers are retained without truncation; converting impossible native
 representations (including negative generate timeout) fails explicitly before
 config/DB, never wraps or clamps. Normal operation limits/defaults stay with the
@@ -449,13 +457,20 @@ against a malicious same-user peer, nor prove permanent stability.
 
 ### Development generations
 
-Stock Vite/Tauri remains the GUI build/reload owner. Its reload does not reload
-the independent task host. Shared core/runtime/CLI source changes make an old
-host reject new business while admitted operations finish; the original owner
-explicitly builds, drains and adopts the new host. UI-only changes must not force
-host restart. No client, shim or build.rs runs Cargo, launchctl or a new rebuild
-broker. On-disk source/binary freshness, each loaded image and actual business
-verification are separate evidence.
+Stock Vite/Tauri remains the GUI build/reload owner. Its reload does not rebuild
+or reload the independent `taskctl runtime-host`. Shared core/runtime/CLI source
+changes (or overwriting `crates/target/debug/taskctl` by running
+`cargo test -p quantnight-taskctl`, which compiles `[[bin]] taskctl` with
+`quantnight-task-core/test-support`) make an already-running host fail
+admission with `image_stale` / `source_stale` until you:
+1. Rebuild `cargo build --locked --manifest-path crates/Cargo.toml -p quantnight-taskctl --bin taskctl`, and
+2. Explicitly drain and reload the enrolled host with `node scripts/register-dev-host.mjs --binding "$BINDING" --runtime-action reload --write` (then verify with `runtime-status`).
+
+Rerunning `npm run tauri dev` alone will **not** fix `image_stale` on the
+independent `runtime-host`. UI-only changes must not force host restart. No
+client, shim or build.rs runs Cargo, launchctl or a new rebuild broker. On-disk
+source/binary freshness, each loaded image and actual business verification are
+separate evidence.
 
 <a id="explicit-desktop-development-taskctl-mode"></a>
 
