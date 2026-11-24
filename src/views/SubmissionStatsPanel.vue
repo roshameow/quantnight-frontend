@@ -10,7 +10,7 @@
               :options="configStore.dataFilterOptions"
               placeholder="选择数据集"
               style="width: 100%"
-              @update:value="fetchStats"
+              @update:value="handleCollectionChange"
             />
           </div>
 
@@ -23,13 +23,13 @@
               placeholder="输入查询条件 (JSON, 回车搜索)"
               clearable
               @select="handleHistorySelect"
-              @keyup.enter="fetchStats"
+              @keyup.enter="handleSearch"
             />
           </div>
 
           <!-- 搜索按钮 -->
           <div style="width: 100px; flex-shrink: 0;">
-            <n-button type="primary" @click="fetchStats" :loading="loading" style="width: 100%">
+            <n-button type="primary" @click="handleRefresh" :loading="loading" style="width: 100%">
               刷新统计
             </n-button>
           </div>
@@ -52,6 +52,10 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <div v-if="statsError" role="alert" style="color: #d03050; margin-bottom: 8px">
+      加载统计失败：{{ statsError }}
     </div>
 
     <n-data-table
@@ -88,22 +92,25 @@
 </template>
 
 <script setup>
-import { ref, onMounted, h, computed } from 'vue';
+import { ref, onMounted, onBeforeUnmount, watch, h, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { NButton, NSpace, NSelect, NDataTable, NModal, NSlider, NText, NTag, NAutoComplete } from 'naive-ui';
 import { useConfigStore } from '../stores/configStore';
 import { useQueryStore } from '../stores/queryStore';
 import { useAlphaTableColumns } from '../composables/useAlphaTableColumns';
+import { createSubmissionStatsLoader } from '../utils/submissionStatsLoader.js';
 import '../assets/table-styles.css';
 
 const configStore = useConfigStore();
 const queryStore = useQueryStore();
 
 const loading = ref(false);
+const statsError = ref('');
 const selectedCollection = ref('alpha_results');
 const searchQuery = ref('');
 const statsData = ref([]);
 const rawStatsResult = ref([]);
+const loadedParams = ref(null);
 
 const windowStartIndex = ref(0);
 
@@ -125,7 +132,7 @@ const historyOptions = computed(() => {
 const handleHistorySelect = (value) => {
   if (!value) return;
   searchQuery.value = value;
-  fetchStats();
+  fetchStats({ force: true });
 };
 
 const removeQuery = (id) => {
@@ -311,6 +318,54 @@ const loadingSet = ref(new Set());
 const expandedRowIds = ref(new Set());
 const visibleColumns = ref(['score', 'pnl', 'message']);
 
+let isPanelMounted = false;
+let alphaListGeneration = 0;
+let activeModalCollection = null;
+let lastStatsScopeKey = null;
+
+function resetDrilldownState({ closeModal = false } = {}) {
+  alphaListGeneration++;
+  activeModalCollection = null;
+  alphaLoading.value = false;
+  alphaListData.value = [];
+  pnlDataMap.value = {};
+  loadingSet.value = new Set();
+  expandedRowIds.value = new Set();
+  if (closeModal) {
+    showAlphaList.value = false;
+  }
+}
+
+watch(showAlphaList, (visible) => {
+  if (!visible) {
+    resetDrilldownState({ closeModal: false });
+  }
+});
+
+const statsLoader = createSubmissionStatsLoader({
+  invoke,
+  onState: (state) => {
+    if (!isPanelMounted) return;
+    const scopeKey = state.params
+      ? JSON.stringify([state.params.collection, state.params.query])
+      : null;
+    if (scopeKey !== lastStatsScopeKey) {
+      lastStatsScopeKey = scopeKey;
+      windowStartIndex.value = 0;
+      resetDrilldownState({ closeModal: true });
+    }
+    rawStatsResult.value = state.rawResult;
+    statsData.value = state.statsData;
+    loading.value = state.loading;
+    statsError.value = state.error ? String(state.error) : '';
+    loadedParams.value = state.loadedParams;
+    if (state.error) {
+      console.error('Failed to fetch stats:', state.error);
+    }
+    windowStartIndex.value = Math.min(windowStartIndex.value, maxWindowIndex.value);
+  },
+});
+
 const { columns: alphaColumns } = useAlphaTableColumns({
   expandedRowIds,
   pnlDataMap,
@@ -318,16 +373,28 @@ const { columns: alphaColumns } = useAlphaTableColumns({
   loadPNL: async (id) => {
     if (loadingSet.value.has(id) || pnlDataMap.value[id] !== undefined) return;
     loadingSet.value.add(id);
+    const requestId = alphaListGeneration;
+    const collection = activeModalCollection || loadedParams.value?.collection || selectedCollection.value;
+    const isCurrent = () => isPanelMounted && requestId === alphaListGeneration;
     try {
       const result = await invoke("get_pnl_by_id", {
-        query: { id, collection: selectedCollection.value },
+        query: { id, collection },
       });
-      pnlDataMap.value[id] = result.pnl_series;
+      if (!isCurrent()) return;
+      if (result && result.children_series && result.children_series.length > 0) {
+        pnlDataMap.value[id] = result;
+      } else {
+        pnlDataMap.value[id] = result ? result.pnl_series : null;
+      }
     } catch (e) {
-      console.error("Error loading PnL:", e);
-      pnlDataMap.value[id] = null;
+      if (isCurrent()) {
+        console.error("Error loading PnL:", e);
+        pnlDataMap.value[id] = null;
+      }
     } finally {
-      loadingSet.value.delete(id);
+      if (isCurrent()) {
+        loadingSet.value.delete(id);
+      }
     }
   },
   visibleColumns
@@ -407,99 +474,53 @@ const columns = [
   }
 ];
 
-async function fetchStats() {
-  loading.value = true;
+function fetchStats({ force = true } = {}) {
   const q = searchQuery.value.trim();
   if (q && q !== '{}') {
     queryStore.addQuery('submission', q);
   }
-
-  try {
-    const result = await invoke('get_submission_stats', {
+  return statsLoader.load(
+    {
       collection: selectedCollection.value,
-      query: q || null
-    });
-    
-    rawStatsResult.value = result;
-    
-    const monthGroups = {};
-    result.forEach(doc => {
-      const month = doc._id.month || 'Unknown';
-      if (!monthGroups[month]) {
-        monthGroups[month] = {
-          month,
-          count: 0,
-          super_count: 0,
-          avg_sharpe: 0,
-          avg_fitness: 0,
-          avg_turnover: 0,
-          avg_returns: 0,
-          avg_margin: 0,
-          children: []
-        };
-      }
-      
-      const regionData = {
-        key: `${month}-${doc._id.region}-${doc._id.delay}`,
-        month,
-        region: doc._id.region,
-        delay: doc._id.delay,
-        count: doc.count || 0,
-        super_count: doc.super_count || 0,
-        avg_sharpe: doc.avg_sharpe,
-        avg_fitness: doc.avg_fitness,
-        avg_turnover: doc.avg_turnover,
-        avg_returns: doc.avg_returns,
-        avg_margin: doc.avg_margin
-      };
-      
-      monthGroups[month].children.push(regionData);
-      
-      const docCount = doc.count || 0;
-      monthGroups[month].count += docCount;
-      monthGroups[month].super_count += (doc.super_count || 0);
-      monthGroups[month].avg_sharpe += (doc.avg_sharpe || 0) * docCount;
-      monthGroups[month].avg_fitness += (doc.avg_fitness || 0) * docCount;
-      monthGroups[month].avg_turnover += (doc.avg_turnover || 0) * docCount;
-      monthGroups[month].avg_returns += (doc.avg_returns || 0) * docCount;
-      monthGroups[month].avg_margin += (doc.avg_margin || 0) * docCount;
-    });
+      query: q || null,
+    },
+    { force },
+  );
+}
 
-    statsData.value = Object.values(monthGroups).map(m => {
-      if (m.count > 0) {
-        m.avg_sharpe /= m.count;
-        m.avg_fitness /= m.count;
-        m.avg_turnover /= m.count;
-        m.avg_returns /= m.count;
-        m.avg_margin /= m.count;
-      }
-      m.children.sort((a, b) => {
-        const regionComp = a.region.localeCompare(b.region);
-        if (regionComp !== 0) return regionComp;
-        return a.delay - b.delay;
-      });
-      return {
-        ...m,
-        key: m.month
-      };
-    }).sort((a, b) => b.month.localeCompare(a.month));
+function handleCollectionChange(value) {
+  selectedCollection.value = value;
+  return fetchStats({ force: false });
+}
 
-  } catch (e) {
-    console.error('Failed to fetch stats:', e);
-  } finally {
-    loading.value = false;
-  }
+function handleSearch() {
+  return fetchStats({ force: true });
+}
+
+function handleRefresh() {
+  return fetchStats({ force: true });
 }
 
 async function viewAlphaList(month, region, delay, alphaType) {
+  const targetCollection = loadedParams.value?.collection || selectedCollection.value;
+  const targetQuery = loadedParams.value
+    ? (loadedParams.value.query || '')
+    : searchQuery.value.trim();
+  const windowMonths = [...selectedMonthsNames.value];
+  const requestId = ++alphaListGeneration;
+  activeModalCollection = targetCollection;
+
   selectedMonth.value = month;
   selectedRegion.value = region || '';
   selectedDelay.value = (delay !== undefined && delay !== null) ? delay : null;
   if (alphaType) selectedRegion.value += ` (${alphaType})`;
 
+  alphaListData.value = [];
+  pnlDataMap.value = {};
+  loadingSet.value = new Set();
+  expandedRowIds.value = new Set();
   showAlphaList.value = true;
   alphaLoading.value = true;
-  alphaListData.value = [];
 
   try {
     let monthCondition = {};
@@ -507,7 +528,7 @@ async function viewAlphaList(month, region, delay, alphaType) {
       monthCondition = {};
     } else if (month === '选定3个月') {
       monthCondition = {
-        $or: selectedMonthsNames.value.map(m => ({
+        $or: windowMonths.map(m => ({
           $or: [
             { "dateSubmitted": { $regex: `^${m}` } },
             { $and: [{ "dateSubmitted": { $exists: false } }, { "dateCreated": { $regex: `^${m}` } }] }
@@ -538,10 +559,9 @@ async function viewAlphaList(month, region, delay, alphaType) {
     }
 
     // Add search query conditions if present
-    const q = searchQuery.value.trim();
-    if (q && q !== '{}') {
+    if (targetQuery && targetQuery !== '{}') {
       try {
-        conditions.push(JSON.parse(q));
+        conditions.push(JSON.parse(targetQuery));
       } catch (e) {
         console.error("Failed to parse search query JSON:", e);
       }
@@ -550,23 +570,35 @@ async function viewAlphaList(month, region, delay, alphaType) {
     const query = conditions.length > 0 ? { $and: conditions } : {};
 
     const params = {
-      collection: selectedCollection.value,
+      collection: targetCollection,
       query: JSON.stringify(query),
       page: 1,
       page_size: 1000
     };
 
     const result = await invoke('get_alpha_results', { params });
-    alphaListData.value = result.data;
+    if (!isPanelMounted || requestId !== alphaListGeneration) return;
+    alphaListData.value = result?.data || [];
   } catch (e) {
-    console.error('Failed to fetch alpha list:', e);
+    if (isPanelMounted && requestId === alphaListGeneration) {
+      console.error('Failed to fetch alpha list:', e);
+    }
   } finally {
-    alphaLoading.value = false;
+    if (isPanelMounted && requestId === alphaListGeneration) {
+      alphaLoading.value = false;
+    }
   }
 }
 
 onMounted(() => {
-  fetchStats();
+  isPanelMounted = true;
+  fetchStats({ force: false });
+});
+
+onBeforeUnmount(() => {
+  isPanelMounted = false;
+  resetDrilldownState({ closeModal: true });
+  statsLoader.dispose();
 });
 </script>
 
