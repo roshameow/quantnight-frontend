@@ -964,6 +964,38 @@ async fn original_pause_never_signals_foreign_identity_or_confirms_known_live_or
 }
 
 #[tokio::test]
+async fn original_stop_verification_uses_host_cap_without_extending_caller_budget() {
+    use quantnight_task_core::{backend_binding::validate_backend_binding,
+        operations_runtime::{OriginalOperationsRuntime, OriginalPauseRuntime}};
+    use std::time::Duration;
+
+    let fake = original_professional_fixture(false);
+    let root = Path::new(&fake.config.env.working_dir);
+    let binding = validate_backend_binding(&fake.config).await.unwrap();
+    let runtime = OriginalPauseRuntime {
+        common: OriginalOperationsRuntime { binding: &binding, observer: None },
+        budget: StopBudget::Cli,
+    };
+    for (remote, caller_seconds, expected_seconds) in [
+        (false, 60, 12), (true, 60, 30), (true, 6, 6),
+    ] {
+        let mut task = normal();
+        task.insert("isRemote", remote);
+        std::fs::write(root.join("scripts/pause_task.sh"), format!(
+            "[[ $3 == --verify-stopped ]] || exit 1\nprintf '%s\\n' \"$QUANTNIGHT_STOP_REMAINING_SECONDS\"\nprintf '%s\\n' '{}'\n",
+            proof(2, remote),
+        )).unwrap();
+        let started = tokio::time::Instant::now();
+        let reply = runtime.verify_stopped(root, &task, Duration::from_secs(caller_seconds))
+            .await.unwrap().unwrap();
+        let allowance: f64 = reply.stdout.lines().next().unwrap().parse().unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        assert!(allowance <= expected_seconds as f64 && allowance >= expected_seconds as f64 - elapsed,
+            "remote={remote}, caller={caller_seconds}: script allowance={allowance}, elapsed={elapsed}");
+    }
+}
+
+#[tokio::test]
 async fn original_stop_adapter_zero_remaining_never_restarts_a_budget_or_process() {
     use quantnight_task_core::{backend_binding::validate_backend_binding,operations_runtime::{OriginalOperationsRuntime,OriginalPauseRuntime}};
     for budget in [StopBudget::Cli,StopBudget::Gui] {

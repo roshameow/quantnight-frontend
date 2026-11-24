@@ -292,7 +292,7 @@ pub(crate) async fn stop_activity_locked(
     verification_task.remove("observedExecutionBeforeStop");
     stage(observer, "stop", "inspect the current execution scope; signal at most once");
     let observation = runtime.inspect_before_stop(
-        root, store, task, remaining(deadline)?.min(Duration::from_secs(12)),
+        root, store, task, remaining(deadline)?.min(crate::operations_runtime::step_cap(remote)),
     ).await?;
     if let Some(observation) = observation {
         let observed = crate::start::config_document(observation)?;
@@ -317,7 +317,7 @@ pub(crate) async fn stop_activity_locked(
             if first.contains("known_original_runners_still_live") {
                 return Err(first);
             }
-            let proof = runtime.verify_stopped(root, &verification_task, remaining(deadline)?.min(Duration::from_secs(12))).await
+            let proof = runtime.verify_stopped(root, &verification_task, remaining(deadline)?.min(crate::operations_runtime::step_cap(remote))).await
                 .map_err(|next| format!("{first}; original read-only recovery: {next}"))?
                 .ok_or_else(|| format!("{first}; original read-only recovery did not confirm stop"))?;
             let basis = verified_stop_proof(&proof.stdout, name, remote)?;
@@ -328,7 +328,7 @@ pub(crate) async fn stop_activity_locked(
     *output = Some(response);
     if used_recovery {
         stage(observer, "receipt_validate", "check current execution scope after stop");
-        runtime.confirm_stopped_scope(root, store, &verification_task, remaining(deadline)?.min(Duration::from_secs(12))).await?;
+        runtime.confirm_stopped_scope(root, store, &verification_task, remaining(deadline)?.min(crate::operations_runtime::step_cap(remote))).await?;
     }
     Ok(basis)
 }

@@ -29,6 +29,14 @@ tokio::task_local! {static OPERATION_ENV:OperationalEnvironment;}
 pub fn current_environment()->Option<OperationalEnvironment>{OPERATION_ENV.try_with(Clone::clone).ok()}
 pub async fn with_environment<T>(environment:Option<OperationalEnvironment>,future:impl std::future::Future<Output=T>)->T{if let Some(environment)=environment{OPERATION_ENV.scope(environment,future).await}else{future.await}}
 
+/// Per-step cap for one original execution observation / stop verification.
+/// Remote hosts may only be reachable through a slow relay (e.g. Tailscale DERP,
+/// SSH handshake alone ~8s), so remote steps get a wider cap. Every step remains
+/// bounded by the caller's overall CLI/GUI budget; local steps are unchanged.
+pub(crate) const LOCAL_STEP_CAP: Duration = Duration::from_secs(12);
+pub(crate) const REMOTE_STEP_CAP: Duration = Duration::from_secs(30);
+pub(crate) fn step_cap(remote: bool) -> Duration { if remote { REMOTE_STEP_CAP } else { LOCAL_STEP_CAP } }
+
 pub struct OriginalOperationsRuntime<'a> {
     pub binding: &'a BackendBinding,
     pub observer: Option<BashScriptObserver>,
@@ -68,7 +76,7 @@ impl OriginalOperationsRuntime<'_> {
     }
     async fn execution_owner(&self, root: &Path, _store: &dyn crate::task_store::TaskStore,
         task: &Document, remote: bool, requested: Option<&Document>, allowance: Duration) -> Result<Value, String> {
-        let deadline = tokio::time::Instant::now() + allowance.min(Duration::from_secs(12));
+        let deadline = tokio::time::Instant::now() + allowance.min(step_cap(remote));
         tokio::time::timeout_at(deadline,async {
         self.verify_root(root).await?;
         let name = task.get_str("name").map_err(|_| "missing task name")?;
@@ -146,9 +154,9 @@ impl OriginalOperationsRuntime<'_> {
     }
     async fn verify_stop_owner(&self, root: &Path, task: &Document, allowance: Duration)
         -> Result<Option<crate::pause::StopOutput>, String> {
-        let out = self.pause_owner(root, task, Some("--verify-stopped"), allowance.min(Duration::from_secs(12))).await?;
-        let name = task.get_str("name").map_err(|_| "missing task name")?;
         let remote = task.get_bool("isRemote").unwrap_or(false);
+        let out = self.pause_owner(root, task, Some("--verify-stopped"), allowance.min(step_cap(remote))).await?;
+        let name = task.get_str("name").map_err(|_| "missing task name")?;
         if crate::pause::verified_stop_observation(&out.stdout, name, remote)? { Ok(Some(out)) } else { Ok(None) }
     }
     fn process(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -213,7 +221,7 @@ impl OperationsRuntime for OriginalOperationsRuntime<'_> {
         command.arg("scripts/check_tmux_python.sh").arg(name)
             .arg(if host.is_remote() { "true" } else { "false" })
             .arg("--require-absent").arg("--binding").arg(binding.to_string());
-        let (out, _) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
+        let (out, _) = run_process_observed(command, Duration::from_secs(20).max(step_cap(host.is_remote())), true, self.observer.clone()).await?;
         require_exact_absence(&out, name, host.is_remote())
     }
 
@@ -358,7 +366,7 @@ impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
         let mut command = self.process("/bin/bash");
         command.arg("scripts/check_tmux_python.sh").arg(name)
             .arg(if remote { "true" } else { "false" }).args(["--require-absent", "--binding"]).arg(binding.to_string());
-        let (out, _) = run_process_observed(command, Duration::from_secs(20), true, self.observer.clone()).await?;
+        let (out, _) = run_process_observed(command, Duration::from_secs(20).max(step_cap(remote)), true, self.observer.clone()).await?;
         require_exact_absence(&out, name, remote)
     }
     async fn validate_execution_binding(&self, root: &Path, binding: &Document, remote: bool) -> Result<(), String> {
@@ -402,7 +410,7 @@ impl crate::start::StartRuntime for OriginalOperationsRuntime<'_> {
 #[async_trait]
 impl crate::inspection::InspectionRuntime for OriginalOperationsRuntime<'_> {
     async fn inspect_execution(&self, root: &Path, store: &dyn crate::task_store::TaskStore, task: &Document, host: Host)
-        -> Result<Option<Value>, String> { self.execution_owner(root,store,task,host.is_remote(),None,Duration::from_secs(12)).await.map(Some) }
+        -> Result<Option<Value>, String> { self.execution_owner(root,store,task,host.is_remote(),None,step_cap(host.is_remote())).await.map(Some) }
     async fn canonical_namespace(&self, root: &Path, profile: &str) -> Result<crate::task_store::CanonicalNamespace, String> {
         let result = self.owner_result(root, "backend.mongodb.mongo_config", "--resolve-task-result-namespace",
             "resolve-task-result-namespace", json!({"authProfile":profile,"configurationBinding":self.binding.request()}),
@@ -557,7 +565,7 @@ impl crate::pause::PauseRuntime for OriginalPauseRuntime<'_> {
         -> Result<bool, String> {
         let name = task.get_str("name").map_err(|_| "missing task name")?;
         let remote = task.get_bool("isRemote").unwrap_or(false);
-        match self.common.pause_owner(root, task, Some("--verify-never-started"), remaining.min(Duration::from_secs(12))).await {
+        match self.common.pause_owner(root, task, Some("--verify-never-started"), remaining.min(step_cap(remote))).await {
             Ok(out) => Ok(crate::pause::verified_stop_proof(&out.stdout, name, remote).ok()
                 == Some(crate::pause::StopConfirmationBasis::RunnersExited)),
             Err(_) => Ok(false),
